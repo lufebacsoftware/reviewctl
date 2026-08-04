@@ -160,10 +160,7 @@ if '--output-schema' in arguments:
     ):
         workspace = Path(arguments[arguments.index('-C') + 1])
         payload['reviewedFiles'] = [
-            {
-                'path': path.name,
-                'sha256': __import__('hashlib').sha256(path.read_bytes()).hexdigest(),
-            }
+            path.name
             for path in workspace.iterdir()
             if path.is_file()
             and path.name not in {
@@ -340,6 +337,9 @@ def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -
     assert "--ephemeral" in arguments
     assert Path(workspace).name.startswith("reviewctl-input-")
     assert not list(turn.glob("**/codex-response.md"))
+    response_path = Path(receipt["attempts"][0]["evidence"]["response"])
+    assert response_path.is_file()
+    assert response_path.read_text()
 
 
 def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Path) -> None:
@@ -526,10 +526,10 @@ def test_review_validation_error_explains_every_structured_contract_boundary() -
     expected_file_hashes = {"brief.md": "a" * 64}
     approved = json.dumps({"verdict": "approved", "findings": []})
     product = product_review_payload()
-    product["reviewedFiles"] = [{"path": "brief.md", "sha256": "b" * 64}]
+    product["reviewedFiles"] = ["invented.md"]
     invalid_product = product_review_payload()
     invalid_product["summary"] = ""
-    invalid_product["reviewedFiles"] = [{"path": "brief.md", "sha256": "a" * 64}]
+    invalid_product["reviewedFiles"] = ["brief.md"]
     judge = {
         "scores": {
             "delivery": 4,
@@ -540,7 +540,7 @@ def test_review_validation_error_explains_every_structured_contract_boundary() -
         },
         "hardConstraintViolations": [],
         "rationale": "The proposal is complete.",
-        "reviewedFiles": [{"path": "brief.md", "sha256": "b" * 64}],
+        "reviewedFiles": ["invented.md"],
     }
 
     assert cli.review_validation_error(approved, "findings-json") is None
@@ -1159,7 +1159,7 @@ def test_product_judge_contract_rejects_invalid_scores_and_violation_lists(
 
 def test_product_contracts_require_valid_codex_read_proof() -> None:
     product = product_review_payload()
-    product["reviewedFiles"] = [{"path": "brief.md", "sha256": "a" * 64}]
+    product["reviewedFiles"] = ["brief.md"]
     assert (
         cli.validate_review_response(
             json.dumps(product), "product-review-json", expected_file_hashes={"brief.md": "a" * 64}
@@ -1335,7 +1335,7 @@ def test_product_helper_guards_cover_invalid_prices_proofs_and_collisions(tmp_pa
     }
     assert cli.validate_product_judge(judge) is None
     judge.pop("extra")
-    judge["reviewedFiles"] = [{"path": "brief.md", "sha256": "a" * 64}]
+    judge["reviewedFiles"] = ["invented.md"]
     assert (
         cli.validate_review_response(
             json.dumps(judge), "product-judge-json", expected_file_hashes={"brief.md": "b" * 64}
@@ -1423,7 +1423,7 @@ def test_product_tournament_last_guard_branches_and_budget(tmp_path: Path) -> No
         },
         "hardConstraintViolations": [],
         "rationale": "Reason.",
-        "reviewedFiles": [{"path": "brief.md", "sha256": "a" * 64}],
+        "reviewedFiles": ["brief.md"],
     }
     assert cli.validate_review_response(
         json.dumps(judge), "product-judge-json", expected_file_hashes={"brief.md": "a" * 64}
@@ -1807,18 +1807,18 @@ def test_findings_contract_rejects_an_unrequested_external_read_proof() -> None:
         {
             "verdict": "approved",
             "findings": [],
-            "reviewedFiles": [{"path": "source.py", "sha256": "a" * 64}],
+            "reviewedFiles": ["source.py"],
         }
     )
 
     assert cli.validate_review_response(response, "findings-json") is None
 
 
-def test_findings_contract_requires_exact_snapshot_hashes() -> None:
+def test_findings_contract_binds_snapshot_names_while_the_runner_owns_hashes() -> None:
     valid = {
         "verdict": "approved",
         "findings": [],
-        "reviewedFiles": [{"path": "source.py", "sha256": "a" * 64}],
+        "reviewedFiles": ["source.py"],
     }
     assert (
         cli.validate_review_response(
@@ -1827,12 +1827,29 @@ def test_findings_contract_requires_exact_snapshot_hashes() -> None:
         is not None
     )
 
-    valid["reviewedFiles"][0]["sha256"] = "b" * 64
+    valid["reviewedFiles"][0] = "/private/tmp/reviewctl-input-abc/source.py"
     assert (
         cli.validate_review_response(
             json.dumps(valid), "findings-json", expected_file_hashes={"source.py": "a" * 64}
         )
-        is None
+        is not None
+    )
+
+
+def test_findings_contract_accepts_unique_snapshot_basename_from_sandbox_path() -> None:
+    response = {
+        "verdict": "approved",
+        "findings": [],
+        "reviewedFiles": ["/private/tmp/reviewctl-input-abc/source.py"],
+    }
+
+    assert (
+        cli.validate_review_response(
+            json.dumps(response),
+            "findings-json",
+            expected_file_hashes={"source.py": "a" * 64},
+        )
+        is not None
     )
 
 
@@ -1841,11 +1858,9 @@ def test_findings_contract_requires_exact_snapshot_hashes() -> None:
     [
         "not-a-list",
         ["not-an-object"],
-        [{"path": 1, "sha256": "a" * 64}],
-        [
-            {"path": "source.py", "sha256": "a" * 64},
-            {"path": "source.py", "sha256": "a" * 64},
-        ],
+        [1],
+        ["source.py", "source.py"],
+        ["source.py", "/private/tmp/reviewctl-input-abc/source.py"],
     ],
 )
 def test_findings_contract_rejects_malformed_or_duplicate_read_proofs(
@@ -3711,7 +3726,7 @@ def test_structured_contract_rejects_findings_outside_the_supplied_packet() -> N
                         "reproduction": "N/A",
                     }
                 ],
-                "reviewedFiles": [{"path": "source.py", "sha256": "a" * 64}],
+                "reviewedFiles": ["source.py"],
             }
         ),
         "findings-json",

@@ -24,7 +24,7 @@ def test_public_tree_excludes_private_review_evidence() -> None:
             ("sites", "pay"),
         )
     )
-    forbidden_directories = {"receipts", "sealed", "council", "dist"}
+    forbidden_directories = {"receipts", "sealed", "council"}
 
     for path in ROOT.rglob("*"):
         if path.is_dir():

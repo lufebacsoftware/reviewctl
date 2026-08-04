@@ -16,8 +16,8 @@ For local development, run `uv sync --all-groups` followed by `uv run pytest`.
 
 ## Optional runtime tools
 
-The core receipt verifier has no runtime dependencies. Transports and evidence
-features call external tools only when selected:
+The core CLI is Python-only and does **not** require Node.js. Transports and
+evidence features call external tools only when selected:
 
 | Feature | External requirement |
 | --- | --- |
@@ -47,8 +47,9 @@ reviewctl run \
 ```
 
 Each model attempt receives a fresh SQLite log database. The runner snapshots each selected file
-before invoking a model, so the source digest and reviewed bytes are the same. A receipt is accepted
-only when the persisted response is non-empty, complete, tied to the requested model, and tied to a
+before invoking a model and records its digest in the receipt provenance. A model declares only the
+frozen snapshot paths it reviewed; it never supplies an unverifiable hash. A receipt is accepted only
+when the persisted response is non-empty, complete, tied to the requested model, and tied to a
 persisted conversation. Finding paths must name an attached file exactly. With `--seal-to`, the exact
 request and response are encrypted with Age; the visible receipt contains only hashes, provenance,
 result metadata, and structured findings.

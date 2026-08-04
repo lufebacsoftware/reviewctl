@@ -93,15 +93,7 @@ CODEX_FINDINGS_SCHEMA = {
         "reviewedFiles": {
             "type": "array",
             "minItems": 1,
-            "items": {
-                "type": "object",
-                "required": ["path", "sha256"],
-                "additionalProperties": False,
-                "properties": {
-                    "path": {"type": "string"},
-                    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-                },
-            },
+            "items": {"type": "string", "minLength": 1},
         },
     },
 }
@@ -1301,21 +1293,23 @@ def codex_prompt(prompt: str, response_contract: str) -> str:
             "Read the frozen files in the current working directory before reviewing. "
             "Return only JSON matching the supplied findings schema. "
             "Use approved only when there are no findings, and changes-requested only when "
-            "findings is non-empty. Calculate and return the SHA-256 for every supplied file in "
-            "reviewedFiles; do not emit a verdict if you cannot read a file."
+            "findings is non-empty. List every frozen snapshot you actually reviewed in "
+            "reviewedFiles; do not emit a verdict if you cannot read a file. The runner, not "
+            "you, records the authoritative source hashes."
         )
     elif response_contract == "product-review-json":
         contract = (
             "Read the frozen briefing files in the current working directory before designing. "
-            "Return only JSON matching the supplied product-design schema. Calculate and return "
-            "the SHA-256 for every supplied file in reviewedFiles; do not return a design if you "
-            "cannot read a file."
+            "Return only JSON matching the supplied product-design schema. List every frozen "
+            "snapshot you actually reviewed in reviewedFiles; do not return a design if you cannot "
+            "read a file. The runner records the authoritative source hashes."
         )
     elif response_contract == "product-judge-json":
         contract = (
             "Read the frozen briefing and anonymous candidate response in the current working "
-            "directory. Return only JSON matching the supplied council-judgment schema. Calculate "
-            "and return the SHA-256 for every supplied file in reviewedFiles."
+            "directory. Return only JSON matching the supplied council-judgment schema. List every "
+            "frozen snapshot you actually reviewed in reviewedFiles. The runner records the "
+            "authoritative source hashes."
         )
     else:
         contract = "Return a complete verdict beginning with VERDICT: and ending with punctuation."
@@ -1579,16 +1573,21 @@ def validate_read_proof(value: dict[str, Any], expected_file_hashes: dict[str, s
     reviewed_files = value.get("reviewedFiles")
     if not isinstance(reviewed_files, list):
         return False
-    reviewed_hashes: dict[str, str] = {}
+    reviewed_paths: set[str] = set()
     for reviewed in reviewed_files:
-        if not isinstance(reviewed, dict):
+        if not isinstance(reviewed, str) or not reviewed:
             return False
-        path = reviewed.get("path")
-        digest = reviewed.get("sha256")
-        if not isinstance(path, str) or not isinstance(digest, str) or path in reviewed_hashes:
+        # Codex receives a private frozen snapshot and may report its absolute
+        # sandbox path. Frozen inputs have unique basenames, so normalize that
+        # path form before comparing the declared files to receipt provenance.
+        snapshot_name = Path(reviewed).name
+        proof_path = reviewed if reviewed in expected_file_hashes else snapshot_name
+        if proof_path in reviewed_paths:
             return False
-        reviewed_hashes[path] = digest
-    return reviewed_hashes == expected_file_hashes
+        # The model declares only the frozen snapshots it reviewed. The runner
+        # preserves the immutable SHA-256 values in the receipt provenance.
+        reviewed_paths.add(proof_path)
+    return reviewed_paths == set(expected_file_hashes)
 
 
 def validate_review_response(
@@ -1807,6 +1806,12 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     timeout_seconds=args.timeout_seconds,
                     workspace=snapshots[0].parent,
                 )
+                # Codex writes its transient response inside the isolated
+                # sandbox, which is removed after the attempt. Persist a copy
+                # in the caller-controlled evidence root so a rejected output
+                # remains diagnosable without weakening the contract gate.
+                response_path = attempt_dir / "response.md"
+                response_path.write_text(persisted.response)
             elif transport == "openrouter":
                 request_path = attempt_dir / "request.json"
                 response_path = attempt_dir / "response.json"
