@@ -54,4 +54,7 @@ def test_release_workflow_builds_and_publishes_verified_artifacts() -> None:
     assert "uv build" in workflow
     assert "sha256sum" in workflow
     assert "uv tool install" in workflow
-    assert "softprops/action-gh-release" in workflow
+    assert "actions/checkout@v6" in workflow
+    assert "actions/attest-build-provenance@v4" in workflow
+    assert "softprops/action-gh-release@v3" in workflow
+    assert "@v2" not in workflow
