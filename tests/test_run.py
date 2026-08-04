@@ -189,6 +189,42 @@ print(f"model: {os.environ.get('CODEX_RESOLVED_MODEL', model)}")
     return executable
 
 
+def write_fake_sandbox_exec(path: Path) -> Path:
+    executable = path / "sandbox-exec"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+
+os.execvp(sys.argv[3], sys.argv[3:])
+"""
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def write_fake_age(path: Path) -> Path:
+    executable = path / "age"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+if os.environ.get('AGE_FAIL'):
+    print('invalid recipient', file=sys.stderr)
+    raise SystemExit(1)
+if '-d' in sys.argv:
+    sys.stdout.buffer.write(Path(sys.argv[-1]).read_bytes())
+else:
+    target = Path(sys.argv[sys.argv.index('-o') + 1])
+    target.write_bytes(sys.stdin.buffer.read())
+"""
+    )
+    executable.chmod(0o755)
+    return executable
+
+
 def write_fake_agy(path: Path) -> Path:
     executable = path / "agy"
     executable.write_text(
@@ -1831,14 +1867,13 @@ def test_findings_contract_rejects_malformed_or_duplicate_read_proofs(
 
 
 def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_root = tmp_path / "source-root"
     source_root.mkdir()
-    secret = source_root / "proprietary.py"
-    secret.write_text("secret = 'never reveal'\n")
     auth = tmp_path / "auth.json"
     auth.write_text('{"access_token":"test"}')
+    monkeypatch.setattr(cli.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
 
     with cli.codex_isolation([source_root], auth_path=auth) as isolation:
         profile = isolation.profile.read_text()
@@ -1847,14 +1882,27 @@ def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home
         assert isolation.home.joinpath("auth.json").read_text() == auth.read_text()
         assert isolation.environment["CODEX_HOME"] == str(isolation.home)
         assert isolation.environment["HOME"] == str(isolation.home)
+
+
+@pytest.mark.skipif(cli.shutil.which("sandbox-exec") is None, reason="macOS integration")
+def test_macos_sandbox_profile_denies_the_original_source_root(tmp_path: Path) -> None:
+    source_root = tmp_path / "source-root"
+    source_root.mkdir()
+    secret = source_root / "proprietary.py"
+    secret.write_text("secret = 'never reveal'\n")
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"access_token":"test"}')
+
+    with cli.codex_isolation([source_root], auth_path=auth) as isolation:
         denied = subprocess.run(
             ["sandbox-exec", "-f", str(isolation.profile), "/bin/cat", str(secret)],
             text=True,
             capture_output=True,
             check=False,
         )
-        assert denied.returncode != 0
-        assert "never reveal" not in denied.stdout
+
+    assert denied.returncode != 0
+    assert "never reveal" not in denied.stdout
 
 
 def test_codex_isolation_rejects_missing_sandbox_or_auth(
@@ -1880,6 +1928,7 @@ def test_codex_transport_fails_closed_when_proprietary_isolation_cannot_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CODEX_AUTH_FILE", str(tmp_path / "missing.json"))
+    monkeypatch.setattr(cli.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
 
     exit_code, error, response = cli.invoke_codex(
         codex_bin="must-not-run",
@@ -1916,6 +1965,7 @@ def test_codex_transport_applies_source_root_isolation_for_proprietary_reviews(
     tools = tmp_path / "tools"
     tools.mkdir()
     fake_codex = write_fake_codex(tools)
+    write_fake_sandbox_exec(tools)
     source_root = tmp_path / "source-root"
     source_root.mkdir()
     source = source_root / "source.py"
@@ -1947,7 +1997,11 @@ def test_codex_transport_applies_source_root_isolation_for_proprietary_reviews(
         "codex",
         "--response-contract",
         "findings-json",
-        env={"CODEX_AUTH_FILE": str(auth), "CODEX_BIN": str(fake_codex)},
+        env={
+            "CODEX_AUTH_FILE": str(auth),
+            "CODEX_BIN": str(fake_codex),
+            "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+        },
     )
 
     assert result.returncode == 0, result.stderr
@@ -2628,7 +2682,12 @@ def test_terminate_process_group_handles_missing_and_stubborn_processes(
     assert signals == [cli.signal.SIGTERM, cli.signal.SIGKILL]
 
 
-def test_seal_failure_and_cli_runtime_error_are_reported(tmp_path: Path) -> None:
+def test_seal_failure_and_cli_runtime_error_are_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_fake_age(tmp_path)
+    monkeypatch.setenv("AGE_FAIL", "1")
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
     with pytest.raises(RuntimeError):
         cli.seal(tmp_path / "request.json", b"payload", "not-an-age-recipient")
 
@@ -2659,26 +2718,25 @@ def test_response_completeness_contract(response: str, complete: bool) -> None:
 
 def age_recipient(tmp_path: Path) -> tuple[Path, str]:
     key = tmp_path / "audit.agekey"
-    subprocess.run(["age-keygen", "-o", str(key)], check=True, capture_output=True)
-    recipient = next(
-        line.split(": ", 1)[1]
-        for line in key.read_text().splitlines()
-        if line.startswith("# public key:")
-    )
-    return key, recipient
+    key.write_text("test identity")
+    return key, "age1testrecipient"
 
 
 def test_sealed_receipt_keeps_request_and_response_out_of_plaintext_artifacts(
     tmp_path: Path,
 ) -> None:
     fake_llm = write_fake_llm(tmp_path)
+    fake_age = write_fake_age(tmp_path)
     key, recipient = age_recipient(tmp_path)
 
     result = run_cli(
         *review_arguments(tmp_path, "accepted"),
         "--seal-to",
         recipient,
-        env={"LLM_BIN": str(fake_llm)},
+        env={
+            "LLM_BIN": str(fake_llm),
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+        },
     )
 
     assert result.returncode == 0, result.stderr
@@ -2688,7 +2746,7 @@ def test_sealed_receipt_keeps_request_and_response_out_of_plaintext_artifacts(
     assert (turn / receipt["sealed"]["response"]).is_file()
     assert not list(turn.glob("**/*.sqlite3"))
     decrypted = subprocess.run(
-        ["age", "-d", "-i", str(key), str(turn / receipt["sealed"]["request"])],
+        [str(fake_age), "-d", "-i", str(key), str(turn / receipt["sealed"]["request"])],
         check=True,
         capture_output=True,
         text=True,
