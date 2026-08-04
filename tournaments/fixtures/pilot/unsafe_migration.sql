@@ -1,0 +1,1 @@
+ALTER TABLE posting_execution DROP CONSTRAINT posting_execution_immutable;
