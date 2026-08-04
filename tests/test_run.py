@@ -278,7 +278,7 @@ def review_arguments(tmp_path: Path, *models: str) -> list[str]:
         "--artifact-root",
         str(tmp_path / "artifacts"),
         "--timeout-seconds",
-        "1",
+        "5",
         *(argument for model in models for argument in ("--model", model)),
         "--file",
         str(source),
