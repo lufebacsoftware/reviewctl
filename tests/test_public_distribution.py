@@ -52,7 +52,7 @@ def test_release_workflow_builds_and_publishes_verified_artifacts() -> None:
     assert "tags:" in workflow
     assert '"v*"' in workflow
     assert "uv build" in workflow
-    assert "sha256sum" in workflow
+    assert "(cd dist && sha256sum * > SHA256SUMS)" in workflow
     assert "uv tool install" in workflow
     assert "actions/checkout@v6" in workflow
     assert "actions/attest-build-provenance@v4" in workflow
