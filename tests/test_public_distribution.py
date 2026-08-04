@@ -58,3 +58,7 @@ def test_release_workflow_builds_and_publishes_verified_artifacts() -> None:
     assert "actions/attest-build-provenance@v4" in workflow
     assert "softprops/action-gh-release@v3" in workflow
     assert "@v2" not in workflow
+    assert "\n            dist/*\n" not in workflow
+    assert "dist/*.whl" in workflow
+    assert "dist/*.tar.gz" in workflow
+    assert "dist/SHA256SUMS" in workflow
