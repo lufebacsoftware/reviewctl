@@ -18,10 +18,10 @@ precision, line accuracy, JSON compliance, transport success, latency, token use
 ## Direct OpenRouter transport
 
 Set `transport = "openrouter"` in a tournament plan to call the OpenRouter chat-completions endpoint
-directly. This transport is synthetic-only: `reviewctl` rejects proprietary source before it constructs
-a network request. The runner, rather than the model, records the frozen source hashes. It persists a
-sanitized canonical request (never its authorization header), the raw provider response, resolved model,
-provider, usage, and cost in the attempt receipt.
+directly. For a proprietary packet, the owning organization's policy must explicitly set
+`source_allowed = true` for the selected model. The runner, rather than the model, records the frozen
+source hashes. It persists a sanitized canonical request (never its authorization header), the raw
+provider response, resolved model, provider, usage, and cost in the attempt receipt.
 
 The portable findings schema contains only `verdict` and `findings`. A response with findings must use
 `changes-requested`; `approved` requires an empty array. Finding severity is a closed vocabulary:

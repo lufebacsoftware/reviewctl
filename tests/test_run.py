@@ -721,8 +721,6 @@ def test_product_judge_contract_requires_scores_and_explicit_hard_violations() -
 
 def test_run_persists_a_synthetic_product_review_without_findings(tmp_path: Path) -> None:
     fake_agy = write_fake_agy(tmp_path)
-    source = tmp_path / "brief.md"
-    source.write_text("Synthetic product brief.\n")
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Design the product from the synthetic briefing.")
     payload = product_review_payload()
@@ -737,8 +735,6 @@ def test_run_persists_a_synthetic_product_review_without_findings(tmp_path: Path
         str(tmp_path / "artifacts"),
         "--model",
         "gemini-3.6-flash-high",
-        "--file",
-        str(source),
         "--transport",
         "agy",
         "--response-contract",
@@ -2265,10 +2261,11 @@ def test_proprietary_source_requires_and_honors_an_explicit_policy(tmp_path: Pat
     assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
 
 
-def test_proprietary_source_rejects_an_unstructured_verdict(tmp_path: Path) -> None:
+def test_proprietary_source_allows_the_selected_response_contract(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     policy = tmp_path / "allowed.toml"
     policy.write_text("[models.accepted]\nsource_allowed = true\n")
+    payload = product_review_payload()
 
     result = run_cli(
         *review_arguments(tmp_path, "accepted"),
@@ -2276,11 +2273,14 @@ def test_proprietary_source_rejects_an_unstructured_verdict(tmp_path: Path) -> N
         "proprietary",
         "--policy",
         str(policy),
-        env={"LLM_BIN": str(fake_llm)},
+        "--response-contract",
+        "product-review-json",
+        env={"LLM_BIN": str(fake_llm), "LLM_SCHEMA_RESPONSE": json.dumps(payload)},
     )
 
-    assert result.returncode == 3
-    assert "requires --response-contract findings-json" in result.stderr
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["review"] == payload
 
 
 def test_rejects_duplicate_file_basenames_before_creating_artifacts(tmp_path: Path) -> None:
@@ -4434,11 +4434,14 @@ def test_invoke_agy_reports_a_missing_binary(tmp_path: Path) -> None:
     assert response.response == ""
 
 
-def test_agy_transport_rejects_proprietary_source_before_invocation(tmp_path: Path) -> None:
+def test_agy_transport_honors_proprietary_source_policy(tmp_path: Path) -> None:
+    fake_agy = write_fake_agy(tmp_path)
     source = tmp_path / "source.py"
     source.write_text("pass\n")
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Review the bounded source.")
+    policy = tmp_path / "policy.toml"
+    policy.write_text('[models."gemini-3.6-flash-medium"]\nsource_allowed = true\n')
 
     result = run_cli(
         "run",
@@ -4458,10 +4461,15 @@ def test_agy_transport_rejects_proprietary_source_before_invocation(tmp_path: Pa
         "proprietary",
         "--response-contract",
         "findings-json",
+        "--policy",
+        str(policy),
+        env={"AGY_BIN": str(fake_agy)},
     )
 
-    assert result.returncode == 3
-    assert "native Antigravity transport is synthetic-only" in result.stderr
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["transport"] == "agy"
+    assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
 
 
 def test_run_uses_the_agy_transport_and_records_evidence(tmp_path: Path) -> None:
@@ -4500,20 +4508,67 @@ def test_run_uses_the_agy_transport_and_records_evidence(tmp_path: Path) -> None
 
 
 def test_openrouter_transport_rejects_proprietary_source_before_a_network_request(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    result = run_cli(
-        *review_arguments(tmp_path, "test-model"),
-        "--transport",
-        "openrouter",
-        "--source-class",
-        "proprietary",
-        "--response-contract",
-        "findings-json",
+    policy = tmp_path / "policy.toml"
+    policy.write_text('[models."test-model"]\nsource_allowed = true\n')
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Review the bounded source.")
+
+    def fake_openrouter(**kwargs: object) -> tuple[int, str, cli.PersistedResponse]:
+        request_path = kwargs["request_path"]
+        response_path = kwargs["response_path"]
+        assert isinstance(request_path, Path)
+        assert isinstance(response_path, Path)
+        request_path.write_text('{"model":"test-model"}')
+        response_path.write_text('{"id":"turn-test"}')
+        return (
+            0,
+            "",
+            cli.PersistedResponse(
+                conversation_id="turn-test",
+                cost_usd=0.001,
+                duration_ms=1,
+                input_tokens=2,
+                model="test-model",
+                output_tokens=3,
+                provider="Test Provider",
+                response='{"verdict":"approved","findings":[]}',
+            ),
+        )
+
+    monkeypatch.setattr(cli, "invoke_openrouter", fake_openrouter)
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "run",
+            "--review-id",
+            "openrouter.proprietary",
+            "--prompt-file",
+            str(prompt),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--model",
+            "test-model",
+            "--file",
+            str(source),
+            "--transport",
+            "openrouter",
+            "--source-class",
+            "proprietary",
+            "--response-contract",
+            "findings-json",
+            "--policy",
+            str(policy),
+        ]
     )
 
-    assert result.returncode == 3
-    assert "synthetic-only" in result.stderr
+    assert args.handler(args) == 0
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    assert receipt["transport"] == "openrouter"
+    assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
 
 
 def test_run_uses_the_openrouter_transport_and_records_evidence(

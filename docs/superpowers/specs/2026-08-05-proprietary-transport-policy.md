@@ -16,12 +16,14 @@ model on every built-in review transport: `llm`, `openrouter`, `agy`, and
 
 The default remains deny: a missing policy, a missing model entry, or
 `source_allowed = false` rejects the packet before an attempt is created. The
-existing proprietary safeguards remain required:
+existing operational safeguards remain required:
 
-- `--response-contract findings-json`
 - an explicit policy file and its digest in the receipt
 - a persisted request/response attempt receipt
 - rejection of empty or invalid provider responses
+
+Every supported response contract remains available. Synthetic prompt-only
+reviews may omit `--file`; their receipt records an empty file list.
 
 ## Compatibility
 
@@ -41,4 +43,6 @@ Tests will prove:
    its receipt;
 3. a permitted proprietary Antigravity packet invokes the transport and
    records its receipt;
-4. the full test suite passes.
+4. a proprietary packet accepts a non-findings contract;
+5. a synthetic prompt-only packet records an empty file list;
+6. the full test suite passes.

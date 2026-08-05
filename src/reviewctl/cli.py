@@ -315,7 +315,7 @@ def validate_request(
         fail(parser, "invalid review id")
     if not args.models:
         fail(parser, "at least one --model is required")
-    if len(args.files) == 0:
+    if len(args.files) == 0 and getattr(args, "source_class", "proprietary") == "proprietary":
         fail(parser, "at least one --file is required")
     if len(args.files) > MAX_FILES:
         fail(parser, f"at most {MAX_FILES} review files are allowed")
@@ -980,9 +980,14 @@ def packet_prompt(prompt: str, files: list[Path], response_contract: str = "verd
     """Add stable file names so structured findings are comparable across models."""
     supplied = ", ".join(file.name for file in files)
     if response_contract in {"product-review-json", "product-judge-json"}:
+        briefing_scope = (
+            f"Supplied synthetic briefing files: {supplied}. "
+            if files
+            else "No briefing files were supplied; use only the prompt. "
+        )
         return (
             f"{prompt}\n\n"
-            f"Supplied synthetic briefing files: {supplied}. "
+            f"{briefing_scope}"
             "Use only the stated briefing. Do not invent product requirements, integrations, "
             "or business facts not present in it."
         )
@@ -1757,18 +1762,6 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         parser.error("provider preferences require --transport openrouter")
     policy_digest: str | None = None
     if args.source_class == "proprietary":
-        if transport in {"openrouter", "agy"}:
-            print(
-                "reviewctl: direct OpenRouter or native Antigravity transport is synthetic-only",
-                file=sys.stderr,
-            )
-            return 3
-        if args.response_contract != "findings-json":
-            print(
-                "reviewctl: proprietary source requires --response-contract findings-json",
-                file=sys.stderr,
-            )
-            return 3
         if not args.policy:
             print("reviewctl: proprietary source requires --policy", file=sys.stderr)
             return 3
