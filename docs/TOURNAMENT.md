@@ -18,8 +18,8 @@ precision, line accuracy, JSON compliance, transport success, latency, token use
 ## Direct OpenRouter transport
 
 Set `transport = "openrouter"` in a tournament plan to call the OpenRouter chat-completions endpoint
-directly. For a proprietary packet, the owning organization's policy must explicitly set
-`source_allowed = true` for the selected model. The runner, rather than the model, records the frozen
+directly. A policy file is optional metadata: when supplied, its SHA-256 is included in the receipt but
+does not block a selected model or transport. The runner, rather than the model, records the frozen
 source hashes. It persists a sanitized canonical request (never its authorization header), the raw
 provider response, resolved model, provider, usage, and cost in the attempt receipt.
 

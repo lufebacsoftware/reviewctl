@@ -1761,18 +1761,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     if provider_preferences and transport != "openrouter":
         parser.error("provider preferences require --transport openrouter")
     policy_digest: str | None = None
-    if args.source_class == "proprietary":
-        if not args.policy:
-            print("reviewctl: proprietary source requires --policy", file=sys.stderr)
-            return 3
-        policy = load_policy(args.policy)
-        denied = [model for model in args.models if not source_allowed(policy, model)]
-        if denied:
-            print(
-                f"reviewctl: models are synthetic-only for proprietary source: {', '.join(denied)}",
-                file=sys.stderr,
-            )
-            return 3
+    if args.policy:
+        load_policy(args.policy)
         policy_digest = policy_sha256(args.policy)
     artifact_root = Path(args.artifact_root)
     turn_dir = review_root(artifact_root, args.review_id)

@@ -2204,7 +2204,7 @@ def test_timeout_terminates_the_attempt_process_group(tmp_path: Path) -> None:
             os.kill(process_id, 0)
 
 
-def test_blocks_proprietary_source_when_policy_marks_model_synthetic_only(tmp_path: Path) -> None:
+def test_proprietary_source_records_a_non_authorizing_policy_without_blocking(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     policy = tmp_path / "policy.toml"
     policy.write_text(
@@ -2226,14 +2226,14 @@ data_collection = "unknown"
         env={"LLM_BIN": str(fake_llm)},
     )
 
-    assert result.returncode == 3
-    assert "synthetic-only" in result.stderr
-    assert not (tmp_path / "artifacts").exists()
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
 
 
-def test_proprietary_source_requires_and_honors_an_explicit_policy(tmp_path: Path) -> None:
+def test_proprietary_source_allows_an_optional_policy(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
-    missing = run_cli(
+    without_policy = run_cli(
         *review_arguments(tmp_path, "accepted"),
         "--source-class",
         "proprietary",
@@ -2241,12 +2241,15 @@ def test_proprietary_source_requires_and_honors_an_explicit_policy(tmp_path: Pat
         "findings-json",
         env={"LLM_BIN": str(fake_llm)},
     )
-    assert missing.returncode == 3
-    assert "requires --policy" in missing.stderr
+    assert without_policy.returncode == 0, without_policy.stderr
+    without_policy_receipt = json.loads(
+        (Path(without_policy.stdout.strip()) / "receipt.json").read_text()
+    )
+    assert without_policy_receipt["policy"] == {"sha256": None}
 
     policy = tmp_path / "allowed.toml"
     policy.write_text("[models.accepted]\nsource_allowed = true\n")
-    accepted = run_cli(
+    with_policy = run_cli(
         *review_arguments(tmp_path, "accepted"),
         "--source-class",
         "proprietary",
@@ -2256,8 +2259,8 @@ def test_proprietary_source_requires_and_honors_an_explicit_policy(tmp_path: Pat
         str(policy),
         env={"LLM_BIN": str(fake_llm)},
     )
-    assert accepted.returncode == 0, accepted.stderr
-    receipt = json.loads((Path(accepted.stdout.strip()) / "receipt.json").read_text())
+    assert with_policy.returncode == 0, with_policy.stderr
+    receipt = json.loads((Path(with_policy.stdout.strip()) / "receipt.json").read_text())
     assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
 
 

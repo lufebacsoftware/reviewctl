@@ -10,13 +10,13 @@ provider ban.
 
 ## Decision
 
-For a proprietary packet, `source_allowed = true` authorizes the configured
-model on every built-in review transport: `llm`, `openrouter`, `agy`, and
-`codex`.
+Every configured model may run on every built-in review transport: `llm`,
+`openrouter`, `agy`, and `codex`. A policy is optional, non-blocking receipt
+metadata.
 
-The default remains deny: a missing policy, a missing model entry, or
-`source_allowed = false` rejects the packet before an attempt is created. The
-existing operational safeguards remain required:
+The runner does not deny a packet because its policy is absent, lacks a model
+entry, or marks `source_allowed = false`. The existing operational safeguards
+remain required:
 
 - an explicit policy file and its digest in the receipt
 - a persisted request/response attempt receipt
@@ -27,22 +27,22 @@ reviews may omit `--file`; their receipt records an empty file list.
 
 ## Compatibility
 
-Existing policies need no changes. A policy that already contains
-`source_allowed = true` will begin to authorize its model for OpenRouter and
-Antigravity in addition to the transports it already authorizes. A later,
-stricter transport allow-list can be added as an explicit policy extension;
-it is not introduced now because it would keep current review work blocked.
+Existing policies need no changes. When supplied, a policy digest remains in
+the receipt regardless of its `source_allowed` values. A later, stricter
+enforcement mode can be added explicitly; it is not enabled now because it
+would keep current review work blocked.
 
 ## Verification
 
 Tests will prove:
 
-1. denied proprietary models still return code 3 before artifacts or provider
-   calls;
-2. a permitted proprietary OpenRouter packet invokes the transport and records
+1. a proprietary packet without a policy runs and records `policy.sha256: null`;
+2. a proprietary packet with a non-authorizing policy runs and records its
+   policy digest;
+3. a proprietary OpenRouter packet invokes the transport and records
    its receipt;
-3. a permitted proprietary Antigravity packet invokes the transport and
+4. a proprietary Antigravity packet invokes the transport and
    records its receipt;
-4. a proprietary packet accepts a non-findings contract;
-5. a synthetic prompt-only packet records an empty file list;
-6. the full test suite passes.
+5. a proprietary packet accepts a non-findings contract;
+6. a synthetic prompt-only packet records an empty file list;
+7. the full test suite passes.

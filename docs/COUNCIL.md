@@ -45,8 +45,7 @@ below.
 
 ## Privacy transition
 
-The policy defaults external candidates to synthetic-only. Before a proprietary product packet is sent,
-the organization must record its decision from the current OpenRouter endpoint compatibility matrix,
-including Zero Data Retention and data-collection status, then set `source_allowed = true` for the
-selected model. The preferred production profile is ZDR plus no data collection. The policy remains
-organization-owned, so a team can authorize or revoke a model without changing the CLI.
+Policies record the organization's retention and data-collection decision for external candidates. They
+are non-blocking metadata for a review run: if supplied, their digest is retained in the receipt. The
+preferred production profile is ZDR plus no data collection. The policy remains organization-owned, so a
+team can later introduce enforcement without changing the review artifacts.
