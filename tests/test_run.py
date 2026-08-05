@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -29,11 +30,25 @@ def run_cli(*arguments: str, env: dict[str, str] | None = None) -> subprocess.Co
     )
 
 
-def write_fake_llm(path: Path) -> Path:
-    executable = path / "llm"
+def write_fake_python_executable(path: Path, name: str, source: str) -> Path:
+    """Create a coverage-neutral stdlib fake without disabling CLI coverage."""
+    executable = path / name
+    payload = path / f".{name}.py"
+    payload.write_text(source)
     executable.write_text(
-        """#!/usr/bin/env python3
-import json
+        "#!/bin/sh\n"
+        "unset COVERAGE_PROCESS_CONFIG COVERAGE_PROCESS_START COV_CORE_SOURCE COV_CORE_CONFIG\n"
+        f'exec {shlex.quote(sys.executable)} {shlex.quote(str(payload))} "$@"\n'
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def write_fake_llm(path: Path) -> Path:
+    return write_fake_python_executable(
+        path,
+        "llm",
+        """import json
 import os
 import sqlite3
 import sys
@@ -94,10 +109,8 @@ if model == 'costed':
         ('{"usage": {"cost": 0.125}, "provider": "Test Provider"}',),
     )
 connection.commit()
-"""
+""",
     )
-    executable.chmod(0o755)
-    return executable
 
 
 def mock_openrouter_curl(
@@ -132,10 +145,10 @@ def mock_openrouter_curl(
 
 
 def write_fake_codex(path: Path) -> Path:
-    executable = path / "codex"
-    executable.write_text(
-        """#!/usr/bin/env python3
-import json
+    return write_fake_python_executable(
+        path,
+        "codex",
+        """import json
 import os
 import sys
 import time
@@ -180,31 +193,27 @@ print(
     file=sys.stderr if os.environ.get('CODEX_SESSION_ON_STDERR') else sys.stdout,
 )
 print(f"model: {os.environ.get('CODEX_RESOLVED_MODEL', model)}")
-"""
+""",
     )
-    executable.chmod(0o755)
-    return executable
 
 
 def write_fake_sandbox_exec(path: Path) -> Path:
-    executable = path / "sandbox-exec"
-    executable.write_text(
-        """#!/usr/bin/env python3
-import os
+    return write_fake_python_executable(
+        path,
+        "sandbox-exec",
+        """import os
 import sys
 
 os.execvp(sys.argv[3], sys.argv[3:])
-"""
+""",
     )
-    executable.chmod(0o755)
-    return executable
 
 
 def write_fake_age(path: Path) -> Path:
-    executable = path / "age"
-    executable.write_text(
-        """#!/usr/bin/env python3
-import os
+    return write_fake_python_executable(
+        path,
+        "age",
+        """import os
 import sys
 from pathlib import Path
 
@@ -216,17 +225,15 @@ if '-d' in sys.argv:
 else:
     target = Path(sys.argv[sys.argv.index('-o') + 1])
     target.write_bytes(sys.stdin.buffer.read())
-"""
+""",
     )
-    executable.chmod(0o755)
-    return executable
 
 
 def write_fake_agy(path: Path) -> Path:
-    executable = path / "agy"
-    executable.write_text(
-        """#!/usr/bin/env python3
-import json
+    return write_fake_python_executable(
+        path,
+        "agy",
+        """import json
 import os
 import sys
 import time
@@ -255,10 +262,8 @@ elif os.environ.get('AGY_LIST'):
     print('[]')
 else:
     print(json.dumps(payload))
-"""
+""",
     )
-    executable.chmod(0o755)
-    return executable
 
 
 def review_arguments(tmp_path: Path, *models: str) -> list[str]:
