@@ -719,7 +719,7 @@ def test_product_judge_contract_requires_scores_and_explicit_hard_violations() -
     assert cli.validate_review_response(json.dumps(payload), "product-judge-json") is None
 
 
-def test_run_persists_a_synthetic_product_review_without_findings(tmp_path: Path) -> None:
+def test_usage_synthetic_prompt_only_product_review(tmp_path: Path) -> None:
     fake_agy = write_fake_agy(tmp_path)
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Design the product from the synthetic briefing.")
@@ -4437,14 +4437,15 @@ def test_invoke_agy_reports_a_missing_binary(tmp_path: Path) -> None:
     assert response.response == ""
 
 
-def test_agy_transport_honors_proprietary_source_policy(tmp_path: Path) -> None:
+def test_usage_private_gemini_product_review(tmp_path: Path) -> None:
     fake_agy = write_fake_agy(tmp_path)
     source = tmp_path / "source.py"
     source.write_text("pass\n")
     prompt = tmp_path / "prompt.md"
-    prompt.write_text("Review the bounded source.")
+    prompt.write_text("Design the bounded product.")
     policy = tmp_path / "policy.toml"
     policy.write_text('[models."gemini-3.6-flash-medium"]\nsource_allowed = true\n')
+    payload = product_review_payload()
 
     result = run_cli(
         "run",
@@ -4463,16 +4464,18 @@ def test_agy_transport_honors_proprietary_source_policy(tmp_path: Path) -> None:
         "--source-class",
         "proprietary",
         "--response-contract",
-        "findings-json",
+        "product-review-json",
         "--policy",
         str(policy),
-        env={"AGY_BIN": str(fake_agy)},
+        env={"AGY_BIN": str(fake_agy), "AGY_RESPONSE": json.dumps(payload)},
     )
 
     assert result.returncode == 0, result.stderr
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
     assert receipt["transport"] == "agy"
     assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
+    request = json.loads(Path(receipt["attempts"][0]["evidence"]["request"]).read_text())
+    assert request["responseContract"] == "product-review-json"
 
 
 def test_run_uses_the_agy_transport_and_records_evidence(tmp_path: Path) -> None:
@@ -4510,7 +4513,7 @@ def test_run_uses_the_agy_transport_and_records_evidence(tmp_path: Path) -> None
     assert attempt["evidence"]["response"].endswith("response.json")
 
 
-def test_openrouter_transport_rejects_proprietary_source_before_a_network_request(
+def test_usage_private_openrouter_review(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     policy = tmp_path / "policy.toml"

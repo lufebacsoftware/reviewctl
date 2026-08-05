@@ -54,6 +54,39 @@ persisted conversation. Finding paths must name an attached file exactly. With `
 request and response are encrypted with Age; the visible receipt contains only hashes, provenance,
 result metadata, and structured findings.
 
+`--policy` is optional review metadata. When provided, its SHA-256 is retained in the receipt; it does
+not block a model, transport, or response contract.
+
+### Gemini/Antigravity product review
+
+```bash
+reviewctl run \
+  --review-id obc-product-gemini \
+  --transport agy \
+  --model gemini-3.6-flash-high \
+  --prompt-file product-review.md \
+  --file product-brief.md \
+  --source-class proprietary \
+  --response-contract product-review-json
+```
+
+Do not pass `--provider-only`, `--provider-order`, or other `--provider-*` options to `agy`; those
+configure OpenRouter routing only.
+
+### Prompt-only synthetic product review
+
+```bash
+reviewctl run \
+  --review-id product-ideas \
+  --transport agy \
+  --model gemini-3.6-flash-high \
+  --prompt-file product-review.md \
+  --source-class synthetic \
+  --response-contract product-review-json
+```
+
+Synthetic prompt-only rounds intentionally omit `--file`; their receipt records an empty file list.
+
 ## Commands
 
 ```bash
@@ -69,7 +102,7 @@ reviewctl council-plan --plan /path/to/organization-tournament.toml \
   --output council/assignments.json
 ```
 
-Use Codex through the same receipt flow when the organization policy permits the selected model:
+Use Codex through the same receipt flow:
 
 ```bash
 reviewctl run \
