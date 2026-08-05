@@ -1840,6 +1840,14 @@ def test_findings_contract_binds_snapshot_names_while_the_runner_owns_hashes() -
         is not None
     )
 
+    valid["reviewedFiles"][0] = " source.py "
+    assert (
+        cli.validate_review_response(
+            json.dumps(valid), "findings-json", expected_file_hashes={"source.py": "a" * 64}
+        )
+        is not None
+    )
+
 
 def test_findings_contract_accepts_unique_snapshot_basename_from_sandbox_path() -> None:
     response = {
@@ -1864,6 +1872,7 @@ def test_findings_contract_accepts_unique_snapshot_basename_from_sandbox_path() 
         "not-a-list",
         ["not-an-object"],
         [1],
+        ["   "],
         ["source.py", "source.py"],
         ["source.py", "/private/tmp/reviewctl-input-abc/source.py"],
     ],
@@ -2567,6 +2576,8 @@ def test_validate_request_rejects_missing_or_ambiguous_fields(
 
 
 def test_validate_request_rejects_blank_missing_and_oversized_fragments(tmp_path: Path) -> None:
+    assert cli.MAX_FRAGMENT_BYTES == 64 * 1024
+
     missing = tmp_path / "missing.py"
     oversized = tmp_path / "oversized.py"
     oversized.write_bytes(b"x" * (cli.MAX_FRAGMENT_BYTES + 1))

@@ -28,7 +28,7 @@ from urllib import request as urlrequest
 from reviewctl import __version__
 
 MAX_FILES = 3
-MAX_FRAGMENT_BYTES = 24 * 1024
+MAX_FRAGMENT_BYTES = 64 * 1024
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_FIELDS = {"severity", "path", "line", "title", "evidence", "reproduction"}
 FINDING_SEVERITIES = {"critical", "high", "medium", "low", "info"}
@@ -1598,8 +1598,11 @@ def validate_read_proof(value: dict[str, Any], expected_file_hashes: dict[str, s
         # Codex receives a private frozen snapshot and may report its absolute
         # sandbox path. Frozen inputs have unique basenames, so normalize that
         # path form before comparing the declared files to receipt provenance.
-        snapshot_name = Path(reviewed).name
-        proof_path = reviewed if reviewed in expected_file_hashes else snapshot_name
+        normalized = reviewed.strip()
+        if not normalized:
+            return False
+        snapshot_name = Path(normalized).name
+        proof_path = normalized if normalized in expected_file_hashes else snapshot_name
         if proof_path in reviewed_paths:
             return False
         # The model declares only the frozen snapshots it reviewed. The runner
