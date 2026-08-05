@@ -2576,7 +2576,7 @@ def test_validate_request_rejects_missing_or_ambiguous_fields(
 
 
 def test_validate_request_rejects_blank_missing_and_oversized_fragments(tmp_path: Path) -> None:
-    assert cli.MAX_FRAGMENT_BYTES == 64 * 1024
+    assert cli.MAX_FRAGMENT_BYTES == 128 * 1024
 
     missing = tmp_path / "missing.py"
     oversized = tmp_path / "oversized.py"
