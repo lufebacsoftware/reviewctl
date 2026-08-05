@@ -27,7 +27,7 @@ Keep this block small and adapt only the bracketed local details:
 
 For material changes to [domain invariants, security boundary, distributed
 behavior, or public API], run the repository's verification commands and a
-persisted `reviewctl` or `llm-review` packet. Record the reviewed commit/diff,
+persisted `reviewctl` receipt. Record the reviewed commit/diff,
 included files, manifest, and which findings were independently verified.
 
 Review the change against [canonical standard or local architecture document].
