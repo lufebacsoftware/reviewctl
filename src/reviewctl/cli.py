@@ -360,6 +360,24 @@ def git_metadata(cwd: Path) -> dict[str, str | None]:
     }
 
 
+def source_git_metadata(files: list[Path]) -> dict[str, str | None]:
+    """Return provenance only when every reviewed file has one Git checkout."""
+    roots: set[Path] = set()
+    for file in files:
+        result = subprocess.run(
+            ["git", "-C", str(file.parent), "rev-parse", "--show-toplevel"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return {"head": None, "remote": None, "repositoryRoot": None}
+        roots.add(Path(result.stdout.strip()).resolve())
+    if len(roots) != 1:
+        return {"head": None, "remote": None, "repositoryRoot": None}
+    return git_metadata(roots.pop())
+
+
 def load_policy(path: str) -> dict[str, Any]:
     import tomllib
 
@@ -1774,7 +1792,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     snapshot_hashes = {file.name: sha256_bytes(file.read_bytes()) for file in snapshots}
     source = {
         "files": source_files,
-        "git": git_metadata(Path.cwd()),
+        "git": source_git_metadata(files),
     }
     attempts: list[dict[str, Any]] = []
     accepted: PersistedResponse | None = None

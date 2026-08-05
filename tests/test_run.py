@@ -1979,6 +1979,67 @@ def test_review_source_roots_uses_git_root_or_file_parent(tmp_path: Path) -> Non
     assert cli.review_source_roots([tracked, detached, tracked]) == [repository, detached.parent]
 
 
+def test_source_git_metadata_uses_the_reviewed_checkout_not_process_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "reviewed-repository"
+    repository.mkdir()
+    source = repository / "src" / "entry.py"
+    source.parent.mkdir()
+    source.write_text("pass\n")
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "add", str(source.relative_to(repository))],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.email=reviewctl@example.test",
+            "-c",
+            "user.name=Reviewctl Test",
+            "commit",
+            "-qm",
+            "add source",
+        ],
+        check=True,
+    )
+    expected_head = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.source_git_metadata([source]) == {
+        "head": expected_head,
+        "remote": None,
+        "repositoryRoot": str(repository),
+    }
+
+
+def test_source_git_metadata_rejects_files_from_multiple_checkouts(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    sources = []
+    for repository in (first, second):
+        repository.mkdir()
+        source = repository / "entry.py"
+        source.write_text("pass\n")
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        sources.append(source)
+
+    assert cli.source_git_metadata(sources) == {
+        "head": None,
+        "remote": None,
+        "repositoryRoot": None,
+    }
+
+
 def test_codex_transport_applies_source_root_isolation_for_proprietary_reviews(
     tmp_path: Path,
 ) -> None:
