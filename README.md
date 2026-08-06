@@ -57,6 +57,14 @@ result metadata, and structured findings.
 `--policy` is optional review metadata. When provided, its SHA-256 is retained in the receipt; it does
 not block a model, transport, or response contract.
 
+### Interactive exploration with pi
+
+Use `pi` for exploratory threads, REPL sessions, and trying a review question.
+Use `reviewctl` for the formal review, receipt verification, and evidence
+archive. A `pi` transcript is working material; it is never an approval or a
+substitute for a frozen `--file` packet. See [Pi and reviewctl](docs/PI-INTEGRATION.md)
+for the promotion workflow.
+
 ### Gemini/Antigravity product review
 
 ```bash
@@ -142,6 +150,7 @@ and retained in that organization's evidence repository. `reviewctl` currently c
 `llm` packet transport; it does not route proprietary source through OpenRouter by default.
 
 Read [the council policy](docs/COUNCIL.md), [evidence contract](docs/EVIDENCE.md),
+[Pi and reviewctl integration](docs/PI-INTEGRATION.md),
 [project-instruction integration guide](docs/PROJECT-INTEGRATION.md), and
 [tournament guide](docs/TOURNAMENT.md) before adding the tool to CI. Model
 qualification, operating rosters, provider experiments, and retained receipts

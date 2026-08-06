@@ -5,6 +5,11 @@ repository owns the review receipt contract, transports, privacy-policy format,
 and neutral synthetic fixtures. Model auditions, operating rosters, provider
 measurements, and tournament evidence belong to a private evidence store.
 
+Interactive assistants such as `pi` are a separate exploration lane. They may
+help shape a question or exercise a local REPL, but `reviewctl` remains the
+owner of formal review execution, receipt verification, and the archived
+evidence packet. See [Pi and reviewctl](PI-INTEGRATION.md) for the handoff.
+
 ## Ownership
 
 | Location | Owns | Does not own |

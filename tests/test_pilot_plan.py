@@ -22,3 +22,22 @@ def test_public_documentation_does_not_contain_local_artifact_paths() -> None:
         contents = document.read_text()
         assert "/users/" not in contents.lower()
         assert "/private/" not in contents.lower()
+
+
+def test_pi_integration_assigns_interactive_and_formal_ownership() -> None:
+    document = (REPOSITORY / "docs" / "PI-INTEGRATION.md").read_text().lower()
+
+    assert "pi" in document
+    assert "interactive" in document
+    assert "reviewctl" in document
+    assert "formal" in document
+    assert "reviewctl verify" in document
+
+
+def test_pi_transcript_is_not_review_evidence() -> None:
+    document = (REPOSITORY / "docs" / "PI-INTEGRATION.md").read_text().lower()
+
+    assert "never" in document
+    assert "approval" in document
+    assert "transcript" in document
+    assert "artifact root" in document
