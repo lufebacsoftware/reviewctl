@@ -2204,7 +2204,9 @@ def test_timeout_terminates_the_attempt_process_group(tmp_path: Path) -> None:
             os.kill(process_id, 0)
 
 
-def test_proprietary_source_records_a_non_authorizing_policy_without_blocking(tmp_path: Path) -> None:
+def test_proprietary_source_records_a_non_authorizing_policy_without_blocking(
+    tmp_path: Path,
+) -> None:
     fake_llm = write_fake_llm(tmp_path)
     policy = tmp_path / "policy.toml"
     policy.write_text(
