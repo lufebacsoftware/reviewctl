@@ -1,5 +1,6 @@
 # Copy into each organization's private configuration repository.
-# source_allowed stays false until the organization records an endpoint privacy decision.
+# These fields are advisory metadata for normal review runs. Use
+# `reviewctl policy-check --enforce` only when a hard privacy gate is wanted.
 
 [models."openrouter/moonshotai/kimi-k2.7-code"]
 source_allowed = false

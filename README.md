@@ -54,8 +54,61 @@ persisted conversation. Finding paths must name an attached file exactly. With `
 request and response are encrypted with Age; the visible receipt contains only hashes, provenance,
 result metadata, and structured findings.
 
+Every run also writes a rotating JSONL runtime log. It records route selection, attempt result,
+provider, duration, exit code, and a redacted diagnostic; it never records prompts or review-file
+contents. By default it is `<artifact-root>/reviewctl.log`, with five 5 MiB backups. Use
+`--log-file /path/to/reviewctl.log` to place it elsewhere. The receipt records the configured log
+path and rotation policy.
+
+To use a review as working documentation, use `--response-contract document` and add
+`--output-file docs/reviews/<name>.md`. The accepted Markdown response is written there and the
+receipt records its path, SHA-256, and character count. Failed or incomplete attempts never
+overwrite the document. `findings-json` remains for merge gates; `product-review-json` remains for
+structured product proposals.
+
+For provider outages or account quotas, declare an ordered fallback route explicitly:
+
+```bash
+reviewctl run \
+  --review-id ledger-review \
+  --prompt-file review-request.md \
+  --route agy:gemini-3.6-flash-high \
+  --route openrouter:google/gemini-2.5-flash \
+  --route llm:openrouter/deepseek/deepseek-v4-flash \
+  --file src/posting.py \
+  --source-class proprietary \
+  --response-contract findings-json
+```
+
+Routes are tried in order only after a retriable delivery failure (`timeout`, transport error,
+missing/empty response, or incomplete contract). An accepted review stops the route chain. Do not
+declare a cross-provider route implicitly: the route list is part of the receipt, so the privacy and
+cost decision remains visible and auditable.
+
+For routes used repeatedly, keep them in a user-local TOML profile instead of repeating them on every
+command. The default file is `~/.config/reviewctl/config.toml`:
+
+```toml
+[profiles.gemini]
+routes = [
+  "agy:gemini-3.6-flash-high",
+  "openrouter:google/gemini-2.5-flash",
+]
+
+[profiles.code]
+routes = [
+  "llm:openrouter/moonshotai/kimi-k2.7-code",
+  "openrouter:google/gemini-2.5-flash",
+]
+```
+
+Select a profile with `--profile gemini`. A profile cannot be combined with `--model` or
+`--route`; the receipt records the profile name, config path, and config SHA-256. This makes a
+quota fallback easy to use while keeping the exact routing decision reviewable.
+
 `--policy` is optional review metadata. When provided, its SHA-256 is retained in the receipt; it does
-not block a model, transport, or response contract.
+not block a model, transport, or response contract. `policy-check` is advisory by default; use
+`policy-check --enforce` only for a deliberate privacy gate.
 
 ### Interactive exploration with pi
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -15,10 +16,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
@@ -42,9 +45,16 @@ PRODUCT_SCORE_FIELDS = {
     "problemFidelity",
     "scopeDiscipline",
 }
-RESPONSE_CONTRACTS = {"verdict", "findings-json", "product-review-json", "product-judge-json"}
+RESPONSE_CONTRACTS = {
+    "document",
+    "verdict",
+    "findings-json",
+    "product-review-json",
+    "product-judge-json",
+}
 TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
+ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy"}
 RETRIABLE_REVIEW_RESULTS = {
     "timeout",
     "transport-failed",
@@ -269,6 +279,14 @@ class PersistedResponse:
 
 
 @dataclass(frozen=True)
+class ReviewRoute:
+    """One ordered transport/model route for a review attempt."""
+
+    transport: str
+    model: str
+
+
+@dataclass(frozen=True)
 class TournamentCandidate:
     """One independently auditable tournament participant."""
 
@@ -304,6 +322,111 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def redact_diagnostic(value: str, *, limit: int = 4000) -> str:
+    """Keep provider diagnostics useful without persisting credentials or huge bodies."""
+    text = value.replace("\x00", "")
+    patterns = (
+        (r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+", r"\1[REDACTED]"),
+        (r"(?i)(bearer\s+)[^\s]+", r"\1[REDACTED]"),
+        (r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED_KEY]"),
+        (r"\b(?:key|token|secret)[=:]\s*[^\s,;]+", "[REDACTED_CREDENTIAL]"),
+    )
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text)
+    return text[:limit]
+
+
+def configure_runtime_logger(
+    path: Path, *, max_bytes: int = 5 * 1024 * 1024, backup_count: int = 5
+) -> logging.Logger:
+    """Create the bounded JSONL diagnostic log used by one reviewctl installation."""
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("reviewctl.runtime")
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+def log_event(logger: logging.Logger, event: str, **fields: object) -> None:
+    """Write structured diagnostics without prompts, source contents, or raw credentials."""
+    safe_fields = {
+        key: redact_diagnostic(value) if key == "diagnostic" and isinstance(value, str) else value
+        for key, value in fields.items()
+    }
+    payload = {"at": utc_now(), "event": event, **safe_fields}
+    logger.info(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+
+
+def parse_route(value: str) -> ReviewRoute:
+    """Parse an ordered `transport:model` route specification."""
+    transport, separator, model = value.partition(":")
+    if not separator or transport not in ROUTE_TRANSPORTS or not model.strip():
+        raise ValueError(
+            "routes must use transport:model with transport in llm, codex, openrouter, agy"
+        )
+    return ReviewRoute(transport=transport, model=model.strip())
+
+
+def load_route_profile(
+    parser: argparse.ArgumentParser, config_value: str | None, profile: str
+) -> tuple[tuple[ReviewRoute, ...], dict[str, str]]:
+    """Load one ordered route profile from a user-owned TOML config file."""
+    config_path = Path(config_value or "~/.config/reviewctl/config.toml").expanduser().resolve()
+    if not config_path.is_file():
+        parser.error(f"reviewctl config does not exist: {config_path}")
+    try:
+        config = tomllib.loads(config_path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    profiles = config.get("profiles")
+    profile_config = profiles.get(profile) if isinstance(profiles, dict) else None
+    route_specs = profile_config.get("routes") if isinstance(profile_config, dict) else None
+    if not isinstance(route_specs, list) or not route_specs or not all(
+        isinstance(value, str) and value.strip() for value in route_specs
+    ):
+        parser.error(f"profile {profile!r} must define a non-empty routes array")
+    try:
+        routes = tuple(parse_route(value) for value in route_specs)
+    except ValueError as error:
+        parser.error(f"profile {profile!r}: {error}")
+    return routes, {
+        "name": profile,
+        "path": str(config_path),
+        "sha256": sha256_bytes(config_path.read_bytes()),
+    }
+
+
+def review_routes(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> tuple[tuple[ReviewRoute, ...], dict[str, str] | None]:
+    """Resolve explicit routes or preserve the legacy single-transport CLI."""
+    route_specs = getattr(args, "routes", [])
+    profile = getattr(args, "profile", None)
+    models = getattr(args, "models", [])
+    if profile:
+        if models or route_specs:
+            parser.error("use --profile or --model/--route, not both")
+        return load_route_profile(parser, getattr(args, "config", None), profile)
+    if route_specs:
+        if models:
+            parser.error("use --route or --model, not both")
+        try:
+            routes = tuple(parse_route(value) for value in route_specs)
+        except ValueError as error:
+            parser.error(str(error))
+        return routes, None
+    return tuple(ReviewRoute(args.transport, model) for model in models), None
+
+
 def fail(parser: argparse.ArgumentParser, message: str) -> None:
     parser.error(message)
 
@@ -313,8 +436,12 @@ def validate_request(
 ) -> tuple[str, list[Path]]:
     if not REVIEW_ID.fullmatch(args.review_id):
         fail(parser, "invalid review id")
-    if not args.models:
-        fail(parser, "at least one --model is required")
+    if (
+        not getattr(args, "models", [])
+        and not getattr(args, "routes", [])
+        and not getattr(args, "profile", None)
+    ):
+        fail(parser, "at least one --model, --route, or --profile is required")
     if len(args.files) == 0 and getattr(args, "source_class", "proprietary") == "proprietary":
         fail(parser, "at least one --file is required")
     if len(args.files) > MAX_FILES:
@@ -979,6 +1106,13 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
 def packet_prompt(prompt: str, files: list[Path], response_contract: str = "verdict") -> str:
     """Add stable file names so structured findings are comparable across models."""
     supplied = ", ".join(file.name for file in files)
+    if response_contract == "document":
+        return (
+            f"{prompt}\n\n"
+            f"Supplied source files: {supplied}. "
+            "Write the requested result as a coherent Markdown document. Use only the supplied "
+            "files and prompt; do not invent facts, requirements, or citations."
+        )
     if response_contract in {"product-review-json", "product-judge-json"}:
         briefing_scope = (
             f"Supplied synthetic briefing files: {supplied}. "
@@ -1070,6 +1204,8 @@ def openrouter_packet(
             "Return only JSON matching the supplied council-judgment schema. Score the proposal, "
             "not its prose style, and list every violated non-negotiable by its exact identifier."
         )
+    elif response_contract == "document":
+        contract = "Return only the requested Markdown document, with no preamble or JSON wrapper."
     else:
         return f"{prompt}\n\n{fragments}"
     return f"{prompt}\n\n{contract}\n\n{fragments}"
@@ -1333,6 +1469,11 @@ def codex_prompt(prompt: str, response_contract: str) -> str:
             "directory. Return only JSON matching the supplied council-judgment schema. List every "
             "frozen snapshot you actually reviewed in reviewedFiles. The runner records the "
             "authoritative source hashes."
+        )
+    elif response_contract == "document":
+        contract = (
+            "Read the frozen files in the current working directory. Return only the requested "
+            "Markdown document, with no JSON wrapper or preamble."
         )
     else:
         contract = "Return a complete verdict beginning with VERDICT: and ending with punctuation."
@@ -1626,6 +1767,9 @@ def validate_review_response(
         return (
             {"verdict": "unstructured", "findings": []} if response_is_complete(response) else None
         )
+    if contract == "document":
+        stripped = response.strip()
+        return {"document": stripped} if len(stripped) >= 20 else None
     try:
         value = json.loads(response)
     except json.JSONDecodeError:
@@ -1702,6 +1846,8 @@ def review_validation_error(
         is not None
     ):
         return None
+    if contract == "document":
+        return "document: response is empty or shorter than 20 characters"
     if contract == "verdict":
         return "verdict: response is incomplete"
     try:
@@ -1752,25 +1898,34 @@ def seal(path: Path, contents: bytes, recipient: str) -> str:
 
 def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     prompt, files = validate_request(parser, args)
+    routes, route_profile = review_routes(parser, args)
     review_prompt = packet_prompt(prompt, files, args.response_contract)
-    transport = getattr(args, "transport", "llm")
     try:
         provider_preferences = provider_preferences_from_args(args)
     except ValueError as error:
         parser.error(str(error))
-    if provider_preferences and transport != "openrouter":
+    if provider_preferences and not any(route.transport == "openrouter" for route in routes):
+        if getattr(args, "routes", []):
+            parser.error("provider preferences require at least one openrouter route")
         parser.error("provider preferences require --transport openrouter")
     policy_digest: str | None = None
     if args.policy:
         load_policy(args.policy)
         policy_digest = policy_sha256(args.policy)
     artifact_root = Path(args.artifact_root)
+    log_path = (
+        Path(args.log_file).expanduser()
+        if getattr(args, "log_file", None)
+        else artifact_root / "reviewctl.log"
+    )
+    logger = configure_runtime_logger(log_path)
     turn_dir = review_root(artifact_root, args.review_id)
     attempts_dir = turn_dir / "attempts"
     attempts_dir.mkdir()
     codex_source_roots = (
         review_source_roots(files)
-        if (transport == "codex" and args.source_class == "proprietary")
+        if any(route.transport == "codex" for route in routes)
+        and args.source_class == "proprietary"
         else None
     )
     snapshots_context = frozen_review_files(files)
@@ -1788,10 +1943,20 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     max_attempts = getattr(args, "max_attempts", 1)
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
+    requested_models = [route.model for route in routes]
+    log_event(
+        logger,
+        "review_started",
+        review_id=args.review_id,
+        routes=[{"model": route.model, "transport": route.transport} for route in routes],
+        source_class=args.source_class,
+    )
     number = 0
-    for model in args.models:
+    for route_index, route in enumerate(routes):
         for _ in range(max_attempts):
             number += 1
+            transport = route.transport
+            model = route.model
             transport_model = (
                 model.removeprefix("openrouter/") if transport == "openrouter" else model
             )
@@ -1800,6 +1965,15 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             database: Path | None = None
             request_path: Path | None = None
             response_path: Path | None = None
+            log_event(
+                logger,
+                "attempt_started",
+                attempt=number,
+                model=model,
+                review_id=args.review_id,
+                route_index=route_index,
+                transport=transport,
+            )
             if transport == "codex":
                 exit_code, stderr, persisted = invoke_codex(
                     codex_bin=os.environ.get("CODEX_BIN", "codex"),
@@ -1909,6 +2083,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "request": str(request_path) if request_path else None,
                     "response": str(response_path) if response_path else None,
                 },
+                "diagnostic": redact_diagnostic(stderr),
                 "exitCode": exit_code,
                 "isolation": ("macos-source-root-deny" if codex_source_roots else None),
                 "model": {"requested": model, "resolved": persisted.model if persisted else None},
@@ -1920,6 +2095,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 },
                 "providerPreferences": provider_preferences,
                 "result": result,
+                "route": {"model": model, "transport": transport},
                 "validationError": validation_error,
                 "transport": transport,
                 "stderrSha256": sha256_bytes(stderr.encode()),
@@ -1934,6 +2110,19 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             }
             attempts.append(attempt)
             (attempt_dir / "attempt.json").write_bytes(canonical_json(attempt) + b"\n")
+            log_event(
+                logger,
+                "attempt_finished",
+                attempt=number,
+                diagnostic=redact_diagnostic(stderr),
+                duration_ms=persisted.duration_ms if persisted else None,
+                exit_code=exit_code,
+                model=model,
+                provider=persisted.provider if persisted else None,
+                result=result,
+                review_id=args.review_id,
+                transport=transport,
+            )
             if result == "accepted":
                 accepted = persisted
                 accepted_review = review
@@ -1941,15 +2130,36 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 break
             if result not in RETRIABLE_REVIEW_RESULTS:
                 break
+            log_event(
+                logger,
+                "route_fallback",
+                attempt=number,
+                from_model=model,
+                from_transport=transport,
+                reason=result,
+                review_id=args.review_id,
+            )
         if accepted is not None:
             break
+
+    output_metadata: dict[str, object] | None = None
+    output_file = getattr(args, "output_file", None)
+    if accepted and output_file:
+        output_path = Path(output_file).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(accepted.response)
+        output_metadata = {
+            "path": str(output_path),
+            "sha256": sha256_bytes(accepted.response.encode()),
+            "characters": len(accepted.response),
+        }
 
     receipt: dict[str, Any] = {
         "acceptedAttempt": accepted_attempt,
         "attempts": attempts,
         "createdAt": utc_now(),
         "model": {
-            "requested": args.models,
+            "requested": requested_models,
             "resolved": accepted.model if accepted else None,
         },
         "policy": {"sha256": policy_digest},
@@ -1963,8 +2173,19 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         "reviewId": args.review_id,
         "source": source,
         "tool": {"name": "reviewctl", "version": __version__},
-        "transport": transport,
+        "transport": (
+            routes[0].transport
+            if len({route.transport for route in routes}) == 1
+            else "routed"
+        ),
+        "routes": [{"model": route.model, "transport": route.transport} for route in routes],
+        "routeProfile": route_profile,
         "providerPreferences": provider_preferences,
+        "output": output_metadata,
+        "logging": {
+            "path": str(log_path),
+            "rotation": {"maxBytes": 5 * 1024 * 1024, "backupCount": 5},
+        },
     }
     if accepted:
         receipt["response"] = {
@@ -1983,7 +2204,13 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     try:
         if args.seal_to:
             request_payload = canonical_json(
-                {"models": args.models, "prompt": review_prompt, "source": source}
+                {
+                    "routes": [
+                        {"model": route.model, "transport": route.transport} for route in routes
+                    ],
+                    "prompt": review_prompt,
+                    "source": source,
+                }
             )
             receipt["sealed"] = {
                 "request": seal(turn_dir / "request.json", request_payload, args.seal_to),
@@ -1996,6 +2223,14 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
 
         receipt["sha256"] = sha256_bytes(canonical_json(receipt))
         (turn_dir / "receipt.json").write_bytes(canonical_json(receipt) + b"\n")
+        log_event(
+            logger,
+            "review_finished",
+            accepted_attempt=accepted_attempt,
+            attempts=len(attempts),
+            result=receipt["result"],
+            review_id=args.review_id,
+        )
         print(turn_dir)
         return 0 if accepted else 1
     finally:
@@ -2024,14 +2259,16 @@ def policy_check(args: argparse.Namespace) -> int:
     model = policy.get("models", {}).get(args.model, {})
     source_allowed = bool(model.get("source_allowed", False))
     decision = {
+        "advisory": not args.enforce,
         "model": args.model,
         "sourceAllowed": source_allowed,
         "syntheticOnly": not source_allowed,
         "zdr": model.get("zdr", "unknown"),
         "dataCollection": model.get("data_collection", "unknown"),
+        "mode": "enforced" if args.enforce else "advisory",
     }
     print(json.dumps(decision, sort_keys=True))
-    return 0 if source_allowed else 3
+    return 0 if source_allowed or not args.enforce else 3
 
 
 def estimate_tokens(prompt: str, files: list[Path]) -> int:
@@ -2479,8 +2716,31 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--prompt")
     run.add_argument("--prompt-file")
     run.add_argument("--model", dest="models", action="append", default=[])
+    run.add_argument(
+        "--route",
+        dest="routes",
+        action="append",
+        default=[],
+        help="ordered fallback route: transport:model (repeatable)",
+    )
+    run.add_argument(
+        "--profile",
+        help="named ordered route profile from --config",
+    )
+    run.add_argument(
+        "--config",
+        help="TOML route config (default: ~/.config/reviewctl/config.toml)",
+    )
     run.add_argument("--file", dest="files", action="append", default=[])
     run.add_argument("--artifact-root", default="~/.cache/reviewctl")
+    run.add_argument(
+        "--log-file",
+        help="rotating JSONL diagnostic log (defaults to <artifact-root>/reviewctl.log)",
+    )
+    run.add_argument(
+        "--output-file",
+        help="write the accepted model response to this document path",
+    )
     run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=90)
     run.add_argument("--max-output-tokens", type=int, default=4096)
     run.add_argument("--max-attempts", type=int, default=1)
@@ -2514,6 +2774,11 @@ def build_parser() -> argparse.ArgumentParser:
     policy = commands.add_parser("policy-check", help="check a model privacy profile")
     policy.add_argument("--policy", required=True)
     policy.add_argument("--model", required=True)
+    policy.add_argument(
+        "--enforce",
+        action="store_true",
+        help="return failure for a model without source_allowed=true",
+    )
     policy.set_defaults(handler=policy_check)
 
     tournament = commands.add_parser("tournament", help="run a bounded synthetic model tournament")

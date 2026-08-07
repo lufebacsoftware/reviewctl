@@ -6,6 +6,10 @@
 digests, prompt digest, policy digest, requested and resolved models, attempt outcomes, token counts,
 latency, provider cost when available, structured findings, and a receipt digest.
 
+When `--response-contract document` and `--output-file` are supplied, the accepted Markdown response
+is also written as a human-readable working document. The receipt binds that document by path,
+character count, and SHA-256; unavailable or incomplete runs do not produce a document.
+
 `reviewctl verify` recomputes the receipt digest. A rebase, altered finding, or altered source
 provenance invalidates the prior receipt and requires a fresh review. The policy digest is the exact
 policy bytes used for that historical decision: changing the policy later does not alter an existing

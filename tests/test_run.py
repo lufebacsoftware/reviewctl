@@ -93,6 +93,8 @@ elif model == 'failure':
     sys.exit(17)
 else:
     response = 'VERDICT: approved\\n1. No blocking findings.'
+    if model == 'documented':
+        response = os.environ.get('LLM_DOCUMENT_RESPONSE', '# Document\\n\\nGenerated.')
     if '--schema' in arguments:
         response = os.environ.get('LLM_SCHEMA_RESPONSE', json.dumps({
             'verdict': 'approved',
@@ -302,6 +304,158 @@ def test_uses_a_separate_database_for_each_attempt_and_accepts_matching_model(
     assert receipt["acceptedAttempt"] == 2
     assert receipt["model"]["resolved"] == "accepted"
     assert receipt["attempts"][0]["database"] != receipt["attempts"][1]["database"]
+
+
+def test_ordered_routes_fallback_after_antigravity_quota_failure(tmp_path: Path) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    fake_llm = write_fake_llm(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "agy:gemini-3.6-flash-high",
+        "--route",
+        "llm:accepted",
+        env={
+            "AGY_BIN": str(fake_agy),
+            "AGY_STATUS": "QUOTA_EXCEEDED",
+            "LLM_BIN": str(fake_llm),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    turn = Path(result.stdout.strip())
+    receipt = json.loads((turn / "receipt.json").read_text())
+    assert [attempt["result"] for attempt in receipt["attempts"]] == [
+        "transport-failed",
+        "accepted",
+    ]
+    assert [attempt["route"] for attempt in receipt["attempts"]] == [
+        {"model": "gemini-3.6-flash-high", "transport": "agy"},
+        {"model": "accepted", "transport": "llm"},
+    ]
+    assert receipt["transport"] == "routed"
+    log = Path(receipt["logging"]["path"])
+    contents = log.read_text()
+    assert '"event":"route_fallback"' in contents
+    assert '"reason":"transport-failed"' in contents
+
+
+def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path: Path) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    fake_llm = write_fake_llm(tmp_path)
+    config = tmp_path / "reviewctl.toml"
+    config.write_text(
+        '[profiles.gemini]\n'
+        'routes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n'
+    )
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--profile",
+        "gemini",
+        "--config",
+        str(config),
+        env={
+            "AGY_BIN": str(fake_agy),
+            "AGY_STATUS": "QUOTA_EXCEEDED",
+            "LLM_BIN": str(fake_llm),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["routeProfile"]["name"] == "gemini"
+    assert receipt["routeProfile"]["path"] == str(config.resolve())
+    assert receipt["routeProfile"]["sha256"] == cli.sha256_bytes(config.read_bytes())
+    assert receipt["routes"] == [
+        {"model": "gemini-3.6-flash-high", "transport": "agy"},
+        {"model": "accepted", "transport": "llm"},
+    ]
+
+
+def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) -> None:
+    config = tmp_path / "reviewctl.toml"
+    config.write_text('[profiles.gemini]\nroutes = ["llm:accepted"]\n')
+
+    result = run_cli(
+        *review_arguments(tmp_path, "accepted"),
+        "--profile",
+        "gemini",
+        "--config",
+        str(config),
+    )
+
+    assert result.returncode == 2
+    assert "use --profile or --model/--route, not both" in result.stderr
+
+
+def test_accepted_response_can_be_written_as_a_document(tmp_path: Path) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    output = tmp_path / "docs" / "review.md"
+
+    result = run_cli(
+        *review_arguments(tmp_path, "accepted"),
+        "--output-file",
+        str(output),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert output.read_text() == "VERDICT: approved\n1. No blocking findings."
+    assert receipt["output"] == {
+        "path": str(output.resolve()),
+        "sha256": cli.sha256_bytes(output.read_bytes()),
+        "characters": len(output.read_text()),
+    }
+
+
+def test_document_contract_accepts_markdown_without_a_verdict(tmp_path: Path) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    output = tmp_path / "docs" / "architecture.md"
+    prompt = tmp_path / "document-prompt.md"
+    prompt.write_text("Write a concise architecture note.")
+
+    result = run_cli(
+        "run",
+        "--review-id",
+        "document-contract",
+        "--prompt-file",
+        str(prompt),
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+        "--model",
+        "documented",
+        "--response-contract",
+        "document",
+        "--output-file",
+        str(output),
+        env={
+            "LLM_BIN": str(fake_llm),
+            "LLM_DOCUMENT_RESPONSE": "# Architecture\n\nA bounded document.",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == "# Architecture\n\nA bounded document."
+
+
+def test_runtime_diagnostics_rotate_and_redact_credentials(tmp_path: Path) -> None:
+    log = tmp_path / "reviewctl.log"
+    logger = cli.configure_runtime_logger(log, max_bytes=180, backup_count=2)
+    for index in range(20):
+        cli.log_event(
+            logger,
+            "attempt_finished",
+            diagnostic=f"Authorization: Bearer secret-{index} " + ("x" * 80),
+        )
+    for handler in logger.handlers:
+        handler.flush()
+
+    assert log.is_file()
+    assert (tmp_path / "reviewctl.log.1").is_file()
+    assert "secret-" not in "".join(path.read_text() for path in tmp_path.glob("reviewctl.log*"))
 
 
 def test_rejects_an_invalid_run_attempt_limit(tmp_path: Path) -> None:
@@ -2877,9 +3031,14 @@ data_collection = "deny"
     )
     allowed = run_cli("policy-check", "--policy", str(policy), "--model", "accepted")
     denied = run_cli("policy-check", "--policy", str(policy), "--model", "unknown")
+    enforced_denied = run_cli(
+        "policy-check", "--policy", str(policy), "--model", "unknown", "--enforce"
+    )
     assert allowed.returncode == 0
     assert json.loads(allowed.stdout)["sourceAllowed"] is True
-    assert denied.returncode == 3
+    assert denied.returncode == 0
+    assert json.loads(denied.stdout)["mode"] == "advisory"
+    assert enforced_denied.returncode == 3
 
     source = tmp_path / "synthetic.py"
     source.write_text("pass\n")
