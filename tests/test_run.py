@@ -345,10 +345,7 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
     fake_agy = write_fake_agy(tmp_path)
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
-    config.write_text(
-        '[profiles.gemini]\n'
-        'routes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n'
-    )
+    config.write_text('[profiles.gemini]\nroutes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n')
 
     result = run_cli(
         *review_arguments(tmp_path),
@@ -388,6 +385,58 @@ def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) ->
 
     assert result.returncode == 2
     assert "use --profile or --model/--route, not both" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("config_text", "profile"),
+    [
+        (None, "missing"),
+        ("not = [valid", "broken"),
+        ("[profiles.empty]\n", "empty"),
+        ('[profiles.invalid]\nroutes = ["bad-route"]\n', "invalid"),
+    ],
+)
+def test_route_profile_rejects_unusable_configurations(
+    tmp_path: Path, config_text: str | None, profile: str
+) -> None:
+    config = tmp_path / f"{profile}.toml"
+    if config_text is not None:
+        config.write_text(config_text)
+
+    with pytest.raises(SystemExit) as error:
+        cli.load_route_profile(cli.build_parser(), str(config), profile)
+
+    assert error.value.code == 2
+
+
+def test_route_resolution_rejects_conflicting_or_malformed_routes() -> None:
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as conflict:
+        cli.review_routes(
+            parser,
+            argparse.Namespace(routes=["llm:accepted"], models=["other"], profile=None),
+        )
+    assert conflict.value.code == 2
+
+    with pytest.raises(SystemExit) as malformed:
+        cli.review_routes(
+            parser,
+            argparse.Namespace(routes=["not-a-route"], models=[], profile=None),
+        )
+    assert malformed.value.code == 2
+
+
+def test_run_rejects_provider_preferences_on_non_openrouter_route(tmp_path: Path) -> None:
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "llm:accepted",
+        "--provider-sort",
+        "price",
+    )
+
+    assert result.returncode == 2
+    assert "provider preferences require at least one openrouter route" in result.stderr
 
 
 def test_accepted_response_can_be_written_as_a_document(tmp_path: Path) -> None:
@@ -703,6 +752,9 @@ def test_review_validation_error_explains_every_structured_contract_boundary() -
     }
 
     assert cli.review_validation_error(approved, "findings-json") is None
+    assert cli.review_validation_error("", "document") == (
+        "document: response is empty or shorter than 20 characters"
+    )
     assert cli.review_validation_error("[]", "findings-json") == (
         "findings-json: top-level response must be an object"
     )
@@ -1336,6 +1388,19 @@ def test_product_prompts_describe_each_transport_contract(tmp_path: Path) -> Non
     assert "non-negotiable" in cli.openrouter_packet("Design", [source], "product-review-json")
     assert "council-judgment" in cli.openrouter_packet("Judge", [source], "product-judge-json")
     assert "anonymous candidate" in cli.codex_prompt("Judge", "product-judge-json")
+
+
+def test_document_prompts_are_explicit_for_each_transport(tmp_path: Path) -> None:
+    source = tmp_path / "guide.md"
+    source.write_text("A bounded documentation source.\n")
+
+    assert "coherent Markdown document" in cli.packet_prompt("Document this.", [source], "document")
+    assert "Markdown document" in cli.openrouter_packet("Document this.", [source], "document")
+    assert "no JSON wrapper" in cli.codex_prompt("Document this.", "document")
+
+
+def test_source_policy_defaults_to_denied() -> None:
+    assert cli.source_allowed({}, "unlisted-model") is False
 
 
 @pytest.mark.parametrize(

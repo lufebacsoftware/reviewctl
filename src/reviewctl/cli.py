@@ -390,8 +390,10 @@ def load_route_profile(
     profiles = config.get("profiles")
     profile_config = profiles.get(profile) if isinstance(profiles, dict) else None
     route_specs = profile_config.get("routes") if isinstance(profile_config, dict) else None
-    if not isinstance(route_specs, list) or not route_specs or not all(
-        isinstance(value, str) and value.strip() for value in route_specs
+    if (
+        not isinstance(route_specs, list)
+        or not route_specs
+        or not all(isinstance(value, str) and value.strip() for value in route_specs)
     ):
         parser.error(f"profile {profile!r} must define a non-empty routes array")
     try:
@@ -2174,9 +2176,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         "source": source,
         "tool": {"name": "reviewctl", "version": __version__},
         "transport": (
-            routes[0].transport
-            if len({route.transport for route in routes}) == 1
-            else "routed"
+            routes[0].transport if len({route.transport for route in routes}) == 1 else "routed"
         ),
         "routes": [{"model": route.model, "transport": route.transport} for route in routes],
         "routeProfile": route_profile,
