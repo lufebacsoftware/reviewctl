@@ -467,8 +467,8 @@ def test_missing_pi_binary_does_not_claim_nonexistent_evidence(tmp_path: Path) -
     assert Path(attempt["evidence"]["request"]).is_file()
     assert attempt["evidence"]["response"] is None
     assert attempt["evidence"]["session"] is None
-    assert Path(attempt["evidence"]["finalResponse"]).is_file()
-    assert Path(attempt["evidence"]["stderr"]).is_file()
+    assert attempt["evidence"]["finalResponse"] is None
+    assert attempt["evidence"]["stderr"] is None
 
 
 def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None:
@@ -712,6 +712,10 @@ def test_help_llm_json_is_machine_readable() -> None:
     assert payload["tool"] == "reviewctl"
     assert "explore" in payload["commands"]
     assert payload["commands"]["explore"]["promote"]["approval"] == "never"
+    assert payload["commands"]["run"]["approval"] == (
+        "only when receipt.result is accepted, acceptedAttempt names the accepted attempt, "
+        "receipt verification succeeds, and material findings are independently checked"
+    )
     assert payload["errors"]["exitCodes"]["1"]["meaning"] == "unavailable-or-invalid"
     assert payload["errors"]["attemptResults"]["incomplete"]["inspect"] == [
         "attempt.json:validationError",

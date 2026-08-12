@@ -495,7 +495,8 @@ def llm_help_payload() -> dict[str, object]:
                 ),
                 "verification": "reviewctl verify RECEIPT.json",
                 "approval": (
-                    "only after a non-empty persisted receipt is verified and findings are "
+                    "only when receipt.result is accepted, acceptedAttempt names the accepted "
+                    "attempt, receipt verification succeeds, and material findings are "
                     "independently checked"
                 ),
             },
@@ -610,8 +611,9 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "--prompt-file FILE --file SOURCE\n"
         "reviewctl verify RECEIPT.json\n"
         "```\n\n"
-        "A formal result requires a non-empty persisted receipt, successful verification, "
-        "and independent checking of material findings.\n\n"
+        "A formal result requires receipt.result=accepted, a non-null acceptedAttempt, "
+        "successful receipt verification, and independent checking of material findings. "
+        "Hash verification alone proves integrity, not acceptance.\n\n"
         "## Diagnose failures\n\n"
         "Do not retry blindly. A run that exits 1 still persists a receipt and attempt evidence. "
         "Read `attempt.json` fields `result`, `diagnostic`, `validationError`, and "
@@ -2817,8 +2819,10 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     response_path=response_path,
                     session_path=session_path,
                 )
-                final_response_path.write_text(persisted.response)
-                diagnostic_path.write_text(redact_diagnostic(stderr, limit=100_000))
+                if persisted.response:
+                    final_response_path.write_text(persisted.response)
+                if response_path.is_file():
+                    diagnostic_path.write_text(redact_diagnostic(stderr, limit=100_000))
             else:
                 database = attempt_dir / "transport.sqlite3"
                 exit_code, stderr = invoke_llm(

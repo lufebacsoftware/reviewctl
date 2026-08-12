@@ -30,9 +30,11 @@ For formal Pi routes, `MODEL` must be provider-qualified, for example
 `openrouter/google/gemini-2.5-flash`. Unqualified Pi model names are rejected
 because they cannot bind the expected provider identity.
 
-A formal result requires a non-empty persisted receipt, successful
-verification, and independent checking of material findings. A missing,
-empty, unavailable, or unverified receipt is not an approval.
+A formal result requires `receipt.result` to be `accepted`, `acceptedAttempt`
+to name the accepted attempt, successful receipt verification, and independent
+checking of material findings. A missing, empty, unavailable, rejected, or
+unverified receipt is not an approval. Hash verification alone proves receipt
+integrity, not acceptance.
 
 For machine-readable guidance:
 

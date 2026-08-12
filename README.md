@@ -60,6 +60,10 @@ contents. By default it is `<artifact-root>/reviewctl.log`, with five 5 MiB back
 `--log-file /path/to/reviewctl.log` to place it elsewhere. The receipt records the configured log
 path and rotation policy.
 
+`reviewctl verify` checks receipt integrity; it does not convert an unavailable
+receipt into an accepted one. Automation must also require `result: accepted`
+and a non-null `acceptedAttempt` before treating a run as formal review evidence.
+
 To use a review as working documentation, use `--response-contract document` and add
 `--output-file docs/reviews/<name>.md`. The accepted Markdown response is written there and the
 receipt records its path, SHA-256, and character count. Failed or incomplete attempts never
