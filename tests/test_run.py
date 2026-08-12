@@ -3113,6 +3113,53 @@ def test_verification_detects_tampered_receipt(tmp_path: Path) -> None:
     assert tampered.returncode == 1
 
 
+def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path, "accepted"),
+        "--response-contract",
+        "findings-json",
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    assert receipt["reviewContract"] == "findings-json"
+    assert receipt["contract"] == {"name": "findings-json", "version": "1"}
+    assert evaluation["name"] == "findings-json"
+    assert evaluation["version"] == "1"
+    assert evaluation["violations"] == []
+    for field in ("preparedSha256", "payloadSha256", "normalizedSha256"):
+        assert len(evaluation[field]) == 64
+        int(evaluation[field], 16)
+    assert run_cli("verify", str(receipt_path)).returncode == 0
+
+
+def test_incomplete_findings_receipt_retains_rejected_contract_evaluation(
+    tmp_path: Path,
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path, "accepted"),
+        "--response-contract",
+        "findings-json",
+        env={"LLM_BIN": str(fake_llm), "LLM_SCHEMA_RESPONSE": "not json"},
+    )
+
+    assert result.returncode == 1
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    assert receipt["result"] == "unavailable"
+    assert evaluation["normalizedSha256"] is None
+    assert evaluation["violations"] == ["invalid-json"]
+    assert run_cli("verify", str(receipt_path)).returncode == 0
+
+
 def test_policy_check_and_tournament_complete_when_under_budget(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     policy = tmp_path / "policy.toml"

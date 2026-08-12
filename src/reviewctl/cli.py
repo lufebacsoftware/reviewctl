@@ -31,9 +31,9 @@ from urllib import request as urlrequest
 from reviewctl import __version__
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
-    REVIEW_VERDICTS,
     REVIEWED_FILES_SCHEMA,
     ContractContext,
+    ContractEvaluation,
     get_contract,
 )
 
@@ -1796,6 +1796,14 @@ def review_validation_error(
     expected_file_hashes: dict[str, str] | None = None,
 ) -> str | None:
     """Explain a rejected structured response without changing the acceptance contract."""
+    if contract == "findings-json":
+        context = ContractContext(
+            file_names=tuple(expected_file_hashes or ()),
+            review_declaration_required=expected_file_hashes is not None,
+        )
+        prepared = get_contract(contract).prepare(context)
+        evaluation = get_contract(contract).evaluate(response, prepared, context)
+        return findings_validation_error(response, evaluation)
     if (
         validate_review_response(response, contract, expected_file_hashes=expected_file_hashes)
         is not None
@@ -1824,17 +1832,34 @@ def review_validation_error(
         if not validate_read_proof(value, expected_file_hashes):
             return f"{contract}: reviewedFiles proof does not match frozen inputs"
 
-    if contract == "findings-json":
+    return f"{contract}: response does not satisfy the required schema"
+
+
+def findings_validation_error(
+    response: str, evaluation: ContractEvaluation
+) -> str | None:
+    """Render one native findings evaluation using the stable CLI diagnostics."""
+    if not evaluation.violations:
+        return None
+    violation = evaluation.violations[0]
+    if violation == "invalid-json":
+        return "findings-json: invalid JSON"
+    if violation == "top-level-not-object":
+        return "findings-json: top-level response must be an object"
+    if violation == "response-fields":
+        return "findings-json: response fields do not match the required schema"
+    if violation == "review-declaration":
+        return "findings-json: reviewedFiles proof does not match frozen inputs"
+    if violation == "verdict":
+        value = json.loads(response)
         verdict = value.get("verdict")
         if not isinstance(verdict, str):
             return "findings-json: verdict must be a string"
-        if verdict not in REVIEW_VERDICTS:
-            return (
-                f"findings-json: invalid verdict {verdict!r}; "
-                "expected approved or changes-requested"
-            )
-        return "findings-json: findings do not satisfy the required schema or verdict invariant"
-    return f"{contract}: response does not satisfy the required schema"
+        return (
+            f"findings-json: invalid verdict {verdict!r}; "
+            "expected approved or changes-requested"
+        )
+    return "findings-json: findings do not satisfy the required schema or verdict invariant"
 
 
 def seal(path: Path, contents: bytes, recipient: str) -> str:
@@ -1886,6 +1911,9 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     snapshots_context = frozen_review_files(files)
     source_files, snapshots = snapshots_context.__enter__()
     snapshot_hashes = {file.name: sha256_bytes(file.read_bytes()) for file in snapshots}
+    native_contract = (
+        get_contract(args.response_contract) if args.response_contract == "findings-json" else None
+    )
     source = {
         "files": source_files,
         "git": source_git_metadata(files),
@@ -1920,6 +1948,21 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             database: Path | None = None
             request_path: Path | None = None
             response_path: Path | None = None
+            contract_context = (
+                ContractContext(
+                    file_names=tuple(snapshot_hashes),
+                    review_declaration_required=(
+                        transport == "codex" and args.source_class == "proprietary"
+                    ),
+                )
+                if native_contract
+                else None
+            )
+            prepared_contract = (
+                native_contract.prepare(contract_context)
+                if native_contract and contract_context
+                else None
+            )
             log_event(
                 logger,
                 "attempt_started",
@@ -1987,32 +2030,50 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     timeout_seconds=args.timeout_seconds,
                 )
                 persisted = load_response(database)
-            review = (
-                validate_review_response(
-                    persisted.response,
-                    args.response_contract,
-                    expected_file_hashes=(
-                        snapshot_hashes
-                        if transport == "codex" and args.source_class == "proprietary"
-                        else None
-                    ),
+            contract_evaluation = (
+                native_contract.evaluate(
+                    persisted.response, prepared_contract, contract_context
                 )
                 if persisted is not None
+                and native_contract
+                and prepared_contract
+                and contract_context
                 else None
             )
-            validation_error = (
-                review_validation_error(
-                    persisted.response,
-                    args.response_contract,
-                    expected_file_hashes=(
-                        snapshot_hashes
-                        if transport == "codex" and args.source_class == "proprietary"
-                        else None
-                    ),
+            if contract_evaluation:
+                review = contract_evaluation.value
+                validation_error = (
+                    findings_validation_error(persisted.response, contract_evaluation)
+                    if review is None
+                    else None
                 )
-                if persisted is not None and review is None
-                else None
-            )
+            else:
+                review = (
+                    validate_review_response(
+                        persisted.response,
+                        args.response_contract,
+                        expected_file_hashes=(
+                            snapshot_hashes
+                            if transport == "codex" and args.source_class == "proprietary"
+                            else None
+                        ),
+                    )
+                    if persisted is not None
+                    else None
+                )
+                validation_error = (
+                    review_validation_error(
+                        persisted.response,
+                        args.response_contract,
+                        expected_file_hashes=(
+                            snapshot_hashes
+                            if transport == "codex" and args.source_class == "proprietary"
+                            else None
+                        ),
+                    )
+                    if persisted is not None and review is None
+                    else None
+                )
             if exit_code == 124:
                 result = "timeout"
             elif exit_code != 0:
@@ -2063,6 +2124,15 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 "conversationId": persisted.conversation_id if persisted else None,
                 "findings": review.get("findings", []) if review else [],
             }
+            if contract_evaluation:
+                attempt["contractEvaluation"] = {
+                    "name": contract_evaluation.name,
+                    "version": contract_evaluation.version,
+                    "preparedSha256": contract_evaluation.prepared_digest,
+                    "payloadSha256": contract_evaluation.payload_digest,
+                    "normalizedSha256": contract_evaluation.normalized_digest,
+                    "violations": list(contract_evaluation.violations),
+                }
             attempts.append(attempt)
             (attempt_dir / "attempt.json").write_bytes(canonical_json(attempt) + b"\n")
             log_event(
@@ -2140,6 +2210,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "rotation": {"maxBytes": 5 * 1024 * 1024, "backupCount": 5},
         },
     }
+    if native_contract:
+        receipt["contract"] = {
+            "name": native_contract.name,
+            "version": native_contract.version,
+        }
     if accepted:
         receipt["response"] = {
             "sha256": sha256_bytes(accepted.response.encode()),

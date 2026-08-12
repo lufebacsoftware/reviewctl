@@ -189,7 +189,10 @@ For accepted and incomplete `findings-json` attempts, assert the attempt records
 }
 ```
 
-Also assert the receipt retains the legacy `reviewContract` string and passes `reviewctl verify`.
+Also assert the receipt retains the legacy `reviewContract` string, records stable contract
+name/version at the top level, keeps the context-specific prepared digest on each attempt, and passes
+`reviewctl verify`. A routed run may prepare more than one dialect, so no single prepared digest is
+claimed at receipt level.
 
 - [ ] **Step 2: Verify RED**
 
@@ -197,7 +200,10 @@ Run the new receipt tests. Expected: failure because attempts do not yet include
 
 - [ ] **Step 3: Record evaluation evidence without moving the acceptance gate**
 
-Prepare the contract once per run, evaluate each raw response once, derive legacy review/error wrappers from that evaluation, and add `contractEvaluation` to structured attempts. Keep transport/model/provider/conversation/result checks in `run_review`; contract validity alone must not imply acceptance.
+Resolve the contract once per run, prepare its context-specific dialect once per attempt, evaluate each
+raw response once, derive legacy review/error wrappers from that evaluation, and add
+`contractEvaluation` to structured attempts. Keep transport/model/provider/conversation/result checks
+in `run_review`; contract validity alone must not imply acceptance.
 
 - [ ] **Step 4: Verify GREEN and commit**
 
