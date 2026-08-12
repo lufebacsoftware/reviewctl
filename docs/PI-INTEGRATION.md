@@ -61,7 +61,10 @@ reviewctl explore resume \
 `reviewctl explore show` prints the manifest, and each turn is retained under
 `~/.cache/reviewctl/explorations/<id>/turns/`. The session JSONL is the Pi
 conversation state; the per-turn event stream and response are diagnostic
-working material.
+working material. A turn always retains its request and `turn.json`; event,
+response, stderr, and session files exist only when Pi produced the corresponding
+content. Transport-independent failures such as a missing executable are recorded
+in `turn.json:diagnostic`, not manufactured as Pi stderr.
 
 ### 2. Promote the formal request
 

@@ -753,7 +753,49 @@ def test_exploration_timeout_retains_partial_diagnostics_and_observed_metadata(
     assert metadata["durationMs"] >= 1000
     assert "partial warning" in (turn / "stderr.log").read_text()
     assert "exploration shutdown diagnostic" in (turn / "stderr.log").read_text()
-    assert "timed out" in (turn / "stderr.log").read_text()
+    assert "timed out" in metadata["diagnostic"]
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected_diagnostic"),
+    [
+        ({"PI_SILENT": "1"}, ""),
+        ({"PI_BIN": "missing"}, "Pi exploration executable not found"),
+    ],
+)
+def test_exploration_does_not_manufacture_transport_artifacts(
+    tmp_path: Path,
+    environment: dict[str, str],
+    expected_diagnostic: str,
+) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    exploration_root = tmp_path / "explorations"
+    env = {"PI_BIN": str(fake_pi), **environment}
+    if environment.get("PI_BIN") == "missing":
+        env["PI_BIN"] = str(tmp_path / "missing-pi")
+
+    result = run_cli(
+        "explore",
+        "start",
+        "--id",
+        "unavailable-thread",
+        "--model",
+        "accepted",
+        "--prompt",
+        "Explore without output.",
+        "--exploration-root",
+        str(exploration_root),
+        env=env,
+    )
+
+    assert result.returncode == 1
+    turn = Path(result.stdout.strip())
+    metadata = json.loads((turn / "turn.json").read_text())
+    assert metadata["status"] == "unavailable"
+    assert expected_diagnostic in metadata["diagnostic"]
+    assert not (turn / "events.jsonl").exists()
+    assert not (turn / "response.md").exists()
+    assert not (turn / "stderr.log").exists()
 
 
 def test_explore_show_and_promote_publish_working_material_not_an_approval(

@@ -1446,7 +1446,7 @@ def invoke_openrouter(
     timeout_seconds: int,
     request_path: Path,
     response_path: Path,
-) -> tuple[int, str, PersistedResponse]:
+) -> tuple[int, str, str, PersistedResponse]:
     """Call OpenRouter directly and persist source-safe request and raw response evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
     if not api_key:
@@ -1975,10 +1975,12 @@ def invoke_pi_exploration(
             # Drain bytes emitted while Pi handles termination so exploration
             # diagnostics and observed metadata remain complete.
             stdout, stderr = process.communicate()
-            events_path.write_bytes(stdout)
+            if stdout:
+                events_path.write_bytes(stdout)
             return (
                 124,
                 pi_timeout_diagnostic(stderr).replace("review attempt", "exploration turn", 1),
+                stderr.decode(errors="replace"),
                 pi_persisted_response(
                     stdout,
                     model,
@@ -1987,13 +1989,15 @@ def invoke_pi_exploration(
                 ),
             )
     except FileNotFoundError:
-        return 127, f"Pi exploration executable not found: {pi_bin}", blank
+        return 127, f"Pi exploration executable not found: {pi_bin}", "", blank
     except OSError as error:
-        return 127, f"Pi exploration could not execute: {error}", blank
+        return 127, f"Pi exploration could not execute: {error}", "", blank
 
-    events_path.write_bytes(stdout)
+    if stdout:
+        events_path.write_bytes(stdout)
     return (
         process.returncode,
+        stderr.decode(errors="replace"),
         stderr.decode(errors="replace"),
         pi_persisted_response(
             stdout, model, round((time.monotonic() - started) * 1000)
@@ -2084,7 +2088,7 @@ def run_exploration_turn(
         response_path = turn_path / "response.md"
         stderr_path = turn_path / "stderr.log"
         request_path.write_text(prompt)
-        exit_code, diagnostic, persisted = invoke_pi_exploration(
+        exit_code, diagnostic, transport_stderr, persisted = invoke_pi_exploration(
             pi_bin=os.environ.get("PI_BIN", "pi"),
             prompt=prompt,
             model=model,
@@ -2094,8 +2098,10 @@ def run_exploration_turn(
             session_path=session_path,
             events_path=events_path,
         )
-        response_path.write_text(persisted.response)
-        stderr_path.write_text(redact_diagnostic(diagnostic, limit=100_000))
+        if persisted.response:
+            response_path.write_text(persisted.response)
+        if transport_stderr:
+            stderr_path.write_text(redact_diagnostic(transport_stderr, limit=100_000))
         turn_manifest = {
             "turn": turn_number,
             "model": persisted.model or model,
@@ -2104,6 +2110,7 @@ def run_exploration_turn(
             "costUsd": persisted.cost_usd,
             "durationMs": persisted.duration_ms,
             "exitCode": exit_code,
+            "diagnostic": redact_diagnostic(diagnostic, limit=100_000),
             "status": "completed" if exit_code == 0 and persisted.response else "unavailable",
         }
         (turn_path / "turn.json").write_text(

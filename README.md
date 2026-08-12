@@ -146,9 +146,10 @@ reviewctl explore promote --id ledger-product-ideas --output /tmp/ledger-product
 Explorations are named, resumable Pi sessions. The default tool set is read-only
 repository inspection (`read,grep,find,ls`); pass `--tools` explicitly when a
 different capability set is appropriate. Selecting `bash`, `edit`, or `write`
-deliberately expands the local execution boundary. Each turn stores its request, Pi
-JSON event stream, response, diagnostics, and session state under
-`~/.cache/reviewctl/explorations`.
+deliberately expands the local execution boundary. Each turn stores its request and
+turn manifest under `~/.cache/reviewctl/explorations`; Pi event, response, stderr,
+and session artifacts are retained only when Pi actually emits or creates them.
+Runner-generated failures remain in the turn manifest's `diagnostic` field.
 
 `promote` creates `prompt.md`, `exploration.md`, and a manifest for the formal
 handoff. The exploratory response is working material, not an approval or a
