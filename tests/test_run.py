@@ -291,7 +291,7 @@ session.write_text(json.dumps({
     'cwd': str(Path.cwd()),
 }) + '\\n')
 response = json.dumps({'verdict': 'approved', 'findings': []})
-if model == 'empty':
+if model == 'empty' or model.endswith('/empty'):
     content = []
 else:
     content = [{'type': 'text', 'text': response}]
@@ -318,7 +318,7 @@ if diagnostic := os.environ.get('PI_STDERR'):
     print(diagnostic, file=sys.stderr, flush=True)
 if delay := os.environ.get('PI_SLEEP'):
     time.sleep(float(delay))
-if model == 'failure':
+if model == 'failure' or model.endswith('/failure'):
     print('provider failed after retries', file=sys.stderr)
     raise SystemExit(17)
 """,
@@ -404,7 +404,7 @@ def test_pi_transport_archives_events_session_and_final_response(tmp_path: Path)
     result = run_cli(
         *review_arguments(tmp_path),
         "--route",
-        "pi:accepted",
+        "pi:openrouter/accepted",
         "--response-contract",
         "findings-json",
         env={"PI_BIN": str(fake_pi)},
@@ -433,7 +433,7 @@ def test_pi_transport_preserves_failed_event_stream(tmp_path: Path) -> None:
     result = run_cli(
         *review_arguments(tmp_path),
         "--route",
-        "pi:failure",
+        "pi:openrouter/failure",
         "--response-contract",
         "findings-json",
         env={"PI_BIN": str(fake_pi)},
@@ -454,7 +454,7 @@ def test_missing_pi_binary_does_not_claim_nonexistent_evidence(tmp_path: Path) -
     result = run_cli(
         *review_arguments(tmp_path),
         "--route",
-        "pi:accepted",
+        "pi:openrouter/accepted",
         "--response-contract",
         "findings-json",
         env={"PI_BIN": str(tmp_path / "missing-pi")},
@@ -506,6 +506,19 @@ def test_pi_transport_rejects_an_observed_provider_route_mismatch(tmp_path: Path
         "requested": "openrouter/google/gemini-2.5-flash",
         "resolved": "google/gemini-2.5-flash",
     }
+
+
+def test_formal_pi_transport_requires_provider_qualified_model_identity(tmp_path: Path) -> None:
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:gemini-2.5-flash",
+        "--response-contract",
+        "findings-json",
+    )
+
+    assert result.returncode == 2
+    assert "pi review models must use provider/model identity" in result.stderr
 
 
 def test_pi_response_normalization_only_removes_one_json_fence() -> None:
@@ -830,7 +843,7 @@ def test_mixed_routes_do_not_apply_the_first_transports_defaults(tmp_path: Path)
     config = tmp_path / "reviewctl.toml"
     config.write_text(
         '[profiles.mixed]\n'
-        'routes = ["agy:gemini-3.6-flash-high", "pi:accepted"]\n'
+        'routes = ["agy:gemini-3.6-flash-high", "pi:openrouter/accepted"]\n'
         '[defaults.agy]\n'
         'timeout_seconds = 111\n'
         '[defaults.pi]\n'
@@ -867,7 +880,7 @@ def test_pi_request_marks_output_token_limit_as_unenforced(tmp_path: Path) -> No
     result = run_cli(
         *review_arguments(tmp_path),
         "--route",
-        "pi:accepted",
+        "pi:openrouter/accepted",
         "--max-output-tokens",
         "1",
         "--response-contract",
@@ -2696,6 +2709,7 @@ def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home
 
         assert f'(deny file-read* (subpath "{source_root}"))' in profile
         assert f'(deny file-write* (subpath "{source_root}"))' in profile
+        assert f'(deny file-write* (subpath "{Path.home().resolve()}"))' in profile
         assert isolation.home.joinpath("auth.json").read_text() == auth.read_text()
         assert isolation.environment["CODEX_HOME"] == str(isolation.home)
         assert isolation.environment["HOME"] == str(isolation.home)

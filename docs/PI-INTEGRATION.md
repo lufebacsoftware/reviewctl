@@ -92,7 +92,8 @@ reviewctl run \
 ```
 
 For a headless Pi attempt or an ordered Pi fallback, select the transport
-explicitly:
+explicitly. Formal Pi model identifiers must include their provider so an
+observed provider change cannot be hidden by an unqualified model name:
 
 ```bash
 reviewctl run \

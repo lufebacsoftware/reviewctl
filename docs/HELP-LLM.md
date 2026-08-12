@@ -26,6 +26,10 @@ reviewctl run --review-id ID --transport TRANSPORT --model MODEL \
 reviewctl verify RECEIPT.json
 ```
 
+For formal Pi routes, `MODEL` must be provider-qualified, for example
+`openrouter/google/gemini-2.5-flash`. Unqualified Pi model names are rejected
+because they cannot bind the expected provider identity.
+
 A formal result requires a non-empty persisted receipt, successful
 verification, and independent checking of material findings. A missing,
 empty, unavailable, or unverified receipt is not an approval.

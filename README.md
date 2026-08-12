@@ -218,13 +218,14 @@ reviewctl run \
 ```
 
 For proprietary reviews on macOS, the Codex transport creates an ephemeral `CODEX_HOME`, copies only
-the required Codex authentication file, and uses `sandbox-exec` to deny reads from the original source
-roots. Codex works from frozen snapshots rather than the checkout. This is a targeted source boundary,
-not a claim that an LLM process is isolated from every host system path. The transport records the
+the required Codex authentication file, and uses `sandbox-exec` to deny reads and writes against the
+original source roots and writes throughout the invoking user's real home. Codex works from frozen
+snapshots rather than the checkout. This is not a claim that an LLM process is isolated from every host
+system path. The transport records the
 Codex session identifier and removes the plaintext final message after extracting its hash and
 validated findings. Because Codex cannot nest its own macOS seatbelt inside `sandbox-exec`, the
-proprietary path uses Codex's external-sandbox bypass flag; the outer profile remains the source-root
-boundary. Codex `*-pro` availability depends on the organization's Codex account; use a successful
+proprietary path uses Codex's external-sandbox bypass flag; the outer profile remains the enforced
+source-read and home-write boundary. Codex `*-pro` availability depends on the organization's Codex account; use a successful
 synthetic qualification before making a role mandatory.
 
 The tournament command accepts only synthetic cases by policy. It estimates the maximum spend from

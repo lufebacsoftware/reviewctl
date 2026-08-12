@@ -27,9 +27,10 @@ file and any temporary JSON schema after extraction; the receipt keeps the Codex
 response hash, and validated structured findings.
 
 For proprietary Codex reviews on macOS, the runner also creates a temporary `CODEX_HOME` with only the
-authentication file required by Codex and applies a `sandbox-exec` deny rule to every original review
-source root. This proves that Codex cannot reopen the reviewed checkout after snapshotting. It is not a
-whole-host sandbox claim: system paths outside the source roots are outside this narrow boundary.
+authentication file required by Codex and applies `sandbox-exec` rules that deny reads and writes to
+every original review source root and deny writes throughout the invoking user's real home. This proves
+that Codex cannot reopen the reviewed checkout after snapshotting or write into the user's home. It is
+not a whole-host sandbox claim: paths outside the source roots and real home remain outside this boundary.
 Codex's internal seatbelt is bypassed only for this externally sandboxed path, because macOS does not
 permit nested seatbelt application; synthetic and non-isolated Codex runs retain `--sandbox read-only`.
 

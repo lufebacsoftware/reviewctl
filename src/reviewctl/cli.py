@@ -1270,7 +1270,7 @@ def codex_isolation(
         shutil.copyfile(source_auth, copied_auth)
         copied_auth.chmod(0o600)
         profile = home / "source-root-deny.sb"
-        denies = "\n".join(
+        source_denies = "\n".join(
             "\n".join(
                 [
                     f"(deny file-read* (subpath {sandbox_profile_path(root)}))",
@@ -1279,6 +1279,10 @@ def codex_isolation(
             )
             for root in source_roots
         )
+        home_write_deny = (
+            f"(deny file-write* (subpath {sandbox_profile_path(Path.home())}))"
+        )
+        denies = f"{source_denies}\n{home_write_deny}"
         profile.write_text(f"(version 1)\n(allow default)\n{denies}\n")
         environment = dict(os.environ)
         environment.update({"CODEX_HOME": str(home), "HOME": str(home), "TMPDIR": str(home)})
@@ -2623,6 +2627,8 @@ def seal(path: Path, contents: bytes, recipient: str) -> str:
 def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     prompt, files = validate_request(parser, args)
     routes, route_profile = review_routes(parser, args)
+    if any(route.transport == "pi" and "/" not in route.model for route in routes):
+        parser.error("pi review models must use provider/model identity")
     route_transports = {route.transport for route in routes}
     transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
     transport_defaults, execution_config = load_transport_defaults(
