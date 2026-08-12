@@ -284,12 +284,15 @@ if log := os.environ.get('PI_ARGUMENTS_LOG'):
     Path(log).write_text(json.dumps(arguments))
 model = arguments[arguments.index('--model') + 1]
 session = Path(arguments[arguments.index('--session') + 1])
-session.write_text(json.dumps({
-    'type': 'session',
-    'version': 3,
-    'id': 'pi-session',
-    'cwd': str(Path.cwd()),
-}) + '\\n')
+if os.environ.get('PI_EMPTY_SESSION'):
+    session.touch()
+else:
+    session.write_text(json.dumps({
+        'type': 'session',
+        'version': 3,
+        'id': 'pi-session',
+        'cwd': str(Path.cwd()),
+    }) + '\\n')
 response = json.dumps({'verdict': 'approved', 'findings': []})
 if model == 'empty' or model.endswith('/empty'):
     content = []
@@ -490,6 +493,25 @@ def test_silent_pi_process_does_not_claim_empty_event_or_stderr_evidence(tmp_pat
     assert attempt["result"] == "model-mismatch"
     assert attempt["evidence"]["response"] is None
     assert attempt["evidence"]["stderr"] is None
+
+
+def test_pi_transport_does_not_claim_an_empty_session_file(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:openrouter/accepted",
+        "--response-contract",
+        "findings-json",
+        env={"PI_BIN": str(fake_pi), "PI_EMPTY_SESSION": "1"},
+    )
+
+    assert result.returncode == 0
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "accepted"
+    assert attempt["evidence"]["session"] is None
 
 
 def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None:

@@ -2927,7 +2927,9 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     ),
                     "session": (
                         str(session_path)
-                        if session_path is not None and session_path.is_file()
+                        if session_path is not None
+                        and session_path.is_file()
+                        and session_path.stat().st_size > 0
                         else None
                     ),
                     "finalResponse": (
