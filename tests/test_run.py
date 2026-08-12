@@ -357,6 +357,15 @@ def review_arguments(tmp_path: Path, *models: str) -> list[str]:
     ]
 
 
+def test_transport_return_annotations_match_runtime_tuple_shapes() -> None:
+    assert cli.invoke_openrouter.__annotations__["return"] == (
+        "tuple[int, str, PersistedResponse]"
+    )
+    assert cli.invoke_pi_exploration.__annotations__["return"] == (
+        "tuple[int, str, str, PersistedResponse]"
+    )
+
+
 def test_uses_a_separate_database_for_each_attempt_and_accepts_matching_model(
     tmp_path: Path,
 ) -> None:

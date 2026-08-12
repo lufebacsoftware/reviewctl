@@ -1459,7 +1459,7 @@ def invoke_openrouter(
     timeout_seconds: int,
     request_path: Path,
     response_path: Path,
-) -> tuple[int, str, str, PersistedResponse]:
+) -> tuple[int, str, PersistedResponse]:
     """Call OpenRouter directly and persist source-safe request and raw response evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
     if not api_key:
@@ -1958,7 +1958,7 @@ def invoke_pi_exploration(
     timeout_seconds: int,
     session_path: Path,
     events_path: Path,
-) -> tuple[int, str, PersistedResponse]:
+) -> tuple[int, str, str, PersistedResponse]:
     """Run one full-tool Pi turn while preserving its resumable session."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
     command = [
