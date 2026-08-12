@@ -717,6 +717,48 @@ def test_explore_resume_uses_the_same_pi_session_and_appends_a_turn(tmp_path: Pa
     assert manifest["session"] == str(session_root / "session.jsonl")
 
 
+def test_explore_resume_can_explicitly_revoke_persisted_tools(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    exploration_root = tmp_path / "explorations"
+    arguments_log = tmp_path / "pi-resume-arguments.json"
+    common = ["--exploration-root", str(exploration_root)]
+
+    started = run_cli(
+        "explore",
+        "start",
+        "--id",
+        "capability-thread",
+        "--model",
+        "accepted",
+        "--tools",
+        "read,grep,find,ls,write",
+        "--prompt",
+        "Start with write access.",
+        *common,
+        env={"PI_BIN": str(fake_pi)},
+    )
+    assert started.returncode == 0, started.stderr
+
+    resumed = run_cli(
+        "explore",
+        "resume",
+        "--id",
+        "capability-thread",
+        "--tools",
+        "read,grep,find,ls",
+        "--prompt",
+        "Continue read-only.",
+        *common,
+        env={"PI_BIN": str(fake_pi), "PI_ARGUMENTS_LOG": str(arguments_log)},
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    arguments = json.loads(arguments_log.read_text())
+    assert arguments[arguments.index("--tools") + 1] == "read,grep,find,ls"
+    manifest = json.loads((exploration_root / "capability-thread" / "manifest.json").read_text())
+    assert manifest["tools"] == "read,grep,find,ls"
+
+
 def test_exploration_timeout_retains_partial_diagnostics_and_observed_metadata(
     tmp_path: Path,
 ) -> None:
@@ -855,6 +897,8 @@ def test_help_llm_describes_the_exploration_and_formal_review_boundary() -> None
     assert result.returncode == 0, result.stderr
     assert "reviewctl explore start" in result.stdout
     assert "reviewctl explore resume" in result.stdout
+    assert "only when Pi produces them" in result.stdout
+    assert "turn.json:diagnostic" in result.stdout
     assert "not an approval" in result.stdout
     assert "reviewctl run" in result.stdout
 
@@ -2865,13 +2909,15 @@ def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home
     auth = tmp_path / "auth.json"
     auth.write_text('{"access_token":"test"}')
     monkeypatch.setattr(cli.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    monkeypatch.setenv("HOME", str(tmp_path / "spoofed-home"))
 
     with cli.codex_isolation([source_root], auth_path=auth) as isolation:
         profile = isolation.profile.read_text()
 
         assert f'(deny file-read* (subpath "{source_root}"))' in profile
         assert f'(deny file-write* (subpath "{source_root}"))' in profile
-        assert f'(deny file-write* (subpath "{Path.home().resolve()}"))' in profile
+        assert f'(deny file-write* (subpath "{cli.account_home()}"))' in profile
+        assert str(tmp_path / "spoofed-home") not in profile
         assert isolation.home.joinpath("auth.json").read_text() == auth.read_text()
         assert isolation.environment["CODEX_HOME"] == str(isolation.home)
         assert isolation.environment["HOME"] == str(isolation.home)

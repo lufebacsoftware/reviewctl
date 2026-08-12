@@ -605,9 +605,10 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "reviewctl explore show --id ID\n"
         "reviewctl explore promote --id ID --output PATH\n"
         "```\n\n"
-        "Exploration sessions are resumable and retain prompts, Pi events, responses, "
-        "diagnostics, and session state. Their response is exploratory working material, "
-        "not an approval.\n\n"
+        "Exploration sessions are resumable. Every turn retains its request and manifest; "
+        "Pi event, response, stderr, and session artifacts exist only when Pi produces "
+        "them. Runner failures are recorded in turn.json:diagnostic. A response is "
+        "exploratory working material, not an approval.\n\n"
         "## Formal review\n\n"
         "```bash\n"
         "reviewctl run --review-id ID --transport TRANSPORT --model MODEL "
@@ -1249,6 +1250,16 @@ def sandbox_profile_path(path: Path) -> str:
     return json.dumps(str(path.resolve()))
 
 
+def account_home() -> Path:
+    """Return the login account home without trusting the HOME environment variable."""
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except (ImportError, KeyError, OSError) as error:
+        raise RuntimeError("Codex isolation could not resolve the login account home") from error
+
+
 @contextmanager
 def codex_isolation(
     source_roots: list[Path], *, auth_path: Path | None = None
@@ -1284,9 +1295,7 @@ def codex_isolation(
             )
             for root in source_roots
         )
-        home_write_deny = (
-            f"(deny file-write* (subpath {sandbox_profile_path(Path.home())}))"
-        )
+        home_write_deny = f"(deny file-write* (subpath {sandbox_profile_path(account_home())}))"
         denies = f"{source_denies}\n{home_write_deny}"
         profile.write_text(f"(version 1)\n(allow default)\n{denies}\n")
         environment = dict(os.environ)
@@ -2074,10 +2083,10 @@ def run_exploration_turn(
             )
             if not cwd.is_dir():
                 fail(parser, f"exploration cwd does not exist: {cwd}")
-            if args.tools == DEFAULT_EXPLORATION_TOOLS and isinstance(manifest.get("tools"), str):
+            if args.tools is None and isinstance(manifest.get("tools"), str):
                 tools = manifest["tools"]
             else:
-                tools = args.tools
+                tools = args.tools or DEFAULT_EXPLORATION_TOOLS
         tools = args.tools if starting else tools
         session_path = path / "session.jsonl"
         turn_number = int(manifest.get("turns", 0)) + 1
@@ -3682,7 +3691,7 @@ def build_parser() -> argparse.ArgumentParser:
     explore_resume.add_argument("--prompt")
     explore_resume.add_argument("--prompt-file")
     explore_resume.add_argument("--cwd")
-    explore_resume.add_argument("--tools", default=DEFAULT_EXPLORATION_TOOLS)
+    explore_resume.add_argument("--tools")
     explore_resume.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=900)
     explore_resume.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
     explore_resume.set_defaults(

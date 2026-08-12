@@ -58,6 +58,11 @@ reviewctl explore resume \
   --prompt "Inspect the relevant tests and refine the bounded review question."
 ```
 
+A resume inherits the prior tool set when `--tools` is omitted. Passing
+`--tools` explicitly replaces it for that turn and subsequent resumes, so an
+explicit `--tools read,grep,find,ls` revokes previously enabled write or shell
+capabilities.
+
 `reviewctl explore show` prints the manifest, and each turn is retained under
 `~/.cache/reviewctl/explorations/<id>/turns/`. The session JSONL is the Pi
 conversation state; the per-turn event stream and response are diagnostic
