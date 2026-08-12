@@ -112,6 +112,37 @@ def test_findings_contract_rejects_duplicate_json_fields() -> None:
     assert evaluation.violations == ("invalid-json",)
 
 
+def test_findings_contract_rejects_mutated_prepared_material() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext()
+    prepared = contract.prepare(context)
+    prepared.schema["additionalProperties"] = True
+
+    evaluation = contract.evaluate(
+        json.dumps({"verdict": "approved", "findings": []}), prepared, context
+    )
+
+    assert evaluation.value is None
+    assert evaluation.violations == ("prepared-contract",)
+
+
+def test_findings_contract_rejects_a_prepared_contract_from_another_context() -> None:
+    contract = get_contract("findings-json")
+    prepared = contract.prepare(ContractContext())
+    declaration_context = ContractContext(
+        file_names=("source.py",), review_declaration_required=True
+    )
+
+    evaluation = contract.evaluate(
+        json.dumps({"verdict": "approved", "findings": []}),
+        prepared,
+        declaration_context,
+    )
+
+    assert evaluation.value is None
+    assert evaluation.violations == ("prepared-contract",)
+
+
 def invalid_contract_cases() -> list[tuple[str, ContractContext, str]]:
     missing_field = finding_payload()
     del missing_field["findings"][0]["title"]  # type: ignore[index]

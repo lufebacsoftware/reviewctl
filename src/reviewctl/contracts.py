@@ -168,6 +168,11 @@ class FindingsJsonContract:
                 violations=(code,),
             )
 
+        if prepared != self.prepare(context) or prepared.digest != hashlib.sha256(
+            canonical_json(prepared.identity_material)
+        ).hexdigest():
+            return rejected("prepared-contract")
+
         try:
             value = json.loads(payload, object_pairs_hook=exact_json_object)
         except (json.JSONDecodeError, DuplicateJsonField):
