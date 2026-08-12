@@ -298,8 +298,8 @@ else:
 message = {
     'role': 'assistant',
     'content': content,
-    'provider': 'openrouter',
-    'model': model,
+    'provider': os.environ.get('PI_PROVIDER', 'openrouter'),
+    'model': os.environ.get('PI_RESOLVED_MODEL', model),
     'usage': {
         'input': 12,
         'output': 34,
@@ -480,7 +480,32 @@ def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None
     ) == "openrouter/google/gemini-2.5-flash"
     assert cli.pi_resolved_model(
         "openrouter/google/gemini-2.5-flash", "google", "gemini-2.5-flash"
-    ) == "openrouter/google/gemini-2.5-flash"
+    ) == "google/gemini-2.5-flash"
+
+
+def test_pi_transport_rejects_an_observed_provider_route_mismatch(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:openrouter/google/gemini-2.5-flash",
+        "--response-contract",
+        "findings-json",
+        env={
+            "PI_BIN": str(fake_pi),
+            "PI_PROVIDER": "google",
+            "PI_RESOLVED_MODEL": "gemini-2.5-flash",
+        },
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["attempts"][0]["result"] == "model-mismatch"
+    assert receipt["attempts"][0]["model"] == {
+        "requested": "openrouter/google/gemini-2.5-flash",
+        "resolved": "google/gemini-2.5-flash",
+    }
 
 
 def test_pi_response_normalization_only_removes_one_json_fence() -> None:

@@ -1676,14 +1676,9 @@ def pi_usage(usage: object) -> tuple[float | None, int | None, int | None]:
 
 def pi_resolved_model(requested: str, provider: str | None, resolved: str) -> str:
     """Rebuild Pi's provider/model identity from its split assistant metadata."""
-    if not resolved or "/" not in requested or not provider:
+    if not resolved or not provider or "/" not in requested:
         return resolved
-    requested_provider, requested_model = requested.split("/", 1)
-    if provider == requested_provider:
-        return f"{provider}/{resolved}"
-    if f"{provider}/{resolved}" == requested_model:
-        return requested
-    return resolved
+    return resolved if resolved.startswith(f"{provider}/") else f"{provider}/{resolved}"
 
 
 def pi_persisted_response(
