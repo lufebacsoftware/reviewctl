@@ -18,7 +18,8 @@ receipt, but a new review records the new policy digest.
 ## Sealed audit payload
 
 The runner never copies source files into its artifact directory. It writes private temporary snapshots
-only for the lifetime of the model process; receipt provenance hashes those exact bytes. Passing
+only for the lifetime of the model process; `snapshotIntegrity` receipt provenance hashes those exact
+bytes locally. Passing
 `--seal-to` stores the exact assembled request and raw model response only as Age-encrypted payloads.
 SQLite transport databases are deleted after extraction, including when Age sealing fails, because they
 contain raw prompt and response data. The Codex transport similarly deletes its `--output-last-message`
@@ -39,10 +40,19 @@ The structured findings contract accepts exactly two outcomes: `approved` with n
 read the files, or returns an ambiguous natural-language verdict produces an unavailable receipt rather
 than an approval.
 
-Every structured response must also return a SHA-256 for every frozen review file. `reviewctl` compares
-that set exactly with the locally snapshotted bytes. This is not a proof of model reasoning, but it is a
-machine-checkable proof that the response could not have been accepted without correctly reading each
-bounded file.
+For transport contexts that require a `reviewDeclaration`, the structured response lists every frozen
+basename it declares it reviewed. `reviewctl` compares that set exactly with the frozen packet. The
+model never supplies the authoritative source hashes; the runner records them from local bytes.
+
+The receipt also distinguishes the `invocationManifest` assembled by reviewctl from a
+`providerRequestObserved` request. Direct transports can persist a sanitized provider-native request.
+An opaque intermediary CLI can expose only the invocation reviewctl controlled unless it returns
+stronger observation evidence. The packet digest identifies reviewctl's intermediate assembled prompt;
+it does not by itself attest what a remote provider received.
+
+Snapshot integrity, a matching declaration, and an observed request are useful but narrower claims.
+None proves cognition, attention, semantic understanding, correct reasoning, or correctness of a
+finding. Model findings remain proposals until independently reproduced or otherwise verified.
 
 Evidence repositories retain the visible receipt and sealed payloads. Their commits must be signed by
 the owning organization. Release signing and reproducible-build provenance apply to the `reviewctl`

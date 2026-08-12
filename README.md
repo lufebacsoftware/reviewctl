@@ -202,7 +202,8 @@ OpenAI/Codex reviews are an approved independent lane, run through the organizat
 and retained in that organization's evidence repository. `reviewctl` currently controls the portable
 `llm` packet transport; it does not route proprietary source through OpenRouter by default.
 
-Read [the council policy](docs/COUNCIL.md), [evidence contract](docs/EVIDENCE.md),
+Read [the architecture and canonical vocabulary](docs/ARCHITECTURE.md),
+[the council policy](docs/COUNCIL.md), [evidence contract](docs/EVIDENCE.md),
 [Pi and reviewctl integration](docs/PI-INTEGRATION.md),
 [project-instruction integration guide](docs/PROJECT-INTEGRATION.md), and
 [tournament guide](docs/TOURNAMENT.md) before adding the tool to CI. Model
