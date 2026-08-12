@@ -11,6 +11,7 @@ import time
 from contextlib import closing
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -622,6 +623,34 @@ def test_findings_schema_is_portable_for_external_reviewers() -> None:
     ]
     assert cli.FINDINGS_SCHEMA["required"] == ["verdict", "findings"]
     assert "reviewedFiles" not in cli.FINDINGS_SCHEMA["properties"]
+
+
+def test_findings_schema_and_transport_instructions_delegate_to_native_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    contexts: list[object] = []
+
+    class StubContract:
+        def prepare(self, context: object) -> SimpleNamespace:
+            contexts.append(context)
+            return SimpleNamespace(
+                schema={"native": context.review_declaration_required},  # type: ignore[attr-defined]
+                output_instructions=(
+                    "NATIVE CONTRACT DECLARATION"
+                    if context.review_declaration_required  # type: ignore[attr-defined]
+                    else "NATIVE CONTRACT PORTABLE"
+                ),
+            )
+
+    monkeypatch.setattr(cli, "get_contract", lambda name: StubContract())
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    assert cli.response_schema("findings-json") == {"native": False}
+    assert cli.response_schema("findings-json", codex=True) == {"native": True}
+    assert "NATIVE CONTRACT PORTABLE" in cli.openrouter_packet("Review", [source])
+    assert "NATIVE CONTRACT DECLARATION" in cli.codex_prompt("Review", "findings-json")
+    assert len(contexts) == 4
 
 
 @pytest.mark.parametrize(

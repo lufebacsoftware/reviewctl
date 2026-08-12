@@ -29,14 +29,18 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from reviewctl import __version__
+from reviewctl.contracts import (
+    FINDINGS_SCHEMA,
+    REVIEW_VERDICTS,
+    REVIEWED_FILES_SCHEMA,
+    ContractContext,
+    get_contract,
+)
 
 MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
-FINDING_FIELDS = {"severity", "path", "line", "title", "evidence", "reproduction"}
-FINDING_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-REVIEW_VERDICTS = {"approved", "changes-requested"}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
 PRODUCT_SCORE_FIELDS = {
     "delivery",
@@ -71,40 +75,12 @@ PROVIDER_PREFERENCE_KEYS = {
     "order",
     "sort",
 }
-FINDINGS_SCHEMA = {
-    "type": "object",
-    "required": ["verdict", "findings"],
-    "additionalProperties": False,
-    "properties": {
-        "verdict": {"type": "string", "enum": sorted(REVIEW_VERDICTS)},
-        "findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": sorted(FINDING_FIELDS),
-                "additionalProperties": False,
-                "properties": {
-                    "severity": {"type": "string", "enum": sorted(FINDING_SEVERITIES)},
-                    "path": {"type": "string"},
-                    "line": {"type": "integer", "minimum": 1},
-                    "title": {"type": "string"},
-                    "evidence": {"type": "string"},
-                    "reproduction": {"type": "string"},
-                },
-            },
-        },
-    },
-}
 CODEX_FINDINGS_SCHEMA = {
     **FINDINGS_SCHEMA,
     "required": ["verdict", "findings", "reviewedFiles"],
     "properties": {
         **FINDINGS_SCHEMA["properties"],
-        "reviewedFiles": {
-            "type": "array",
-            "minItems": 1,
-            "items": {"type": "string", "minLength": 1},
-        },
+        "reviewedFiles": REVIEWED_FILES_SCHEMA,
     },
 }
 
@@ -254,8 +230,11 @@ def codex_schema(schema: dict[str, object]) -> dict[str, object]:
 
 def response_schema(contract: str, *, codex: bool = False) -> dict[str, object] | None:
     """Return the strict JSON schema for one supported response contract."""
+    if contract == "findings-json":
+        return get_contract(contract).prepare(
+            ContractContext(review_declaration_required=codex)
+        ).schema
     schema = {
-        "findings-json": FINDINGS_SCHEMA,
         "product-review-json": PRODUCT_REVIEW_SCHEMA,
         "product-judge-json": PRODUCT_JUDGE_SCHEMA,
     }.get(contract)
@@ -1190,12 +1169,9 @@ def openrouter_packet(
         f"--- BEGIN {file.name} ---\n{file.read_text()}\n--- END {file.name} ---" for file in files
     )
     if response_contract == "findings-json":
-        contract = (
-            "Return only JSON matching the supplied schema. The top-level object has exactly "
-            "`verdict` and `findings`. Each finding has exactly six fields: `severity`, `path`, "
-            "`line`, `title`, `evidence`, and `reproduction`. Use `changes-requested` if and only "
-            "if `findings` is non-empty; use `approved` if and only if `findings` is empty."
-        )
+        contract = get_contract(response_contract).prepare(
+            ContractContext(file_names=tuple(file.name for file in files))
+        ).output_instructions
     elif response_contract == "product-review-json":
         contract = (
             "Return only JSON matching the supplied product-design schema. Address every stated "
@@ -1447,16 +1423,17 @@ def invoke_agy(
     )
 
 
-def codex_prompt(prompt: str, response_contract: str) -> str:
+def codex_prompt(
+    prompt: str, response_contract: str, *, review_declaration_required: bool = True
+) -> str:
     """Add the output contract Codex must satisfy without expanding source scope."""
     if response_contract == "findings-json":
+        prepared = get_contract(response_contract).prepare(
+            ContractContext(review_declaration_required=review_declaration_required)
+        )
         contract = (
             "Read the frozen files in the current working directory before reviewing. "
-            "Return only JSON matching the supplied findings schema. "
-            "Use approved only when there are no findings, and changes-requested only when "
-            "findings is non-empty. List every frozen snapshot you actually reviewed in "
-            "reviewedFiles; do not emit a verdict if you cannot read a file. The runner, not "
-            "you, records the authoritative source hashes."
+            f"{prepared.output_instructions}"
         )
     elif response_contract == "product-review-json":
         contract = (
@@ -1530,7 +1507,13 @@ def invoke_codex(
         schema_path = output_path.with_name("codex-response.schema.json")
         schema_path.write_bytes(canonical_json(schema))
         command.extend(["--output-schema", str(schema_path)])
-    command.append(codex_prompt(prompt, response_contract))
+    command.append(
+        codex_prompt(
+            prompt,
+            response_contract,
+            review_declaration_required=source_roots is not None,
+        )
+    )
     if isolation:
         command = ["sandbox-exec", "-f", str(isolation.profile), *command]
 
@@ -1772,6 +1755,13 @@ def validate_review_response(
     if contract == "document":
         stripped = response.strip()
         return {"document": stripped} if len(stripped) >= 20 else None
+    if contract == "findings-json":
+        context = ContractContext(
+            file_names=tuple(expected_file_hashes or ()),
+            review_declaration_required=expected_file_hashes is not None,
+        )
+        prepared = get_contract(contract).prepare(context)
+        return get_contract(contract).evaluate(response, prepared, context).value
     try:
         value = json.loads(response)
     except json.JSONDecodeError:
@@ -1796,44 +1786,7 @@ def validate_review_response(
                 return None
             value = {key: item for key, item in value.items() if key != "reviewedFiles"}
         return validate_product_judge(value)
-    if contract != "findings-json" or not isinstance(value.get("verdict"), str):
-        return None
-    if value["verdict"] not in REVIEW_VERDICTS:
-        return None
-    findings = value.get("findings")
-    if not isinstance(findings, list):
-        return None
-    for finding in findings:
-        if not isinstance(finding, dict) or not FINDING_FIELDS <= finding.keys():
-            return None
-        if not all(
-            isinstance(finding[field], str) and finding[field].strip()
-            for field in FINDING_FIELDS - {"line"}
-        ):
-            return None
-        if finding["severity"] not in FINDING_SEVERITIES:
-            return None
-        if not isinstance(finding["line"], int) or finding["line"] < 1:
-            return None
-        if expected_file_hashes is not None and finding["path"] not in expected_file_hashes:
-            return None
-    if (value["verdict"] == "approved") != (not findings):
-        return None
-    if expected_file_hashes is None:
-        if value.get("reviewedFiles") is not None or set(value) != {"verdict", "findings"}:
-            return None
-        return {"verdict": value["verdict"], "findings": findings}
-    if set(value) != {
-        "verdict",
-        "findings",
-        "reviewedFiles",
-    } or not validate_read_proof(value, expected_file_hashes):
-        return None
-    return {
-        "verdict": value["verdict"],
-        "findings": findings,
-        "reviewedFiles": value["reviewedFiles"],
-    }
+    return None
 
 
 def review_validation_error(
