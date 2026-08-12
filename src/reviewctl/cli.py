@@ -56,9 +56,11 @@ RESPONSE_CONTRACTS = {
     "product-review-json",
     "product-judge-json",
 }
-TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy"}
+DEFAULT_REVIEW_TIMEOUT_SECONDS = 90
+DEFAULT_REVIEW_MAX_ATTEMPTS = 1
+TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
-ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy"}
+ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "pi"}
 RETRIABLE_REVIEW_RESULTS = {
     "timeout",
     "transport-failed",
@@ -350,14 +352,14 @@ def parse_route(value: str) -> ReviewRoute:
     transport, separator, model = value.partition(":")
     if not separator or transport not in ROUTE_TRANSPORTS or not model.strip():
         raise ValueError(
-            "routes must use transport:model with transport in llm, codex, openrouter, agy"
+            "routes must use transport:model with transport in llm, codex, openrouter, agy, pi"
         )
     return ReviewRoute(transport=transport, model=model.strip())
 
 
 def load_route_profile(
     parser: argparse.ArgumentParser, config_value: str | None, profile: str
-) -> tuple[tuple[ReviewRoute, ...], dict[str, str]]:
+) -> tuple[tuple[ReviewRoute, ...], dict[str, object]]:
     """Load one ordered route profile from a user-owned TOML config file."""
     config_path = Path(config_value or "~/.config/reviewctl/config.toml").expanduser().resolve()
     if not config_path.is_file():
@@ -379,8 +381,65 @@ def load_route_profile(
         routes = tuple(parse_route(value) for value in route_specs)
     except ValueError as error:
         parser.error(f"profile {profile!r}: {error}")
+    settings: dict[str, int] = {}
+    for key, minimum, maximum in (
+        ("timeout_seconds", 1, None),
+        ("max_attempts", 1, 3),
+    ):
+        value = profile_config.get(key) if isinstance(profile_config, dict) else None
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            parser.error(f"profile {profile!r}: {key} must be a positive integer")
+        if maximum is not None and value > maximum:
+            parser.error(f"profile {profile!r}: {key} must be from {minimum} to {maximum}")
+        settings[key] = value
     return routes, {
         "name": profile,
+        "path": str(config_path),
+        "sha256": sha256_bytes(config_path.read_bytes()),
+        "settings": settings,
+    }
+
+
+def load_transport_defaults(
+    parser: argparse.ArgumentParser, config_value: str | None, transport: str
+) -> tuple[dict[str, int], dict[str, str] | None]:
+    """Load optional execution defaults for direct transport invocations."""
+    config_path = Path(config_value or "~/.config/reviewctl/config.toml").expanduser().resolve()
+    if not config_path.is_file():
+        if config_value:
+            parser.error(f"reviewctl config does not exist: {config_path}")
+        return {}, None
+    try:
+        config = tomllib.loads(config_path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    defaults = config.get("defaults")
+    transport_defaults = defaults.get(transport) if isinstance(defaults, dict) else None
+    if transport_defaults is None:
+        return {}, {
+            "path": str(config_path),
+            "sha256": sha256_bytes(config_path.read_bytes()),
+        }
+    if not isinstance(transport_defaults, dict):
+        parser.error(f"defaults.{transport} must be a TOML table")
+    settings: dict[str, int] = {}
+    for key, minimum, maximum in (
+        ("timeout_seconds", 1, None),
+        ("max_attempts", 1, 3),
+    ):
+        value = transport_defaults.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            parser.error(f"defaults.{transport}.{key} must be a positive integer")
+        if maximum is not None and value > maximum:
+            parser.error(
+                f"defaults.{transport}.{key} must be from {minimum} to {maximum}"
+            )
+        settings[key] = value
+    return settings, {
         "path": str(config_path),
         "sha256": sha256_bytes(config_path.read_bytes()),
     }
@@ -388,7 +447,7 @@ def load_route_profile(
 
 def review_routes(
     parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> tuple[tuple[ReviewRoute, ...], dict[str, str] | None]:
+) -> tuple[tuple[ReviewRoute, ...], dict[str, object] | None]:
     """Resolve explicit routes or preserve the legacy single-transport CLI."""
     route_specs = getattr(args, "routes", [])
     profile = getattr(args, "profile", None)
@@ -410,6 +469,157 @@ def review_routes(
 
 def fail(parser: argparse.ArgumentParser, message: str) -> None:
     parser.error(message)
+
+
+def llm_help_payload() -> dict[str, object]:
+    """Return stable machine-readable usage guidance for coding agents."""
+    return {
+        "tool": "reviewctl",
+        "purpose": (
+            "Explore ideas with Pi, then promote bounded questions to formal review receipts."
+        ),
+        "commands": {
+            "explore": {
+                "start": "reviewctl explore start --id ID --model MODEL --cwd PATH --prompt TEXT",
+                "resume": "reviewctl explore resume --id ID --prompt TEXT",
+                "show": "reviewctl explore show --id ID",
+                "promote": {
+                    "usage": "reviewctl explore promote --id ID --output PATH",
+                    "approval": "never",
+                },
+            },
+            "run": {
+                "usage": (
+                    "reviewctl run --review-id ID --transport TRANSPORT --model MODEL "
+                    "--prompt-file FILE --file SOURCE"
+                ),
+                "verification": "reviewctl verify RECEIPT.json",
+                "approval": (
+                    "only after a non-empty persisted receipt is verified and findings are "
+                    "independently checked"
+                ),
+            },
+            "help-llm": "reviewctl help-llm --format json",
+        },
+        "defaults": {
+            "explorationRoot": "~/.cache/reviewctl/explorations",
+            "explorationTools": "read,grep,find,ls,bash",
+            "explorationIsResumable": True,
+        },
+        "errors": {
+            "exitCodes": {
+                "0": {"meaning": "completed", "next": "inspect and verify the receipt"},
+                "1": {
+                    "meaning": "unavailable-or-invalid",
+                    "next": "inspect the persisted attempt before changing inputs or routes",
+                },
+                "2": {
+                    "meaning": "invocation-error",
+                    "next": "correct the named CLI argument, file, config, or policy error",
+                },
+            },
+            "attemptResults": {
+                "accepted": {"meaning": "all gates passed", "inspect": ["receipt.json"]},
+                "timeout": {
+                    "meaning": "transport exceeded the effective timeout",
+                    "inspect": ["attempt.json:diagnostic", "receipt.json:executionSettings"],
+                },
+                "transport-failed": {
+                    "meaning": "transport exited unsuccessfully",
+                    "inspect": ["attempt.json:exitCode", "attempt.json:diagnostic", "stderr.log"],
+                },
+                "missing-response": {
+                    "meaning": "transport produced no persisted response record",
+                    "inspect": ["attempt.json:evidence", "attempt.json:diagnostic"],
+                },
+                "model-mismatch": {
+                    "meaning": "resolved model differs from the requested model",
+                    "inspect": ["attempt.json:model"],
+                },
+                "provider-mismatch": {
+                    "meaning": "observed provider violates the requested provider policy",
+                    "inspect": ["attempt.json:provider", "attempt.json:providerPreferences"],
+                },
+                "empty": {
+                    "meaning": "transport persisted an empty response",
+                    "inspect": ["attempt.json:evidence", "attempt.json:diagnostic"],
+                },
+                "missing-conversation": {
+                    "meaning": "transport response has no durable conversation identifier",
+                    "inspect": ["attempt.json:conversationId", "attempt.json:evidence"],
+                },
+                "incomplete": {
+                    "meaning": "response failed the selected response contract",
+                    "inspect": [
+                        "attempt.json:validationError",
+                        "attempt.json:contractEvaluation.violations",
+                        "attempt evidence response",
+                    ],
+                },
+            },
+            "contractViolations": {
+                "prepared-contract": (
+                    "prepared contract identity or packet context did not authenticate"
+                ),
+                "invalid-json": "payload is not exact JSON or contains duplicate object keys",
+                "top-level-not-object": "structured payload is not a JSON object",
+                "response-fields": "top-level fields differ from the prepared schema",
+                "review-declaration": "reviewedFiles does not match the frozen packet",
+                "verdict": "verdict is missing, mistyped, or outside the allowed vocabulary",
+                "findings-shape": "findings is not an array",
+                "finding-fields": "a finding has missing or additional fields",
+                "finding-value": "a finding has an invalid severity, line, or blank string",
+                "finding-path": "a finding path is outside the frozen packet",
+                "verdict-invariant": "verdict and finding count disagree",
+            },
+            "redaction": "diagnostics are bounded and credential-shaped values are redacted",
+        },
+        "rules": [
+            "Exploration responses are working material, not approvals.",
+            "Promote only the bounded question and selected source files to formal review.",
+            "Do not attach a full conversation as a substitute for source files.",
+            "A missing, empty, unavailable, or unverified receipt is not an approval.",
+        ],
+    }
+
+
+def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Print concise Markdown or JSON guidance intended for LLM tool discovery."""
+    payload = llm_help_payload()
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+        return 0
+    print(
+        "# reviewctl\n\n"
+        "Use `reviewctl explore` for resumable Pi conversations and product or architecture "
+        "exploration. Use `reviewctl run` for a bounded formal review.\n\n"
+        "## Exploration\n\n"
+        "```bash\n"
+        "reviewctl explore start --id ID --model MODEL --cwd PATH --prompt \"QUESTION\"\n"
+        "reviewctl explore resume --id ID --prompt \"NEXT QUESTION\"\n"
+        "reviewctl explore show --id ID\n"
+        "reviewctl explore promote --id ID --output PATH\n"
+        "```\n\n"
+        "Exploration sessions are resumable and retain prompts, Pi events, responses, "
+        "diagnostics, and session state. Their response is exploratory working material, "
+        "not an approval.\n\n"
+        "## Formal review\n\n"
+        "```bash\n"
+        "reviewctl run --review-id ID --transport TRANSPORT --model MODEL "
+        "--prompt-file FILE --file SOURCE\n"
+        "reviewctl verify RECEIPT.json\n"
+        "```\n\n"
+        "A formal result requires a non-empty persisted receipt, successful verification, "
+        "and independent checking of material findings.\n\n"
+        "## Diagnose failures\n\n"
+        "Do not retry blindly. A run that exits 1 still persists a receipt and attempt evidence. "
+        "Read `attempt.json` fields `result`, `diagnostic`, `validationError`, and "
+        "`contractEvaluation.violations`; then inspect only the referenced request, response, "
+        "session, or stderr artifact. Exit 2 means the CLI rejected an argument or local input "
+        "before a review could run. Diagnostics are bounded and credential-shaped values are "
+        "redacted. After any correction, run `reviewctl verify RECEIPT.json` on the new receipt.\n"
+    )
+    return 0
 
 
 def validate_request(
@@ -1060,7 +1270,13 @@ def codex_isolation(
         copied_auth.chmod(0o600)
         profile = home / "source-root-deny.sb"
         denies = "\n".join(
-            f"(deny file-read* (subpath {sandbox_profile_path(root)}))" for root in source_roots
+            "\n".join(
+                [
+                    f"(deny file-read* (subpath {sandbox_profile_path(root)}))",
+                    f"(deny file-write* (subpath {sandbox_profile_path(root)}))",
+                ]
+            )
+            for root in source_roots
         )
         profile.write_text(f"(version 1)\n(allow default)\n{denies}\n")
         environment = dict(os.environ)
@@ -1233,6 +1449,10 @@ def invoke_openrouter(
             {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
         ],
     }
+    # Gemini 3.6 Flash requires reasoning and can consume a short fallback
+    # budget without emitting a final answer. Keep the fallback responsive.
+    if model == "google/gemini-3.6-flash":
+        payload["reasoning"] = {"effort": "minimal"}
     if schema := response_schema(response_contract):
         payload["response_format"] = {
             "type": "json_schema",
@@ -1423,6 +1643,529 @@ def invoke_agy(
     )
 
 
+def pi_content_text(content: object) -> str:
+    """Extract only text blocks from one Pi assistant message."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        block.get("text", "")
+        for block in content
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        )
+    )
+
+
+def pi_usage(usage: object) -> tuple[float | None, int | None, int | None]:
+    """Normalize Pi's nested usage object into the portable receipt fields."""
+    if not isinstance(usage, dict):
+        return None, None, None
+    cost = usage.get("cost")
+    cost_value = cost.get("total") if isinstance(cost, dict) else cost
+    return (
+        numeric_value(cost_value),
+        token_value(usage.get("input")),
+        token_value(usage.get("output")),
+    )
+
+
+def pi_resolved_model(requested: str, provider: str | None, resolved: str) -> str:
+    """Rebuild Pi's provider/model identity from its split assistant metadata."""
+    if not resolved or "/" not in requested or not provider:
+        return resolved
+    requested_provider, requested_model = requested.split("/", 1)
+    if provider == requested_provider:
+        return f"{provider}/{resolved}"
+    if f"{provider}/{resolved}" == requested_model:
+        return requested
+    return resolved
+
+
+def pi_system_prompt(response_contract: str) -> str:
+    """Replace Pi's coding-agent prompt with the selected review contract."""
+    schema = response_schema(response_contract)
+    if schema is not None:
+        return (
+            "You are a bounded review transport. Read only the supplied files. "
+            "Return exactly one JSON object and no Markdown fences, commentary, or alternative "
+            "review format. The object must satisfy this JSON Schema:\n"
+            f"{canonical_json(schema).decode()}"
+        )
+    if response_contract == "document":
+        return "You are a bounded document transport. Return only the requested Markdown document."
+    return (
+        "You are a bounded review transport. Return one complete verdict beginning with VERDICT:."
+    )
+
+
+def normalize_pi_response(response: str, response_contract: str) -> str:
+    """Remove only one outer JSON fence that Pi may add despite the contract."""
+    if response_contract not in {"findings-json", "product-review-json", "product-judge-json"}:
+        return response
+    match = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", response, flags=re.DOTALL)
+    if match is None:
+        return response
+    candidate = match.group(1)
+    try:
+        value = json.loads(candidate)
+    except json.JSONDecodeError:
+        return response
+    return candidate if isinstance(value, dict) else response
+
+
+def invoke_pi(
+    *,
+    pi_bin: str,
+    prompt: str,
+    model: str,
+    files: list[Path],
+    max_output_tokens: int,
+    response_contract: str,
+    timeout_seconds: int,
+    request_path: Path,
+    response_path: Path,
+    session_path: Path,
+) -> tuple[int, str, PersistedResponse]:
+    """Run Pi in JSON mode and retain its complete event stream and session."""
+    blank = PersistedResponse("", None, None, None, "", None, None, "")
+    command = [
+        pi_bin,
+        "--mode",
+        "json",
+        "--print",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-context-files",
+        "--no-approve",
+        "--system-prompt",
+        pi_system_prompt(response_contract),
+        "--model",
+        model,
+        "--session",
+        str(session_path),
+    ]
+    command.extend(f"@{file}" for file in files)
+    command.append(
+        f"{prompt}\n\nReturn only the requested {response_contract} response. "
+        "Do not edit files, run commands, or use information outside the supplied files."
+    )
+    request_path.write_bytes(
+        canonical_json(
+            {
+                "command": "pi",
+                "mode": "json",
+                "model": model,
+                "maxOutputTokens": max_output_tokens,
+                "responseContract": response_contract,
+                "files": [str(file) for file in files],
+                "prompt": prompt,
+                "session": str(session_path),
+            }
+        )
+        + b"\n"
+    )
+    started = time.monotonic()
+    stdout = b""
+    stderr = b""
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=files[0].parent if files else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            stdout = error.output if isinstance(error.output, bytes) else b""
+            stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+            terminate_process_group(process)
+            response_path.write_bytes(stdout)
+            return 124, "review attempt timed out", blank
+    except FileNotFoundError:
+        return 127, f"Pi transport executable not found: {pi_bin}", blank
+    except OSError as error:
+        return 127, f"Pi transport could not execute: {error}", blank
+
+    response_path.write_bytes(stdout)
+    session_id = ""
+    assistant_message: dict[str, object] | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "session" and isinstance(event.get("id"), str):
+            session_id = event["id"]
+        if event.get("type") == "message_end":
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                assistant_message = message
+        if event.get("type") == "agent_end":
+            messages = event.get("messages")
+            if isinstance(messages, list):
+                for message in messages:
+                    if isinstance(message, dict) and message.get("role") == "assistant":
+                        assistant_message = message
+    if assistant_message is None:
+        return (
+            process.returncode,
+            stderr.decode(errors="replace"),
+            PersistedResponse(
+                conversation_id=session_id,
+                cost_usd=None,
+                duration_ms=round((time.monotonic() - started) * 1000),
+                input_tokens=None,
+                model="",
+                output_tokens=None,
+                provider=None,
+                response="",
+            ),
+        )
+    cost_usd, input_tokens, output_tokens = pi_usage(assistant_message.get("usage"))
+    provider = assistant_message.get("provider")
+    resolved_model = assistant_message.get("model")
+    return (
+        process.returncode,
+        stderr.decode(errors="replace"),
+        PersistedResponse(
+            conversation_id=session_id,
+            cost_usd=cost_usd,
+            duration_ms=round((time.monotonic() - started) * 1000),
+            input_tokens=input_tokens,
+            model=(
+                pi_resolved_model(model, provider, resolved_model)
+                if isinstance(resolved_model, str)
+                else ""
+            ),
+            output_tokens=output_tokens,
+            provider=provider if isinstance(provider, str) else None,
+            response=normalize_pi_response(
+                pi_content_text(assistant_message.get("content")), response_contract
+            ),
+        ),
+    )
+
+
+DEFAULT_EXPLORATION_TOOLS = "read,grep,find,ls,bash"
+
+
+def exploration_path(root: str | Path, exploration_id: str) -> Path:
+    """Resolve one named exploration below its user-owned root."""
+    if not REVIEW_ID.fullmatch(exploration_id):
+        raise ValueError("invalid exploration id")
+    root_path = Path(root).expanduser().resolve()
+    return root_path / exploration_id
+
+
+def read_exploration_prompt(prompt: str | None, prompt_file: str | None) -> str:
+    """Load one non-empty prompt for an exploratory turn."""
+    if prompt and prompt_file:
+        raise ValueError("use either --prompt or --prompt-file")
+    if not prompt and not prompt_file:
+        raise ValueError("one of --prompt or --prompt-file is required")
+    value = Path(prompt_file).read_text() if prompt_file else prompt or ""
+    if not value.strip():
+        raise ValueError("exploration prompt must not be empty")
+    return value
+
+
+def invoke_pi_exploration(
+    *,
+    pi_bin: str,
+    prompt: str,
+    model: str,
+    tools: str,
+    cwd: Path,
+    timeout_seconds: int,
+    session_path: Path,
+    events_path: Path,
+) -> tuple[int, str, PersistedResponse]:
+    """Run one full-tool Pi turn while preserving its resumable session."""
+    blank = PersistedResponse("", None, None, None, "", None, None, "")
+    command = [
+        pi_bin,
+        "--mode",
+        "json",
+        "--print",
+        "--model",
+        model,
+        "--tools",
+        tools,
+        "--approve",
+        "--session",
+        str(session_path),
+        prompt,
+    ]
+    started = time.monotonic()
+    stdout = b""
+    stderr = b""
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            stdout = error.output if isinstance(error.output, bytes) else b""
+            stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+            terminate_process_group(process)
+            events_path.write_bytes(stdout)
+            return 124, "exploration turn timed out", blank
+    except FileNotFoundError:
+        return 127, f"Pi exploration executable not found: {pi_bin}", blank
+    except OSError as error:
+        return 127, f"Pi exploration could not execute: {error}", blank
+
+    events_path.write_bytes(stdout)
+    session_id = ""
+    assistant_message: dict[str, object] | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "session" and isinstance(event.get("id"), str):
+            session_id = event["id"]
+        if event.get("type") == "message_end":
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                assistant_message = message
+        if event.get("type") == "agent_end":
+            messages = event.get("messages")
+            if isinstance(messages, list):
+                for message in messages:
+                    if isinstance(message, dict) and message.get("role") == "assistant":
+                        assistant_message = message
+    if assistant_message is None:
+        return (
+            process.returncode,
+            stderr.decode(errors="replace"),
+            PersistedResponse(
+                conversation_id=session_id,
+                cost_usd=None,
+                duration_ms=round((time.monotonic() - started) * 1000),
+                input_tokens=None,
+                model="",
+                output_tokens=None,
+                provider=None,
+                response="",
+            ),
+        )
+    cost_usd, input_tokens, output_tokens = pi_usage(assistant_message.get("usage"))
+    provider = assistant_message.get("provider")
+    resolved_model = assistant_message.get("model")
+    return (
+        process.returncode,
+        stderr.decode(errors="replace"),
+        PersistedResponse(
+            conversation_id=session_id,
+            cost_usd=cost_usd,
+            duration_ms=round((time.monotonic() - started) * 1000),
+            input_tokens=input_tokens,
+            model=(
+                pi_resolved_model(model, provider, resolved_model)
+                if isinstance(resolved_model, str)
+                else ""
+            ),
+            output_tokens=output_tokens,
+            provider=provider if isinstance(provider, str) else None,
+            response=pi_content_text(assistant_message.get("content")),
+        ),
+    )
+
+
+def load_exploration(root: str | Path, exploration_id: str) -> tuple[Path, dict[str, object]]:
+    """Load and validate the manifest for one named exploration."""
+    path = exploration_path(root, exploration_id)
+    manifest_path = path / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"exploration does not exist: {exploration_id}")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read exploration manifest: {error}") from error
+    if not isinstance(manifest, dict) or manifest.get("id") != exploration_id:
+        raise ValueError(f"invalid exploration manifest: {manifest_path}")
+    return path, manifest
+
+
+def exploration_manifest_path(path: Path) -> Path:
+    return path / "manifest.json"
+
+
+def write_exploration_manifest(path: Path, manifest: dict[str, object]) -> None:
+    exploration_manifest_path(path).write_text(
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def run_exploration_turn(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, *, starting: bool
+) -> int:
+    """Start or resume one Pi exploration turn."""
+    try:
+        prompt = read_exploration_prompt(args.prompt, args.prompt_file)
+        root = Path(args.exploration_root).expanduser().resolve()
+        if starting:
+            path = exploration_path(root, args.id)
+            if path.exists():
+                fail(parser, f"exploration already exists: {args.id}")
+            model = args.model
+            if not model:
+                fail(parser, "--model is required for explore start")
+            cwd = Path(args.cwd).expanduser().resolve()
+            if not cwd.is_dir():
+                fail(parser, f"exploration cwd does not exist: {cwd}")
+            path.mkdir(parents=True)
+            (path / "turns").mkdir()
+            manifest: dict[str, object] = {
+                "format": "reviewctl.exploration.v1",
+                "id": args.id,
+                "model": model,
+                "tools": args.tools,
+                "cwd": str(cwd),
+                "session": str(path / "session.jsonl"),
+                "createdAt": utc_now(),
+                "updatedAt": utc_now(),
+                "turns": 0,
+                "status": "created",
+            }
+        else:
+            path, manifest = load_exploration(root, args.id)
+            model = args.model or manifest.get("model")
+            if not isinstance(model, str) or not model:
+                fail(parser, "exploration manifest has no model; pass --model")
+            cwd_value = args.cwd or manifest.get("cwd")
+            cwd = (
+                Path(cwd_value).expanduser().resolve()
+                if isinstance(cwd_value, str)
+                else Path.cwd()
+            )
+            if not cwd.is_dir():
+                fail(parser, f"exploration cwd does not exist: {cwd}")
+            if args.tools == DEFAULT_EXPLORATION_TOOLS and isinstance(manifest.get("tools"), str):
+                tools = manifest["tools"]
+            else:
+                tools = args.tools
+        tools = args.tools if starting else tools
+        session_path = path / "session.jsonl"
+        turn_number = int(manifest.get("turns", 0)) + 1
+        turn_path = path / "turns" / f"{turn_number:03d}"
+        turn_path.mkdir(parents=True, exist_ok=False)
+        request_path = turn_path / "request.md"
+        events_path = turn_path / "events.jsonl"
+        response_path = turn_path / "response.md"
+        stderr_path = turn_path / "stderr.log"
+        request_path.write_text(prompt)
+        exit_code, diagnostic, persisted = invoke_pi_exploration(
+            pi_bin=os.environ.get("PI_BIN", "pi"),
+            prompt=prompt,
+            model=model,
+            tools=tools,
+            cwd=cwd,
+            timeout_seconds=args.timeout_seconds,
+            session_path=session_path,
+            events_path=events_path,
+        )
+        response_path.write_text(persisted.response)
+        stderr_path.write_text(redact_diagnostic(diagnostic, limit=100_000))
+        turn_manifest = {
+            "turn": turn_number,
+            "model": persisted.model or model,
+            "provider": persisted.provider,
+            "conversationId": persisted.conversation_id,
+            "costUsd": persisted.cost_usd,
+            "durationMs": persisted.duration_ms,
+            "exitCode": exit_code,
+            "status": "completed" if exit_code == 0 and persisted.response else "unavailable",
+        }
+        (turn_path / "turn.json").write_text(
+            json.dumps(turn_manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        )
+        manifest.update(
+            {
+                "model": model,
+                "tools": tools,
+                "cwd": str(cwd),
+                "updatedAt": utc_now(),
+                "turns": turn_number,
+                "status": turn_manifest["status"],
+                "lastTurn": str(turn_path),
+            }
+        )
+        write_exploration_manifest(path, manifest)
+        print(turn_path)
+        return 0 if turn_manifest["status"] == "completed" else 1
+    except ValueError as error:
+        fail(parser, str(error))
+    return 1
+
+
+def show_exploration(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    try:
+        _, manifest = load_exploration(args.exploration_root, args.id)
+    except ValueError as error:
+        fail(parser, str(error))
+    print(json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True))
+    return 0
+
+
+def promote_exploration(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    try:
+        path, manifest = load_exploration(args.exploration_root, args.id)
+    except ValueError as error:
+        fail(parser, str(error))
+    last_turn = manifest.get("lastTurn")
+    if not isinstance(last_turn, str):
+        fail(parser, "exploration has no completed turn to promote")
+    response_path = Path(last_turn) / "response.md"
+    if not response_path.is_file() or not response_path.read_text().strip():
+        fail(parser, "exploration has no non-empty response to promote")
+    output = Path(args.output).expanduser().resolve()
+    if output.exists() and any(output.iterdir()):
+        fail(parser, f"promotion output is not empty: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "exploration.md").write_text(response_path.read_text())
+    prompt = (
+        "Treat exploration.md as exploratory working material; it is not an approval or a source "
+        "of truth. Independently verify its claims against the attached source files and tests. "
+        "Report only findings supported by the frozen inputs.\n\n"
+        f"Exploration id: {args.id}\n"
+        "The formal review must not treat the exploratory response as a merge decision."
+    )
+    (output / "prompt.md").write_text(prompt + "\n")
+    promoted_manifest = {
+        "format": "reviewctl.exploration-promotion.v1",
+        "exploration": str(path),
+        "id": args.id,
+        "sourceManifest": manifest,
+        "explorationResponse": str(output / "exploration.md"),
+        "formalPrompt": str(output / "prompt.md"),
+        "status": "working-material",
+    }
+    (output / "manifest.json").write_text(
+        json.dumps(promoted_manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    )
+    print(output)
+    return 0
+
+
 def codex_prompt(
     prompt: str, response_contract: str, *, review_declaration_required: bool = True
 ) -> str:
@@ -1487,6 +2230,11 @@ def invoke_codex(
     temporary_root = isolation.home if isolation else workspace
     output_path = temporary_root / "codex-response.md"
     schema_path: Path | None = None
+    sandbox_arguments = (
+        ["--dangerously-bypass-approvals-and-sandbox"]
+        if isolation
+        else ["--sandbox", "read-only"]
+    )
     command = [
         codex_bin,
         "exec",
@@ -1494,8 +2242,7 @@ def invoke_codex(
         "--ignore-rules",
         "--ephemeral",
         "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
+        *sandbox_arguments,
         "--model",
         model,
         "-C",
@@ -1515,6 +2262,9 @@ def invoke_codex(
         )
     )
     if isolation:
+        # Codex's own seatbelt cannot be nested inside macOS sandbox-exec.
+        # The outer profile already denies the original proprietary checkout;
+        # use Codex's documented external-sandbox mode for the inner process.
         command = ["sandbox-exec", "-f", str(isolation.profile), *command]
 
     started = time.monotonic()
@@ -1888,6 +2638,9 @@ def seal(path: Path, contents: bytes, recipient: str) -> str:
 def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     prompt, files = validate_request(parser, args)
     routes, route_profile = review_routes(parser, args)
+    transport_defaults, execution_config = load_transport_defaults(
+        parser, getattr(args, "config", None), routes[0].transport
+    )
     review_prompt = packet_prompt(prompt, files, args.response_contract)
     try:
         provider_preferences = provider_preferences_from_args(args)
@@ -1932,7 +2685,31 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     accepted_review: dict[str, Any] | None = None
     accepted_attempt: int | None = None
 
-    max_attempts = getattr(args, "max_attempts", 1)
+    profile_settings = route_profile.get("settings", {}) if route_profile else {}
+    configured_timeout = (
+        profile_settings.get("timeout_seconds")
+        if isinstance(profile_settings, dict)
+        else transport_defaults.get("timeout_seconds")
+    )
+    if configured_timeout is None:
+        configured_timeout = transport_defaults.get("timeout_seconds")
+    configured_attempts = (
+        profile_settings.get("max_attempts")
+        if isinstance(profile_settings, dict)
+        else transport_defaults.get("max_attempts")
+    )
+    if configured_attempts is None:
+        configured_attempts = transport_defaults.get("max_attempts")
+    timeout_seconds = (
+        args.timeout_seconds
+        if args.timeout_seconds is not None
+        else configured_timeout or DEFAULT_REVIEW_TIMEOUT_SECONDS
+    )
+    max_attempts = (
+        args.max_attempts
+        if args.max_attempts is not None
+        else configured_attempts or DEFAULT_REVIEW_MAX_ATTEMPTS
+    )
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
     requested_models = [route.model for route in routes]
@@ -1972,6 +2749,9 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 if native_contract and contract_context
                 else None
             )
+            session_path: Path | None = None
+            final_response_path: Path | None = None
+            diagnostic_path: Path | None = None
             log_event(
                 logger,
                 "attempt_started",
@@ -1988,7 +2768,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     model=model,
                     response_contract=args.response_contract,
                     source_roots=codex_source_roots,
-                    timeout_seconds=args.timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                     workspace=snapshots[0].parent,
                 )
                 # Codex writes its transient response inside the isolated
@@ -2008,7 +2788,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     max_output_tokens=args.max_output_tokens,
                     provider_preferences=provider_preferences,
                     response_contract=args.response_contract,
-                    timeout_seconds=args.timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                     request_path=request_path,
                     response_path=response_path,
                 )
@@ -2022,10 +2802,30 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     files=snapshots,
                     max_output_tokens=args.max_output_tokens,
                     response_contract=args.response_contract,
-                    timeout_seconds=args.timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                     request_path=request_path,
                     response_path=response_path,
                 )
+            elif transport == "pi":
+                request_path = attempt_dir / "request.json"
+                response_path = attempt_dir / "events.jsonl"
+                session_path = attempt_dir / "session.jsonl"
+                final_response_path = attempt_dir / "response.md"
+                diagnostic_path = attempt_dir / "stderr.log"
+                exit_code, stderr, persisted = invoke_pi(
+                    pi_bin=os.environ.get("PI_BIN", "pi"),
+                    prompt=review_prompt,
+                    model=transport_model,
+                    files=snapshots,
+                    max_output_tokens=args.max_output_tokens,
+                    response_contract=args.response_contract,
+                    timeout_seconds=timeout_seconds,
+                    request_path=request_path,
+                    response_path=response_path,
+                    session_path=session_path,
+                )
+                final_response_path.write_text(persisted.response)
+                diagnostic_path.write_text(redact_diagnostic(stderr, limit=100_000))
             else:
                 database = attempt_dir / "transport.sqlite3"
                 exit_code, stderr = invoke_llm(
@@ -2036,7 +2836,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     files=snapshots,
                     max_output_tokens=args.max_output_tokens,
                     response_contract=args.response_contract,
-                    timeout_seconds=args.timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                 )
                 persisted = load_response(database)
             contract_evaluation = (
@@ -2107,6 +2907,13 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 "evidence": {
                     "request": str(request_path) if request_path else None,
                     "response": str(response_path) if response_path else None,
+                    "session": (
+                        str(session_path)
+                        if session_path is not None and session_path.is_file()
+                        else None
+                    ),
+                    "finalResponse": str(final_response_path) if final_response_path else None,
+                    "stderr": str(diagnostic_path) if diagnostic_path else None,
                 },
                 "diagnostic": redact_diagnostic(stderr),
                 "exitCode": exit_code,
@@ -2207,6 +3014,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         "reviewId": args.review_id,
         "source": source,
         "tool": {"name": "reviewctl", "version": __version__},
+        "executionSettings": {
+            "timeoutSeconds": timeout_seconds,
+            "maxAttempts": max_attempts,
+        },
+        "executionConfig": execution_config,
         "transport": (
             routes[0].transport if len({route.transport for route in routes}) == 1 else "routed"
         ),
@@ -2778,9 +3590,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-file",
         help="write the accepted model response to this document path",
     )
-    run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=90)
+    run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
     run.add_argument("--max-output-tokens", type=int, default=4096)
-    run.add_argument("--max-attempts", type=int, default=1)
+    run.add_argument("--max-attempts", type=int, default=None)
     run.add_argument("--policy")
     run.add_argument("--provider-only", action="append", default=[])
     run.add_argument("--provider-order", action="append", default=[])
@@ -2801,8 +3613,59 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--seal-to")
     run.add_argument("--source-class", choices=("proprietary", "synthetic"), default="synthetic")
     run.add_argument("--response-contract", choices=sorted(RESPONSE_CONTRACTS), default="verdict")
-    run.add_argument("--transport", choices=("llm", "codex", "openrouter", "agy"), default="llm")
+    run.add_argument(
+        "--transport", choices=("llm", "codex", "openrouter", "agy", "pi"), default="llm"
+    )
     run.set_defaults(handler=lambda namespace: run_review(parser, namespace))
+
+    explore = commands.add_parser(
+        "explore", help="run resumable Pi conversations and prepare formal review handoffs"
+    )
+    explore_commands = explore.add_subparsers(dest="explore_command", required=True)
+    explore_start = explore_commands.add_parser("start", help="start a named Pi exploration")
+    explore_start.add_argument("--id", required=True)
+    explore_start.add_argument("--model", required=True)
+    explore_start.add_argument("--prompt")
+    explore_start.add_argument("--prompt-file")
+    explore_start.add_argument("--cwd", default=".")
+    explore_start.add_argument("--tools", default=DEFAULT_EXPLORATION_TOOLS)
+    explore_start.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=900)
+    explore_start.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
+    explore_start.set_defaults(
+        handler=lambda namespace: run_exploration_turn(parser, namespace, starting=True)
+    )
+
+    explore_resume = explore_commands.add_parser("resume", help="continue a named Pi exploration")
+    explore_resume.add_argument("--id", required=True)
+    explore_resume.add_argument("--model")
+    explore_resume.add_argument("--prompt")
+    explore_resume.add_argument("--prompt-file")
+    explore_resume.add_argument("--cwd")
+    explore_resume.add_argument("--tools", default=DEFAULT_EXPLORATION_TOOLS)
+    explore_resume.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=900)
+    explore_resume.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
+    explore_resume.set_defaults(
+        handler=lambda namespace: run_exploration_turn(parser, namespace, starting=False)
+    )
+
+    explore_show = explore_commands.add_parser("show", help="show a named exploration manifest")
+    explore_show.add_argument("--id", required=True)
+    explore_show.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
+    explore_show.set_defaults(handler=lambda namespace: show_exploration(parser, namespace))
+
+    explore_promote = explore_commands.add_parser(
+        "promote", help="prepare the latest exploration response for formal review"
+    )
+    explore_promote.add_argument("--id", required=True)
+    explore_promote.add_argument("--output", required=True)
+    explore_promote.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
+    explore_promote.set_defaults(handler=lambda namespace: promote_exploration(parser, namespace))
+
+    help_llm_parser = commands.add_parser(
+        "help-llm", help="print concise usage guidance for coding agents"
+    )
+    help_llm_parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    help_llm_parser.set_defaults(handler=lambda namespace: help_llm(parser, namespace))
 
     verify = commands.add_parser("verify", help="verify a receipt hash")
     verify.add_argument("receipt")

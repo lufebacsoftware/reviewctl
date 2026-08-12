@@ -30,6 +30,8 @@ For proprietary Codex reviews on macOS, the runner also creates a temporary `COD
 authentication file required by Codex and applies a `sandbox-exec` deny rule to every original review
 source root. This proves that Codex cannot reopen the reviewed checkout after snapshotting. It is not a
 whole-host sandbox claim: system paths outside the source roots are outside this narrow boundary.
+Codex's internal seatbelt is bypassed only for this externally sandboxed path, because macOS does not
+permit nested seatbelt application; synthetic and non-isolated Codex runs retain `--sandbox read-only`.
 
 On timeout, `reviewctl` discards any partially written Codex final message before validation. A timeout
 can record duration and transport failure, but it can never contribute a partial verdict or finding to a

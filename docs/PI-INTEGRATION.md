@@ -2,52 +2,78 @@
 
 Use `pi` as the interactive workbench and `reviewctl` as the formal review and
 evidence archive. They can use the same provider, but they have different
-contracts.
+contracts. `reviewctl` also exposes a `pi` transport for bounded, headless
+runs; that transport is the only way a Pi response can enter the formal
+receipt flow.
 
 ## Division of responsibility
 
-`pi` is for short exploratory conversations and resumable threads. Use it to
-understand a design, inspect a checkout, run a REPL, try a report, or shape a
-review question. Keep each thread in a dedicated session directory outside the
-`reviewctl` artifact root.
+`pi` is for exploratory conversations and resumable threads. Use the integrated
+`reviewctl explore` commands to understand a design, inspect a checkout, run a
+REPL, try a report, or shape a review question. Keep these sessions in the
+exploration root, outside the formal `reviewctl` artifact root.
 
 `reviewctl` is for a bounded review. It freezes the selected source files,
 applies the source and provider policy, invokes the selected transport, stores
 the request and response evidence, and writes a verifiable receipt. Its
 artifact root is the archive for formal reviews; use `--seal-to` when the
-request and response must also be encrypted with Age.
+request and response must also be encrypted with Age. The `pi` transport runs
+with tools, extensions, skills, prompt templates, and context-file discovery
+disabled; it archives Pi's JSON event stream, session file, stderr, and
+extracted final response for every attempt, including failures and empty
+responses.
 
 An interactive `pi` transcript is never an approval, a merge decision, or a
 formal review receipt. The transcript may inform the prompt, but the formal
-question must be promoted through `reviewctl`.
+question must be promoted through `reviewctl`. A `reviewctl --route pi:...`
+attempt is formal only because `reviewctl` freezes the inputs, validates the
+response contract, persists the attempt, and produces a receipt that still
+requires `reviewctl verify`.
 
 ## Promotion workflow
 
-### 1. Explore with pi
+### 1. Explore with reviewctl and pi
 
-Start a named, isolated thread. Limit tools to the smallest set needed for the
-question, and do not point the session directory at a review artifact root.
+Start a named, resumable thread. The default tool set is repository inspection
+and `bash`; the session is not a merge gate.
 
 ```bash
-pi \
-  --name accounting-design \
-  --session-dir "$TMPDIR/pi-accounting-design" \
-  --tools read,grep,find,ls,bash \
-  --no-approve \
-  "Explore the proposed accounting change. Do not edit files or create commits.
-   Separate observations from recommendations and suggest a bounded review question."
+reviewctl explore start \
+  --id accounting-design \
+  --model openai-codex/gpt-5.6-sol \
+  --cwd ~/Code/workspaces/ledger \
+  --prompt "Explore the proposed accounting change. Do not edit files or create commits. \
+Separate observations from recommendations and suggest a bounded review question."
 ```
 
-For a later turn, resume the same thread with `pi --continue` or select it
-with `--session`. Treat the conversation as working notes, not evidence.
+Continue the same conversation:
 
-### 2. Freeze the formal request
+```bash
+reviewctl explore resume \
+  --id accounting-design \
+  --prompt "Inspect the relevant tests and refine the bounded review question."
+```
 
-Write the agreed question to a prompt file outside the interactive session
-directory. Attach only the source and focused tests needed for that question.
-Do not attach the entire `pi` transcript as a substitute for source files.
+`reviewctl explore show` prints the manifest, and each turn is retained under
+`~/.cache/reviewctl/explorations/<id>/turns/`. The session JSONL is the Pi
+conversation state; the per-turn event stream and response are diagnostic
+working material.
 
-### 3. Run and archive the review
+### 2. Promote the formal request
+
+When the exploratory question is ready, create a handoff package:
+
+```bash
+reviewctl explore promote \
+  --id accounting-design \
+  --output review-handoffs/accounting-design
+```
+
+This creates `prompt.md`, the latest exploratory response as `exploration.md`,
+and a manifest. Attach only the source and focused tests needed for the formal
+question; do not treat the exploratory response as a source of truth.
+
+### 3. Run and archive the formal review
 
 ```bash
 reviewctl run \
@@ -63,6 +89,25 @@ reviewctl run \
   --artifact-root review-artifacts \
   --seal-to age1auditrecipient...
 ```
+
+For a headless Pi attempt or an ordered Pi fallback, select the transport
+explicitly:
+
+```bash
+reviewctl run \
+  --review-id bounded-accounting-change-pi \
+  --route pi:openrouter/google/gemini-2.5-flash \
+  --prompt-file review-request.md \
+  --file src/accounting.clj \
+  --file test/accounting_test.clj \
+  --source-class proprietary \
+  --response-contract findings-json
+```
+
+Pi's interactive session directory is not reused. Each attempt gets an
+isolated session inside its review artifact directory, and an empty or failed
+Pi process is recorded as unavailable rather than discarded or treated as an
+approval.
 
 The same flow may use `--transport agy` for a bounded synthetic product
 review, or the approved Codex transport for proprietary source. Do not infer

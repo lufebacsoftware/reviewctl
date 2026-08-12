@@ -269,6 +269,56 @@ else:
     )
 
 
+def write_fake_pi(path: Path) -> Path:
+    return write_fake_python_executable(
+        path,
+        "pi",
+        """import json
+import os
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+if log := os.environ.get('PI_ARGUMENTS_LOG'):
+    Path(log).write_text(json.dumps(arguments))
+model = arguments[arguments.index('--model') + 1]
+session = Path(arguments[arguments.index('--session') + 1])
+session.write_text(json.dumps({
+    'type': 'session',
+    'version': 3,
+    'id': 'pi-session',
+    'cwd': str(Path.cwd()),
+}) + '\\n')
+response = json.dumps({'verdict': 'approved', 'findings': []})
+if model == 'empty':
+    content = []
+else:
+    content = [{'type': 'text', 'text': response}]
+message = {
+    'role': 'assistant',
+    'content': content,
+    'provider': 'openrouter',
+    'model': model,
+    'usage': {
+        'input': 12,
+        'output': 34,
+        'cost': {'total': 0.02},
+    },
+}
+events = [
+    {'type': 'session', 'version': 3, 'id': 'pi-session'},
+    {'type': 'agent_start'},
+    {'type': 'message_end', 'message': message},
+    {'type': 'agent_end', 'messages': [message]},
+]
+print('\\n'.join(json.dumps(event) for event in events))
+if model == 'failure':
+    print('provider failed after retries', file=sys.stderr)
+    raise SystemExit(17)
+""",
+    )
+
+
 def review_arguments(tmp_path: Path, *models: str) -> list[str]:
     prompt = tmp_path / "prompt.md"
     source = tmp_path / "source.py"
@@ -342,11 +392,261 @@ def test_ordered_routes_fallback_after_antigravity_quota_failure(tmp_path: Path)
     assert '"reason":"transport-failed"' in contents
 
 
+def test_pi_transport_archives_events_session_and_final_response(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:accepted",
+        "--response-contract",
+        "findings-json",
+        env={"PI_BIN": str(fake_pi)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    turn = Path(result.stdout.strip())
+    receipt = json.loads((turn / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert receipt["transport"] == "pi"
+    assert receipt["response"]["conversationId"] == "pi-session"
+    assert receipt["response"]["provider"] == "openrouter"
+    assert attempt["costUsd"] == 0.02
+    assert Path(attempt["evidence"]["request"]).is_file()
+    assert Path(attempt["evidence"]["response"]).read_text()
+    assert Path(attempt["evidence"]["session"]).is_file()
+    assert Path(attempt["evidence"]["finalResponse"]).read_text() == (
+        '{"verdict": "approved", "findings": []}'
+    )
+    assert Path(attempt["evidence"]["stderr"]).is_file()
+
+
+def test_pi_transport_preserves_failed_event_stream(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:failure",
+        "--response-contract",
+        "findings-json",
+        env={"PI_BIN": str(fake_pi)},
+    )
+
+    assert result.returncode == 1
+    turn = Path(result.stdout.strip())
+    receipt = json.loads((turn / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "transport-failed"
+    assert "provider failed after retries" in attempt["diagnostic"]
+    assert Path(attempt["evidence"]["response"]).read_text()
+    assert Path(attempt["evidence"]["session"]).is_file()
+    assert "provider failed after retries" in Path(attempt["evidence"]["stderr"]).read_text()
+
+
+def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None:
+    assert cli.pi_resolved_model("google/gemini-2.5-flash", "google", "gemini-2.5-flash") == (
+        "google/gemini-2.5-flash"
+    )
+    assert cli.pi_resolved_model(
+        "openrouter/google/gemini-2.5-flash", "openrouter", "google/gemini-2.5-flash"
+    ) == "openrouter/google/gemini-2.5-flash"
+    assert cli.pi_resolved_model(
+        "openrouter/google/gemini-2.5-flash", "google", "gemini-2.5-flash"
+    ) == "openrouter/google/gemini-2.5-flash"
+
+
+def test_pi_response_normalization_only_removes_one_json_fence() -> None:
+    fenced = '```json\n{"verdict":"approved","findings":[]}\n```'
+
+    assert cli.normalize_pi_response(fenced, "findings-json") == (
+        '{"verdict":"approved","findings":[]}'
+    )
+    assert cli.normalize_pi_response("```json\n[]\n```", "findings-json") == "```json\n[]\n```"
+    assert cli.normalize_pi_response(fenced, "document") == fenced
+
+
+def test_explore_start_creates_a_named_resumable_pi_session(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    exploration_root = tmp_path / "explorations"
+    arguments_log = tmp_path / "pi-arguments.json"
+
+    result = run_cli(
+        "explore",
+        "start",
+        "--id",
+        "ledger-ideas",
+        "--model",
+        "accepted",
+        "--prompt",
+        "Explore the product direction.",
+        "--exploration-root",
+        str(exploration_root),
+        env={"PI_BIN": str(fake_pi), "PI_ARGUMENTS_LOG": str(arguments_log)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    session_root = exploration_root / "ledger-ideas"
+    manifest = json.loads((session_root / "manifest.json").read_text())
+    assert manifest["id"] == "ledger-ideas"
+    assert manifest["model"] == "accepted"
+    assert manifest["turns"] == 1
+    arguments = json.loads(arguments_log.read_text())
+    assert "--tools" in arguments
+    assert arguments[arguments.index("--tools") + 1] == "read,grep,find,ls,bash"
+    assert "--approve" in arguments
+    assert "--no-tools" not in arguments
+    assert (session_root / "session.jsonl").is_file()
+    assert (session_root / "turns" / "001" / "request.md").read_text() == (
+        "Explore the product direction."
+    )
+    assert (session_root / "turns" / "001" / "events.jsonl").is_file()
+    assert (session_root / "turns" / "001" / "response.md").is_file()
+
+
+def test_explore_resume_uses_the_same_pi_session_and_appends_a_turn(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    exploration_root = tmp_path / "explorations"
+    common = ["--exploration-root", str(exploration_root)]
+
+    started = run_cli(
+        "explore",
+        "start",
+        "--id",
+        "ledger-thread",
+        "--model",
+        "accepted",
+        "--prompt",
+        "Start the thread.",
+        *common,
+        env={"PI_BIN": str(fake_pi)},
+    )
+    assert started.returncode == 0, started.stderr
+
+    resumed = run_cli(
+        "explore",
+        "resume",
+        "--id",
+        "ledger-thread",
+        "--prompt",
+        "Continue the thread.",
+        *common,
+        env={"PI_BIN": str(fake_pi)},
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    session_root = exploration_root / "ledger-thread"
+    manifest = json.loads((session_root / "manifest.json").read_text())
+    assert manifest["turns"] == 2
+    assert (session_root / "turns" / "002" / "request.md").read_text() == (
+        "Continue the thread."
+    )
+    assert manifest["session"] == str(session_root / "session.jsonl")
+
+
+def test_explore_show_and_promote_publish_working_material_not_an_approval(
+    tmp_path: Path,
+) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    exploration_root = tmp_path / "explorations"
+    start = run_cli(
+        "explore",
+        "start",
+        "--id",
+        "product-notes",
+        "--model",
+        "accepted",
+        "--prompt",
+        "Explore this idea.",
+        "--exploration-root",
+        str(exploration_root),
+        env={"PI_BIN": str(fake_pi)},
+    )
+    assert start.returncode == 0, start.stderr
+
+    shown = run_cli(
+        "explore",
+        "show",
+        "--id",
+        "product-notes",
+        "--exploration-root",
+        str(exploration_root),
+    )
+    assert shown.returncode == 0, shown.stderr
+    assert json.loads(shown.stdout)["turns"] == 1
+
+    output = tmp_path / "promotion"
+    promoted = run_cli(
+        "explore",
+        "promote",
+        "--id",
+        "product-notes",
+        "--exploration-root",
+        str(exploration_root),
+        "--output",
+        str(output),
+    )
+
+    assert promoted.returncode == 0, promoted.stderr
+    assert (output / "exploration.md").read_text()
+    prompt = (output / "prompt.md").read_text()
+    assert "exploratory working material" in prompt
+    assert "not an approval" in prompt
+    assert json.loads((output / "manifest.json").read_text())["id"] == "product-notes"
+
+
+def test_help_llm_describes_the_exploration_and_formal_review_boundary() -> None:
+    result = run_cli("help-llm")
+
+    assert result.returncode == 0, result.stderr
+    assert "reviewctl explore start" in result.stdout
+    assert "reviewctl explore resume" in result.stdout
+    assert "not an approval" in result.stdout
+    assert "reviewctl run" in result.stdout
+
+
+def test_help_llm_json_is_machine_readable() -> None:
+    result = run_cli("help-llm", "--format", "json")
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["tool"] == "reviewctl"
+    assert "explore" in payload["commands"]
+    assert payload["commands"]["explore"]["promote"]["approval"] == "never"
+    assert payload["errors"]["exitCodes"]["1"]["meaning"] == "unavailable-or-invalid"
+    assert payload["errors"]["attemptResults"]["incomplete"]["inspect"] == [
+        "attempt.json:validationError",
+        "attempt.json:contractEvaluation.violations",
+        "attempt evidence response",
+    ]
+    assert payload["errors"]["contractViolations"]["prepared-contract"] == (
+        "prepared contract identity or packet context did not authenticate"
+    )
+    assert payload["errors"]["redaction"] == (
+        "diagnostics are bounded and credential-shaped values are redacted"
+    )
+
+
+def test_help_llm_markdown_explains_how_to_diagnose_a_failed_attempt() -> None:
+    result = run_cli("help-llm")
+
+    assert result.returncode == 0, result.stderr
+    assert "## Diagnose failures" in result.stdout
+    assert "contractEvaluation.violations" in result.stdout
+    assert "reviewctl verify RECEIPT.json" in result.stdout
+    assert "Do not retry blindly" in result.stdout
+
+
 def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path: Path) -> None:
     fake_agy = write_fake_agy(tmp_path)
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
-    config.write_text('[profiles.gemini]\nroutes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n')
+    config.write_text(
+        '[profiles.gemini]\n'
+        'routes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n'
+        'timeout_seconds = 600\n'
+        'max_attempts = 2\n'
+    )
 
     result = run_cli(
         *review_arguments(tmp_path),
@@ -366,10 +666,76 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
     assert receipt["routeProfile"]["name"] == "gemini"
     assert receipt["routeProfile"]["path"] == str(config.resolve())
     assert receipt["routeProfile"]["sha256"] == cli.sha256_bytes(config.read_bytes())
+    assert receipt["routeProfile"]["settings"] == {
+        "timeout_seconds": 600,
+        "max_attempts": 2,
+    }
+    assert receipt["executionSettings"] == {
+        "timeoutSeconds": 5,
+        "maxAttempts": 2,
+    }
     assert receipt["routes"] == [
         {"model": "gemini-3.6-flash-high", "transport": "agy"},
         {"model": "accepted", "transport": "llm"},
     ]
+
+
+def test_route_profile_applies_execution_settings_when_cli_omits_them(tmp_path: Path) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    config = tmp_path / "reviewctl.toml"
+    config.write_text(
+        '[profiles.code]\n'
+        'routes = ["llm:accepted"]\n'
+        'timeout_seconds = 600\n'
+        'max_attempts = 2\n'
+    )
+    arguments = review_arguments(tmp_path)
+    arguments.remove("--timeout-seconds")
+    arguments.remove("5")
+
+    result = run_cli(
+        *arguments,
+        "--profile",
+        "code",
+        "--config",
+        str(config),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["executionSettings"] == {
+        "timeoutSeconds": 600,
+        "maxAttempts": 2,
+    }
+
+
+def test_direct_transport_applies_configured_transport_defaults(tmp_path: Path) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    config = tmp_path / "reviewctl.toml"
+    config.write_text(
+        '[defaults.llm]\n'
+        'timeout_seconds = 600\n'
+        'max_attempts = 2\n'
+    )
+    arguments = review_arguments(tmp_path, "accepted")
+    arguments.remove("--timeout-seconds")
+    arguments.remove("5")
+
+    result = run_cli(
+        *arguments,
+        "--config",
+        str(config),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["executionSettings"] == {
+        "timeoutSeconds": 600,
+        "maxAttempts": 2,
+    }
+    assert receipt["executionConfig"]["path"] == str(config.resolve())
 
 
 def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) -> None:
@@ -395,6 +761,18 @@ def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) ->
         ("not = [valid", "broken"),
         ("[profiles.empty]\n", "empty"),
         ('[profiles.invalid]\nroutes = ["bad-route"]\n', "invalid"),
+        (
+            '[profiles.invalid-timeout]\n'
+            'routes = ["llm:accepted"]\n'
+            'timeout_seconds = 0\n',
+            "invalid-timeout",
+        ),
+        (
+            '[profiles.invalid-attempts]\n'
+            'routes = ["llm:accepted"]\n'
+            'max_attempts = 4\n',
+            "invalid-attempts",
+        ),
     ],
 )
 def test_route_profile_rejects_unusable_configurations(
@@ -523,13 +901,17 @@ def test_rejects_an_invalid_run_attempt_limit(tmp_path: Path) -> None:
 
 
 def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -> None:
-    fake_codex = write_fake_codex(tmp_path)
-    arguments_log = tmp_path / "codex-arguments.json"
+    fake_codex_root = tmp_path.parent / "codex-bin"
+    fake_codex_root.mkdir()
+    fake_codex = write_fake_codex(fake_codex_root)
+    arguments_log = tmp_path.parent / "codex-arguments.json"
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
         "--transport",
         "codex",
+        "--source-class",
+        "proprietary",
         env={"CODEX_BIN": str(fake_codex), "CODEX_ARGUMENTS_LOG": str(arguments_log)},
     )
 
@@ -545,6 +927,8 @@ def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -
     assert "--ignore-user-config" in arguments
     assert "--ignore-rules" in arguments
     assert "--ephemeral" in arguments
+    assert "--dangerously-bypass-approvals-and-sandbox" in arguments
+    assert "--sandbox" not in arguments
     assert Path(workspace).name.startswith("reviewctl-input-")
     assert not list(turn.glob("**/codex-response.md"))
     response_path = Path(receipt["attempts"][0]["evidence"]["response"])
@@ -688,6 +1072,8 @@ def test_codex_receipt_records_why_a_structured_response_is_rejected(tmp_path: P
         *review_arguments(tmp_path, "gpt-5.6-terra"),
         "--transport",
         "codex",
+        "--source-class",
+        "synthetic",
         "--response-contract",
         "findings-json",
         env={"CODEX_BIN": str(fake_codex), "CODEX_RESPONSE": malformed},
@@ -703,6 +1089,7 @@ def test_codex_receipt_records_why_a_structured_response_is_rejected(tmp_path: P
 
 def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) -> None:
     fake_codex = write_fake_codex(tmp_path)
+    arguments_log = tmp_path / "codex-arguments.json"
     response = json.dumps({"verdict": "approved", "findings": []})
 
     result = run_cli(
@@ -713,6 +1100,7 @@ def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) ->
         "findings-json",
         env={
             "CODEX_BIN": str(fake_codex),
+            "CODEX_ARGUMENTS_LOG": str(arguments_log),
             "CODEX_RESPONSE": response,
             "CODEX_SKIP_READ_PROOF": "1",
         },
@@ -720,6 +1108,9 @@ def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stderr
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    arguments = json.loads(arguments_log.read_text())
+    assert arguments[arguments.index("--sandbox") + 1] == "read-only"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in arguments
     assert receipt["result"] == "accepted"
     assert receipt["findings"] == []
 
@@ -2159,6 +2550,7 @@ def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home
         profile = isolation.profile.read_text()
 
         assert f'(deny file-read* (subpath "{source_root}"))' in profile
+        assert f'(deny file-write* (subpath "{source_root}"))' in profile
         assert isolation.home.joinpath("auth.json").read_text() == auth.read_text()
         assert isolation.environment["CODEX_HOME"] == str(isolation.home)
         assert isolation.environment["HOME"] == str(isolation.home)
@@ -4444,6 +4836,38 @@ def test_invoke_openrouter_forwards_requested_provider_preferences(
     assert response.provider == "Ionstream"
     assert json.loads((tmp_path / "request.json").read_text())["provider"] == preferences
     assert json.loads((tmp_path / "request.json").read_text())["provider"] == preferences
+
+
+def test_invoke_openrouter_limits_gemini_36_flash_reasoning_for_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(
+        monkeypatch,
+        body=(
+            b'{"id":"turn","model":"google/gemini-3.6-flash",'
+            b'"choices":[{"message":{"content":"hola desde OpenRouter"}}]}'
+        ),
+    )
+
+    exit_code, _, response = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Say hello.",
+        model="google/gemini-3.6-flash",
+        files=[source],
+        max_output_tokens=256,
+        response_contract="document",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert exit_code == 0
+    assert response.response == "hola desde OpenRouter"
+    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == {
+        "effort": "minimal"
+    }
 
 
 def test_invoke_openrouter_requires_an_api_key(tmp_path: Path) -> None:
