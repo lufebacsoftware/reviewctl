@@ -450,6 +450,27 @@ def test_pi_transport_preserves_failed_event_stream(tmp_path: Path) -> None:
     assert "provider failed after retries" in Path(attempt["evidence"]["stderr"]).read_text()
 
 
+def test_missing_pi_binary_does_not_claim_nonexistent_evidence(tmp_path: Path) -> None:
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:accepted",
+        "--response-contract",
+        "findings-json",
+        env={"PI_BIN": str(tmp_path / "missing-pi")},
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "transport-failed"
+    assert Path(attempt["evidence"]["request"]).is_file()
+    assert attempt["evidence"]["response"] is None
+    assert attempt["evidence"]["session"] is None
+    assert Path(attempt["evidence"]["finalResponse"]).is_file()
+    assert Path(attempt["evidence"]["stderr"]).is_file()
+
+
 def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None:
     assert cli.pi_resolved_model("google/gemini-2.5-flash", "google", "gemini-2.5-flash") == (
         "google/gemini-2.5-flash"

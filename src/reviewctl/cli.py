@@ -2897,15 +2897,31 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             attempt = {
                 "database": str(database) if database else None,
                 "evidence": {
-                    "request": str(request_path) if request_path else None,
-                    "response": str(response_path) if response_path else None,
+                    "request": (
+                        str(request_path)
+                        if request_path is not None and request_path.is_file()
+                        else None
+                    ),
+                    "response": (
+                        str(response_path)
+                        if response_path is not None and response_path.is_file()
+                        else None
+                    ),
                     "session": (
                         str(session_path)
                         if session_path is not None and session_path.is_file()
                         else None
                     ),
-                    "finalResponse": str(final_response_path) if final_response_path else None,
-                    "stderr": str(diagnostic_path) if diagnostic_path else None,
+                    "finalResponse": (
+                        str(final_response_path)
+                        if final_response_path is not None and final_response_path.is_file()
+                        else None
+                    ),
+                    "stderr": (
+                        str(diagnostic_path)
+                        if diagnostic_path is not None and diagnostic_path.is_file()
+                        else None
+                    ),
                 },
                 "diagnostic": redact_diagnostic(stderr),
                 "exitCode": exit_code,
