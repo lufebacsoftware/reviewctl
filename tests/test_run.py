@@ -301,7 +301,6 @@ else:
 message = {
     'role': 'assistant',
     'content': content,
-    'provider': os.environ.get('PI_PROVIDER', 'openrouter'),
     'model': os.environ.get('PI_RESOLVED_MODEL', model),
     'usage': {
         'input': 12,
@@ -309,6 +308,8 @@ message = {
         'cost': {'total': 0.02},
     },
 }
+if not os.environ.get('PI_OMIT_PROVIDER'):
+    message['provider'] = os.environ.get('PI_PROVIDER', 'openrouter')
 events = [
     {'type': 'session', 'version': 3, 'id': 'pi-session'},
     {'type': 'agent_start'},
@@ -524,6 +525,9 @@ def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None
     assert cli.pi_resolved_model(
         "openrouter/google/gemini-2.5-flash", "google", "gemini-2.5-flash"
     ) == "google/gemini-2.5-flash"
+    assert cli.pi_resolved_model(
+        "openrouter/google/gemini-2.5-flash", None, "openrouter/google/gemini-2.5-flash"
+    ) == ""
 
 
 def test_pi_transport_rejects_an_observed_provider_route_mismatch(tmp_path: Path) -> None:
@@ -549,6 +553,33 @@ def test_pi_transport_rejects_an_observed_provider_route_mismatch(tmp_path: Path
         "requested": "openrouter/google/gemini-2.5-flash",
         "resolved": "google/gemini-2.5-flash",
     }
+
+
+def test_pi_transport_rejects_a_missing_observed_provider(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:openrouter/google/gemini-2.5-flash",
+        "--response-contract",
+        "findings-json",
+        env={
+            "PI_BIN": str(fake_pi),
+            "PI_OMIT_PROVIDER": "1",
+            "PI_RESOLVED_MODEL": "openrouter/google/gemini-2.5-flash",
+        },
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "model-mismatch"
+    assert attempt["model"] == {
+        "requested": "openrouter/google/gemini-2.5-flash",
+        "resolved": "",
+    }
+    assert attempt["provider"]["resolved"] is None
 
 
 def test_formal_pi_transport_requires_provider_qualified_model_identity(tmp_path: Path) -> None:
