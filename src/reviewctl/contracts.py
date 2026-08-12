@@ -64,6 +64,8 @@ class PreparedContract:
 
     name: str
     version: str
+    file_names: tuple[str, ...]
+    review_declaration_required: bool
     schema: dict[str, Any]
     output_instructions: str
     digest: str
@@ -73,6 +75,10 @@ class PreparedContract:
         return {
             "name": self.name,
             "version": self.version,
+            "context": {
+                "fileNames": list(self.file_names),
+                "reviewDeclarationRequired": self.review_declaration_required,
+            },
             "schema": self.schema,
             "outputInstructions": self.output_instructions,
         }
@@ -141,12 +147,18 @@ class FindingsJsonContract:
         identity = {
             "name": self.name,
             "version": self.version,
+            "context": {
+                "fileNames": list(context.file_names),
+                "reviewDeclarationRequired": context.review_declaration_required,
+            },
             "schema": schema,
             "outputInstructions": instructions,
         }
         return PreparedContract(
             name=self.name,
             version=self.version,
+            file_names=context.file_names,
+            review_declaration_required=context.review_declaration_required,
             schema=schema,
             output_instructions=instructions,
             digest=hashlib.sha256(canonical_json(identity)).hexdigest(),

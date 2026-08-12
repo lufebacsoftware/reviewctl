@@ -143,6 +143,27 @@ def test_findings_contract_rejects_a_prepared_contract_from_another_context() ->
     assert evaluation.violations == ("prepared-contract",)
 
 
+def test_findings_contract_rejects_file_context_substitution() -> None:
+    contract = get_contract("findings-json")
+    prepared = contract.prepare(
+        ContractContext(file_names=("source.py",), review_declaration_required=True)
+    )
+    substituted_context = ContractContext(
+        file_names=("other.py",), review_declaration_required=True
+    )
+
+    evaluation = contract.evaluate(
+        json.dumps(
+            {"verdict": "approved", "findings": [], "reviewedFiles": ["other.py"]}
+        ),
+        prepared,
+        substituted_context,
+    )
+
+    assert evaluation.value is None
+    assert evaluation.violations == ("prepared-contract",)
+
+
 def invalid_contract_cases() -> list[tuple[str, ContractContext, str]]:
     missing_field = finding_payload()
     del missing_field["findings"][0]["title"]  # type: ignore[index]
