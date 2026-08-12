@@ -736,7 +736,12 @@ def test_exploration_timeout_retains_partial_diagnostics_and_observed_metadata(
         "1",
         "--exploration-root",
         str(exploration_root),
-        env={"PI_BIN": str(fake_pi), "PI_SLEEP": "3", "PI_STDERR": "partial warning"},
+        env={
+            "PI_BIN": str(fake_pi),
+            "PI_SLEEP": "3",
+            "PI_STDERR": "partial warning",
+            "PI_TERM_STDERR": "exploration shutdown diagnostic",
+        },
     )
 
     assert result.returncode == 1
@@ -747,6 +752,7 @@ def test_exploration_timeout_retains_partial_diagnostics_and_observed_metadata(
     assert metadata["provider"] == "openrouter"
     assert metadata["durationMs"] >= 1000
     assert "partial warning" in (turn / "stderr.log").read_text()
+    assert "exploration shutdown diagnostic" in (turn / "stderr.log").read_text()
     assert "timed out" in (turn / "stderr.log").read_text()
 
 

@@ -1970,10 +1970,11 @@ def invoke_pi_exploration(
         )
         try:
             stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            stdout = error.output if isinstance(error.output, bytes) else b""
-            stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+        except subprocess.TimeoutExpired:
             terminate_process_group(process)
+            # Drain bytes emitted while Pi handles termination so exploration
+            # diagnostics and observed metadata remain complete.
+            stdout, stderr = process.communicate()
             events_path.write_bytes(stdout)
             return (
                 124,
