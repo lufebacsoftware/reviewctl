@@ -27,16 +27,17 @@ def test_public_tree_excludes_private_review_evidence() -> None:
     forbidden_directories = {"receipts", "sealed", "council"}
 
     for path in ROOT.rglob("*"):
+        relative_path = path.relative_to(ROOT)
         if path.is_dir():
             assert path.name.lower() not in forbidden_directories
             continue
-        if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+        if "__pycache__" in relative_path.parts or path.suffix in {".pyc", ".pyo"}:
             continue
-        if any(part.startswith(".") and part != ".github" for part in path.parts):
+        if any(part.startswith(".") and part != ".github" for part in relative_path.parts):
             continue
         contents = path.read_text(errors="ignore").lower()
         for fragment in forbidden_fragments:
-            assert fragment not in contents, f"{fragment!r} leaked through {path.relative_to(ROOT)}"
+            assert fragment not in contents, f"{fragment!r} leaked through {relative_path}"
 
 
 def test_project_integration_assigns_rosters_to_private_evidence_store() -> None:

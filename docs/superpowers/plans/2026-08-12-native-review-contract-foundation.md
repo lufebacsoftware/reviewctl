@@ -244,13 +244,13 @@ Expected: zero test/lint failures and only intentionally uncommitted review arti
 Freeze no more than three uniquely named files and run the workspace checkout explicitly:
 
 ```bash
-uv run --project /Users/luisfernando/Code/workspaces/reviewctl reviewctl run \
+uv run --project /path/to/reviewctl reviewctl run \
   --review-id reviewctl-native-contract-foundation \
   --transport codex \
   --model gpt-5.6-sol \
   --source-class proprietary \
   --response-contract findings-json \
-  --policy /Users/luisfernando/Code/workspaces/reviewctl-evidence/policies/openbancor.toml \
+  --policy /path/to/private-evidence/policies/organization.toml \
   --prompt-file <bounded-request.md> \
   --file src/reviewctl/contracts.py \
   --file tests/test_contracts.py \
@@ -259,7 +259,7 @@ uv run --project /Users/luisfernando/Code/workspaces/reviewctl reviewctl run \
 
 - [ ] **Step 3: Verify and independently adjudicate**
 
-Run `uv run --project /Users/luisfernando/Code/workspaces/reviewctl reviewctl verify <receipt.json>`. Independently reproduce every material finding against source/tests. If a finding is valid, add a failing regression test before changing code, rerun the suite, and repeat the formal review against the new commit.
+Run `uv run --project /path/to/reviewctl reviewctl verify <receipt.json>`. Independently reproduce every material finding against source/tests. If a finding is valid, add a failing regression test before changing code, rerun the suite, and repeat the formal review against the new commit.
 
 - [ ] **Step 4: Record final evidence**
 
