@@ -1850,10 +1850,11 @@ def invoke_pi(
         )
         try:
             stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            stdout = error.output if isinstance(error.output, bytes) else b""
-            stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+        except subprocess.TimeoutExpired:
             terminate_process_group(process)
+            # A second communicate returns the complete buffered streams,
+            # including bytes emitted while the process handled termination.
+            stdout, stderr = process.communicate()
             if stdout:
                 response_path.write_bytes(stdout)
             if stderr:

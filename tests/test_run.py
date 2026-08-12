@@ -275,6 +275,7 @@ def write_fake_pi(path: Path) -> Path:
         "pi",
         """import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -321,6 +322,11 @@ if not os.environ.get('PI_SILENT'):
     sys.stdout.flush()
 if diagnostic := os.environ.get('PI_STDERR'):
     print(diagnostic, file=sys.stderr, flush=True)
+if termination_diagnostic := os.environ.get('PI_TERM_STDERR'):
+    def report_termination(signum, frame):
+        print(termination_diagnostic, file=sys.stderr, flush=True)
+        raise SystemExit(143)
+    signal.signal(signal.SIGTERM, report_termination)
 if delay := os.environ.get('PI_SLEEP'):
     time.sleep(float(delay))
 if model == 'failure' or model.endswith('/failure'):
@@ -453,6 +459,33 @@ def test_pi_transport_preserves_failed_event_stream(tmp_path: Path) -> None:
     assert Path(attempt["evidence"]["response"]).read_text()
     assert Path(attempt["evidence"]["session"]).is_file()
     assert "provider failed after retries" in Path(attempt["evidence"]["stderr"]).read_text()
+
+
+def test_pi_timeout_drains_diagnostics_emitted_during_termination(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    arguments = review_arguments(tmp_path)
+    arguments[arguments.index("--timeout-seconds") + 1] = "1"
+
+    result = run_cli(
+        *arguments,
+        "--route",
+        "pi:openrouter/accepted",
+        "--response-contract",
+        "findings-json",
+        env={
+            "PI_BIN": str(fake_pi),
+            "PI_SLEEP": "3",
+            "PI_TERM_STDERR": "diagnostic emitted during termination",
+        },
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "timeout"
+    assert "diagnostic emitted during termination" in Path(
+        attempt["evidence"]["stderr"]
+    ).read_text()
 
 
 def test_missing_pi_binary_does_not_claim_nonexistent_evidence(tmp_path: Path) -> None:
