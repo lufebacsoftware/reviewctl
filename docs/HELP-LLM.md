@@ -12,9 +12,12 @@ reviewctl explore show --id ID
 reviewctl explore promote --id ID --output PATH
 ```
 
-Exploration sessions are resumable and retain prompts, Pi events, responses,
-diagnostics, and session state. Their response is exploratory working material,
-not an approval. The default tool set is read-only: `read,grep,find,ls`.
+Exploration sessions are resumable. Every turn retains `request.md` and
+`turn.json`; Pi events, responses, stderr, and session state exist only when Pi
+actually produces the corresponding content. Runner failures such as a missing
+executable are recorded in `turn.json:diagnostic`. A response is exploratory
+working material, not an approval. The default tool set is read-only:
+`read,grep,find,ls`.
 Selecting `bash`, `edit`, or `write` explicitly expands that boundary and must
 be a deliberate local decision.
 
