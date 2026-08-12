@@ -1698,7 +1698,7 @@ def pi_resolved_model(requested: str, provider: str | None, resolved: str) -> st
         return ""
     if "/" not in requested:
         return resolved
-    if not provider:
+    if not provider or "/" in provider:
         return ""
     return resolved if resolved.startswith(f"{provider}/") else f"{provider}/{resolved}"
 

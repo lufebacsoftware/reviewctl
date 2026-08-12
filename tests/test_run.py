@@ -561,6 +561,33 @@ def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None
     assert cli.pi_resolved_model(
         "openrouter/google/gemini-2.5-flash", None, "openrouter/google/gemini-2.5-flash"
     ) == ""
+    assert cli.pi_resolved_model(
+        "openrouter/google/gemini-2.5-flash", "openrouter/google", "gemini-2.5-flash"
+    ) == ""
+
+
+def test_pi_transport_rejects_a_non_atomic_observed_provider(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:openrouter/google/gemini-2.5-flash",
+        "--response-contract",
+        "findings-json",
+        env={
+            "PI_BIN": str(fake_pi),
+            "PI_PROVIDER": "openrouter/google",
+            "PI_RESOLVED_MODEL": "gemini-2.5-flash",
+        },
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "model-mismatch"
+    assert attempt["model"]["resolved"] == ""
+    assert attempt["provider"]["resolved"] == "openrouter/google"
 
 
 def test_pi_transport_rejects_an_observed_provider_route_mismatch(tmp_path: Path) -> None:
