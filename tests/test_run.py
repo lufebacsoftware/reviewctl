@@ -935,6 +935,45 @@ def test_explore_show_and_promote_publish_working_material_not_an_approval(
     assert json.loads((output / "manifest.json").read_text())["id"] == "product-notes"
 
 
+def test_explore_promote_rejects_an_existing_output_file_without_traceback(
+    tmp_path: Path,
+) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    exploration_root = tmp_path / "explorations"
+    started = run_cli(
+        "explore",
+        "start",
+        "--id",
+        "promotion-file",
+        "--model",
+        "accepted",
+        "--prompt",
+        "Explore this idea.",
+        "--exploration-root",
+        str(exploration_root),
+        env={"PI_BIN": str(fake_pi)},
+    )
+    assert started.returncode == 0, started.stderr
+    output = tmp_path / "existing-output"
+    output.write_text("keep me")
+
+    promoted = run_cli(
+        "explore",
+        "promote",
+        "--id",
+        "promotion-file",
+        "--output",
+        str(output),
+        "--exploration-root",
+        str(exploration_root),
+    )
+
+    assert promoted.returncode == 2
+    assert "promotion output is not a directory" in promoted.stderr
+    assert "Traceback" not in promoted.stderr
+    assert output.read_text() == "keep me"
+
+
 def test_help_llm_describes_the_exploration_and_formal_review_boundary() -> None:
     result = run_cli("help-llm")
 

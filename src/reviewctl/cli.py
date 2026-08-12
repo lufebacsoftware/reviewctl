@@ -2179,8 +2179,11 @@ def promote_exploration(parser: argparse.ArgumentParser, args: argparse.Namespac
     if not response_path.is_file() or not response_path.read_text().strip():
         fail(parser, "exploration has no non-empty response to promote")
     output = Path(args.output).expanduser().resolve()
-    if output.exists() and any(output.iterdir()):
-        fail(parser, f"promotion output is not empty: {output}")
+    if output.exists():
+        if not output.is_dir():
+            fail(parser, f"promotion output is not a directory: {output}")
+        if any(output.iterdir()):
+            fail(parser, f"promotion output is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
     (output / "exploration.md").write_text(response_path.read_text())
     prompt = (
