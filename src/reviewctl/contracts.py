@@ -219,7 +219,18 @@ class FindingsJsonContract:
             for reviewed in reviewed_files:
                 if not isinstance(reviewed, str) or not reviewed.strip():
                     return rejected("review-declaration")
-                normalized_files.append(Path(reviewed.strip()).name)
+                declared = reviewed.strip()
+                if declared in context.file_names:
+                    normalized_files.append(declared)
+                    continue
+                declared_path = Path(declared)
+                if (
+                    not declared_path.is_absolute()
+                    or not declared_path.parent.name.startswith("reviewctl-input-")
+                    or declared_path.name not in context.file_names
+                ):
+                    return rejected("review-declaration")
+                normalized_files.append(declared_path.name)
             if len(normalized_files) != len(set(normalized_files)) or set(
                 normalized_files
             ) != set(context.file_names):

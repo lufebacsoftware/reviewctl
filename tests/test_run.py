@@ -540,7 +540,8 @@ def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -
     workspace = arguments[arguments.index("-C") + 1]
     assert receipt["model"]["resolved"] == "gpt-5.6-terra"
     assert receipt["response"]["conversationId"] == "codex-conversation"
-    assert receipt["response"]["provider"] == "openai-codex"
+    assert receipt["response"]["provider"] is None
+    assert receipt["attempts"][0]["provider"]["resolved"] is None
     assert "--ignore-user-config" in arguments
     assert "--ignore-rules" in arguments
     assert "--ephemeral" in arguments
@@ -2107,6 +2108,12 @@ def test_findings_contract_accepts_unique_snapshot_basename_from_sandbox_path() 
             expected_file_hashes={"source.py": "a" * 64},
         )
         is not None
+    )
+
+
+def test_legacy_product_read_proof_rejects_arbitrary_relative_paths() -> None:
+    assert not cli.validate_read_proof(
+        {"reviewedFiles": ["../source.py"]}, {"source.py": "a" * 64}
     )
 
 

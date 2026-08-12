@@ -82,7 +82,10 @@ def test_findings_contract_normalizes_a_required_review_declaration() -> None:
     )
     prepared = contract.prepare(context)
     value = finding_payload()
-    value["reviewedFiles"] = ["/private/tmp/review/source.py", "test_source.py"]
+    value["reviewedFiles"] = [
+        "/private/tmp/reviewctl-input-abc/source.py",
+        "test_source.py",
+    ]
 
     evaluation = contract.evaluate(json.dumps(value), prepared, context)
 
@@ -149,6 +152,24 @@ def invalid_contract_cases() -> list[tuple[str, ContractContext, str]]:
         ),
         (
             json.dumps(declaration),
+            ContractContext(file_names=("source.py",), review_declaration_required=True),
+            "review-declaration",
+        ),
+        (
+            json.dumps(
+                {"verdict": "approved", "findings": [], "reviewedFiles": ["../source.py"]}
+            ),
+            ContractContext(file_names=("source.py",), review_declaration_required=True),
+            "review-declaration",
+        ),
+        (
+            json.dumps(
+                {
+                    "verdict": "approved",
+                    "findings": [],
+                    "reviewedFiles": ["unrelated/source.py"],
+                }
+            ),
             ContractContext(file_names=("source.py",), review_declaration_required=True),
             "review-declaration",
         ),

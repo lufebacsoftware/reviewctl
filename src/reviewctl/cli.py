@@ -1551,7 +1551,7 @@ def invoke_codex(
                 input_tokens=None,
                 model=resolved_model.group(1) if resolved_model else "",
                 output_tokens=None,
-                provider="openai-codex",
+                provider=None,
                 response=(
                     output_path.read_text() if output_path.is_file() and not timed_out else ""
                 ),
@@ -1732,8 +1732,17 @@ def validate_read_proof(value: dict[str, Any], expected_file_hashes: dict[str, s
         normalized = reviewed.strip()
         if not normalized:
             return False
-        snapshot_name = Path(normalized).name
-        proof_path = normalized if normalized in expected_file_hashes else snapshot_name
+        if normalized in expected_file_hashes:
+            proof_path = normalized
+        else:
+            snapshot_path = Path(normalized)
+            if (
+                not snapshot_path.is_absolute()
+                or not snapshot_path.parent.name.startswith("reviewctl-input-")
+                or snapshot_path.name not in expected_file_hashes
+            ):
+                return False
+            proof_path = snapshot_path.name
         if proof_path in reviewed_paths:
             return False
         # The model declares only the frozen snapshots it reviewed. The runner
