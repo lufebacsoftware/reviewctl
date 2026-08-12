@@ -662,6 +662,9 @@ def test_pi_response_normalization_only_removes_one_json_fence() -> None:
         '{"verdict":"approved","findings":[]}'
     )
     assert cli.normalize_pi_response("```json\n[]\n```", "findings-json") == "```json\n[]\n```"
+    assert cli.normalize_pi_response(
+        '```json\n{"verdict":NaN}\n```', "findings-json"
+    ) == '```json\n{"verdict":NaN}\n```'
     assert cli.normalize_pi_response(fenced, "document") == fenced
 
 
@@ -950,6 +953,11 @@ def test_help_llm_json_is_machine_readable() -> None:
         "attempt.json:validationError",
         "attempt.json:contractEvaluation.violations",
         "attempt evidence response",
+    ]
+    assert payload["errors"]["attemptResults"]["transport-failed"]["inspect"] == [
+        "attempt.json:exitCode",
+        "attempt.json:diagnostic",
+        "attempt.json:evidence.stderr when non-null",
     ]
     assert payload["errors"]["contractViolations"]["prepared-contract"] == (
         "prepared contract identity or packet context did not authenticate"

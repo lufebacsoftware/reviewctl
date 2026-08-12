@@ -531,7 +531,11 @@ def llm_help_payload() -> dict[str, object]:
                 },
                 "transport-failed": {
                     "meaning": "transport exited unsuccessfully",
-                    "inspect": ["attempt.json:exitCode", "attempt.json:diagnostic", "stderr.log"],
+                    "inspect": [
+                        "attempt.json:exitCode",
+                        "attempt.json:diagnostic",
+                        "attempt.json:evidence.stderr when non-null",
+                    ],
                 },
                 "missing-response": {
                     "meaning": "transport produced no persisted response record",
@@ -1776,6 +1780,11 @@ def pi_system_prompt(response_contract: str) -> str:
     )
 
 
+def reject_nonstandard_json_constant(constant: str) -> None:
+    """Reject NaN and infinity values accepted by Python but forbidden by JSON."""
+    raise ValueError(f"non-standard JSON constant: {constant}")
+
+
 def normalize_pi_response(response: str, response_contract: str) -> str:
     """Remove only one outer JSON fence that Pi may add despite the contract."""
     if response_contract not in {"findings-json", "product-review-json", "product-judge-json"}:
@@ -1785,8 +1794,8 @@ def normalize_pi_response(response: str, response_contract: str) -> str:
         return response
     candidate = match.group(1)
     try:
-        value = json.loads(candidate)
-    except json.JSONDecodeError:
+        value = json.loads(candidate, parse_constant=reject_nonstandard_json_constant)
+    except (json.JSONDecodeError, ValueError):
         return response
     return candidate if isinstance(value, dict) else response
 
