@@ -510,7 +510,10 @@ def llm_help_payload() -> dict[str, object]:
         },
         "errors": {
             "exitCodes": {
-                "0": {"meaning": "completed", "next": "inspect and verify the receipt"},
+                "0": {
+                    "meaning": "completed",
+                    "next": "follow the selected command's next step; only run creates a receipt",
+                },
                 "1": {
                     "meaning": "unavailable-or-invalid",
                     "next": "inspect the persisted attempt before changing inputs or routes",
@@ -1787,6 +1790,7 @@ def invoke_pi(
     request_path: Path,
     response_path: Path,
     session_path: Path,
+    diagnostic_path: Path,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Pi in JSON mode and retain its complete event stream and session."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -1846,7 +1850,12 @@ def invoke_pi(
             stdout = error.output if isinstance(error.output, bytes) else b""
             stderr = error.stderr if isinstance(error.stderr, bytes) else b""
             terminate_process_group(process)
-            response_path.write_bytes(stdout)
+            if stdout:
+                response_path.write_bytes(stdout)
+            if stderr:
+                diagnostic_path.write_text(
+                    redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
+                )
             return (
                 124,
                 pi_timeout_diagnostic(stderr),
@@ -1862,7 +1871,12 @@ def invoke_pi(
     except OSError as error:
         return 127, f"Pi transport could not execute: {error}", blank
 
-    response_path.write_bytes(stdout)
+    if stdout:
+        response_path.write_bytes(stdout)
+    if stderr:
+        diagnostic_path.write_text(
+            redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
+        )
     persisted = pi_persisted_response(
         stdout, model, round((time.monotonic() - started) * 1000)
     )
@@ -2818,11 +2832,10 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     request_path=request_path,
                     response_path=response_path,
                     session_path=session_path,
+                    diagnostic_path=diagnostic_path,
                 )
                 if persisted.response:
                     final_response_path.write_text(persisted.response)
-                if response_path.is_file():
-                    diagnostic_path.write_text(redact_diagnostic(stderr, limit=100_000))
             else:
                 database = attempt_dir / "transport.sqlite3"
                 exit_code, stderr = invoke_llm(

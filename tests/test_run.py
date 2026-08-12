@@ -312,8 +312,9 @@ events = [
     {'type': 'message_end', 'message': message},
     {'type': 'agent_end', 'messages': [message]},
 ]
-print('\\n'.join(json.dumps(event) for event in events))
-sys.stdout.flush()
+if not os.environ.get('PI_SILENT'):
+    print('\\n'.join(json.dumps(event) for event in events))
+    sys.stdout.flush()
 if diagnostic := os.environ.get('PI_STDERR'):
     print(diagnostic, file=sys.stderr, flush=True)
 if delay := os.environ.get('PI_SLEEP'):
@@ -424,7 +425,7 @@ def test_pi_transport_archives_events_session_and_final_response(tmp_path: Path)
     assert Path(attempt["evidence"]["finalResponse"]).read_text() == (
         '{"verdict": "approved", "findings": []}'
     )
-    assert Path(attempt["evidence"]["stderr"]).is_file()
+    assert attempt["evidence"]["stderr"] is None
 
 
 def test_pi_transport_preserves_failed_event_stream(tmp_path: Path) -> None:
@@ -468,6 +469,26 @@ def test_missing_pi_binary_does_not_claim_nonexistent_evidence(tmp_path: Path) -
     assert attempt["evidence"]["response"] is None
     assert attempt["evidence"]["session"] is None
     assert attempt["evidence"]["finalResponse"] is None
+    assert attempt["evidence"]["stderr"] is None
+
+
+def test_silent_pi_process_does_not_claim_empty_event_or_stderr_evidence(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:openrouter/silent",
+        "--response-contract",
+        "findings-json",
+        env={"PI_BIN": str(fake_pi), "PI_SILENT": "1"},
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "model-mismatch"
+    assert attempt["evidence"]["response"] is None
     assert attempt["evidence"]["stderr"] is None
 
 
@@ -717,6 +738,9 @@ def test_help_llm_json_is_machine_readable() -> None:
         "receipt verification succeeds, and material findings are independently checked"
     )
     assert payload["errors"]["exitCodes"]["1"]["meaning"] == "unavailable-or-invalid"
+    assert payload["errors"]["exitCodes"]["0"]["next"] == (
+        "follow the selected command's next step; only run creates a receipt"
+    )
     assert payload["errors"]["attemptResults"]["incomplete"]["inspect"] == [
         "attempt.json:validationError",
         "attempt.json:contractEvaluation.violations",
