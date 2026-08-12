@@ -2073,7 +2073,7 @@ def run_exploration_turn(
                 "model": model,
                 "tools": args.tools,
                 "cwd": str(cwd),
-                "session": str(path / "session.jsonl"),
+                "session": None,
                 "createdAt": utc_now(),
                 "updatedAt": utc_now(),
                 "turns": 0,
@@ -2139,6 +2139,11 @@ def run_exploration_turn(
                 "model": model,
                 "tools": tools,
                 "cwd": str(cwd),
+                "session": (
+                    str(session_path)
+                    if session_path.is_file() and session_path.stat().st_size > 0
+                    else None
+                ),
                 "updatedAt": utc_now(),
                 "turns": turn_number,
                 "status": turn_manifest["status"],

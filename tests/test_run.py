@@ -865,6 +865,11 @@ def test_exploration_does_not_manufacture_transport_artifacts(
     metadata = json.loads((turn / "turn.json").read_text())
     assert metadata["status"] == "unavailable"
     assert expected_diagnostic in metadata["diagnostic"]
+    manifest = json.loads((exploration_root / "unavailable-thread" / "manifest.json").read_text())
+    expected_session = None if environment.get("PI_BIN") == "missing" else str(
+        exploration_root / "unavailable-thread" / "session.jsonl"
+    )
+    assert manifest["session"] == expected_session
     assert not (turn / "events.jsonl").exists()
     assert not (turn / "response.md").exists()
     assert not (turn / "stderr.log").exists()
