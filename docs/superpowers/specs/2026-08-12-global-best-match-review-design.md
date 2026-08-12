@@ -87,6 +87,107 @@ Global instructions own the common behavior:
 - follow fallbacks for unavailable or incomplete attempts;
 - distinguish accepted, degraded, unavailable, and waived outcomes.
 
+## Agent Compatibility
+
+The review semantics are agent-neutral. Cursor, Codex, Pi, and Claude consume
+the same behavioral contract through their native instruction-discovery
+mechanisms; they do not receive different definitions of acceptance, fallback,
+or waiver.
+
+### Canonical instruction contract
+
+`reviewctl` owns one concise canonical instruction fragment containing:
+
+- material-review triggers and best-effort behavior;
+- the command for machine-readable discovery;
+- accepted, degraded, unavailable, and waiver semantics;
+- the requirement to persist and verify evidence;
+- the prohibition on treating model output as self-validating approval;
+- the pointer to project-specific dimensions and verification commands.
+
+Agent adapters may change file syntax, imports, or installation paths, but not
+those semantics. Generated fragments include a contract version and digest so
+drift can be detected.
+
+The canonical fragment is a reviewctl-owned artifact, not whichever generated
+agent file happened to be installed first. A project keeps its domain-specific
+instructions in `AGENTS.md`; it references or embeds the versioned common
+fragment without becoming the owner of global review semantics.
+
+### Compatibility matrix
+
+| Agent | Global instructions | Project instructions | Adapter rule |
+| --- | --- | --- | --- |
+| Codex | `~/.codex/AGENTS.md` or the active `CODEX_HOME` equivalent | `AGENTS.md` / `AGENTS.override.md` hierarchy | Use the canonical Markdown fragment directly; preserve Codex's root-to-cwd precedence. |
+| Cursor | Cursor User Rules | Root `AGENTS.md` for portable rules; `.cursor/rules/*.mdc` only for Cursor-specific scoping | Keep common review semantics in `AGENTS.md`; generate an MDC wrapper only when globs or Cursor-only attachment behavior are required. |
+| Pi | `~/.pi/agent/AGENTS.md` | `AGENTS.md` or `CLAUDE.md` discovered from parent directories and cwd | Use the canonical Markdown fragment; an optional Pi extension may add UX but is not required for correctness. |
+| Claude Code | `~/.claude/CLAUDE.md` or managed organization instructions | `CLAUDE.md`, preferably importing `@AGENTS.md`, or a symlink when no Claude-only additions are needed | Keep `AGENTS.md` canonical at project scope and make `CLAUDE.md` a short import or pointer, not a divergent copy. |
+
+Codex officially composes global and project `AGENTS.md` guidance in precedence
+order. Cursor supports project rules and root `AGENTS.md`, with User Rules for
+global behavior. Pi loads global and project `AGENTS.md`/`CLAUDE.md` context.
+Claude Code reads `CLAUDE.md`, not `AGENTS.md` directly, and officially
+recommends importing or linking `AGENTS.md` when sharing instructions. These
+assumptions are based on the current primary documentation:
+
+- [Codex custom instructions](https://developers.openai.com/codex/guides/agents-md)
+- [Cursor rules](https://docs.cursor.com/context/rules-for-ai)
+- [Pi coding-agent context files](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#context-files)
+- [Claude Code memory and AGENTS.md compatibility](https://code.claude.com/docs/en/memory#agentsmd)
+
+### Instruction rendering and drift checks
+
+Add a read-only instruction interface:
+
+```text
+reviewctl instructions render --agent codex|cursor|pi|claude \
+  --scope global|project --format markdown|json
+reviewctl instructions check --agent codex|cursor|pi|claude \
+  --scope global|project
+```
+
+`render` prints the adapter fragment but does not overwrite user instruction
+files. Installation remains an explicit, reviewable operation during rollout.
+`check` reports the expected location, whether the canonical contract digest is
+present, conflicting or stale review rules, and the command needed to repair
+the integration. It never reports private model rosters or credentials.
+
+Its JSON result is stable and typed:
+
+```text
+AgentIntegrationStatus
+├── agent
+├── scope
+├── expectedLocations[]
+├── discoveredLocations[]
+├── contractVersion
+├── expectedDigest
+├── discoveredDigests[]
+├── status: current | missing | stale | conflicting | unsupported
+├── conflicts[]
+└── remediation[]
+```
+
+`remediation` is declarative: it identifies the content and destination but
+does not silently modify user or managed organization instructions.
+
+At project scope, `check` also reports whether `AGENTS.md` and `CLAUDE.md`
+diverge. A Claude import of `@AGENTS.md` or a valid symlink is compatible. A
+second independently maintained review policy is drift.
+
+### Invocation compatibility
+
+All four agents invoke the same `reviewctl` executable and consume the same JSON
+schemas. Agent-specific adapters do not call providers directly. When shell
+execution is available, they use the CLI. A future MCP or native tool adapter
+may wrap the CLI, but it must preserve the request, result, receipt, fragment,
+and consolidation types exactly.
+
+Instructions are behavioral guidance, not a technical sandbox. During the
+advisory rollout no agent-specific hook may turn a best-effort unavailable
+result into a hard global block. Later enforcement hooks are allowed only for
+the critical dimensions and authorization rules defined by policy.
+
 Initial globally recognized dimensions are:
 
 - correctness;
@@ -356,7 +457,8 @@ The JSON output becomes the stable agent-discovery contract and includes:
 - best-match and fallback behavior;
 - partial-evaluation and consolidation types;
 - recovery steps based only on evidence locators that exist;
-- global instruction snippets and project-integration pointers.
+- global instruction snippets, compatibility status, and project-integration
+  pointers.
 
 Schema changes are additive during stabilization. Breaking changes require a
 new schema version and compatibility tests.
@@ -371,6 +473,8 @@ that reports without exposing secrets:
 - available transports and required binaries;
 - evidence-root writability;
 - whether the user-local binary directory is in `PATH`;
+- detected Cursor, Codex, Pi, and Claude instruction locations and contract
+  digests;
 - machine-readable remediation for local and Amélia installations.
 
 `help-llm` points agents to `doctor --format json` when discovery or environment
@@ -381,8 +485,8 @@ checks fail.
 ### Phase 0: Baseline
 
 Inventory current local and Amélia installations, paths, versions, global
-instructions, project pointers, and representative tasks. Record baseline CLI
-and receipt fixtures.
+instructions for all four supported agents, project pointers, and representative
+tasks. Record baseline CLI and receipt fixtures.
 
 ### Phase 1: Stabilize
 
@@ -396,6 +500,8 @@ Update:
 
 - `HELP-LLM.md` and generated machine help;
 - installation and Amélia discovery guidance;
+- Cursor, Codex, Pi, and Claude compatibility and instruction-rendering
+  guidance;
 - the reusable project-integration template;
 - migration guidance from direct `llm-review` or copied model rosters.
 
@@ -408,6 +514,9 @@ Install the same short global instruction locally and on Amélia:
 - agents attempt best match and bounded fallbacks;
 - degraded or unavailable outcomes are reported honestly;
 - critical degraded outcomes require human authorization.
+
+Render the instruction through each agent adapter and verify that the agent
+loads the expected contract digest. Do not hand-maintain four semantic copies.
 
 During this phase, failures are collected as stabilization evidence rather than
 treated as universal blockers.
@@ -497,6 +606,14 @@ must persist the bounded attempt state first when safe to do so.
 - Amélia installation with and without the user-local binary directory in
   `PATH`;
 - global instruction discovery by Codex;
+- global and project instruction discovery by Cursor, Codex, Pi, and Claude;
+- rendered adapter fragments carry the same semantic contract version and
+  digest;
+- Claude imports or links the canonical project `AGENTS.md` without divergence;
+- Cursor MDC wrappers, when present, contain only Cursor-specific scope metadata
+  and a reference to the canonical contract rather than a second semantic copy;
+- each agent can run `help-llm --format json`, `doctor --format json`, and a
+  synthetic best-match/fallback smoke test;
 - representative project reviews with project-specific triggers;
 - no secrets in diagnostics, receipts, logs, or instruction files.
 
@@ -505,8 +622,8 @@ must persist the bounded attempt state first when safe to do so.
 The design is ready for global enforcement only when:
 
 1. local and Amélia installations expose the same supported CLI and help schema;
-2. representative coding-agent tasks discover and invoke `reviewctl` without
-   hard-coded repository paths;
+2. representative Cursor, Codex, Pi, and Claude tasks discover and invoke
+   `reviewctl` without hard-coded repository paths or divergent semantics;
 3. incomplete responses contribute validated fragments to a later fallback;
 4. consolidated output retains exact provenance and disagreements;
 5. no incomplete attempt is accepted;
@@ -516,6 +633,10 @@ The design is ready for global enforcement only when:
 8. expected errors provide machine-readable recovery without tracebacks;
 9. the full test suite, lint, public-distribution checks, and formal review pass;
 10. the advisory rollout produces no unresolved high-impact workflow defects.
+
+Compatibility means equivalent review behavior and evidence, not identical
+agent UX. Failure of one agent adapter does not authorize changing receipt
+semantics for that agent.
 
 ## Non-Goals
 
