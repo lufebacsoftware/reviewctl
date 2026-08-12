@@ -19,9 +19,12 @@ the request and response evidence, and writes a verifiable receipt. Its
 artifact root is the archive for formal reviews; use `--seal-to` when the
 request and response must also be encrypted with Age. The `pi` transport runs
 with tools, extensions, skills, prompt templates, and context-file discovery
-disabled; it archives Pi's JSON event stream, session file, stderr, and
-extracted final response for every attempt, including failures and empty
-responses.
+disabled. For each attempt, it records only the Pi artifacts actually observed:
+the JSON event stream when Pi emits stdout, the session file when Pi creates it,
+stderr when Pi emits diagnostics, and an extracted final response when one is
+non-empty. Missing executables, silent processes, failures, and empty responses
+therefore leave the corresponding receipt evidence locator as `null`; reviewctl
+does not manufacture empty files as evidence.
 
 An interactive `pi` transcript is never an approval, a merge decision, or a
 formal review receipt. The transcript may inform the prompt, but the formal
