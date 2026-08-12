@@ -139,9 +139,10 @@ reviewctl explore show --id ledger-product-ideas
 reviewctl explore promote --id ledger-product-ideas --output /tmp/ledger-product-review
 ```
 
-Explorations are named, resumable Pi sessions. The default tool set is
-read-only repository inspection plus `bash`; pass `--tools` explicitly when a
-different capability set is appropriate. Each turn stores its request, Pi
+Explorations are named, resumable Pi sessions. The default tool set is read-only
+repository inspection (`read,grep,find,ls`); pass `--tools` explicitly when a
+different capability set is appropriate. Selecting `bash`, `edit`, or `write`
+deliberately expands the local execution boundary. Each turn stores its request, Pi
 JSON event stream, response, diagnostics, and session state under
 `~/.cache/reviewctl/explorations`.
 
@@ -152,6 +153,10 @@ bounded source files, response contract, privacy policy, and receipt
 verification required for a formal review. For a bounded headless Pi attempt,
 use `--route pi:<provider/model>`; that transport remains separate from these
 full-tool sessions. See [Pi and reviewctl](docs/PI-INTEGRATION.md).
+
+Pi's current CLI does not expose an output-token cap. Formal Pi request evidence
+therefore records the requested value separately with
+`outputTokenLimitEnforced: false`; do not treat that value as a budget guarantee.
 
 ### Gemini/Antigravity product review
 

@@ -14,7 +14,9 @@ reviewctl explore promote --id ID --output PATH
 
 Exploration sessions are resumable and retain prompts, Pi events, responses,
 diagnostics, and session state. Their response is exploratory working material,
-not an approval. The default tool set is `read,grep,find,ls,bash`.
+not an approval. The default tool set is read-only: `read,grep,find,ls`.
+Selecting `bash`, `edit`, or `write` explicitly expands that boundary and must
+be a deliberate local decision.
 
 ## Formal review
 

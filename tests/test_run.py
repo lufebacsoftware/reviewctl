@@ -276,6 +276,7 @@ def write_fake_pi(path: Path) -> Path:
         """import json
 import os
 import sys
+import time
 from pathlib import Path
 
 arguments = sys.argv[1:]
@@ -312,6 +313,11 @@ events = [
     {'type': 'agent_end', 'messages': [message]},
 ]
 print('\\n'.join(json.dumps(event) for event in events))
+sys.stdout.flush()
+if diagnostic := os.environ.get('PI_STDERR'):
+    print(diagnostic, file=sys.stderr, flush=True)
+if delay := os.environ.get('PI_SLEEP'):
+    time.sleep(float(delay))
 if model == 'failure':
     print('provider failed after retries', file=sys.stderr)
     raise SystemExit(17)
@@ -493,8 +499,9 @@ def test_explore_start_creates_a_named_resumable_pi_session(tmp_path: Path) -> N
     assert manifest["turns"] == 1
     arguments = json.loads(arguments_log.read_text())
     assert "--tools" in arguments
-    assert arguments[arguments.index("--tools") + 1] == "read,grep,find,ls,bash"
-    assert "--approve" in arguments
+    assert arguments[arguments.index("--tools") + 1] == "read,grep,find,ls"
+    assert "--no-approve" in arguments
+    assert "--approve" not in arguments
     assert "--no-tools" not in arguments
     assert (session_root / "session.jsonl").is_file()
     assert (session_root / "turns" / "001" / "request.md").read_text() == (
@@ -542,6 +549,39 @@ def test_explore_resume_uses_the_same_pi_session_and_appends_a_turn(tmp_path: Pa
         "Continue the thread."
     )
     assert manifest["session"] == str(session_root / "session.jsonl")
+
+
+def test_exploration_timeout_retains_partial_diagnostics_and_observed_metadata(
+    tmp_path: Path,
+) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    exploration_root = tmp_path / "explorations"
+
+    result = run_cli(
+        "explore",
+        "start",
+        "--id",
+        "slow-thread",
+        "--model",
+        "accepted",
+        "--prompt",
+        "Explore slowly.",
+        "--timeout-seconds",
+        "1",
+        "--exploration-root",
+        str(exploration_root),
+        env={"PI_BIN": str(fake_pi), "PI_SLEEP": "3", "PI_STDERR": "partial warning"},
+    )
+
+    assert result.returncode == 1
+    turn = Path(result.stdout.strip())
+    metadata = json.loads((turn / "turn.json").read_text())
+    assert metadata["conversationId"] == "pi-session"
+    assert metadata["model"] == "accepted"
+    assert metadata["provider"] == "openrouter"
+    assert metadata["durationMs"] >= 1000
+    assert "partial warning" in (turn / "stderr.log").read_text()
+    assert "timed out" in (turn / "stderr.log").read_text()
 
 
 def test_explore_show_and_promote_publish_working_material_not_an_approval(
@@ -736,6 +776,65 @@ def test_direct_transport_applies_configured_transport_defaults(tmp_path: Path) 
         "maxAttempts": 2,
     }
     assert receipt["executionConfig"]["path"] == str(config.resolve())
+
+
+def test_mixed_routes_do_not_apply_the_first_transports_defaults(tmp_path: Path) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    fake_pi = write_fake_pi(tmp_path)
+    config = tmp_path / "reviewctl.toml"
+    config.write_text(
+        '[profiles.mixed]\n'
+        'routes = ["agy:gemini-3.6-flash-high", "pi:accepted"]\n'
+        '[defaults.agy]\n'
+        'timeout_seconds = 111\n'
+        '[defaults.pi]\n'
+        'timeout_seconds = 222\n'
+    )
+    arguments = review_arguments(tmp_path)
+    arguments.remove("--timeout-seconds")
+    arguments.remove("5")
+
+    result = run_cli(
+        *arguments,
+        "--profile",
+        "mixed",
+        "--config",
+        str(config),
+        "--response-contract",
+        "findings-json",
+        env={
+            "AGY_BIN": str(fake_agy),
+            "AGY_STATUS": "QUOTA_EXCEEDED",
+            "PI_BIN": str(fake_pi),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["executionSettings"]["timeoutSeconds"] == 90
+    assert receipt["executionConfig"]["path"] == str(config.resolve())
+
+
+def test_pi_request_marks_output_token_limit_as_unenforced(tmp_path: Path) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "pi:accepted",
+        "--max-output-tokens",
+        "1",
+        "--response-contract",
+        "findings-json",
+        env={"PI_BIN": str(fake_pi)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    request = json.loads(Path(receipt["attempts"][0]["evidence"]["request"]).read_text())
+    assert request["requestedMaxOutputTokens"] == 1
+    assert request["outputTokenLimitEnforced"] is False
+    assert "maxOutputTokens" not in request
 
 
 def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) -> None:

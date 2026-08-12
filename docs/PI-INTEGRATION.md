@@ -34,8 +34,9 @@ requires `reviewctl verify`.
 
 ### 1. Explore with reviewctl and pi
 
-Start a named, resumable thread. The default tool set is repository inspection
-and `bash`; the session is not a merge gate.
+Start a named, resumable thread. The default tool set is read-only repository
+inspection. Add `bash`, `edit`, or `write` only as a deliberate local execution
+decision; the session is not a merge gate.
 
 ```bash
 reviewctl explore start \
@@ -108,6 +109,10 @@ Pi's interactive session directory is not reused. Each attempt gets an
 isolated session inside its review artifact directory, and an empty or failed
 Pi process is recorded as unavailable rather than discarded or treated as an
 approval.
+
+Pi's current CLI has no output-token limit option. The request artifact records
+`requestedMaxOutputTokens` together with `outputTokenLimitEnforced: false` so
+automation cannot mistake the requested value for an enforced budget cap.
 
 The same flow may use `--transport agy` for a bounded synthetic product
 review, or the approved Codex transport for proprietary source. Do not infer

@@ -503,8 +503,9 @@ def llm_help_payload() -> dict[str, object]:
         },
         "defaults": {
             "explorationRoot": "~/.cache/reviewctl/explorations",
-            "explorationTools": "read,grep,find,ls,bash",
+            "explorationTools": "read,grep,find,ls",
             "explorationIsResumable": True,
+            "piOutputTokenLimitEnforced": False,
         },
         "errors": {
             "exitCodes": {
@@ -1685,6 +1686,62 @@ def pi_resolved_model(requested: str, provider: str | None, resolved: str) -> st
     return resolved
 
 
+def pi_persisted_response(
+    stdout: bytes,
+    requested_model: str,
+    duration_ms: int,
+    *,
+    include_response: bool = True,
+) -> PersistedResponse:
+    """Recover the metadata Pi emitted, including from a partial event stream."""
+    session_id = ""
+    assistant_message: dict[str, object] | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "session" and isinstance(event.get("id"), str):
+            session_id = event["id"]
+        if event.get("type") == "message_end":
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                assistant_message = message
+        if event.get("type") == "agent_end":
+            messages = event.get("messages")
+            if isinstance(messages, list):
+                for message in messages:
+                    if isinstance(message, dict) and message.get("role") == "assistant":
+                        assistant_message = message
+    if assistant_message is None:
+        return PersistedResponse(session_id, None, duration_ms, None, "", None, None, "")
+    cost_usd, input_tokens, output_tokens = pi_usage(assistant_message.get("usage"))
+    provider = assistant_message.get("provider")
+    resolved_model = assistant_message.get("model")
+    response = pi_content_text(assistant_message.get("content")) if include_response else ""
+    return PersistedResponse(
+        conversation_id=session_id,
+        cost_usd=cost_usd,
+        duration_ms=duration_ms,
+        input_tokens=input_tokens,
+        model=(
+            pi_resolved_model(requested_model, provider, resolved_model)
+            if isinstance(resolved_model, str)
+            else ""
+        ),
+        output_tokens=output_tokens,
+        provider=provider if isinstance(provider, str) else None,
+        response=response,
+    )
+
+
+def pi_timeout_diagnostic(stderr: bytes) -> str:
+    details = stderr.decode(errors="replace").strip()
+    return f"review attempt timed out: {details}" if details else "review attempt timed out"
+
+
 def pi_system_prompt(response_contract: str) -> str:
     """Replace Pi's coding-agent prompt with the selected review contract."""
     schema = response_schema(response_contract)
@@ -1761,7 +1818,8 @@ def invoke_pi(
                 "command": "pi",
                 "mode": "json",
                 "model": model,
-                "maxOutputTokens": max_output_tokens,
+                "requestedMaxOutputTokens": max_output_tokens,
+                "outputTokenLimitEnforced": False,
                 "responseContract": response_contract,
                 "files": [str(file) for file in files],
                 "prompt": prompt,
@@ -1788,75 +1846,48 @@ def invoke_pi(
             stderr = error.stderr if isinstance(error.stderr, bytes) else b""
             terminate_process_group(process)
             response_path.write_bytes(stdout)
-            return 124, "review attempt timed out", blank
+            return (
+                124,
+                pi_timeout_diagnostic(stderr),
+                pi_persisted_response(
+                    stdout,
+                    model,
+                    round((time.monotonic() - started) * 1000),
+                    include_response=False,
+                ),
+            )
     except FileNotFoundError:
         return 127, f"Pi transport executable not found: {pi_bin}", blank
     except OSError as error:
         return 127, f"Pi transport could not execute: {error}", blank
 
     response_path.write_bytes(stdout)
-    session_id = ""
-    assistant_message: dict[str, object] | None = None
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "session" and isinstance(event.get("id"), str):
-            session_id = event["id"]
-        if event.get("type") == "message_end":
-            message = event.get("message")
-            if isinstance(message, dict) and message.get("role") == "assistant":
-                assistant_message = message
-        if event.get("type") == "agent_end":
-            messages = event.get("messages")
-            if isinstance(messages, list):
-                for message in messages:
-                    if isinstance(message, dict) and message.get("role") == "assistant":
-                        assistant_message = message
-    if assistant_message is None:
+    persisted = pi_persisted_response(
+        stdout, model, round((time.monotonic() - started) * 1000)
+    )
+    if not persisted.response:
         return (
             process.returncode,
             stderr.decode(errors="replace"),
-            PersistedResponse(
-                conversation_id=session_id,
-                cost_usd=None,
-                duration_ms=round((time.monotonic() - started) * 1000),
-                input_tokens=None,
-                model="",
-                output_tokens=None,
-                provider=None,
-                response="",
-            ),
+            persisted,
         )
-    cost_usd, input_tokens, output_tokens = pi_usage(assistant_message.get("usage"))
-    provider = assistant_message.get("provider")
-    resolved_model = assistant_message.get("model")
     return (
         process.returncode,
         stderr.decode(errors="replace"),
         PersistedResponse(
-            conversation_id=session_id,
-            cost_usd=cost_usd,
-            duration_ms=round((time.monotonic() - started) * 1000),
-            input_tokens=input_tokens,
-            model=(
-                pi_resolved_model(model, provider, resolved_model)
-                if isinstance(resolved_model, str)
-                else ""
-            ),
-            output_tokens=output_tokens,
-            provider=provider if isinstance(provider, str) else None,
-            response=normalize_pi_response(
-                pi_content_text(assistant_message.get("content")), response_contract
-            ),
+            conversation_id=persisted.conversation_id,
+            cost_usd=persisted.cost_usd,
+            duration_ms=persisted.duration_ms,
+            input_tokens=persisted.input_tokens,
+            model=persisted.model,
+            output_tokens=persisted.output_tokens,
+            provider=persisted.provider,
+            response=normalize_pi_response(persisted.response, response_contract),
         ),
     )
 
 
-DEFAULT_EXPLORATION_TOOLS = "read,grep,find,ls,bash"
+DEFAULT_EXPLORATION_TOOLS = "read,grep,find,ls"
 
 
 def exploration_path(root: str | Path, exploration_id: str) -> Path:
@@ -1901,7 +1932,7 @@ def invoke_pi_exploration(
         model,
         "--tools",
         tools,
-        "--approve",
+        "--no-approve",
         "--session",
         str(session_path),
         prompt,
@@ -1924,68 +1955,27 @@ def invoke_pi_exploration(
             stderr = error.stderr if isinstance(error.stderr, bytes) else b""
             terminate_process_group(process)
             events_path.write_bytes(stdout)
-            return 124, "exploration turn timed out", blank
+            return (
+                124,
+                pi_timeout_diagnostic(stderr).replace("review attempt", "exploration turn", 1),
+                pi_persisted_response(
+                    stdout,
+                    model,
+                    round((time.monotonic() - started) * 1000),
+                    include_response=False,
+                ),
+            )
     except FileNotFoundError:
         return 127, f"Pi exploration executable not found: {pi_bin}", blank
     except OSError as error:
         return 127, f"Pi exploration could not execute: {error}", blank
 
     events_path.write_bytes(stdout)
-    session_id = ""
-    assistant_message: dict[str, object] | None = None
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "session" and isinstance(event.get("id"), str):
-            session_id = event["id"]
-        if event.get("type") == "message_end":
-            message = event.get("message")
-            if isinstance(message, dict) and message.get("role") == "assistant":
-                assistant_message = message
-        if event.get("type") == "agent_end":
-            messages = event.get("messages")
-            if isinstance(messages, list):
-                for message in messages:
-                    if isinstance(message, dict) and message.get("role") == "assistant":
-                        assistant_message = message
-    if assistant_message is None:
-        return (
-            process.returncode,
-            stderr.decode(errors="replace"),
-            PersistedResponse(
-                conversation_id=session_id,
-                cost_usd=None,
-                duration_ms=round((time.monotonic() - started) * 1000),
-                input_tokens=None,
-                model="",
-                output_tokens=None,
-                provider=None,
-                response="",
-            ),
-        )
-    cost_usd, input_tokens, output_tokens = pi_usage(assistant_message.get("usage"))
-    provider = assistant_message.get("provider")
-    resolved_model = assistant_message.get("model")
     return (
         process.returncode,
         stderr.decode(errors="replace"),
-        PersistedResponse(
-            conversation_id=session_id,
-            cost_usd=cost_usd,
-            duration_ms=round((time.monotonic() - started) * 1000),
-            input_tokens=input_tokens,
-            model=(
-                pi_resolved_model(model, provider, resolved_model)
-                if isinstance(resolved_model, str)
-                else ""
-            ),
-            output_tokens=output_tokens,
-            provider=provider if isinstance(provider, str) else None,
-            response=pi_content_text(assistant_message.get("content")),
+        pi_persisted_response(
+            stdout, model, round((time.monotonic() - started) * 1000)
         ),
     )
 
@@ -2638,8 +2628,10 @@ def seal(path: Path, contents: bytes, recipient: str) -> str:
 def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     prompt, files = validate_request(parser, args)
     routes, route_profile = review_routes(parser, args)
+    route_transports = {route.transport for route in routes}
+    transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
     transport_defaults, execution_config = load_transport_defaults(
-        parser, getattr(args, "config", None), routes[0].transport
+        parser, getattr(args, "config", None), transport_default_key
     )
     review_prompt = packet_prompt(prompt, files, args.response_contract)
     try:
