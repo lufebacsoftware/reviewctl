@@ -143,7 +143,12 @@ def v2_findings_receipt() -> dict[str, object]:
         {"verdict": "changes-requested", "findings": [finding()], "extra": True}
     )
     complete_payload = json.dumps({"verdict": "approved", "findings": []})
-    partial = contract.evaluate(partial_payload, prepared, context)
+    partial = contract.evaluate(
+        partial_payload,
+        prepared,
+        context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
     complete = contract.evaluate(complete_payload, prepared, context)
     promoted_fragment = promote_fragments(
         partial,
@@ -169,6 +174,7 @@ def v2_findings_receipt() -> dict[str, object]:
         "transport": "routed",
         "reviewContract": "findings-json",
         "contract": {"name": "findings-json", "version": "1"},
+        "prompt": {"packetSha256": "b" * 64},
         "routes": [
             {"model": "first", "transport": "llm"},
             {"model": "second", "transport": "codex"},
@@ -250,6 +256,7 @@ def v2_invalid_findings_receipt() -> dict[str, object]:
         "transport": "llm",
         "reviewContract": "findings-json",
         "contract": {"name": "findings-json", "version": "1"},
+        "prompt": {"packetSha256": "b" * 64},
         "routes": [{"model": "first", "transport": "llm"}],
         "attempts": [
             {
@@ -329,6 +336,7 @@ def test_promote_fragments_records_attempt_provenance_only_for_contract_incomple
         "routeIndex": 0,
         "payloadDigest": result[0].payload_digest,
         "rawResponseDigest": evaluation.payload_digest,
+        "packetDigest": "b" * 64,
     }
     assert copy(result[0].finding) is result[0].finding
     assert deepcopy(result[0].finding) is result[0].finding
@@ -524,6 +532,18 @@ def test_build_completion_context_rejects_findings_outside_target_scope() -> Non
         build_completion_context(
             evaluation.completion_request,
             fragments,
+            allowed_file_names=("source.py",),
+        )
+
+
+def test_build_completion_context_rejects_fragments_from_another_packet() -> None:
+    evaluation = incomplete_evaluation(finding())
+    foreign_request = replace(evaluation.completion_request, packet_digest="c" * 64)
+
+    with pytest.raises(ValueError, match="packet"):
+        build_completion_context(
+            foreign_request,
+            promoted(finding()),
             allowed_file_names=("source.py",),
         )
 
@@ -1069,6 +1089,21 @@ def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> 
     assert validate_v2_receipt(v2_findings_receipt()) == ()
 
 
+@pytest.mark.parametrize("packet_digest", [None, "c" * 64])
+def test_validate_v2_receipt_binds_promoted_fragments_to_packet(
+    packet_digest: str | None,
+) -> None:
+    receipt = v2_findings_receipt()
+    promoted_fragment = receipt["attempts"][0]["promotedFragments"][0]
+    if packet_digest is None:
+        promoted_fragment.pop("packetDigest")
+    else:
+        promoted_fragment["packetDigest"] = packet_digest
+    _sign_receipt(receipt)
+
+    assert "promoted-fragments" in validate_v2_receipt(receipt)
+
+
 @pytest.mark.parametrize("attempt_index", [0, 1])
 def test_validate_v2_receipt_requires_raw_response_for_contract_evaluation(
     attempt_index: int,
@@ -1464,6 +1499,7 @@ def test_validate_v2_receipt_accepts_complete_duplicate_findings() -> None:
         route_index=promoted_value["routeIndex"],
         payload_digest=promoted_value["payloadDigest"],
         raw_response_digest=promoted_value["rawResponseDigest"],
+        packet_digest=promoted_value["packetDigest"],
     )
     receipt["consolidatedReview"] = consolidate(
         normalized,

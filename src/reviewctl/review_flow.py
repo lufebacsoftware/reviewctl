@@ -186,6 +186,7 @@ def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | 
         or not _is_sha256(fragment.fragment_id)
         or not _is_sha256(fragment.payload_digest)
         or not _is_sha256(fragment.raw_response_digest)
+        or not _is_sha256(fragment.packet_digest)
         or not _is_positive_int(fragment.source_attempt)
         or not _is_nonnegative_int(fragment.route_index)
     ):
@@ -215,6 +216,7 @@ class PromotedFragment:
     route_index: int
     payload_digest: str
     raw_response_digest: str
+    packet_digest: str
 
     def provenance_dict(self) -> dict[str, object]:
         return _FrozenDict(
@@ -223,6 +225,7 @@ class PromotedFragment:
                 "fragmentId": self.fragment_id,
                 "payloadDigest": self.payload_digest,
                 "rawResponseDigest": self.raw_response_digest,
+                "packetDigest": self.packet_digest,
                 "routeIndex": self.route_index,
             }
         )
@@ -236,6 +239,7 @@ class PromotedFragment:
             "routeIndex": self.route_index,
             "payloadDigest": self.payload_digest,
             "rawResponseDigest": self.raw_response_digest,
+            "packetDigest": self.packet_digest,
         }
 
 
@@ -367,6 +371,7 @@ def _validate_completion_context(context: object) -> bool:
                 or source.fingerprint != fingerprint
                 or source_finding != finding
                 or source_finding["path"] not in context.file_names
+                or source.packet_digest != context.packet_digest
                 or provenance in seen_provenance
             ):
                 return False
@@ -433,6 +438,7 @@ def promote_fragments(
         or not _is_sha256(raw_response_digest)
         or not _is_positive_int(attempt)
         or not _is_nonnegative_int(route_index)
+        or not _is_sha256(evaluation.completion_request.packet_digest)
     ):
         return ()
 
@@ -468,6 +474,7 @@ def promote_fragments(
                 route_index=route_index,
                 payload_digest=fragment.payload_digest,
                 raw_response_digest=raw_response_digest,
+                packet_digest=evaluation.completion_request.packet_digest,
             )
         )
     return tuple(promoted)
@@ -514,6 +521,8 @@ def build_completion_context(
             raise ValueError("invalid promoted fragment identity")
         if finding["path"] not in target_file_names:
             raise ValueError("promoted finding is outside target review scope")
+        if fragment.packet_digest != request.packet_digest:
+            raise ValueError("promoted fragment belongs to a different packet")
         validated.append((fragment, finding))
     ordered = sorted(validated, key=lambda item: (item[0].source_attempt, item[0].fragment_id))
     grouped: dict[str, list[tuple[PromotedFragment, dict[str, Any]]]] = {}
@@ -1172,6 +1181,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     route_index=item.get("routeIndex"),
                     payload_digest=item.get("payloadDigest"),
                     raw_response_digest=item.get("rawResponseDigest"),
+                    packet_digest=item.get("packetDigest"),
                 )
             except Exception:
                 reject("promoted-fragments")
@@ -1183,6 +1193,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     fragment.fingerprint,
                     fragment.payload_digest,
                     fragment.raw_response_digest,
+                    fragment.packet_digest,
                 )
             ):
                 reject("promoted-fragments")
@@ -1199,6 +1210,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 or fragment.source_attempt != index
                 or fragment.route_index != route_index
                 or fragment.raw_response_digest != raw_digest
+                or fragment.packet_digest != packet_digest
                 or not source_fragments
                 or any(
                     source.get("fingerprint") != fragment.fingerprint
