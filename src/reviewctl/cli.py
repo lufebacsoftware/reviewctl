@@ -670,12 +670,16 @@ def setup_topology_payload(topology: LocalExecutionTopology) -> dict[str, object
 def sanitize_setup_human_text(value: str) -> str:
     """Render terminal controls as inert, single-line escaped text."""
     escaped_controls = {"\r": r"\r", "\n": r"\n", "\t": r"\t"}
-    return "".join(
-        escaped_controls.get(character, f"\\x{ord(character):02x}")
-        if ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
-        else character
-        for character in value
-    )
+    rendered = []
+    for character in value:
+        code_point = ord(character)
+        if code_point <= 0x1F or 0x7F <= code_point <= 0x9F:
+            rendered.append(escaped_controls.get(character, f"\\x{code_point:02x}"))
+        elif 0xD800 <= code_point <= 0xDFFF:
+            rendered.append(f"\\u{code_point:04x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
 
 
 def print_setup_topology(topology: LocalExecutionTopology, output_format: str) -> None:

@@ -1227,6 +1227,47 @@ def test_setup_human_output_escapes_terminal_controls_without_changing_json(
     assert payload["backends"][0]["diagnostics"] == [diagnostic]
 
 
+def test_setup_human_text_escapes_all_surrogate_code_points() -> None:
+    value = "readable \ud800 \udfff surrogateescape \udc80 \udcff"
+
+    assert cli.sanitize_setup_human_text(value) == (
+        "readable \\ud800 \\udfff surrogateescape \\udc80 \\udcff"
+    )
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(os, "environb"),
+    reason="requires POSIX bytes environment support",
+)
+def test_setup_human_subprocess_does_not_recreate_raw_environment_control_byte() -> None:
+    environment = os.environb.copy()
+    environment[b"PATH"] = b""
+    environment[b"CODEX_BIN"] = b"missing-\x9b-tool"
+
+    result = subprocess.run(
+        [
+            os.fsencode(sys.executable),
+            b"-m",
+            b"reviewctl",
+            b"setup",
+            b"discover",
+            b"--format",
+            b"human",
+        ],
+        cwd=os.fsencode(REPOSITORY),
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert b"missing-\\udc9b-tool" in result.stdout
+    assert not any(
+        (byte < 0x20 and byte != 0x0A) or 0x7F <= byte <= 0x9F
+        for byte in result.stdout
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "availability", "probe_performed", "expected_exit"),
     [
