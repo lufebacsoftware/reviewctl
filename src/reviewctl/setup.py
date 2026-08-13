@@ -15,20 +15,22 @@ from reviewctl.backends import BackendDescriptor, BackendRegistry, DiscoveryKind
 _MAX_OUTPUT_LENGTH = 500
 _WINDOWS_EXECUTABLE_EXTENSIONS = (".COM", ".EXE", ".BAT", ".CMD")
 _SENSITIVE_LABEL = (
-    r"(?:authorization|credentials?|tokens?|api[-_]?keys?|client[-_]?secret|"
-    r"password|passwd|private[-_]?key|[a-z0-9_-]*secrets?)"
+    r"(?:access[-_]token|auth[-_]token|refresh[-_]token|id[-_]token|"
+    r"secret[-_]access[-_]key|access[-_]key[-_]id|client[-_]secret|"
+    r"api[-_]key|private[-_]key|password|passwd|authorization|credentials?|"
+    r"tokens?|secrets?|(?:[a-z0-9]+[-_])+secrets?)"
 )
+_DELIMITED_SENSITIVE_LABEL = rf"(?<![a-z0-9_-]){_SENSITIVE_LABEL}(?![a-z0-9_-])"
 _URI_USERINFO = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _BEARER_CREDENTIAL = re.compile(r"(?i)(\bbearer)(\s+)[^\s,;\"']+")
+_RECOGNIZABLE_SK_KEY = re.compile(
+    r"(?<![a-zA-Z0-9_-])(sk-)[a-zA-Z0-9_-]{16,}(?![a-zA-Z0-9_-])"
+)
 _QUOTED_SENSITIVE_VALUE = re.compile(
     rf'(?i)("\b{_SENSITIVE_LABEL}\b"\s*:\s*)"(?:\\.|[^"\\])*"'
 )
 _SENSITIVE_VALUE = re.compile(
-    rf"(?im)(\b{_SENSITIVE_LABEL}\b)(\s*[:=]\s*)[^\r\n]*"
-)
-_SENSITIVE_ENV_VALUE = re.compile(
-    r"(?im)(\b[A-Z][A-Z0-9_]*(?:AUTHORIZATION|CREDENTIALS?|TOKENS?|API_KEY|"
-    r"CLIENT_SECRET|PASSWORD|PASSWD|PRIVATE_KEY|SECRETS?)[A-Z0-9_]*)(\s*=\s*)[^\r\n]*"
+    rf"(?im)({_DELIMITED_SENSITIVE_LABEL})(\s*[:=]\s*)[^\r\n]*"
 )
 
 ExecutableLookup = Callable[[str, str | None], str | None]
@@ -59,10 +61,10 @@ class LocalExecutionTopology:
 
 def _bounded_output(value: str) -> str:
     redacted = _URI_USERINFO.sub(r"\1[REDACTED]@", value)
-    redacted = _SENSITIVE_ENV_VALUE.sub(r"\1\2[REDACTED]", redacted)
     redacted = _QUOTED_SENSITIVE_VALUE.sub(r'\1"[REDACTED]"', redacted)
     redacted = _BEARER_CREDENTIAL.sub(r"\1\2[REDACTED]", redacted)
     redacted = _SENSITIVE_VALUE.sub(r"\1\2[REDACTED]", redacted)
+    redacted = _RECOGNIZABLE_SK_KEY.sub(r"\1[REDACTED]", redacted)
     return redacted[:_MAX_OUTPUT_LENGTH]
 
 

@@ -872,3 +872,115 @@ def test_discovery_does_not_redact_unstructured_secret_prose_or_safe_neighbors()
     assert installation.resolved_executable == "/safe/bin/tool"
     assert installation.version == safe_version
     assert installation.diagnostics == ("safe diagnostic",)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "access_token",
+        "auth-token",
+        "refresh_token",
+        "id-token",
+        "secret_access_key",
+        "access-key-id",
+        "client_secret",
+        "api-key",
+        "private_key",
+        "password",
+        "passwd",
+        "authorization",
+        "credential",
+        "credentials",
+        "token",
+        "tokens",
+        "secret",
+        "secrets",
+        "ACCESS_TOKEN",
+        "SECRET_ACCESS_KEY",
+        "API_KEY",
+    ],
+)
+def test_discovery_redacts_exact_separator_delimited_credential_labels(label: str) -> None:
+    secret = f"{label}-credential-must-not-survive"
+    version = json.dumps({label: secret, "version": "tool 6.0"})
+    diagnostic = f"{label}={secret}\nsafe diagnostic"
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (version, diagnostic),
+    )
+
+    assert secret not in repr(asdict(installation))
+    assert installation.resolved_executable == "/safe/bin/tool"
+    assert installation.version is not None
+    assert '"version": "tool 6.0"' in installation.version
+    assert '"[REDACTED]"' in installation.version
+    assert installation.diagnostics == (f"{label}=[REDACTED]\nsafe diagnostic",)
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["notasecret", "my_tokenization", "secretariat", "tokenizer", "api_keyboard"],
+)
+def test_discovery_preserves_benign_substring_labels(label: str) -> None:
+    safe_value = f"{label}-ordinary-value"
+    version = json.dumps({label: safe_value, "version": "tool 6.1"})
+    diagnostic = f"{label}={safe_value}"
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (version, diagnostic),
+    )
+
+    assert installation.version == version
+    assert installation.diagnostics == (diagnostic,)
+    assert safe_value in repr(asdict(installation))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "sk-1234567890abcdef",
+        "sk-abc_DEF-1234567890",
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    ],
+)
+def test_discovery_redacts_recognizable_sk_keys(key: str) -> None:
+    version = f"tool 7.0 key={key} safe=visible" + "x" * 600
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (version, None),
+    )
+
+    assert key not in repr(asdict(installation))
+    assert installation.version is not None
+    assert installation.version.startswith("tool 7.0 key=sk-[REDACTED] safe=visible")
+    assert len(installation.version) <= 500
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "tool 7.1 key=sk-short safe=visible",
+        "tool 7.1 ordinary-sk-1234567890abcdef-word safe=visible",
+        "tool 7.1 well-known-hyphenated-words safe=visible",
+    ],
+)
+def test_discovery_preserves_short_or_embedded_sk_and_ordinary_hyphen_words(
+    safe_text: str,
+) -> None:
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (safe_text, None),
+    )
+
+    assert installation.version == safe_text
