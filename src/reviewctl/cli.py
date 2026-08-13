@@ -59,6 +59,7 @@ from reviewctl.review_flow import (
     consolidate,
     promote_fragments,
     render_completion_prompt,
+    validate_v2_receipt,
 )
 from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discover_topology
 
@@ -258,9 +259,11 @@ def codex_schema(schema: dict[str, object]) -> dict[str, object]:
 def response_schema(contract: str, *, codex: bool = False) -> dict[str, object] | None:
     """Return the strict JSON schema for one supported response contract."""
     if contract == "findings-json":
-        return get_contract(contract).prepare(
-            ContractContext(review_declaration_required=codex)
-        ).schema
+        return (
+            get_contract(contract)
+            .prepare(ContractContext(review_declaration_required=codex))
+            .schema
+        )
     schema = {
         "product-review-json": PRODUCT_REVIEW_SCHEMA,
         "product-judge-json": PRODUCT_JUDGE_SCHEMA,
@@ -466,9 +469,7 @@ def load_transport_defaults(
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             parser.error(f"defaults.{transport}.{key} must be a positive integer")
         if maximum is not None and value > maximum:
-            parser.error(
-                f"defaults.{transport}.{key} must be from {minimum} to {maximum}"
-            )
+            parser.error(f"defaults.{transport}.{key} must be from {minimum} to {maximum}")
         settings[key] = value
     return settings, {
         "path": str(config_path),
@@ -645,8 +646,8 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "exploration. Use `reviewctl run` for a bounded formal review.\n\n"
         "## Exploration\n\n"
         "```bash\n"
-        "reviewctl explore start --id ID --model MODEL --cwd PATH --prompt \"QUESTION\"\n"
-        "reviewctl explore resume --id ID --prompt \"NEXT QUESTION\"\n"
+        'reviewctl explore start --id ID --model MODEL --cwd PATH --prompt "QUESTION"\n'
+        'reviewctl explore resume --id ID --prompt "NEXT QUESTION"\n'
         "reviewctl explore show --id ID\n"
         "reviewctl explore promote --id ID --output PATH\n"
         "```\n\n"
@@ -754,8 +755,10 @@ def run_setup(args: argparse.Namespace) -> int:
     print_setup_topology(selected_topology, args.format)
     if args.setup_command != "check":
         return 0
-    checked = selected if selected_names else tuple(
-        backend for backend in selected if backend.availability != "not-applicable"
+    checked = (
+        selected
+        if selected_names
+        else tuple(backend for backend in selected if backend.availability != "not-applicable")
     )
     return 0 if all(backend.availability == "available" for backend in checked) else 1
 
@@ -1570,9 +1573,11 @@ def openrouter_packet(
         f"--- BEGIN {file.name} ---\n{file.read_text()}\n--- END {file.name} ---" for file in files
     )
     if response_contract == "findings-json":
-        contract = get_contract(response_contract).prepare(
-            ContractContext(file_names=tuple(file.name for file in files))
-        ).output_instructions
+        contract = (
+            get_contract(response_contract)
+            .prepare(ContractContext(file_names=tuple(file.name for file in files)))
+            .output_instructions
+        )
     elif response_contract == "product-review-json":
         contract = (
             "Return only JSON matching the supplied product-design schema. Address every stated "
@@ -2065,9 +2070,7 @@ def invoke_pi(
         diagnostic_path.write_text(
             redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
         )
-    persisted = pi_persisted_response(
-        stdout, model, round((time.monotonic() - started) * 1000)
-    )
+    persisted = pi_persisted_response(stdout, model, round((time.monotonic() - started) * 1000))
     if not persisted.response:
         return (
             process.returncode,
@@ -2182,9 +2185,7 @@ def invoke_pi_exploration(
         process.returncode,
         stderr.decode(errors="replace"),
         stderr.decode(errors="replace"),
-        pi_persisted_response(
-            stdout, model, round((time.monotonic() - started) * 1000)
-        ),
+        pi_persisted_response(stdout, model, round((time.monotonic() - started) * 1000)),
     )
 
 
@@ -2251,9 +2252,7 @@ def run_exploration_turn(
                 fail(parser, "exploration manifest has no model; pass --model")
             cwd_value = args.cwd or manifest.get("cwd")
             cwd = (
-                Path(cwd_value).expanduser().resolve()
-                if isinstance(cwd_value, str)
-                else Path.cwd()
+                Path(cwd_value).expanduser().resolve() if isinstance(cwd_value, str) else Path.cwd()
             )
             if not cwd.is_dir():
                 fail(parser, f"exploration cwd does not exist: {cwd}")
@@ -2440,9 +2439,7 @@ def invoke_codex(
     output_path = temporary_root / "codex-response.md"
     schema_path: Path | None = None
     sandbox_arguments = (
-        ["--dangerously-bypass-approvals-and-sandbox"]
-        if isolation
-        else ["--sandbox", "read-only"]
+        ["--dangerously-bypass-approvals-and-sandbox"] if isolation else ["--sandbox", "read-only"]
     )
     command = [
         codex_bin,
@@ -2478,9 +2475,13 @@ def invoke_codex(
 
     started = time.monotonic()
     timed_out = False
-    process_environment = isolation.environment if isolation else codex_process_environment(
-        os.environ,
-        {"HOME": os.environ.get("HOME") or str(account_home())},
+    process_environment = (
+        isolation.environment
+        if isolation
+        else codex_process_environment(
+            os.environ,
+            {"HOME": os.environ.get("HOME") or str(account_home())},
+        )
     )
     try:
         process = subprocess.Popen(
@@ -3049,9 +3050,7 @@ def review_validation_error(
     return f"{contract}: response does not satisfy the required schema"
 
 
-def findings_validation_error(
-    response: str, evaluation: ContractEvaluation
-) -> str | None:
+def findings_validation_error(response: str, evaluation: ContractEvaluation) -> str | None:
     """Render one native findings evaluation using the stable CLI diagnostics."""
     if not evaluation.violations:
         return None
@@ -3069,10 +3068,7 @@ def findings_validation_error(
         verdict = value.get("verdict")
         if not isinstance(verdict, str):
             return "findings-json: verdict must be a string"
-        return (
-            f"findings-json: invalid verdict {verdict!r}; "
-            "expected approved or changes-requested"
-        )
+        return f"findings-json: invalid verdict {verdict!r}; expected approved or changes-requested"
     return "findings-json: findings do not satisfy the required schema or verdict invariant"
 
 
@@ -3391,11 +3387,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 else gate_result
             )
             newly_promoted: tuple[PromotedFragment, ...] = ()
-            if (
-                native_contract
-                and contract_evaluation is not None
-                and raw_response is not None
-            ):
+            if native_contract and contract_evaluation is not None and raw_response is not None:
                 newly_promoted = promote_fragments(
                     contract_evaluation,
                     gate_result=gate_result,
@@ -3408,6 +3400,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     completion_request = contract_evaluation.completion_request
 
             attempt = {
+                "number": number,
+                "routeIndex": route_index,
                 "database": str(database) if database else None,
                 "evidence": {
                     "request": (
@@ -3507,9 +3501,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                             "invalidFragmentIndexes": list(
                                 contract_evaluation.completion_request.invalid_fragment_indexes
                             ),
-                            "violations": list(
-                                contract_evaluation.completion_request.violations
-                            ),
+                            "violations": list(contract_evaluation.completion_request.violations),
                         }
                         if contract_evaluation.completion_request is not None
                         else None
@@ -3558,6 +3550,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         }
 
     receipt: dict[str, Any] = {
+        "receiptSchemaVersion": 2,
         "acceptedAttempt": accepted_attempt,
         "attempts": attempts,
         "createdAt": utc_now(),
@@ -3665,9 +3658,32 @@ def valid_receipt(receipt: dict[str, Any]) -> bool:
 
 def verify_receipt(args: argparse.Namespace) -> int:
     receipt_path = Path(args.receipt)
-    receipt = json.loads(receipt_path.read_text())
-    valid = isinstance(receipt, dict) and valid_receipt(receipt)
-    print(json.dumps({"receipt": str(receipt_path), "valid": valid}, sort_keys=True))
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        violations = ("json-receipt",)
+    else:
+        if not isinstance(receipt, dict):
+            violations = ("receipt-object",)
+        elif "receiptSchemaVersion" not in receipt:
+            violations = () if valid_receipt(receipt) else ("receipt-digest",)
+        elif receipt.get("receiptSchemaVersion") == 2 and not isinstance(
+            receipt.get("receiptSchemaVersion"), bool
+        ):
+            violations = validate_v2_receipt(receipt)
+        else:
+            violations = ("receipt-schema-version",)
+    valid = not violations
+    print(
+        json.dumps(
+            {
+                "receipt": str(receipt_path),
+                "valid": valid,
+                "violations": list(violations),
+            },
+            sort_keys=True,
+        )
+    )
     return 0 if valid else 1
 
 

@@ -380,9 +380,7 @@ def review_arguments(tmp_path: Path, *models: str) -> list[str]:
 
 
 def test_transport_return_annotations_match_runtime_tuple_shapes() -> None:
-    assert cli.invoke_openrouter.__annotations__["return"] == (
-        "tuple[int, str, PersistedResponse]"
-    )
+    assert cli.invoke_openrouter.__annotations__["return"] == ("tuple[int, str, PersistedResponse]")
     assert cli.invoke_pi_exploration.__annotations__["return"] == (
         "tuple[int, str, str, PersistedResponse]"
     )
@@ -403,9 +401,7 @@ def test_run_dispatches_frozen_packet_through_registered_backend(
         return cli.BackendExecution(
             0,
             "",
-            cli.PersistedResponse(
-                "fake-turn", None, 1, 10, "accepted", 2, None, response_json
-            ),
+            cli.PersistedResponse("fake-turn", None, 1, 10, "accepted", 2, None, response_json),
             cli.BackendEvidence(response=evidence_path),
         )
 
@@ -467,9 +463,7 @@ def test_run_rejects_raw_response_evidence_collision_without_overwriting_adapter
         return cli.BackendExecution(
             0,
             "",
-            cli.PersistedResponse(
-                "conversation", None, 1, 10, "accepted", 2, None, response_json
-            ),
+            cli.PersistedResponse("conversation", None, 1, 10, "accepted", 2, None, response_json),
             cli.BackendEvidence(response=collision_path),
         )
 
@@ -663,9 +657,7 @@ def test_partial_findings_complete_with_typed_same_route_retry(
     assert "<reviewctl-completion-context>" in second_prompt
     assert finding["title"] in second_prompt
     assert receipt["prompt"]["packetSha256"] == cli.sha256_bytes(first_prompt.encode())
-    assert receipt["attempts"][0]["attemptRequestSha256"] == cli.sha256_bytes(
-        first_prompt.encode()
-    )
+    assert receipt["attempts"][0]["attemptRequestSha256"] == cli.sha256_bytes(first_prompt.encode())
     assert receipt["attempts"][1]["attemptRequestSha256"] == cli.sha256_bytes(
         second_prompt.encode()
     )
@@ -676,9 +668,9 @@ def test_partial_findings_complete_with_typed_same_route_retry(
     ]
     first_evaluation = receipt["attempts"][0]["contractEvaluation"]
     assert first_evaluation["status"] == "incomplete"
-    assert first_evaluation["completionRequest"]["packetDigest"] == receipt["prompt"][
-        "packetSha256"
-    ]
+    assert (
+        first_evaluation["completionRequest"]["packetDigest"] == receipt["prompt"]["packetSha256"]
+    )
     promoted = receipt["attempts"][0]["promotedFragments"]
     assert len(promoted) == 1
     assert receipt["fallbackRelationships"] == [
@@ -697,6 +689,7 @@ def test_partial_findings_complete_with_typed_same_route_retry(
     assert receipt["consolidatedReview"]["approved"] is False
     assert receipt["consolidatedReview"]["acceptedAttempt"] == 2
     assert len(receipt["consolidatedReview"]["findings"]) == 1
+    assert cli.validate_v2_receipt(receipt) == ()
     log = Path(receipt["logging"]["path"]).read_text()
     assert '"event":"attempt_retry"' in log
     assert '"from_attempt":1' in log
@@ -730,13 +723,15 @@ def test_partial_then_invalid_preserves_only_consolidated_partial_evidence(
     assert len(requests) == 2
     assert receipt["result"] == "unavailable"
     assert receipt["acceptedAttempt"] is None
-    assert [
-        attempt["contractEvaluation"]["status"] for attempt in receipt["attempts"]
-    ] == ["incomplete", "invalid"]
+    assert [attempt["contractEvaluation"]["status"] for attempt in receipt["attempts"]] == [
+        "incomplete",
+        "invalid",
+    ]
     assert receipt["attempts"][1]["promotedFragments"] == []
     assert receipt["consolidatedReview"]["status"] == "unavailable"
     assert receipt["consolidatedReview"]["approved"] is False
     assert len(receipt["consolidatedReview"]["findings"]) == 1
+    assert cli.validate_v2_receipt(receipt) == ()
 
 
 def test_partial_findings_follow_the_actual_route_fallback(
@@ -814,6 +809,7 @@ def test_precontract_gates_never_invoke_native_or_legacy_evaluation(
 
         monkeypatch.setattr(cli, "get_contract", lambda _: ExplodingContract())
     else:
+
         def explode(*_: object, **__: object) -> object:
             raise AssertionError("legacy validation crossed a pre-gate")
 
@@ -997,9 +993,7 @@ def test_completion_prompt_uses_target_route_contract_context(
         return cli.BackendExecution(
             0,
             "",
-            cli.PersistedResponse(
-                "conversation", None, 1, 10, request.model, 2, None, response
-            ),
+            cli.PersistedResponse("conversation", None, 1, 10, request.model, 2, None, response),
             cli.BackendEvidence(),
         )
 
@@ -1023,9 +1017,7 @@ def test_completion_prompt_uses_target_route_contract_context(
     )
 
     assert namespace.handler(namespace) == 0
-    receipt = json.loads(
-        (Path(capsys.readouterr().out.strip()) / "receipt.json").read_text()
-    )
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
     assert len(captured) == 2
     first_prompt, target_prompt = (request.prompt for request in captured)
     encoded_context = target_prompt.split("<reviewctl-completion-context>\n", 1)[1].split(
@@ -1054,9 +1046,10 @@ def test_completion_prompt_uses_target_route_contract_context(
     assert partial not in target_prompt
     first_attempt = receipt["attempts"][0]
     assert first_attempt["contractEvaluation"]["preparedSha256"] == source_prepared.digest
-    assert first_attempt["promotedFragments"][0]["payloadDigest"] == first_attempt[
-        "rawResponse"
-    ]["sha256"]
+    assert (
+        first_attempt["promotedFragments"][0]["payloadDigest"]
+        == first_attempt["rawResponse"]["sha256"]
+    )
 
 
 def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(
@@ -1096,9 +1089,7 @@ def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(
         expected_routes[1],
         expected_routes[1],
     ]
-    assert [attempt["result"] for attempt in receipt["attempts"]] == [
-        "missing-response"
-    ] * 4
+    assert [attempt["result"] for attempt in receipt["attempts"]] == ["missing-response"] * 4
 
 
 def test_uses_a_separate_database_for_each_attempt_and_accepts_matching_model(
@@ -1239,9 +1230,9 @@ def test_pi_timeout_drains_diagnostics_emitted_during_termination(tmp_path: Path
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
     attempt = receipt["attempts"][0]
     assert attempt["result"] == "timeout"
-    assert "diagnostic emitted during termination" in Path(
-        attempt["evidence"]["stderr"]
-    ).read_text()
+    assert (
+        "diagnostic emitted during termination" in Path(attempt["evidence"]["stderr"]).read_text()
+    )
 
 
 def test_missing_pi_binary_does_not_claim_nonexistent_evidence(tmp_path: Path) -> None:
@@ -1308,18 +1299,28 @@ def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None
     assert cli.pi_resolved_model("google/gemini-2.5-flash", "google", "gemini-2.5-flash") == (
         "google/gemini-2.5-flash"
     )
-    assert cli.pi_resolved_model(
-        "openrouter/google/gemini-2.5-flash", "openrouter", "google/gemini-2.5-flash"
-    ) == "openrouter/google/gemini-2.5-flash"
-    assert cli.pi_resolved_model(
-        "openrouter/google/gemini-2.5-flash", "google", "gemini-2.5-flash"
-    ) == "google/gemini-2.5-flash"
-    assert cli.pi_resolved_model(
-        "openrouter/google/gemini-2.5-flash", None, "openrouter/google/gemini-2.5-flash"
-    ) == ""
-    assert cli.pi_resolved_model(
-        "openrouter/google/gemini-2.5-flash", "openrouter/google", "gemini-2.5-flash"
-    ) == ""
+    assert (
+        cli.pi_resolved_model(
+            "openrouter/google/gemini-2.5-flash", "openrouter", "google/gemini-2.5-flash"
+        )
+        == "openrouter/google/gemini-2.5-flash"
+    )
+    assert (
+        cli.pi_resolved_model("openrouter/google/gemini-2.5-flash", "google", "gemini-2.5-flash")
+        == "google/gemini-2.5-flash"
+    )
+    assert (
+        cli.pi_resolved_model(
+            "openrouter/google/gemini-2.5-flash", None, "openrouter/google/gemini-2.5-flash"
+        )
+        == ""
+    )
+    assert (
+        cli.pi_resolved_model(
+            "openrouter/google/gemini-2.5-flash", "openrouter/google", "gemini-2.5-flash"
+        )
+        == ""
+    )
 
 
 def test_pi_transport_rejects_a_non_atomic_observed_provider(tmp_path: Path) -> None:
@@ -1418,9 +1419,10 @@ def test_pi_response_normalization_only_removes_one_json_fence() -> None:
         '{"verdict":"approved","findings":[]}'
     )
     assert cli.normalize_pi_response("```json\n[]\n```", "findings-json") == "```json\n[]\n```"
-    assert cli.normalize_pi_response(
-        '```json\n{"verdict":NaN}\n```', "findings-json"
-    ) == '```json\n{"verdict":NaN}\n```'
+    assert (
+        cli.normalize_pi_response('```json\n{"verdict":NaN}\n```', "findings-json")
+        == '```json\n{"verdict":NaN}\n```'
+    )
     assert cli.normalize_pi_response(fenced, "document") == fenced
 
 
@@ -1497,9 +1499,7 @@ def test_explore_resume_uses_the_same_pi_session_and_appends_a_turn(tmp_path: Pa
     session_root = exploration_root / "ledger-thread"
     manifest = json.loads((session_root / "manifest.json").read_text())
     assert manifest["turns"] == 2
-    assert (session_root / "turns" / "002" / "request.md").read_text() == (
-        "Continue the thread."
-    )
+    assert (session_root / "turns" / "002" / "request.md").read_text() == ("Continue the thread.")
     assert manifest["session"] == str(session_root / "session.jsonl")
 
 
@@ -1622,8 +1622,10 @@ def test_exploration_does_not_manufacture_transport_artifacts(
     assert metadata["status"] == "unavailable"
     assert expected_diagnostic in metadata["diagnostic"]
     manifest = json.loads((exploration_root / "unavailable-thread" / "manifest.json").read_text())
-    expected_session = None if environment.get("PI_BIN") == "missing" else str(
-        exploration_root / "unavailable-thread" / "session.jsonl"
+    expected_session = (
+        None
+        if environment.get("PI_BIN") == "missing"
+        else str(exploration_root / "unavailable-thread" / "session.jsonl")
     )
     assert manifest["session"] == expected_session
     assert not (turn / "events.jsonl").exists()
@@ -1910,8 +1912,7 @@ def test_setup_human_output_escapes_terminal_controls_without_changing_json(
         "  diagnostic: warning\\x1b]52;c;Y2xpcA==\\x07\\r\\nforged\\tline\\x00\\x80",
     ]
     assert not any(
-        (ord(character) < 32 and character != "\n")
-        or 0x7F <= ord(character) <= 0x9F
+        (ord(character) < 32 and character != "\n") or 0x7F <= ord(character) <= 0x9F
         for character in human_output
     )
 
@@ -1957,10 +1958,7 @@ def test_setup_human_subprocess_does_not_recreate_raw_environment_control_byte()
 
     assert result.returncode == 0, result.stderr
     assert b"missing-\\udc9b-tool" in result.stdout
-    assert not any(
-        (byte < 0x20 and byte != 0x0A) or 0x7F <= byte <= 0x9F
-        for byte in result.stdout
-    )
+    assert not any((byte < 0x20 and byte != 0x0A) or 0x7F <= byte <= 0x9F for byte in result.stdout)
 
 
 @pytest.mark.parametrize(
@@ -1984,9 +1982,10 @@ def test_setup_check_explicit_backend_exit_status(
         setup_installation(name, availability, probe_performed=probe_performed)
     )
 
-    assert invoke_setup(
-        monkeypatch, topology, "check", "--backend", name, "--format", "json"
-    ) == expected_exit
+    assert (
+        invoke_setup(monkeypatch, topology, "check", "--backend", name, "--format", "json")
+        == expected_exit
+    )
 
     payload = json.loads(capsys.readouterr().out)
     assert [backend["name"] for backend in payload["backends"]] == [name]
@@ -2021,17 +2020,20 @@ def test_setup_check_repeatable_selection_filters_output_and_checks_every_select
         setup_installation("pi", "available"),
     )
 
-    assert invoke_setup(
-        monkeypatch,
-        topology,
-        "check",
-        "--backend",
-        "agy",
-        "--backend",
-        "codex",
-        "--format",
-        "json",
-    ) == 1
+    assert (
+        invoke_setup(
+            monkeypatch,
+            topology,
+            "check",
+            "--backend",
+            "agy",
+            "--backend",
+            "codex",
+            "--format",
+            "json",
+        )
+        == 1
+    )
 
     payload = json.loads(capsys.readouterr().out)
     assert [backend["name"] for backend in payload["backends"]] == ["agy", "codex"]
@@ -2124,10 +2126,10 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
     config.write_text(
-        '[profiles.gemini]\n'
+        "[profiles.gemini]\n"
         'routes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n'
-        'timeout_seconds = 600\n'
-        'max_attempts = 2\n'
+        "timeout_seconds = 600\n"
+        "max_attempts = 2\n"
     )
 
     result = run_cli(
@@ -2166,10 +2168,7 @@ def test_route_profile_applies_execution_settings_when_cli_omits_them(tmp_path: 
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
     config.write_text(
-        '[profiles.code]\n'
-        'routes = ["llm:accepted"]\n'
-        'timeout_seconds = 600\n'
-        'max_attempts = 2\n'
+        '[profiles.code]\nroutes = ["llm:accepted"]\ntimeout_seconds = 600\nmax_attempts = 2\n'
     )
     arguments = review_arguments(tmp_path)
     arguments.remove("--timeout-seconds")
@@ -2195,11 +2194,7 @@ def test_route_profile_applies_execution_settings_when_cli_omits_them(tmp_path: 
 def test_direct_transport_applies_configured_transport_defaults(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
-    config.write_text(
-        '[defaults.llm]\n'
-        'timeout_seconds = 600\n'
-        'max_attempts = 2\n'
-    )
+    config.write_text("[defaults.llm]\ntimeout_seconds = 600\nmax_attempts = 2\n")
     arguments = review_arguments(tmp_path, "accepted")
     arguments.remove("--timeout-seconds")
     arguments.remove("5")
@@ -2225,12 +2220,12 @@ def test_mixed_routes_do_not_apply_the_first_transports_defaults(tmp_path: Path)
     fake_pi = write_fake_pi(tmp_path)
     config = tmp_path / "reviewctl.toml"
     config.write_text(
-        '[profiles.mixed]\n'
+        "[profiles.mixed]\n"
         'routes = ["agy:gemini-3.6-flash-high", "pi:openrouter/accepted"]\n'
-        '[defaults.agy]\n'
-        'timeout_seconds = 111\n'
-        '[defaults.pi]\n'
-        'timeout_seconds = 222\n'
+        "[defaults.agy]\n"
+        "timeout_seconds = 111\n"
+        "[defaults.pi]\n"
+        "timeout_seconds = 222\n"
     )
     arguments = review_arguments(tmp_path)
     arguments.remove("--timeout-seconds")
@@ -2303,15 +2298,11 @@ def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) ->
         ("[profiles.empty]\n", "empty"),
         ('[profiles.invalid]\nroutes = ["bad-route"]\n', "invalid"),
         (
-            '[profiles.invalid-timeout]\n'
-            'routes = ["llm:accepted"]\n'
-            'timeout_seconds = 0\n',
+            '[profiles.invalid-timeout]\nroutes = ["llm:accepted"]\ntimeout_seconds = 0\n',
             "invalid-timeout",
         ),
         (
-            '[profiles.invalid-attempts]\n'
-            'routes = ["llm:accepted"]\n'
-            'max_attempts = 4\n',
+            '[profiles.invalid-attempts]\nroutes = ["llm:accepted"]\nmax_attempts = 4\n',
             "invalid-attempts",
         ),
     ],
@@ -2911,8 +2902,42 @@ def test_usage_synthetic_prompt_only_product_review(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["receiptSchemaVersion"] == 2
+    assert receipt["attempts"][0]["number"] == 1
     assert receipt["review"] == payload
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout) == {
+        "receipt": str(receipt_path),
+        "valid": True,
+        "violations": [],
+    }
+
+
+@pytest.mark.parametrize("contract", ["document", "product-review-json"])
+def test_generated_unavailable_non_findings_v2_receipt_verifies(
+    tmp_path: Path, contract: str
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path, "missing"),
+        "--response-contract",
+        contract,
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert result.returncode == 1
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["receiptSchemaVersion"] == 2
+    assert receipt["result"] == "unavailable"
+    assert receipt["acceptedAttempt"] is None
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["violations"] == []
     assert "findings" not in receipt
 
 
@@ -4043,9 +4068,7 @@ def test_findings_contract_accepts_unique_snapshot_basename_from_sandbox_path() 
 
 
 def test_legacy_product_read_proof_rejects_arbitrary_relative_paths() -> None:
-    assert not cli.validate_read_proof(
-        {"reviewedFiles": ["../source.py"]}, {"source.py": "a" * 64}
-    )
+    assert not cli.validate_read_proof({"reviewedFiles": ["../source.py"]}, {"source.py": "a" * 64})
 
 
 @pytest.mark.parametrize(
@@ -5241,7 +5264,9 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     receipt = json.loads(receipt_path.read_text())
     attempt = receipt["attempts"][0]
     evaluation = attempt["contractEvaluation"]
-    assert "receiptSchemaVersion" not in receipt
+    assert receipt["receiptSchemaVersion"] == 2
+    assert attempt["number"] == 1
+    assert attempt["routeIndex"] == 0
     assert receipt["fallbackRelationships"] == []
     assert receipt["consolidatedReview"]["status"] == "accepted"
     assert receipt["acceptedAttempt"] == 1
@@ -5292,6 +5317,8 @@ def test_invalid_json_findings_receipt_retains_rejected_contract_evaluation(
     receipt = json.loads(receipt_path.read_text())
     attempt = receipt["attempts"][0]
     evaluation = attempt["contractEvaluation"]
+    assert receipt["receiptSchemaVersion"] == 2
+    assert attempt["number"] == 1
     assert receipt["result"] == "unavailable"
     assert receipt["acceptedAttempt"] is None
     assert attempt["result"] == "incomplete"
@@ -5300,6 +5327,30 @@ def test_invalid_json_findings_receipt_retains_rejected_contract_evaluation(
     verified = run_cli("verify", str(receipt_path))
     assert verified.returncode == 0, verified.stderr
     assert json.loads(verified.stdout)["valid"] is True
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected_violation"),
+    [
+        ("{", "json-receipt"),
+        ("[]", "receipt-object"),
+        ('{"receiptSchemaVersion":3}', "receipt-schema-version"),
+        ('{"receiptSchemaVersion":2,"attempts":[null,true]}', "attempts"),
+    ],
+)
+def test_verify_reports_malformed_and_hostile_receipts_without_traceback(
+    tmp_path: Path, contents: str, expected_violation: str
+) -> None:
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(contents)
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert "Traceback" not in verified.stderr
+    result = json.loads(verified.stdout)
+    assert result["valid"] is False
+    assert expected_violation in result["violations"]
 
 
 def test_policy_check_and_tournament_complete_when_under_budget(tmp_path: Path) -> None:
@@ -6649,9 +6700,7 @@ def test_invoke_openrouter_limits_gemini_36_flash_reasoning_for_fallback(
 
     assert exit_code == 0
     assert response.response == "hola desde OpenRouter"
-    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == {
-        "effort": "minimal"
-    }
+    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == {"effort": "minimal"}
 
 
 def test_invoke_openrouter_requires_an_api_key(tmp_path: Path) -> None:

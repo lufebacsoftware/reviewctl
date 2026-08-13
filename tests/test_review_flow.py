@@ -1,3 +1,4 @@
+import hashlib
 import json
 from copy import copy, deepcopy
 from dataclasses import replace
@@ -18,6 +19,7 @@ from reviewctl.review_flow import (
     consolidate,
     promote_fragments,
     render_completion_prompt,
+    validate_v2_receipt,
 )
 
 
@@ -68,6 +70,114 @@ def promoted(*findings: dict[str, object], attempt: int = 1, route_index: int = 
     )
 
 
+def _evaluation_dict(evaluation) -> dict[str, object]:
+    return {
+        "name": evaluation.name,
+        "version": evaluation.version,
+        "preparedSha256": evaluation.prepared_digest,
+        "payloadSha256": evaluation.payload_digest,
+        "normalizedSha256": evaluation.normalized_digest,
+        "violations": list(evaluation.violations),
+        "status": evaluation.status.value,
+        "fragments": [
+            {
+                "fragmentId": fragment.fragment_id,
+                "fingerprint": fragment.fingerprint,
+                "kind": fragment.kind.value,
+                "value": dict(fragment.value),
+                "payloadDigest": fragment.payload_digest,
+                "scope": list(fragment.scope),
+            }
+            for fragment in evaluation.valid_fragments
+        ],
+        "coverage": None,
+        "completionRequest": None,
+    }
+
+
+def _sign_receipt(receipt: dict[str, object]) -> dict[str, object]:
+    receipt.pop("sha256", None)
+    receipt["sha256"] = hashlib.sha256(canonical_json(receipt)).hexdigest()
+    return receipt
+
+
+def v2_findings_receipt() -> dict[str, object]:
+    contract = get_contract("findings-json")
+    context = ContractContext()
+    prepared = contract.prepare(context)
+    partial_payload = json.dumps(
+        {"verdict": "changes-requested", "findings": [finding()], "extra": True}
+    )
+    complete_payload = json.dumps({"verdict": "approved", "findings": []})
+    partial = contract.evaluate(partial_payload, prepared, context)
+    complete = contract.evaluate(complete_payload, prepared, context)
+    promoted_fragment = promote_fragments(
+        partial,
+        gate_result="contract-incomplete",
+        attempt=1,
+        route_index=0,
+        raw_response_digest=partial.payload_digest,
+    )[0]
+    receipt: dict[str, object] = {
+        "receiptSchemaVersion": 2,
+        "result": "accepted",
+        "acceptedAttempt": 2,
+        "reviewContract": "findings-json",
+        "contract": {"name": "findings-json", "version": "1"},
+        "routes": [
+            {"model": "first", "transport": "llm"},
+            {"model": "second", "transport": "codex"},
+        ],
+        "attempts": [
+            {
+                "number": 1,
+                "routeIndex": 0,
+                "route": {"model": "first", "transport": "llm"},
+                "result": "incomplete",
+                "rawResponse": {
+                    "path": "attempts/01/raw-response.txt",
+                    "sha256": partial.payload_digest,
+                    "characters": len(partial_payload),
+                },
+                "contractEvaluation": _evaluation_dict(partial),
+                "promotedFragments": [promoted_fragment.to_dict()],
+                "findings": [],
+            },
+            {
+                "number": 2,
+                "routeIndex": 1,
+                "route": {"model": "second", "transport": "codex"},
+                "result": "accepted",
+                "rawResponse": {
+                    "path": "attempts/02/raw-response.txt",
+                    "sha256": complete.payload_digest,
+                    "characters": len(complete_payload),
+                },
+                "contractEvaluation": _evaluation_dict(complete),
+                "promotedFragments": [],
+                "findings": [],
+            },
+        ],
+        "fallbackRelationships": [
+            {
+                "fromAttempt": 1,
+                "toAttempt": 2,
+                "kind": "route-fallback",
+                "reason": "contract-incomplete",
+                "promotedFragmentIds": [promoted_fragment.fragment_id],
+            }
+        ],
+        "verdict": "approved",
+        "findings": [],
+        "consolidatedReview": consolidate(
+            {"verdict": "approved", "findings": []},
+            (promoted_fragment,),
+            2,
+        ).to_dict(),
+    }
+    return _sign_receipt(receipt)
+
+
 @pytest.mark.parametrize(
     "gate_result",
     [
@@ -84,13 +194,16 @@ def promoted(*findings: dict[str, object], attempt: int = 1, route_index: int = 
 def test_promote_fragments_fails_closed_for_every_non_partial_gate(gate_result: str) -> None:
     evaluation = incomplete_evaluation(finding())
 
-    assert promote_fragments(
-        evaluation,
-        gate_result=gate_result,
-        attempt=1,
-        route_index=0,
-        raw_response_digest="raw-digest",
-    ) == ()
+    assert (
+        promote_fragments(
+            evaluation,
+            gate_result=gate_result,
+            attempt=1,
+            route_index=0,
+            raw_response_digest="raw-digest",
+        )
+        == ()
+    )
 
 
 def test_promote_fragments_records_attempt_provenance_only_for_contract_incomplete() -> None:
@@ -137,13 +250,16 @@ def test_contract_incomplete_gate_cannot_promote_complete_or_invalid_evaluation(
     encoded = json.dumps(payload) if isinstance(payload, dict) else payload
     evaluation = contract.evaluate(encoded, prepared, context)
 
-    assert promote_fragments(
-        evaluation,
-        gate_result="contract-incomplete",
-        attempt=1,
-        route_index=0,
-        raw_response_digest=evaluation.payload_digest,
-    ) == ()
+    assert (
+        promote_fragments(
+            evaluation,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
 
 
 @pytest.mark.parametrize("tamper", ["fingerprint", "fragment_id", "value", "scope", "payload"])
@@ -162,13 +278,16 @@ def test_promote_fragments_rejects_tampered_contract_fragment_identity(tamper: s
         fragment = replace(fragment, payload_digest="1" * 64)
     evaluation = replace(evaluation, valid_fragments=(fragment,))
 
-    assert promote_fragments(
-        evaluation,
-        gate_result="contract-incomplete",
-        attempt=1,
-        route_index=0,
-        raw_response_digest=evaluation.payload_digest,
-    ) == ()
+    assert (
+        promote_fragments(
+            evaluation,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
 
 
 @pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"])
@@ -182,25 +301,31 @@ def test_promote_fragments_fails_closed_for_isolated_unicode_surrogate(
         value={**fragment.value, "title": f"broken {surrogate}"},
     )
 
-    assert promote_fragments(
-        replace(evaluation, valid_fragments=(fragment,)),
-        gate_result="contract-incomplete",
-        attempt=1,
-        route_index=0,
-        raw_response_digest=evaluation.payload_digest,
-    ) == ()
+    assert (
+        promote_fragments(
+            replace(evaluation, valid_fragments=(fragment,)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
 
 
 def test_promote_fragments_requires_raw_response_to_match_evaluated_payload() -> None:
     evaluation = incomplete_evaluation(finding())
 
-    assert promote_fragments(
-        evaluation,
-        gate_result="contract-incomplete",
-        attempt=1,
-        route_index=0,
-        raw_response_digest="different-digest",
-    ) == ()
+    assert (
+        promote_fragments(
+            evaluation,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest="different-digest",
+        )
+        == ()
+    )
 
 
 @pytest.mark.parametrize(
@@ -219,25 +344,31 @@ def test_promote_fragments_rejects_invalid_finding_values(
     evaluation = incomplete_evaluation(finding())
     fragment = replace(evaluation.valid_fragments[0], value=invalid_finding)
 
-    assert promote_fragments(
-        replace(evaluation, valid_fragments=(fragment,)),
-        gate_result="contract-incomplete",
-        attempt=1,
-        route_index=0,
-        raw_response_digest=evaluation.payload_digest,
-    ) == ()
+    assert (
+        promote_fragments(
+            replace(evaluation, valid_fragments=(fragment,)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
 
 
 def test_promote_fragments_requires_completion_request_even_for_incomplete_status() -> None:
     evaluation = replace(incomplete_evaluation(finding()), completion_request=None)
 
-    assert promote_fragments(
-        evaluation,
-        gate_result="contract-incomplete",
-        attempt=1,
-        route_index=0,
-        raw_response_digest="raw-digest",
-    ) == ()
+    assert (
+        promote_fragments(
+            evaluation,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest="raw-digest",
+        )
+        == ()
+    )
 
 
 def test_build_completion_context_deduplicates_content_but_preserves_provenance() -> None:
@@ -299,13 +430,16 @@ def test_promote_fragments_rejects_invalid_provenance_coordinates(
 ) -> None:
     evaluation = incomplete_evaluation(finding())
 
-    assert promote_fragments(
-        evaluation,
-        gate_result="contract-incomplete",
-        attempt=attempt,  # type: ignore[arg-type]
-        route_index=route_index,  # type: ignore[arg-type]
-        raw_response_digest=evaluation.payload_digest,
-    ) == ()
+    assert (
+        promote_fragments(
+            evaluation,
+            gate_result="contract-incomplete",
+            attempt=attempt,  # type: ignore[arg-type]
+            route_index=route_index,  # type: ignore[arg-type]
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
 
 
 def test_completion_context_orders_unique_content_by_first_canonical_source() -> None:
@@ -562,9 +696,7 @@ def test_consolidate_validates_mixed_untrusted_fragments_before_sorting() -> Non
 
 
 def test_consolidate_rejects_an_impossible_accepted_verdict_finding_pair() -> None:
-    result = consolidate(
-        {"verdict": "approved", "findings": [finding()]}, (), accepted_attempt=2
-    )
+    result = consolidate({"verdict": "approved", "findings": [finding()]}, (), accepted_attempt=2)
 
     assert result.status == "unavailable"
     assert result.approved is False
@@ -583,9 +715,7 @@ def test_consolidate_fails_closed_for_invalid_accepted_finding() -> None:
 def test_consolidate_ignores_invalid_untrusted_promoted_object() -> None:
     fragment = replace(promoted(finding())[0], finding={"title": "partial"})
 
-    result = consolidate(
-        {"verdict": "approved", "findings": []}, (fragment,), accepted_attempt=2
-    )
+    result = consolidate({"verdict": "approved", "findings": []}, (fragment,), accepted_attempt=2)
 
     assert result.status == "accepted"
     assert result.findings == ()
@@ -616,10 +746,166 @@ def test_promote_fragments_rejects_non_finding_kind() -> None:
     evaluation = incomplete_evaluation(finding())
     fragment = replace(evaluation.valid_fragments[0], kind="other")  # type: ignore[arg-type]
 
-    assert promote_fragments(
-        replace(evaluation, valid_fragments=(fragment,)),
-        gate_result="contract-incomplete",
-        attempt=1,
-        route_index=0,
-        raw_response_digest=evaluation.payload_digest,
-    ) == ()
+    assert (
+        promote_fragments(
+            replace(evaluation, valid_fragments=(fragment,)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> None:
+    assert validate_v2_receipt(v2_findings_receipt()) == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "violation"),
+    [
+        ("digest", "receipt-digest"),
+        ("schema", "receipt-schema-version"),
+        ("attempt-number", "attempt-numbering"),
+        ("accepted-reference", "accepted-attempt"),
+        ("accepted-result", "accepted-attempt"),
+        ("accepted-status", "accepted-attempt"),
+        ("duplicate-accepted", "accepted-attempt"),
+        ("partial-status-complete", "contract-evaluation"),
+        ("unavailable-accepted", "result"),
+        ("relationship-order", "fallback-relationships"),
+        ("relationship-reference", "fallback-relationships"),
+        ("relationship-kind", "fallback-relationships"),
+        ("relationship-fragment", "fallback-relationships"),
+        ("contract-fragment-id", "contract-fragments"),
+        ("contract-fingerprint", "contract-fragments"),
+        ("contract-payload", "contract-fragments"),
+        ("promoted-id", "promoted-fragments"),
+        ("promoted-fingerprint", "promoted-fragments"),
+        ("promoted-payload", "promoted-fragments"),
+        ("promoted-source", "promoted-fragments"),
+        ("promoted-route", "promoted-fragments"),
+        ("promoted-raw", "promoted-fragments"),
+        ("raw-path", "raw-response"),
+        ("raw-digest", "raw-response"),
+        ("raw-characters", "raw-response"),
+        ("consolidation", "consolidated-review"),
+    ],
+)
+def test_validate_v2_receipt_detects_rehashed_structural_mutations(
+    mutation: str, violation: str
+) -> None:
+    receipt = deepcopy(v2_findings_receipt())
+    attempts = receipt["attempts"]
+    first = attempts[0]
+    second = attempts[1]
+    if mutation == "digest":
+        receipt["sha256"] = "0" * 64
+    elif mutation == "schema":
+        receipt["receiptSchemaVersion"] = 3
+    elif mutation == "attempt-number":
+        second["number"] = 1
+    elif mutation == "accepted-reference":
+        receipt["acceptedAttempt"] = 3
+    elif mutation == "accepted-result":
+        second["result"] = "incomplete"
+    elif mutation == "accepted-status":
+        second["contractEvaluation"]["status"] = "incomplete"
+    elif mutation == "duplicate-accepted":
+        first["result"] = "accepted"
+    elif mutation == "partial-status-complete":
+        first["contractEvaluation"]["status"] = "complete"
+    elif mutation == "unavailable-accepted":
+        receipt["result"] = "unavailable"
+    elif mutation == "relationship-order":
+        receipt["fallbackRelationships"][0]["fromAttempt"] = 2
+    elif mutation == "relationship-reference":
+        receipt["fallbackRelationships"][0]["toAttempt"] = 9
+    elif mutation == "relationship-kind":
+        receipt["fallbackRelationships"][0]["kind"] = "redirect"
+    elif mutation == "relationship-fragment":
+        receipt["fallbackRelationships"][0]["promotedFragmentIds"] = ["0" * 64]
+    elif mutation == "contract-fragment-id":
+        first["contractEvaluation"]["fragments"][0]["fragmentId"] = "0" * 64
+    elif mutation == "contract-fingerprint":
+        first["contractEvaluation"]["fragments"][0]["fingerprint"] = "0" * 64
+    elif mutation == "contract-payload":
+        first["contractEvaluation"]["fragments"][0]["payloadDigest"] = "0" * 64
+    elif mutation == "promoted-id":
+        first["promotedFragments"][0]["fragmentId"] = "0" * 64
+    elif mutation == "promoted-fingerprint":
+        first["promotedFragments"][0]["fingerprint"] = "0" * 64
+    elif mutation == "promoted-payload":
+        first["promotedFragments"][0]["payloadDigest"] = "0" * 64
+    elif mutation == "promoted-source":
+        first["promotedFragments"][0]["sourceAttempt"] = 2
+    elif mutation == "promoted-route":
+        first["promotedFragments"][0]["routeIndex"] = 1
+    elif mutation == "promoted-raw":
+        first["promotedFragments"][0]["rawResponseDigest"] = "0" * 64
+    elif mutation == "raw-path":
+        first["rawResponse"]["path"] = 7
+    elif mutation == "raw-digest":
+        first["rawResponse"]["sha256"] = "A" * 64
+    elif mutation == "raw-characters":
+        first["rawResponse"]["characters"] = True
+    else:
+        receipt["consolidatedReview"]["approved"] = True
+    if mutation != "digest":
+        _sign_receipt(receipt)
+
+    assert violation in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        None,
+        [],
+        {"receiptSchemaVersion": 2, "attempts": [None, {"number": []}]},
+        {"receiptSchemaVersion": 2, "sha256": "\ud800", "attempts": "hostile"},
+        {"receiptSchemaVersion": True, "attempts": [True]},
+    ],
+)
+def test_validate_v2_receipt_never_raises_for_hostile_host_values(hostile: object) -> None:
+    violations = validate_v2_receipt(hostile)  # type: ignore[arg-type]
+
+    assert isinstance(violations, tuple)
+    assert violations
+
+
+def test_validate_v2_receipt_rejects_unhashable_relationship_ids_without_raising() -> None:
+    receipt = v2_findings_receipt()
+    receipt["fallbackRelationships"][0]["promotedFragmentIds"] = [[], 7]
+    _sign_receipt(receipt)
+
+    assert "fallback-relationships" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_allows_non_findings_without_native_contract_data() -> None:
+    receipt = _sign_receipt(
+        {
+            "receiptSchemaVersion": 2,
+            "reviewContract": "document",
+            "result": "accepted",
+            "acceptedAttempt": 1,
+            "routes": [{"model": "writer", "transport": "llm"}],
+            "attempts": [
+                {
+                    "number": 1,
+                    "routeIndex": 0,
+                    "route": {"model": "writer", "transport": "llm"},
+                    "result": "accepted",
+                    "rawResponse": {
+                        "path": "attempts/01/raw-response.txt",
+                        "sha256": "a" * 64,
+                        "characters": 30,
+                    },
+                    "promotedFragments": [],
+                }
+            ],
+        }
+    )
+
+    assert validate_v2_receipt(receipt) == ()
