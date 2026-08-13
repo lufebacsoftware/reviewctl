@@ -1472,10 +1472,16 @@ def invoke_openrouter(
             {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
         ],
     }
-    # These reasoning models can consume the whole fallback budget without
-    # emitting a final answer. Keep formal review responses responsive.
-    if model in {"google/gemini-3.6-flash", "z-ai/glm-5.2"}:
+    # Gemini 3.6 Flash accepts effort levels, while GLM 5.2 exposes an
+    # explicit reasoning-token budget. Keep formal review responses
+    # responsive instead of allowing reasoning to consume the whole cap.
+    if model == "google/gemini-3.6-flash":
         payload["reasoning"] = {"effort": "minimal"}
+    elif model == "z-ai/glm-5.2":
+        if max_output_tokens >= 2048:
+            payload["reasoning"] = {"max_tokens": min(2048, max_output_tokens // 2)}
+        else:
+            payload["reasoning"] = {"effort": "minimal"}
     if schema := response_schema(response_contract):
         payload["response_format"] = {
             "type": "json_schema",

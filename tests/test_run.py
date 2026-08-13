@@ -5095,9 +5095,18 @@ def test_invoke_openrouter_persists_a_portable_structured_response(
     assert captured["timeout"] == 8
 
 
-@pytest.mark.parametrize("model", ["google/gemini-3.6-flash", "z-ai/glm-5.2"])
+@pytest.mark.parametrize(
+    ("model", "expected_reasoning"),
+    [
+        ("google/gemini-3.6-flash", {"effort": "minimal"}),
+        ("z-ai/glm-5.2", {"max_tokens": 2048}),
+    ],
+)
 def test_invoke_openrouter_requests_minimal_reasoning_for_reasoning_models(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model: str,
+    expected_reasoning: dict[str, object],
 ) -> None:
     source = tmp_path / "source.py"
     source.write_text("pass\n")
@@ -5116,7 +5125,7 @@ def test_invoke_openrouter_requests_minimal_reasoning_for_reasoning_models(
         prompt="Return JSON.",
         model=model,
         files=[source],
-        max_output_tokens=64,
+        max_output_tokens=12000,
         response_contract="findings-json",
         timeout_seconds=1,
         request_path=tmp_path / "request.json",
@@ -5124,9 +5133,7 @@ def test_invoke_openrouter_requests_minimal_reasoning_for_reasoning_models(
     )
 
     assert (exit_code, error) == (0, "")
-    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == {
-        "effort": "minimal"
-    }
+    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == expected_reasoning
 
 
 def test_invoke_openrouter_rejects_a_malformed_choice_shape(
