@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -66,8 +67,8 @@ def test_remote_api_discovery_does_not_inspect_credentials_or_call_local_probes(
     )
     secret = "credential-value-that-must-not-appear"
 
-    def unexpected_which(executable: str) -> str | None:
-        raise AssertionError(f"which called for {executable}")
+    def unexpected_which(executable: str, path: str | None) -> str | None:
+        raise AssertionError(f"which called for {executable} in {path}")
 
     def unexpected_probe(
         executable: str, environ: dict[str, str]
@@ -104,11 +105,11 @@ def test_remote_api_discovery_does_not_inspect_credentials_or_call_local_probes(
 def test_executable_discovery_resolves_override_or_default(
     environ: dict[str, str], expected_requested: str
 ) -> None:
-    which_calls: list[str] = []
+    which_calls: list[tuple[str, str | None]] = []
     probe_calls: list[tuple[str, dict[str, str]]] = []
 
-    def fake_which(executable: str) -> str | None:
-        which_calls.append(executable)
+    def fake_which(executable: str, path: str | None) -> str | None:
+        which_calls.append((executable, path))
         return f"/tools/{executable}"
 
     def fake_probe(
@@ -134,7 +135,7 @@ def test_executable_discovery_resolves_override_or_default(
         (),
         True,
     )
-    assert which_calls == [expected_requested]
+    assert which_calls == [(expected_requested, environ.get("PATH"))]
     assert probe_calls == [(f"/tools/{expected_requested}", {})]
 
 
@@ -151,7 +152,7 @@ def test_missing_executable_is_distinct_from_qualification_and_is_not_probed() -
     installation = discover_backend(
         descriptor("pi"),
         environ={},
-        which=lambda executable: None,
+        which=lambda executable, path: None,
         probe=fake_probe,
     )
 
@@ -178,7 +179,7 @@ def test_discovery_probe_receives_only_path_and_systemroot() -> None:
             "OPENAI_API_KEY": "must-not-reach-child",
             "AUTHORIZATION": "Bearer must-not-reach-child",
         },
-        which=lambda executable: "/safe/bin/agy",
+        which=lambda executable, path: "/safe/bin/agy",
         probe=fake_probe,
     )
 
@@ -205,6 +206,8 @@ def test_probe_version_uses_exact_safe_subprocess_options(monkeypatch: pytest.Mo
             {
                 "capture_output": True,
                 "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
                 "timeout": 5,
                 "check": False,
                 "env": {"PATH": "/safe/bin"},
@@ -230,7 +233,7 @@ def test_topology_is_stably_sorted_and_serializes_with_asdict() -> None:
     topology = discover_topology(
         registry,
         environ={},
-        which=lambda executable: f"/bin/{executable}",
+        which=lambda executable, path: f"/bin/{executable}",
         probe=lambda executable, environ: (f"{executable} 1.0", None),
     )
 
@@ -307,7 +310,9 @@ def test_topology_is_stably_sorted_and_serializes_with_asdict() -> None:
             "token: super-secret\n",
             "Authorization: Bearer also-secret\n" + "x" * 600,
             None,
-            "token: [REDACTED]\nAuthorization: [REDACTED]\n" + "x" * 456,
+            "version probe exited with status 2: "
+            "token: [REDACTED]\nAuthorization: [REDACTED]\n"
+            + "x" * 420,
         ),
     ],
 )
@@ -359,3 +364,171 @@ def test_probe_version_bounds_timeout_and_os_error_diagnostics(
     assert expected_text in diagnostic
     assert len(diagnostic) <= 500
     assert "super-secret" not in diagnostic
+
+
+def _write_executable(path: Path, body: str) -> Path:
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_discovery_uses_supplied_path_instead_of_ambient_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ambient_dir = tmp_path / "ambient"
+    supplied_dir = tmp_path / "supplied"
+    ambient_dir.mkdir()
+    supplied_dir.mkdir()
+    _write_executable(ambient_dir / "review-probe", "printf 'ambient 1.0\\n'")
+    supplied = _write_executable(supplied_dir / "review-probe", "printf 'supplied 2.0\\n'")
+    monkeypatch.setenv("PATH", str(ambient_dir))
+
+    installation = discover_backend(
+        descriptor("probe", default_executable="review-probe"),
+        environ={"PATH": str(supplied_dir)},
+    )
+
+    assert installation.resolved_executable == str(supplied)
+    assert installation.version == "supplied 2.0"
+
+
+def test_probe_version_real_child_receives_only_allowed_environment(tmp_path: Path) -> None:
+    executable = _write_executable(
+        tmp_path / "environment-probe",
+        "if [ -z \"$DISCOVERY_SECRET\" ]; then printf 'isolated 1.0\\n'; "
+        "else printf 'secret leaked\\n'; exit 9; fi",
+    )
+
+    result = probe_version(
+        str(executable),
+        {"PATH": "/usr/bin:/bin", "SYSTEMROOT": "safe", "DISCOVERY_SECRET": "do-not-leak"},
+    )
+
+    assert result == ("isolated 1.0", None)
+
+
+def test_probe_version_real_child_combines_stdout_stderr_and_nonzero_status(
+    tmp_path: Path,
+) -> None:
+    executable = _write_executable(
+        tmp_path / "failing-probe",
+        "printf 'stdout detail\\n'; printf 'stderr detail\\n' >&2; exit 7",
+    )
+
+    assert probe_version(str(executable), {}) == (
+        None,
+        "version probe exited with status 7: stdout detail\nstderr detail",
+    )
+
+
+def test_probe_version_replaces_invalid_utf8_from_real_child(tmp_path: Path) -> None:
+    executable = _write_executable(tmp_path / "invalid-output", "printf '\\377version 1.0\\n'")
+
+    version, diagnostic = probe_version(str(executable), {})
+
+    assert version == "�version 1.0"
+    assert diagnostic is None
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    [
+        (0, (None, "version probe produced no output")),
+        (4, (None, "version probe exited with status 4")),
+    ],
+)
+def test_probe_version_reports_empty_output_consistently(
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    expected: tuple[str | None, str | None],
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], returncode, "", ""),
+    )
+
+    assert probe_version("tool", {}) == expected
+
+
+def test_timeout_output_is_sanitized_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "timeout-secret-value"
+    error = subprocess.TimeoutExpired(
+        ["tool", "--version"],
+        5,
+        output=(f"CLIENT_SECRET={secret}\n" + "x" * 600).encode(),
+        stderr=b"PASSWORD=stderr-secret\n",
+    )
+
+    def raise_timeout(*args: object, **kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(subprocess, "run", raise_timeout)
+
+    version, diagnostic = probe_version("tool", {"PRIVATE_KEY": "child-secret"})
+
+    assert version is None
+    assert diagnostic is not None
+    assert diagnostic.startswith(
+        "version probe timed out after 5 seconds: CLIENT_SECRET=[REDACTED]"
+    )
+    assert len(diagnostic) == 500
+    assert secret not in diagnostic
+    assert "stderr-secret" not in diagnostic
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "CLIENT_SECRET",
+        "password",
+        "PASSWD",
+        "private_key",
+        "TOKEN",
+        "api-key",
+        "Authorization",
+    ],
+)
+def test_discovery_sanitizes_secret_shaped_requested_executable_and_diagnostic(
+    label: str,
+) -> None:
+    secret = "injected-secret-value"
+    requested = f"/safe/tool?{label}={secret}"
+    lookup_calls: list[tuple[str, str | None]] = []
+
+    def fake_which(executable: str, path: str | None) -> str | None:
+        lookup_calls.append((executable, path))
+        return None
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"TOOL_BIN": requested, "PATH": "/safe/bin"},
+        which=fake_which,
+    )
+
+    assert lookup_calls == [(requested, "/safe/bin")]
+    assert installation.requested_executable == f"/safe/tool?{label}=[REDACTED]"
+    assert installation.diagnostics == (
+        f"executable not found: /safe/tool?{label}=[REDACTED]",
+    )
+    assert secret not in repr(asdict(installation))
+
+
+def test_discovery_sanitizes_injected_probe_results_without_changing_safe_paths() -> None:
+    secret = "probe-secret-value"
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (
+            f"tool 1.0 CLIENT_SECRET={secret}",
+            f"PRIVATE_KEY={secret}",
+        ),
+    )
+
+    assert installation.requested_executable == "tool"
+    assert installation.resolved_executable == "/safe/bin/tool"
+    assert installation.version == "tool 1.0 CLIENT_SECRET=[REDACTED]"
+    assert installation.diagnostics == ("PRIVATE_KEY=[REDACTED]",)
+    assert secret not in repr(installation)
