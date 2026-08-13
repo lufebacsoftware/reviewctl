@@ -301,6 +301,84 @@ class CompletionContext:
         }
 
 
+def _valid_completion_file_names(value: object) -> bool:
+    return (
+        type(value) is tuple
+        and bool(value)
+        and all(
+            type(file_name) is str
+            and bool(file_name.strip())
+            and file_name not in {".", ".."}
+            and "/" not in file_name
+            and "\\" not in file_name
+            for file_name in value
+        )
+        and list(value) == sorted(set(value))
+    )
+
+
+def _validate_completion_context(context: object) -> bool:
+    """Reproduce every identity and ordering invariant before prompt serialization."""
+    if not isinstance(context, CompletionContext) or not _valid_completion_manifest(
+        prepared_digest=context.prepared_digest,
+        packet_digest=context.packet_digest,
+        missing_fields=context.missing_fields,
+        invalid_fragment_indexes=context.invalid_fragment_indexes,
+        violations=context.violations,
+        sequence_type=tuple,
+        require_packet_digest=True,
+    ):
+        return False
+    if not _valid_completion_file_names(context.file_names) or type(context.findings) is not tuple:
+        return False
+
+    seen_fingerprints: set[str] = set()
+    seen_provenance: set[tuple[int, str]] = set()
+    finding_order: list[tuple[int, str, str]] = []
+    for item in context.findings:
+        if (
+            not isinstance(item, CompletionFinding)
+            or not _is_sha256(item.fingerprint)
+            or not _valid_finding(item.finding)
+            or item.finding["path"] not in context.file_names
+            or type(item.sources) is not tuple
+            or not item.sources
+        ):
+            return False
+        finding = _copy_finding(item.finding)
+        fingerprint = _fragment_fingerprint(
+            finding,
+            contract="findings-json",
+            version="1",
+            scope=(finding["path"],),
+        )
+        if item.fingerprint != fingerprint or fingerprint in seen_fingerprints:
+            return False
+        seen_fingerprints.add(fingerprint)
+
+        source_order: list[tuple[int, str]] = []
+        for source in item.sources:
+            if not isinstance(source, PromotedFragment):
+                return False
+            source_finding = _validated_promoted_finding(source)
+            provenance = (source.source_attempt, source.fragment_id)
+            if (
+                source_finding is None
+                or source.fingerprint != fingerprint
+                or source_finding != finding
+                or source_finding["path"] not in context.file_names
+                or provenance in seen_provenance
+            ):
+                return False
+            seen_provenance.add(provenance)
+            source_order.append(provenance)
+        if source_order != sorted(source_order):
+            return False
+        finding_order.append((*source_order[0], fingerprint))
+
+    return finding_order == sorted(finding_order)
+
+
 @dataclass(frozen=True)
 class ConsolidatedFinding:
     fingerprint: str
@@ -449,7 +527,7 @@ def build_completion_context(
         )
         for fingerprint, sources in grouped.items()
     )
-    return CompletionContext(
+    context = CompletionContext(
         prepared_digest=request.prepared_digest,
         packet_digest=request.packet_digest,
         file_names=target_file_names,
@@ -458,20 +536,15 @@ def build_completion_context(
         violations=tuple(request.violations),
         findings=findings,
     )
+    if not _validate_completion_context(context):
+        raise ValueError("invalid completion context")
+    return context
 
 
 def render_completion_prompt(original_prompt: str, context: CompletionContext) -> str:
     """Append only typed prior evidence, never the raw prior model response."""
-    if not _valid_completion_manifest(
-        prepared_digest=context.prepared_digest,
-        packet_digest=context.packet_digest,
-        missing_fields=context.missing_fields,
-        invalid_fragment_indexes=context.invalid_fragment_indexes,
-        violations=context.violations,
-        sequence_type=tuple,
-        require_packet_digest=True,
-    ):
-        raise ValueError("invalid completion manifest")
+    if not _validate_completion_context(context):
+        raise ValueError("invalid completion context")
     instructions = (
         "Review each extracted finding independently: confirm, replace, or add findings based "
         "on the original packet. Absence is not a dispute. There is no inherited approval. "

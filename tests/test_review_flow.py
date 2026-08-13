@@ -713,12 +713,92 @@ def test_render_completion_prompt_revalidates_direct_completion_context(
     )
     malicious = replace(context, **{field: value})
 
-    with pytest.raises(ValueError, match="^invalid completion manifest$") as error:
+    with pytest.raises(ValueError, match="^invalid completion context$") as error:
         render_completion_prompt("Review the packet.", malicious)
 
     assert "raw prior response" not in str(error.value)
     assert COMPLETION_CONTEXT_START not in str(error.value)
     assert COMPLETION_CONTEXT_END not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "file_names",
+    [(), ("",), ("source.py", "source.py"), ("z.py", "a.py"), ("dir/source.py",)],
+)
+def test_render_completion_prompt_rejects_noncanonical_direct_scope(
+    file_names: tuple[str, ...],
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = build_completion_context(
+        evaluation.completion_request,
+        promoted(finding()),
+        allowed_file_names=("source.py",),
+    )
+
+    with pytest.raises(ValueError, match="^invalid completion context$") as error:
+        render_completion_prompt("Review the packet.", replace(context, file_names=file_names))
+
+    assert COMPLETION_CONTEXT_START not in str(error.value)
+    assert COMPLETION_CONTEXT_END not in str(error.value)
+
+
+def test_render_completion_prompt_rejects_replaced_completion_finding_identity() -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = build_completion_context(
+        evaluation.completion_request,
+        promoted(finding()),
+        allowed_file_names=("source.py",),
+    )
+    item = context.findings[0]
+    mutations = (
+        replace(item, fingerprint="0" * 64),
+        replace(item, finding=finding(path="foreign.py", title="raw foreign content")),
+        replace(item, sources=()),
+        replace(item, sources=promoted(finding(title="Different source"))),
+    )
+
+    for malicious_item in mutations:
+        with pytest.raises(ValueError, match="^invalid completion context$") as error:
+            render_completion_prompt(
+                "Review the packet.", replace(context, findings=(malicious_item,))
+            )
+        assert "raw foreign content" not in str(error.value)
+        assert COMPLETION_CONTEXT_START not in str(error.value)
+        assert COMPLETION_CONTEXT_END not in str(error.value)
+
+
+def test_render_completion_prompt_rejects_noncanonical_source_provenance() -> None:
+    evaluation = incomplete_evaluation(finding())
+    first = promoted(finding(), attempt=1)[0]
+    second = promoted(finding(), attempt=2)[0]
+    context = build_completion_context(
+        evaluation.completion_request,
+        (second, first),
+        allowed_file_names=("source.py",),
+    )
+    item = context.findings[0]
+
+    for sources in ((second, first), (first, first)):
+        with pytest.raises(ValueError, match="^invalid completion context$"):
+            render_completion_prompt(
+                "Review the packet.",
+                replace(context, findings=(replace(item, sources=sources),)),
+            )
+
+
+def test_render_completion_prompt_rejects_noncanonical_grouped_findings() -> None:
+    evaluation = incomplete_evaluation(finding())
+    first = promoted(finding(title="First"), attempt=1)[0]
+    second = promoted(finding(title="Second"), attempt=2)[0]
+    context = build_completion_context(
+        evaluation.completion_request,
+        (second, first),
+        allowed_file_names=("source.py",),
+    )
+
+    for findings in (tuple(reversed(context.findings)), (context.findings[0],) * 2):
+        with pytest.raises(ValueError, match="^invalid completion context$"):
+            render_completion_prompt("Review the packet.", replace(context, findings=findings))
 
 
 def test_render_completion_prompt_escapes_framing_and_instruction_injection_reversibly() -> None:
