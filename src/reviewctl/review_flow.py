@@ -678,10 +678,9 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     if not routes_valid:
         reject("routes")
     top_transport = receipt.get("transport")
-    if (
-        type(top_transport) is not str
-        or top_transport not in SUPPORTED_REVIEW_TRANSPORTS | {"routed"}
-    ):
+    if type(top_transport) is not str or top_transport not in SUPPORTED_REVIEW_TRANSPORTS | {
+        "routed"
+    }:
         reject("receipt-transport")
     elif routes_valid:
         transports = {route[1] for route in route_identities if route is not None}

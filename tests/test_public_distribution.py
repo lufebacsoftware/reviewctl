@@ -52,9 +52,9 @@ def test_public_tree_excludes_private_review_evidence() -> None:
     for path in ROOT.rglob("*"):
         relative_path = path.relative_to(ROOT)
         if PUBLIC_RECEIPT_FIXTURES in relative_path.parents:
-            assert is_reviewed_public_receipt_fixture(
-                relative_path, is_dir=path.is_dir()
-            ), f"unreviewed public receipt fixture: {relative_path}"
+            assert is_reviewed_public_receipt_fixture(relative_path, is_dir=path.is_dir()), (
+                f"unreviewed public receipt fixture: {relative_path}"
+            )
         if path.is_dir():
             assert (
                 is_reviewed_public_receipt_fixture(relative_path, is_dir=True)
@@ -72,9 +72,7 @@ def test_public_tree_excludes_private_review_evidence() -> None:
 
 def test_public_receipt_fixture_guard_rejects_unreviewed_paths() -> None:
     for filename in REVIEWED_PUBLIC_RECEIPT_FIXTURES:
-        assert is_reviewed_public_receipt_fixture(
-            PUBLIC_RECEIPT_FIXTURES / filename, is_dir=False
-        )
+        assert is_reviewed_public_receipt_fixture(PUBLIC_RECEIPT_FIXTURES / filename, is_dir=False)
     for relative_path, is_dir in (
         (PUBLIC_RECEIPT_FIXTURES / "unexpected.json", False),
         (PUBLIC_RECEIPT_FIXTURES / "nested", True),
@@ -128,9 +126,7 @@ def test_architecture_defines_backend_seam_and_controller_ownership() -> None:
 
 
 def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> None:
-    architecture = " ".join(
-        (ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split()
-    )
+    architecture = " ".join((ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split())
 
     for adapter in ("llm", "openrouter", "agy", "pi", "codex"):
         assert f"`{adapter}`" in architecture
@@ -161,9 +157,7 @@ def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> N
 
 
 def test_architecture_defines_partial_review_and_consolidation_semantics() -> None:
-    architecture = " ".join(
-        (ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split()
-    )
+    architecture = " ".join((ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split())
 
     for invariant in (
         "complete, incomplete, or invalid",

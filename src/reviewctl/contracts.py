@@ -212,8 +212,7 @@ def _contains_surrogate(value: object) -> bool:
         return any(_contains_surrogate(item) for item in value)
     if isinstance(value, dict):
         return any(
-            _contains_surrogate(key) or _contains_surrogate(item)
-            for key, item in value.items()
+            _contains_surrogate(key) or _contains_surrogate(item) for key, item in value.items()
         )
     return False
 
@@ -225,8 +224,7 @@ def _validate_finding(
         return None, "finding-fields"
     string_fields = FINDING_FIELDS - {"line"}
     if not all(
-        isinstance(finding[field], str) and finding[field].strip()
-        for field in string_fields
+        isinstance(finding[field], str) and finding[field].strip() for field in string_fields
     ):
         return None, "finding-value"
     if finding["severity"] not in FINDING_SEVERITIES:
@@ -301,9 +299,11 @@ class FindingsJsonContract:
                 violations=(code,),
             )
 
-        if prepared != self.prepare(context) or prepared.digest != hashlib.sha256(
-            canonical_json(prepared.identity_material)
-        ).hexdigest():
+        if (
+            prepared != self.prepare(context)
+            or prepared.digest
+            != hashlib.sha256(canonical_json(prepared.identity_material)).hexdigest()
+        ):
             return rejected("prepared-contract")
 
         try:
@@ -352,9 +352,7 @@ class FindingsJsonContract:
             violation = first_finding_violation
 
         verdict_invariant = (
-            verdict_valid
-            and findings_are_list
-            and (verdict == "approved") == (not findings)
+            verdict_valid and findings_are_list and (verdict == "approved") == (not findings)
         )
         if violation is None and not verdict_invariant:
             violation = "verdict-invariant"
@@ -429,9 +427,7 @@ class FindingsJsonContract:
                 )
             ).hexdigest()
             fragment_id = hashlib.sha256(
-                canonical_json(
-                    {"fingerprint": fingerprint, "payloadDigest": payload_digest}
-                )
+                canonical_json({"fingerprint": fingerprint, "payloadDigest": payload_digest})
             ).hexdigest()
             fragments.append(
                 ContractFragment(

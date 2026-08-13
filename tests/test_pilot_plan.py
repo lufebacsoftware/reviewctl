@@ -44,9 +44,7 @@ def test_pi_transcript_is_not_review_evidence() -> None:
 
 
 def test_help_llm_carries_setup_and_nonqualification_invariants() -> None:
-    document = " ".join(
-        (REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower().split()
-    )
+    document = " ".join((REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower().split())
 
     for command in (
         "reviewctl setup discover --format json",
@@ -60,10 +58,7 @@ def test_help_llm_carries_setup_and_nonqualification_invariants() -> None:
             "setup diagnostics observe only executable presence and version for registered "
             "executable backends."
         ),
-        (
-            "setup diagnostics never authenticate, call a model or provider, or write "
-            "configuration."
-        ),
+        ("setup diagnostics never authenticate, call a model or provider, or write configuration."),
         "availability is not qualification.",
         (
             "remote api backends may execute providers or models remotely, but setup never "
@@ -87,9 +82,7 @@ def test_help_llm_carries_setup_and_nonqualification_invariants() -> None:
 
 
 def test_help_llm_gives_machine_readable_next_actions_for_every_result() -> None:
-    document = " ".join(
-        (REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower().split()
-    )
+    document = " ".join((REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower().split())
 
     for instruction in (
         "incomplete: inspect `completionrequest`, `fallbackrelationships`, and `rawresponse`",
@@ -101,9 +94,7 @@ def test_help_llm_gives_machine_readable_next_actions_for_every_result() -> None
 
 
 def test_evidence_contract_documents_raw_and_structural_receipt_evidence() -> None:
-    document = " ".join(
-        (REPOSITORY / "docs" / "EVIDENCE.md").read_text().lower().split()
-    )
+    document = " ".join((REPOSITORY / "docs" / "EVIDENCE.md").read_text().lower().split())
 
     for invariant in (
         "`rawresponse` records its durable absolute path, sha-256, and character count",
@@ -118,9 +109,7 @@ def test_evidence_contract_documents_raw_and_structural_receipt_evidence() -> No
 
 def test_raw_response_docs_describe_the_current_absolute_path_contract() -> None:
     for name in ("EVIDENCE.md", "HELP-LLM.md"):
-        document = " ".join(
-            (REPOSITORY / "docs" / name).read_text().lower().split()
-        )
+        document = " ".join((REPOSITORY / "docs" / name).read_text().lower().split())
 
         assert "durable absolute path" in document
         assert "relative path" not in document

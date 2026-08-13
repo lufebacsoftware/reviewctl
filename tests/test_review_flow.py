@@ -1540,9 +1540,7 @@ def test_validate_v2_receipt_allows_non_findings_without_native_contract_data() 
             "reviewContract": "document",
             "sourceClass": "synthetic",
             "source": {
-                "files": [
-                    {"name": "source.py", "path": "/bounded/source.py", "sha256": "b" * 64}
-                ]
+                "files": [{"name": "source.py", "path": "/bounded/source.py", "sha256": "b" * 64}]
             },
             "transport": "llm",
             "result": "accepted",

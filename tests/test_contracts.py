@@ -22,15 +22,14 @@ def test_findings_contract_prepares_a_stable_portable_contract() -> None:
     assert prepared.version == "1"
     assert prepared.schema["required"] == ["verdict", "findings"]
     assert "reviewedFiles" not in prepared.schema["properties"]
-    assert prepared.digest == hashlib.sha256(
-        canonical_json(prepared.identity_material)
-    ).hexdigest()
+    assert prepared.digest == hashlib.sha256(canonical_json(prepared.identity_material)).hexdigest()
     assert "changes-requested" in prepared.output_instructions
     assert "approved" in prepared.output_instructions
 
 
-def test_findings_contract_can_require_a_review_declaration_without_mutating_portable_schema(
-) -> None:
+def test_findings_contract_can_require_a_review_declaration_without_mutating_portable_schema() -> (
+    None
+):
     contract = get_contract("findings-json")
 
     declared = contract.prepare(
@@ -81,9 +80,10 @@ def test_findings_contract_evaluates_and_hashes_a_normalized_value() -> None:
     assert evaluation.value == finding_payload()
     assert evaluation.violations == ()
     assert evaluation.payload_digest == hashlib.sha256(payload.encode()).hexdigest()
-    assert evaluation.normalized_digest == hashlib.sha256(
-        canonical_json(finding_payload())
-    ).hexdigest()
+    assert (
+        evaluation.normalized_digest
+        == hashlib.sha256(canonical_json(finding_payload())).hexdigest()
+    )
     assert evaluation.status is EvaluationStatus.COMPLETE
     assert len(evaluation.valid_fragments) == 1
     assert evaluation.valid_fragments[0].kind is FragmentKind.FINDING
@@ -192,9 +192,7 @@ def test_findings_contract_rejects_file_context_substitution() -> None:
     )
 
     evaluation = contract.evaluate(
-        json.dumps(
-            {"verdict": "approved", "findings": [], "reviewedFiles": ["other.py"]}
-        ),
+        json.dumps({"verdict": "approved", "findings": [], "reviewedFiles": ["other.py"]}),
         prepared,
         substituted_context,
     )
@@ -247,9 +245,7 @@ def invalid_contract_cases() -> list[tuple[str, ContractContext, str]]:
             "review-declaration",
         ),
         (
-            json.dumps(
-                {"verdict": "approved", "findings": [], "reviewedFiles": ["../source.py"]}
-            ),
+            json.dumps({"verdict": "approved", "findings": [], "reviewedFiles": ["../source.py"]}),
             ContractContext(file_names=("source.py",), review_declaration_required=True),
             "review-declaration",
         ),
@@ -321,14 +317,17 @@ def test_finding_fingerprint_ignores_payload_formatting_but_fragment_id_does_not
         )
     ).hexdigest()
     assert compact_fragment.fingerprint == expected_fingerprint
-    assert compact_fragment.fragment_id == hashlib.sha256(
-        canonical_json(
-            {
-                "fingerprint": expected_fingerprint,
-                "payloadDigest": compact_fragment.payload_digest,
-            }
-        )
-    ).hexdigest()
+    assert (
+        compact_fragment.fragment_id
+        == hashlib.sha256(
+            canonical_json(
+                {
+                    "fingerprint": expected_fingerprint,
+                    "payloadDigest": compact_fragment.payload_digest,
+                }
+            )
+        ).hexdigest()
+    )
 
 
 def test_mixed_findings_extract_only_valid_siblings_and_request_completion() -> None:
@@ -370,9 +369,7 @@ def test_mixed_findings_extract_only_valid_siblings_and_request_completion() -> 
 
 def test_valid_finding_can_survive_invalid_top_level_requirements() -> None:
     contract = get_contract("findings-json")
-    context = ContractContext(
-        file_names=("source.py",), review_declaration_required=True
-    )
+    context = ContractContext(file_names=("source.py",), review_declaration_required=True)
     prepared = contract.prepare(context)
     value = finding_payload()
     value["verdict"] = "unavailable"
@@ -424,9 +421,7 @@ def test_invalid_findings_do_not_extract_or_make_response_incomplete() -> None:
         {"title": ""},
         {"extra": "field"},
     ):
-        evaluation = contract.evaluate(
-            json.dumps(finding_payload(**overrides)), prepared, context
-        )
+        evaluation = contract.evaluate(json.dumps(finding_payload(**overrides)), prepared, context)
 
         assert evaluation.status is EvaluationStatus.INVALID
         assert evaluation.valid_fragments == ()
@@ -446,9 +441,12 @@ def test_missing_findings_and_approved_response_never_extract_fragments() -> Non
 
         assert evaluation.valid_fragments == ()
         assert evaluation.completion_request is None
-    assert contract.evaluate(
-        json.dumps({"verdict": "approved", "findings": []}), prepared, context
-    ).status is EvaluationStatus.COMPLETE
+    assert (
+        contract.evaluate(
+            json.dumps({"verdict": "approved", "findings": []}), prepared, context
+        ).status
+        is EvaluationStatus.COMPLETE
+    )
 
 
 def test_exact_json_object_and_prepared_contract_are_required_before_extraction() -> None:
@@ -458,7 +456,7 @@ def test_exact_json_object_and_prepared_contract_are_required_before_extraction(
     finding = json.dumps(finding_payload()["findings"][0])
     payloads = (
         f'{{"verdict":"changes-requested","findings":[{finding}],"findings":[]}}',
-        f'[{finding}]',
+        f"[{finding}]",
         f'{{"verdict":"changes-requested","findings":[{finding}]',
     )
 
@@ -480,10 +478,7 @@ def assert_non_finite_json_is_rejected(constant: str) -> None:
     context = ContractContext(file_names=("source.py",))
     prepared = contract.prepare(context)
     finding = json.dumps(finding_payload()["findings"][0])
-    payload = (
-        f'{{"verdict":"changes-requested","findings":[{finding}],'
-        f'"nonFinite":{constant}}}'
-    )
+    payload = f'{{"verdict":"changes-requested","findings":[{finding}],"nonFinite":{constant}}}'
 
     evaluation = contract.evaluate(payload, prepared, context)
 
@@ -514,9 +509,7 @@ def assert_isolated_surrogate_is_rejected(surrogate: str, *, extra_field: bool) 
     if extra_field:
         value["extra"] = True
 
-    evaluation = contract.evaluate(
-        json.dumps(value, ensure_ascii=True), prepared, context
-    )
+    evaluation = contract.evaluate(json.dumps(value, ensure_ascii=True), prepared, context)
 
     assert evaluation.status is EvaluationStatus.INVALID
     assert evaluation.violations == ("invalid-json",)
@@ -540,9 +533,7 @@ def test_findings_contract_rejects_escaped_surrogate_in_top_level_extra() -> Non
     prepared = contract.prepare(context)
     value = {**finding_payload(), "extra": chr(0xD800)}
 
-    evaluation = contract.evaluate(
-        json.dumps(value, ensure_ascii=True), prepared, context
-    )
+    evaluation = contract.evaluate(json.dumps(value, ensure_ascii=True), prepared, context)
 
     assert evaluation.status is EvaluationStatus.INVALID
     assert evaluation.violations == ("invalid-json",)
@@ -559,9 +550,10 @@ def test_findings_contract_rejects_literal_surrogate_with_stable_payload_digest(
 
     evaluation = contract.evaluate(payload, prepared, context)
 
-    assert evaluation.payload_digest == hashlib.sha256(
-        payload.encode(errors="surrogatepass")
-    ).hexdigest()
+    assert (
+        evaluation.payload_digest
+        == hashlib.sha256(payload.encode(errors="surrogatepass")).hexdigest()
+    )
     assert evaluation.status is EvaluationStatus.INVALID
     assert evaluation.violations == ("invalid-json",)
     assert evaluation.valid_fragments == ()
@@ -571,15 +563,11 @@ def test_findings_contract_rejects_literal_surrogate_with_stable_payload_digest(
 
 def test_findings_contract_rejects_surrogate_in_reviewed_files() -> None:
     contract = get_contract("findings-json")
-    context = ContractContext(
-        file_names=("source.py",), review_declaration_required=True
-    )
+    context = ContractContext(file_names=("source.py",), review_declaration_required=True)
     prepared = contract.prepare(context)
     value = {**finding_payload(), "reviewedFiles": [chr(0xDC00)]}
 
-    evaluation = contract.evaluate(
-        json.dumps(value, ensure_ascii=True), prepared, context
-    )
+    evaluation = contract.evaluate(json.dumps(value, ensure_ascii=True), prepared, context)
 
     assert evaluation.status is EvaluationStatus.INVALID
     assert evaluation.violations == ("invalid-json",)
