@@ -88,9 +88,33 @@ def _fragment_id(fingerprint: str, payload_digest: str) -> str:
     ).hexdigest()
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | None:
     """Reproduce v1 finding identity at every promoted-fragment trust boundary."""
-    if not _valid_finding(fragment.finding):
+    if (
+        not _valid_finding(fragment.finding)
+        or not _is_sha256(fragment.fingerprint)
+        or not _is_sha256(fragment.fragment_id)
+        or not _is_sha256(fragment.payload_digest)
+        or not _is_sha256(fragment.raw_response_digest)
+        or not _is_positive_int(fragment.source_attempt)
+        or not _is_nonnegative_int(fragment.route_index)
+    ):
         return None
     finding = _copy_finding(fragment.finding)
     fingerprint = _fragment_fingerprint(
@@ -246,7 +270,12 @@ def promote_fragments(
         return ()
     if evaluation.completion_request is None:
         return ()
-    if raw_response_digest != evaluation.payload_digest:
+    if (
+        raw_response_digest != evaluation.payload_digest
+        or not _is_sha256(raw_response_digest)
+        or not _is_positive_int(attempt)
+        or not _is_nonnegative_int(route_index)
+    ):
         return ()
 
     promoted: list[PromotedFragment] = []
@@ -289,17 +318,23 @@ def build_completion_context(
     """Build a deterministic, prompt-safe view of typed fragments and contract gaps."""
     if request is None:
         raise ValueError("completion context requires a contract completion request")
+    validated: list[tuple[PromotedFragment, dict[str, Any]]] = []
+    for fragment in promoted_fragments:
+        finding = _validated_promoted_finding(fragment)
+        if finding is None:
+            raise ValueError("invalid promoted fragment identity")
+        validated.append((fragment, finding))
     ordered = sorted(
-        promoted_fragments, key=lambda item: (item.source_attempt, item.fragment_id)
+        validated, key=lambda item: (item[0].source_attempt, item[0].fragment_id)
     )
-    grouped: dict[str, list[PromotedFragment]] = {}
-    for fragment in ordered:
-        grouped.setdefault(fragment.fingerprint, []).append(fragment)
+    grouped: dict[str, list[tuple[PromotedFragment, dict[str, Any]]]] = {}
+    for fragment, finding in ordered:
+        grouped.setdefault(fragment.fingerprint, []).append((fragment, finding))
     findings = tuple(
         CompletionFinding(
             fingerprint=fingerprint,
-            finding=_copy_finding(sources[0].finding),
-            sources=tuple(sources),
+            finding=sources[0][1],
+            sources=tuple(source[0] for source in sources),
         )
         for fingerprint, sources in grouped.items()
     )
@@ -372,7 +407,7 @@ def consolidate(
             )
         )
 
-    if accepted_attempt is None or accepted_review is None:
+    if not _is_positive_int(accepted_attempt) or accepted_review is None:
         return ConsolidatedReview(
             status="unavailable",
             verdict=None,

@@ -263,6 +263,51 @@ def test_build_completion_context_requires_a_typed_gap_manifest() -> None:
         build_completion_context(None, ())
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("finding", {"title": "tampered"}),
+        ("fingerprint", "0" * 64),
+        ("fragment_id", "0" * 64),
+        ("payload_digest", "A" * 64),
+        ("raw_response_digest", "a" * 63),
+        ("source_attempt", True),
+        ("source_attempt", 0),
+        ("source_attempt", -1),
+        ("source_attempt", "1"),
+        ("route_index", False),
+        ("route_index", -1),
+        ("route_index", "0"),
+    ],
+)
+def test_build_completion_context_rejects_invalid_promoted_fragment_identity(
+    field: str, value: object
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+    fragment = replace(promoted(finding())[0], **{field: value})
+
+    with pytest.raises(ValueError, match="^invalid promoted fragment identity$"):
+        build_completion_context(evaluation.completion_request, (fragment,))
+
+
+@pytest.mark.parametrize(
+    ("attempt", "route_index"),
+    [(True, 0), (0, 0), (-1, 0), ("1", 0), (1, True), (1, -1), (1, "0")],
+)
+def test_promote_fragments_rejects_invalid_provenance_coordinates(
+    attempt: object, route_index: object
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+
+    assert promote_fragments(
+        evaluation,
+        gate_result="contract-incomplete",
+        attempt=attempt,  # type: ignore[arg-type]
+        route_index=route_index,  # type: ignore[arg-type]
+        raw_response_digest=evaluation.payload_digest,
+    ) == ()
+
+
 def test_completion_context_orders_unique_content_by_first_canonical_source() -> None:
     earlier = promoted(finding(title="Zed"), attempt=1)
     later = promoted(finding(title="Alpha"), attempt=2)
@@ -433,7 +478,36 @@ def test_consolidate_does_not_approve_when_unconfirmed_partial_findings_remain()
     assert result.findings[0].disputed is False
 
 
-@pytest.mark.parametrize("tamper", ["finding", "fingerprint", "fragment_id", "raw_digest"])
+@pytest.mark.parametrize("accepted_attempt", [None, True, False, 0, -1, "1", 1.5])
+def test_consolidate_rejects_invalid_accepted_attempt_but_preserves_partial_evidence(
+    accepted_attempt: object,
+) -> None:
+    result = consolidate(
+        {"verdict": "approved", "findings": []},
+        promoted(finding()),
+        accepted_attempt=accepted_attempt,  # type: ignore[arg-type]
+    )
+
+    assert result.status == "unavailable"
+    assert result.verdict is None
+    assert result.approved is False
+    assert result.accepted_attempt is None
+    assert len(result.findings) == 1
+    assert result.findings[0].confirmed is False
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "finding",
+        "fingerprint",
+        "fragment_id",
+        "payload_digest",
+        "raw_digest",
+        "source_attempt",
+        "route_index",
+    ],
+)
 def test_consolidate_discards_promoted_fragments_with_divergent_identity(tamper: str) -> None:
     fragment = promoted(finding())[0]
     if tamper == "finding":
@@ -442,6 +516,12 @@ def test_consolidate_discards_promoted_fragments_with_divergent_identity(tamper:
         fragment = replace(fragment, fingerprint="0" * 64)
     elif tamper == "fragment_id":
         fragment = replace(fragment, fragment_id="0" * 64)
+    elif tamper == "payload_digest":
+        fragment = replace(fragment, payload_digest="A" * 64)
+    elif tamper == "source_attempt":
+        fragment = replace(fragment, source_attempt=True)
+    elif tamper == "route_index":
+        fragment = replace(fragment, route_index=-1)
     else:
         fragment = replace(fragment, raw_response_digest="1" * 64)
 
