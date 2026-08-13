@@ -295,6 +295,26 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def write_private_exclusive(path: Path, contents: bytes) -> None:
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError(
+            f"raw response evidence collision at {path}: "
+            "the adapter already created the reserved raw-response.txt path; "
+            "configure the adapter to use a different evidence path"
+        ) from error
+    try:
+        remaining = memoryview(contents)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written == 0:
+                raise OSError(f"could not finish writing raw response evidence at {path}")
+            remaining = remaining[written:]
+    finally:
+        os.close(descriptor)
+
+
 def canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
 
@@ -3217,7 +3237,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             if persisted is not None:
                 raw_response_path = attempt_dir / "raw-response.txt"
                 raw_response_bytes = persisted.response.encode(errors="surrogatepass")
-                raw_response_path.write_bytes(raw_response_bytes)
+                write_private_exclusive(raw_response_path, raw_response_bytes)
                 raw_response = {
                     "path": str(raw_response_path),
                     "sha256": sha256_bytes(raw_response_bytes),

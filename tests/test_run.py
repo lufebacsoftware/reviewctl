@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -419,7 +420,11 @@ def test_run_dispatches_frozen_packet_through_registered_backend(
     ]
     namespace = cli.build_parser().parse_args(arguments)
 
-    assert namespace.handler(namespace) == 0
+    previous_umask = os.umask(0o022)
+    try:
+        assert namespace.handler(namespace) == 0
+    finally:
+        os.umask(previous_umask)
     assert len(captured) == 1
     request = captured[0]
     original_source = tmp_path / "source.py"
@@ -441,8 +446,53 @@ def test_run_dispatches_frozen_packet_through_registered_backend(
     assert raw_response_path == request.attempt_dir / "raw-response.txt"
     assert raw_response_path != evidence_path
     assert raw_response_path.read_text() == response_json
+    assert stat.S_IMODE(raw_response_path.stat().st_mode) == 0o600
     assert raw_response["sha256"] == cli.sha256_bytes(response_json.encode())
     assert raw_response["characters"] == len(response_json)
+
+
+def test_run_rejects_raw_response_evidence_collision_without_overwriting_adapter_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    response_json = '{"verdict":"approved","findings":[]}'
+    native_bytes = b"adapter-native-evidence"
+    collision_path: Path | None = None
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        nonlocal collision_path
+        collision_path = request.attempt_dir / "raw-response.txt"
+        collision_path.write_bytes(native_bytes)
+        return cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse(
+                "conversation", None, 1, 10, "accepted", 2, None, response_json
+            ),
+            cli.BackendEvidence(response=collision_path),
+        )
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path, "accepted"),
+            "--transport",
+            "llm",
+            "--response-contract",
+            "findings-json",
+        ]
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"raw response evidence collision at .*raw-response\.txt.*different evidence path",
+    ):
+        namespace.handler(namespace)
+
+    assert collision_path is not None
+    assert collision_path.read_bytes() == native_bytes
 
 
 @pytest.mark.parametrize(
