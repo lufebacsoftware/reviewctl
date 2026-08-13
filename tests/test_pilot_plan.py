@@ -84,3 +84,33 @@ def test_help_llm_carries_setup_and_nonqualification_invariants() -> None:
     for product in ("cursor", "claude"):
         unsupported_claim = " ".join((product, "is", "supported"))
         assert unsupported_claim not in document
+
+
+def test_help_llm_gives_machine_readable_next_actions_for_every_result() -> None:
+    document = " ".join(
+        (REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower().split()
+    )
+
+    for instruction in (
+        "incomplete: inspect `completionrequest`, `fallbackrelationships`, and `rawresponse`",
+        "invalid: inspect `violations`, `evaluationerror`, and `rawresponse`",
+        "accepted: inspect both the legacy and consolidated views, then run `reviewctl verify`",
+        "errors are actionable for llms",
+    ):
+        assert instruction in document
+
+
+def test_evidence_contract_documents_raw_and_structural_receipt_evidence() -> None:
+    document = " ".join(
+        (REPOSITORY / "docs" / "EVIDENCE.md").read_text().lower().split()
+    )
+
+    for invariant in (
+        "`rawresponse` records its relative path, sha-256, and character count",
+        "a non-null response is retained even when it is empty or rejected",
+        "v1 verification is digest-only",
+        "v2 verification is structural and offline",
+        "acceptedattempt must identify a real complete accepted attempt",
+        "unconfirmed findings remain visible in the consolidated view",
+    ):
+        assert invariant in document

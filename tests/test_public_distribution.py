@@ -160,6 +160,59 @@ def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> N
         assert unsupported_claim not in architecture
 
 
+def test_architecture_defines_partial_review_and_consolidation_semantics() -> None:
+    architecture = " ".join(
+        (ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split()
+    )
+
+    for invariant in (
+        "complete, incomplete, or invalid",
+        "pre-gates run before contract evaluation",
+        "rejected responses never promote fragments",
+        "completion context is bound to the target contract",
+        "never contains the raw response",
+        "never inherits approval",
+        "absence is not a dispute",
+        "acceptedattempt names a real complete accepted attempt",
+        "partial or unconfirmed findings",
+        "approval is stricter",
+        "maxattempts applies independently to each route",
+        "schema v1 remains digest-only",
+        "schema v2 adds offline structural verification",
+    ):
+        assert invariant in architecture
+
+    for deferred in (
+        "no baml runtime dependency",
+        "editable execution is deferred",
+        "federation is optional future work",
+        "potzal is not a dependency",
+    ):
+        assert deferred in architecture
+
+
+def test_public_docs_do_not_claim_deferred_integrations_or_publish_private_rosters() -> None:
+    public_docs = "\n".join(
+        (ROOT / "docs" / name).read_text().lower()
+        for name in ("ARCHITECTURE.md", "EVIDENCE.md", "HELP-LLM.md")
+    )
+
+    for unsupported_claim in (
+        "cursor is supported",
+        "claude is supported",
+        "potzal is required",
+        "baml is required",
+    ):
+        assert unsupported_claim not in public_docs
+    for forbidden_detail in (
+        "model roster:",
+        "provider command:",
+        "api key:",
+        "price table:",
+    ):
+        assert forbidden_detail not in public_docs
+
+
 def test_release_workflow_builds_and_publishes_verified_artifacts() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
 
