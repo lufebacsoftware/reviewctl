@@ -437,6 +437,48 @@ def test_run_dispatches_frozen_packet_through_registered_backend(
     assert evidence_path.read_text() == response_json
 
 
+def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    executions: list[str] = []
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        executions.append(request.model)
+        return cli.BackendExecution(0, "", None, cli.BackendEvidence())
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    arguments = [
+        *review_arguments(tmp_path, "route1", "route2"),
+        "--max-attempts",
+        "2",
+    ]
+    namespace = cli.build_parser().parse_args(arguments)
+
+    assert namespace.handler(namespace) == 1
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    expected_routes = [
+        {"model": "route1", "transport": "llm"},
+        {"model": "route2", "transport": "llm"},
+    ]
+    expected_execution_order = ["route1", "route1", "route2", "route2"]
+    assert receipt["executionSettings"]["maxAttempts"] == 2
+    assert receipt["routes"] == expected_routes
+    assert executions == expected_execution_order
+    assert len(executions) <= len(expected_routes) * 2
+    assert [attempt["route"] for attempt in receipt["attempts"]] == [
+        expected_routes[0],
+        expected_routes[0],
+        expected_routes[1],
+        expected_routes[1],
+    ]
+    assert [attempt["result"] for attempt in receipt["attempts"]] == [
+        "missing-response"
+    ] * 4
+
+
 def test_uses_a_separate_database_for_each_attempt_and_accepts_matching_model(
     tmp_path: Path,
 ) -> None:
@@ -4491,30 +4533,67 @@ def test_verification_detects_tampered_receipt(tmp_path: Path) -> None:
 
 def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
+    complete_response = {
+        "verdict": "changes-requested",
+        "findings": [
+            {
+                "severity": "high",
+                "path": "source.py",
+                "line": 1,
+                "title": "Example finding",
+                "evidence": "The bounded source contains the example.",
+                "reproduction": "Inspect source.py line 1.",
+            }
+        ],
+    }
 
     result = run_cli(
         *review_arguments(tmp_path, "accepted"),
         "--response-contract",
         "findings-json",
-        env={"LLM_BIN": str(fake_llm)},
+        env={
+            "LLM_BIN": str(fake_llm),
+            "LLM_SCHEMA_RESPONSE": json.dumps(complete_response),
+        },
     )
 
     assert result.returncode == 0, result.stderr
     receipt_path = Path(result.stdout.strip()) / "receipt.json"
     receipt = json.loads(receipt_path.read_text())
-    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    attempt = receipt["attempts"][0]
+    evaluation = attempt["contractEvaluation"]
+    for future_field in (
+        "receiptSchemaVersion",
+        "consolidatedReview",
+        "fallbackRelationships",
+    ):
+        assert future_field not in receipt
+    assert receipt["acceptedAttempt"] == 1
+    assert receipt["result"] == "accepted"
+    assert attempt["result"] == "accepted"
+    assert receipt["verdict"] == complete_response["verdict"]
+    assert receipt["findings"] == complete_response["findings"]
     assert receipt["reviewContract"] == "findings-json"
     assert receipt["contract"] == {"name": "findings-json", "version": "1"}
-    assert evaluation["name"] == "findings-json"
-    assert evaluation["version"] == "1"
+    assert set(evaluation) == {
+        "name",
+        "version",
+        "preparedSha256",
+        "payloadSha256",
+        "normalizedSha256",
+        "violations",
+    }
+    assert (evaluation["name"], evaluation["version"]) == ("findings-json", "1")
     assert evaluation["violations"] == []
     for field in ("preparedSha256", "payloadSha256", "normalizedSha256"):
         assert len(evaluation[field]) == 64
         int(evaluation[field], 16)
-    assert run_cli("verify", str(receipt_path)).returncode == 0
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["valid"] is True
 
 
-def test_incomplete_findings_receipt_retains_rejected_contract_evaluation(
+def test_invalid_json_findings_receipt_retains_rejected_contract_evaluation(
     tmp_path: Path,
 ) -> None:
     fake_llm = write_fake_llm(tmp_path)
@@ -4529,11 +4608,16 @@ def test_incomplete_findings_receipt_retains_rejected_contract_evaluation(
     assert result.returncode == 1
     receipt_path = Path(result.stdout.strip()) / "receipt.json"
     receipt = json.loads(receipt_path.read_text())
-    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    attempt = receipt["attempts"][0]
+    evaluation = attempt["contractEvaluation"]
     assert receipt["result"] == "unavailable"
+    assert receipt["acceptedAttempt"] is None
+    assert attempt["result"] == "incomplete"
     assert evaluation["normalizedSha256"] is None
     assert evaluation["violations"] == ["invalid-json"]
-    assert run_cli("verify", str(receipt_path)).returncode == 0
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["valid"] is True
 
 
 def test_policy_check_and_tournament_complete_when_under_budget(tmp_path: Path) -> None:

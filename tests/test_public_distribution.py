@@ -3,7 +3,15 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import reviewctl
+
 ROOT = Path(__file__).parents[1]
+
+
+def test_runtime_version_matches_project_metadata() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+
+    assert reviewctl.__version__ == project["version"]
 
 
 def test_public_package_uses_apache_license() -> None:
