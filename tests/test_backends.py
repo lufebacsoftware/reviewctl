@@ -318,6 +318,62 @@ def test_execute_llm_backend_invokes_legacy_transport_and_maps_database_evidence
     assert_execution_has_transport_semantics_only(execution)
 
 
+def test_execute_llm_backend_preserves_failure_without_persisted_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    database = request.attempt_dir / "transport.sqlite3"
+
+    monkeypatch.setattr(cli, "invoke_llm", lambda **_kwargs: (42, "transport failed"))
+    monkeypatch.setattr(cli, "load_response", lambda _database: None)
+
+    execution = cli.execute_llm_backend(request)
+
+    assert execution == BackendExecution(
+        exit_code=42,
+        diagnostic="transport failed",
+        response=None,
+        evidence=BackendEvidence(database=database),
+    )
+
+
+@pytest.mark.parametrize(
+    ("environment", "execute", "invoker", "executable_argument"),
+    [
+        ("LLM_BIN", cli.execute_llm_backend, "invoke_llm", "llm_bin"),
+        ("CODEX_BIN", cli.execute_codex_backend, "invoke_codex", "codex_bin"),
+        ("AGY_BIN", cli.execute_agy_backend, "invoke_agy", "agy_bin"),
+        ("PI_BIN", cli.execute_pi_backend, "invoke_pi", "pi_bin"),
+    ],
+)
+def test_backend_executable_override_reaches_legacy_invoker(
+    environment: str,
+    execute: backends.BackendExecutor,
+    invoker: str,
+    executable_argument: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = backend_request(tmp_path)
+    request.attempt_dir.mkdir()
+    executable = f"/test/bin/{environment.lower()}"
+    captured: dict[str, object] = {}
+    response = PersistedResponse("", None, None, None, "", None, None, "")
+
+    def fake_invoker(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return (0, "") if invoker == "invoke_llm" else (0, "", response)
+
+    monkeypatch.setenv(environment, executable)
+    monkeypatch.setattr(cli, invoker, fake_invoker)
+    if invoker == "invoke_llm":
+        monkeypatch.setattr(cli, "load_response", lambda _database: response)
+
+    execute(request)
+
+    assert captured[executable_argument] == executable
+
+
 def test_execute_codex_backend_persists_rejected_response_and_maps_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
