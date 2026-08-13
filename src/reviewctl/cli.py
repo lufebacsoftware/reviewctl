@@ -1374,6 +1374,7 @@ def codex_process_environment(
         "HOME",
         "CODEX_HOME",
         "CODEX_AUTH_FILE",
+        "CODEX_CA_CERTIFICATES",
         "TMPDIR",
         "TMP",
         "TEMP",
@@ -1405,8 +1406,9 @@ def codex_isolation(
     sandbox = shutil.which("sandbox-exec")
     if sandbox is None:
         raise RuntimeError("proprietary Codex reviews require macOS sandbox-exec")
-    source_auth = (
-        auth_path or Path(os.environ.get("CODEX_AUTH_FILE", "~/.codex/auth.json")).expanduser()
+    configured_auth = os.environ.get("CODEX_AUTH_FILE")
+    source_auth = auth_path or (
+        Path(configured_auth) if configured_auth else account_home() / ".codex" / "auth.json"
     )
     if not source_auth.is_file():
         raise RuntimeError(f"Codex isolation requires auth file: {source_auth}")

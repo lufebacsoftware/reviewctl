@@ -3413,9 +3413,11 @@ def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home
     monkeypatch.setenv("PATH", "/opt/reviewctl/bin")
     monkeypatch.setenv("LANG", "en_US.UTF-8")
     monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setenv("CODEX_CA_CERTIFICATES", str(tmp_path / "codex-ca.pem"))
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("ARBITRARY_SECRET", "arbitrary-secret")
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy-user:proxy-secret@example.test")
 
     with cli.codex_isolation([source_root], auth_path=auth) as isolation:
         profile = isolation.profile.read_text()
@@ -3431,10 +3433,12 @@ def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home
         assert isolation.environment["PATH"] == "/opt/reviewctl/bin"
         assert isolation.environment["LANG"] == "en_US.UTF-8"
         assert isolation.environment["SSL_CERT_FILE"] == str(tmp_path / "ca.pem")
+        assert isolation.environment["CODEX_CA_CERTIFICATES"] == str(tmp_path / "codex-ca.pem")
         assert "CODEX_AUTH_FILE" not in isolation.environment
         assert "AWS_SECRET_ACCESS_KEY" not in isolation.environment
         assert "OPENAI_API_KEY" not in isolation.environment
         assert "ARBITRARY_SECRET" not in isolation.environment
+        assert "HTTPS_PROXY" not in isolation.environment
 
 
 def test_invoke_codex_passes_an_explicit_allowlisted_environment(
@@ -3462,9 +3466,11 @@ def test_invoke_codex_passes_an_explicit_allowlisted_environment(
     monkeypatch.setenv("HOME", str(tmp_path / "account-home"))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setenv("CODEX_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("CODEX_CA_CERTIFICATES", str(tmp_path / "codex-ca.pem"))
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("ARBITRARY_SECRET", "arbitrary-secret")
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy-user:proxy-secret@example.test")
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
 
     exit_code, _, response = cli.invoke_codex(
@@ -3483,9 +3489,11 @@ def test_invoke_codex_passes_an_explicit_allowlisted_environment(
     assert environment["HOME"] == str(tmp_path / "account-home")
     assert environment["CODEX_HOME"] == str(codex_home)
     assert environment["CODEX_AUTH_FILE"] == str(auth_file)
+    assert environment["CODEX_CA_CERTIFICATES"] == str(tmp_path / "codex-ca.pem")
     assert "AWS_SECRET_ACCESS_KEY" not in environment
     assert "OPENAI_API_KEY" not in environment
     assert "ARBITRARY_SECRET" not in environment
+    assert "HTTPS_PROXY" not in environment
     assert exit_code == 0
     assert response.response == "VERDICT: approved."
 
@@ -3528,6 +3536,39 @@ def test_codex_isolation_rejects_missing_sandbox_or_auth(
     with pytest.raises(RuntimeError, match="auth file"):
         with cli.codex_isolation([source_root], auth_path=tmp_path / "missing.json"):
             pass
+
+
+@pytest.mark.parametrize(
+    ("home_value", "auth_value"),
+    [(None, None), ("", "")],
+    ids=["home-unset", "home-empty"],
+)
+def test_codex_isolation_resolves_default_auth_from_account_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    home_value: str | None,
+    auth_value: str | None,
+) -> None:
+    source_root = tmp_path / "source-root"
+    source_root.mkdir()
+    login_home = tmp_path / "login-home"
+    auth = login_home / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"account-auth"}')
+    monkeypatch.setattr(cli.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(cli, "account_home", lambda: login_home)
+    monkeypatch.setattr(cli.Path, "expanduser", lambda _: tmp_path / "untrusted-auth.json")
+    if home_value is None:
+        monkeypatch.delenv("HOME", raising=False)
+    else:
+        monkeypatch.setenv("HOME", home_value)
+    if auth_value is None:
+        monkeypatch.delenv("CODEX_AUTH_FILE", raising=False)
+    else:
+        monkeypatch.setenv("CODEX_AUTH_FILE", auth_value)
+
+    with cli.codex_isolation([source_root]) as isolation:
+        assert isolation.home.joinpath("auth.json").read_text() == auth.read_text()
 
 
 def test_codex_transport_fails_closed_when_proprietary_isolation_cannot_start(
