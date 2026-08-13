@@ -389,7 +389,7 @@ class FindingsJsonContract:
             ):
                 review_declaration_valid = False
             if review_declaration_valid:
-                normalized_files = candidate_files
+                normalized_files = list(context.file_names)
             elif violation is None:
                 violation = "review-declaration"
 

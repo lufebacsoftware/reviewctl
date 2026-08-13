@@ -47,6 +47,27 @@ def test_findings_contract_can_require_a_review_declaration_without_mutating_por
     assert declared.digest != portable.digest
 
 
+def test_findings_contract_normalizes_reviewed_files_to_authoritative_context_order() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("alpha.py", "beta.py"), review_declaration_required=True)
+    prepared = contract.prepare(context)
+    payload = json.dumps(
+        {
+            "verdict": "approved",
+            "findings": [],
+            "reviewedFiles": ["beta.py", "alpha.py"],
+        }
+    )
+
+    evaluation = contract.evaluate(payload, prepared, context)
+
+    assert evaluation.value == {
+        "verdict": "approved",
+        "findings": [],
+        "reviewedFiles": ["alpha.py", "beta.py"],
+    }
+
+
 def test_contract_registry_rejects_unknown_contracts() -> None:
     try:
         get_contract("unknown")

@@ -22,9 +22,14 @@ COMPLETION_CONTEXT_END = "</reviewctl-completion-context>"
 # Pure receipt validation cannot construct the CLI registry, so this allowlist is
 # kept synchronized with build_backend_registry() by a focused registry test.
 SUPPORTED_REVIEW_TRANSPORTS = frozenset({"agy", "codex", "llm", "openrouter", "pi"})
-SUPPORTED_RESPONSE_CONTRACTS = frozenset(
-    {"document", "verdict", "findings-json", "product-review-json", "product-judge-json"}
-)
+RECEIPT_CONTRACT_VERSIONS = {
+    "document": "legacy-1",
+    "verdict": "legacy-1",
+    "findings-json": "1",
+    "product-review-json": "legacy-1",
+    "product-judge-json": "legacy-1",
+}
+SUPPORTED_RESPONSE_CONTRACTS = frozenset(RECEIPT_CONTRACT_VERSIONS)
 SUPPORTED_ATTEMPT_RESULTS = frozenset(
     {
         "accepted",
@@ -74,7 +79,7 @@ def _freeze_source(value: dict[str, object]) -> dict[str, object]:
 def _valid_finding(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != FINDING_FIELDS:
         return False
-    if value["severity"] not in FINDING_SEVERITIES:
+    if not isinstance(value["severity"], str) or value["severity"] not in FINDING_SEVERITIES:
         return False
     if not isinstance(value["line"], int) or isinstance(value["line"], bool):
         return False
@@ -121,6 +126,15 @@ def _is_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def receipt_contract_identity(review_contract: str) -> dict[str, str]:
+    """Return the stable receipt identity for a supported response contract."""
+    try:
+        version = RECEIPT_CONTRACT_VERSIONS[review_contract]
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"unsupported review contract: {review_contract!r}") from error
+    return {"name": review_contract, "version": version}
 
 
 def _is_positive_int(value: object) -> bool:
@@ -201,7 +215,7 @@ class FallbackRelationship:
     promoted_fragment_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.kind not in {"retry", "route-fallback"}:
+        if not isinstance(self.kind, str) or self.kind not in {"retry", "route-fallback"}:
             raise ValueError(f"unsupported fallback relationship kind: {self.kind}")
         if not all(isinstance(fragment_id, str) for fragment_id in self.promoted_fragment_ids):
             raise ValueError("promoted fragment IDs must be strings")
@@ -478,7 +492,8 @@ def consolidate(
     verdict = accepted_review.get("verdict")
     accepted_findings = accepted_review.get("findings")
     if (
-        verdict not in {"approved", "changes-requested"}
+        not isinstance(verdict, str)
+        or verdict not in {"approved", "changes-requested"}
         or not isinstance(accepted_findings, list)
         or (verdict == "approved") != (not accepted_findings)
     ):
@@ -556,7 +571,8 @@ def _receipt_normalized_review(value: object) -> dict[str, Any] | None:
     verdict = value.get("verdict")
     findings = value.get("findings")
     if (
-        verdict not in {"approved", "changes-requested"}
+        not isinstance(verdict, str)
+        or verdict not in {"approved", "changes-requested"}
         or not isinstance(findings, list)
         or not all(_valid_finding(finding) for finding in findings)
         or (verdict == "approved") != (not findings)
@@ -734,16 +750,16 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     if not isinstance(review_contract, str) or review_contract not in SUPPORTED_RESPONSE_CONTRACTS:
         reject("review-contract")
     contract_identity = receipt.get("contract")
-    findings_contract_definition = get_contract("findings-json")
-    native_findings_identity = (
-        type(contract_identity) is dict
-        and set(contract_identity) == {"name", "version"}
-        and contract_identity.get("name") == findings_contract_definition.name
-        and contract_identity.get("version") == findings_contract_definition.version
+    expected_contract_identity = (
+        receipt_contract_identity(review_contract)
+        if isinstance(review_contract, str) and review_contract in SUPPORTED_RESPONSE_CONTRACTS
+        else None
     )
-    if native_findings_identity and review_contract != "findings-json":
-        reject("review-contract")
-    if review_contract == "findings-json" and not native_findings_identity:
+    if (
+        type(contract_identity) is not dict
+        or set(contract_identity) != {"name", "version"}
+        or contract_identity != expected_contract_identity
+    ):
         reject("review-contract")
     findings_contract = review_contract == "findings-json"
     all_promoted: list[PromotedFragment] = []
@@ -758,7 +774,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     )
 
     for index, attempt in enumerate(attempts, start=1):
-        if attempt.get("result") not in SUPPORTED_ATTEMPT_RESULTS:
+        attempt_result = attempt.get("result")
+        if not isinstance(attempt_result, str) or attempt_result not in SUPPORTED_ATTEMPT_RESULTS:
             reject("attempt-result")
 
         raw = attempt.get("rawResponse")
@@ -843,6 +860,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and raw_digest == payload_digest
                     and isinstance(violations_value, list)
                     and all(isinstance(item, str) for item in violations_value)
+                    and isinstance(evaluation_status, str)
                     and evaluation_status in {"complete", "incomplete", "invalid"}
                     and isinstance(fragment_values, list)
                 )
@@ -1123,6 +1141,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and destination == target
                     and source <= len(attempts)
                     and destination <= len(attempts)
+                    and isinstance(kind, str)
                     and kind in {"retry", "route-fallback"}
                     and isinstance(relationship.get("reason"), str)
                     and isinstance(ids, list)

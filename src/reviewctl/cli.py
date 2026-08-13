@@ -59,6 +59,7 @@ from reviewctl.review_flow import (
     build_completion_context,
     consolidate,
     promote_fragments,
+    receipt_contract_identity,
     render_completion_prompt,
     validate_v2_receipt,
 )
@@ -3614,6 +3615,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         },
         "result": "accepted" if accepted else "unavailable",
         "reviewContract": args.response_contract,
+        "contract": receipt_contract_identity(args.response_contract),
         "reviewId": args.review_id,
         "sourceClass": args.source_class,
         "source": source,
@@ -3636,10 +3638,6 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         },
     }
     if native_contract:
-        receipt["contract"] = {
-            "name": native_contract.name,
-            "version": native_contract.version,
-        }
         receipt["fallbackRelationships"] = [
             relationship.to_dict() for relationship in fallback_relationships
         ]

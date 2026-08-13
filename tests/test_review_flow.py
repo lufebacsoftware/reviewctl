@@ -19,6 +19,7 @@ from reviewctl.review_flow import (
     build_completion_context,
     consolidate,
     promote_fragments,
+    receipt_contract_identity,
     render_completion_prompt,
     validate_v2_receipt,
 )
@@ -991,6 +992,33 @@ def test_validate_v2_receipt_requires_exact_native_contract_identity_before_gate
 
 
 @pytest.mark.parametrize(
+    ("review_contract", "expected"),
+    [
+        ("findings-json", {"name": "findings-json", "version": "1"}),
+        ("document", {"name": "document", "version": "legacy-1"}),
+        ("verdict", {"name": "verdict", "version": "legacy-1"}),
+        (
+            "product-review-json",
+            {"name": "product-review-json", "version": "legacy-1"},
+        ),
+        (
+            "product-judge-json",
+            {"name": "product-judge-json", "version": "legacy-1"},
+        ),
+    ],
+)
+def test_receipt_contract_identity_has_an_exact_version_for_every_supported_contract(
+    review_contract: str, expected: dict[str, str]
+) -> None:
+    assert receipt_contract_identity(review_contract) == expected
+
+
+def test_receipt_contract_identity_rejects_unknown_contracts() -> None:
+    with pytest.raises(ValueError, match="unsupported review contract"):
+        receipt_contract_identity("unknown")
+
+
+@pytest.mark.parametrize(
     "review_contract",
     ["document", "verdict", "product-review-json", "product-judge-json", "unknown"],
 )
@@ -1753,11 +1781,12 @@ def test_validate_v2_receipt_rejects_promotion_from_non_incomplete_status(
     assert "promoted-fragments" in validate_v2_receipt(receipt)
 
 
-def test_validate_v2_receipt_allows_non_findings_without_native_contract_data() -> None:
+def test_validate_v2_receipt_requires_exact_non_findings_contract_identity() -> None:
     receipt = _sign_receipt(
         {
             "receiptSchemaVersion": 2,
             "reviewContract": "document",
+            "contract": {"name": "document", "version": "legacy-1"},
             "sourceClass": "synthetic",
             "source": {
                 "files": [{"name": "source.py", "path": "/bounded/source.py", "sha256": "b" * 64}]
@@ -1786,3 +1815,29 @@ def test_validate_v2_receipt_allows_non_findings_without_native_contract_data() 
     )
 
     assert validate_v2_receipt(receipt) == ()
+
+    receipt.pop("contract")
+    _sign_receipt(receipt)
+    assert "review-contract" in validate_v2_receipt(receipt)
+
+    receipt["contract"] = {"name": "verdict", "version": "legacy-1"}
+    _sign_receipt(receipt)
+    assert "review-contract" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("field", "hostile"),
+    [("severity", ["high"]), ("verdict", ["approved"])],
+)
+def test_validate_v2_receipt_rejects_unhashable_review_values_without_raising(
+    field: str, hostile: list[str]
+) -> None:
+    receipt = v2_findings_receipt()
+    evaluation = receipt["attempts"][1]["contractEvaluation"]
+    if field == "severity":
+        evaluation["normalizedValue"]["findings"] = [finding(severity=hostile)]
+    else:
+        evaluation["normalizedValue"][field] = hostile
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
