@@ -596,6 +596,127 @@ signatures, and export-policy-permitted blobs. Omitted or sealed blobs remain
 explicit; importing a summary bundle never implies possession of raw source or
 responses.
 
+### Synchronization contract
+
+The canonical bundle manifest contains at least:
+
+```text
+ReviewExchangeBundle
+├── schemaVersion
+├── bundleId
+├── projectId
+├── originId
+├── sequenceStart
+├── sequenceEnd
+├── previousBundleId
+├── events[]
+│   ├── eventId
+│   ├── originSequence
+│   ├── parentEventIds[]
+│   ├── eventType
+│   └── payloadDigest
+├── objects[]
+├── trustSnapshot
+└── signatures[]
+```
+
+`bundleId` is the SHA-256 digest of the canonical manifest, events, objects, and
+trust snapshot with the `bundleId` and `signatures` fields excluded. Adding an
+allowed signature does not change bundle identity. `eventId` is the digest of
+the canonical project, origin, sequence, parents, type, and payload digest with
+the `eventId` field excluded. Each `ProjectId + OriginId` sequence is strictly
+monotonic and contiguous. A delta bundle may start after sequence one only when
+the importer already holds the preceding cursor for that exact pair and
+`previousBundleId`; the first bundle uses no previous identifier.
+
+Import behavior is deterministic:
+
+- an existing `eventId` with identical canonical bytes is an idempotent no-op;
+- an `eventId` reused with different bytes is a conflict;
+- a `ProjectId + OriginId + originSequence` reused by a different event is an
+  origin fork;
+- a missing parent, sequence gap, or mismatched previous bundle is incomplete;
+- conflict, fork, incomplete, malformed, untrusted, revoked-key, and replayed
+  inputs never append review facts.
+
+An import never edits, replaces, renumbers, resolves, or silently consolidates
+an existing journal. It either appends previously unseen verified facts and a
+local import record, reports an exact duplicate, or produces an explicit
+quarantine/conflict result.
+
+### Trust and replay protection
+
+Every bundle signature records `keyId`, algorithm, signed payload digest, and
+signature bytes. Local trust policy pins an organization/project trust root and
+binds authorized keys to exact `ProjectId + OriginId` pairs, bundle classes,
+validity periods, and allowed export classifications. Organization-wide roots
+delegate project scopes explicitly; authorization for one project never implies
+authorization for another. Rotation and revocation are signed trust events with
+monotonic versions; a replacement key does not rewrite bundles signed by its
+predecessor.
+
+The importer verifies the canonical payload digest, signature threshold,
+key/project/origin authorization, exact target-project match, validity interval,
+trust-version continuity, revocation state, previous bundle, and project-origin
+cursor before append. A bundle at or below the accepted cursor is permitted
+only when its canonical payload and events are already known; an additional
+valid signature may be recorded without re-appending facts. A different
+canonical event or payload at an accepted sequence is a replay/fork conflict.
+
+Offline verification is supported against a pinned local trust snapshot and
+records that snapshot's digest and freshness time. It proves validity relative
+to that snapshot, not that no newer key revocation or policy exists. Policy may
+require a fresher checkpoint before importing restricted material.
+
+### Object privacy
+
+Every embedded or referenced object declares:
+
+```text
+ExchangeObject
+├── objectId and digest
+├── classification
+├── disclosure: plaintext | redacted | sealed | omitted
+├── allowedRecipients[]
+├── visibleMetadata[]
+└── ciphertextDigest
+```
+
+Export policy evaluates each object independently. Redaction creates a new
+derived object with provenance to the private original digest; it never claims
+byte identity with the original. Sealing binds declared recipients and retains
+only ciphertext in the bundle. Omitted objects leave a typed locator/digest only
+when policy permits even that metadata. Bundle-level metadata uses an explicit
+allow-list so project names, paths, reviewer/model identities, findings, and
+timestamps are not made visible merely because payload blobs are encrypted.
+
+### Import state and quarantine
+
+Inspection and import return a typed result:
+
+```text
+BundleImportResult
+├── status: accepted | duplicate | quarantined | conflict
+├── bundleId
+├── sourceOriginId
+├── importerActorId
+├── importerOriginId
+├── cursorBefore
+├── cursorAfter
+├── trustSnapshotDigest
+├── appendedEventIds[]
+├── reasons[]
+└── quarantineLocator
+```
+
+Malformed, incomplete, untrusted, revoked, or policy-incompatible bundles enter
+a non-authoritative quarantine without journal append. Quarantine bytes are
+content-addressed, access-controlled, and excluded from projections. A later
+retry re-verifies the original bytes under an explicit updated trust/policy
+snapshot; it never mutates the quarantined artifact. Accepted imports append a
+local `BundleImported` event recording which actor/origin imported each source
+bundle and which facts were newly appended.
+
 The core exchange interface is transport-neutral:
 
 ```text
@@ -616,6 +737,12 @@ protocol adapter remain possible.
 No transport decides whether a review is valid, accepted, independent,
 consolidable, or waived. There is no multi-primary review database, remote
 execution, or automatic synchronization in the stabilization phase.
+
+The central ownership rule is:
+
+> reviewctl interprets, verifies, imports, and consolidates review events.
+> Potzal, when configured, only preserves, authorizes access to, and distributes
+> opaque verifiable bundles.
 
 ## Waivers and Critical Changes
 
@@ -649,13 +776,16 @@ reviewctl project init --project-id ID
 reviewctl project show --format human|json
 reviewctl exchange export --project ID --output BUNDLE
 reviewctl exchange inspect BUNDLE --format human|json
-reviewctl exchange import BUNDLE
+reviewctl exchange import BUNDLE [--project ID]
 ```
 
 `project init` writes only the non-secret project identity after explicit user
-invocation. `exchange inspect` does not import or trust a bundle. Import verifies
-the bundle, signature, origin continuity, export classification, and local trust
-policy before appending any event.
+invocation. `exchange inspect` does not import or trust a bundle. Import uses
+the current repository's effective `ProjectId`; outside a project it requires
+`--project`. The effective project must exactly match the signed bundle project.
+Import then verifies the signature, project-origin authorization, origin
+continuity, export classification, and local trust policy before appending any
+event.
 
 ### `reviewctl run`
 
@@ -836,6 +966,10 @@ must persist the bounded attempt state first when safe to do so.
 - Editable attempts cannot be promoted into review attempts or approvals.
 - Exchange bundles disclose only fields and blobs permitted by export policy;
   transports receive opaque bytes and locators, never backend credentials.
+- Bundle signatures, trust roots, cursors, and replay decisions belong to
+  reviewctl even when bundle bytes are stored in Potzal.
+- Quarantined imports are non-authoritative and excluded from all review
+  projections until a later explicit verification succeeds.
 
 ## Testing Strategy
 
@@ -891,8 +1025,23 @@ must persist the bounded attempt state first when safe to do so.
 - deterministic self-contained bundle identity;
 - signature and trust-policy verification before journal append;
 - idempotent repeated import and conflicting-event rejection;
-- per-origin monotonic sequence and preserved causal links;
+- per-origin monotonic contiguous sequence, previous-bundle cursor, and
+  preserved causal links;
+- event-ID collision, origin-sequence fork, missing-parent, sequence-gap, and
+  replay quarantine;
+- cross-project substitution rejection when a valid origin key is not delegated
+  to the signed and effective `ProjectId`;
+- key rotation, revocation, threshold, validity-period, and stale offline trust
+  snapshot behavior;
 - summary-only, sealed-blob, and full-evidence export policies;
+- per-object classification, redaction provenance, recipient-bound sealing,
+  omission, and visible-metadata allow-list behavior;
+- quarantine exclusion from projections and explicit retry under a new
+  trust/policy snapshot;
+- `BundleImported` provenance recording source and importing origins plus cursor
+  movement;
+- proof that import never updates, deletes, renumbers, or silently consolidates
+  an existing journal event;
 - identical consolidated projection after importing the same origin streams in
   different orders;
 - filesystem transport first; optional Potzal transport treats the bundle as
@@ -939,14 +1088,18 @@ The design is ready for global enforcement only when:
     remains a separate non-approval artifact;
 11. local setup on Eloísa and Amélia requires no remote dispatch or shared
     credentials;
-12. the candidate commit passes the repository-versioned commands
+12. a manual Eloísa-to-Amélia exchange verifies signature and trust continuity,
+    advances the correct origin cursor, preserves an identical consolidated
+    projection, and quarantines a tampered/replayed variant without modifying
+    either authoritative journal;
+13. the candidate commit passes the repository-versioned commands
     `uv run pytest` and `uv run ruff check .`; every backend claimed supported
     has a passing conformance case in that committed test suite and a receipt
     bound to the candidate commit or one of its ancestors;
-13. a formal findings-json review of the candidate commit is accepted, its
+14. a formal findings-json review of the candidate commit is accepted, its
     receipt verifies, and every reported material finding is resolved or
     independently rejected with recorded evidence;
-14. every advisory `WorkflowDefect` classified `critical` or `high` has status
+15. every advisory `WorkflowDefect` classified `critical` or `high` has status
     `resolved` or `superseded` and satisfies the required `resolutionEvidence`;
     none remains open, merely acknowledged, or deferred at global enforcement.
 
