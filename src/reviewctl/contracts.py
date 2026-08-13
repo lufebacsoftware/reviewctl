@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 FINDING_FIELDS = {"severity", "path", "line", "title", "evidence", "reproduction"}
 FINDING_SEVERITIES = {"critical", "high", "medium", "low", "info"}
@@ -182,6 +182,34 @@ def exact_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+class _FrozenDict(dict[str, Any]):
+    """JSON-compatible dictionary with immutable v1 finding values."""
+
+    def _reject_mutation(self, *args: object, **kwargs: object) -> NoReturn:
+        raise TypeError("contract finding values are immutable")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+    __ior__ = _reject_mutation
+
+
+def _contains_surrogate(value: object) -> bool:
+    return isinstance(value, str) and any(
+        0xD800 <= ord(character) <= 0xDFFF for character in value
+    )
+
+
+def _finding_contains_surrogate(finding: object) -> bool:
+    return isinstance(finding, dict) and any(
+        _contains_surrogate(value) for value in finding.values()
+    )
+
+
 def _validate_finding(
     finding: object, context: ContractContext
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -193,6 +221,8 @@ def _validate_finding(
         for field in string_fields
     ):
         return None, "finding-value"
+    if any(_contains_surrogate(finding[field]) for field in string_fields):
+        return None, "finding-value"
     if finding["severity"] not in FINDING_SEVERITIES:
         return None, "finding-value"
     line = finding["line"]
@@ -200,7 +230,7 @@ def _validate_finding(
         return None, "finding-value"
     if context.file_names and finding["path"] not in context.file_names:
         return None, "finding-path"
-    return dict(finding), None
+    return _FrozenDict(finding), None
 
 
 class FindingsJsonContract:
@@ -300,18 +330,23 @@ class FindingsJsonContract:
         normalized_findings: list[dict[str, Any]] = []
         invalid_fragment_indexes: list[int] = []
         first_finding_violation: str | None = None
+        surrogate_finding_invalid = False
         if findings_are_list:
             for index, finding in enumerate(findings):
                 normalized_finding, finding_violation = _validate_finding(finding, context)
                 if finding_violation is not None:
                     invalid_fragment_indexes.append(index)
+                    surrogate_finding_invalid |= _finding_contains_surrogate(finding)
                     if first_finding_violation is None:
                         first_finding_violation = finding_violation
                     continue
                 assert normalized_finding is not None
                 normalized_findings.append(normalized_finding)
-        if violation is None and first_finding_violation is not None:
-            violation = first_finding_violation
+        if first_finding_violation is not None:
+            if violation is None:
+                violation = first_finding_violation
+            elif violation == "response-fields" and surrogate_finding_invalid:
+                violation = "finding-value"
 
         verdict_invariant = (
             verdict_valid

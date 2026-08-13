@@ -1,6 +1,8 @@
 import hashlib
 import json
 
+import pytest
+
 from reviewctl.contracts import (
     ContractContext,
     ContractEvaluation,
@@ -501,3 +503,55 @@ def test_findings_contract_rejects_infinity_before_fragment_extraction() -> None
 
 def test_findings_contract_rejects_negative_infinity_before_fragment_extraction() -> None:
     assert_non_finite_json_is_rejected("-Infinity")
+
+
+def assert_isolated_surrogate_is_rejected(surrogate: str, *, extra_field: bool) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    value = finding_payload(title=surrogate)
+    if extra_field:
+        value["extra"] = True
+
+    evaluation = contract.evaluate(
+        json.dumps(value, ensure_ascii=True), prepared, context
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("finding-value",)
+    assert evaluation.valid_fragments == ()
+    assert evaluation.completion_request is None
+
+
+def test_findings_contract_rejects_isolated_surrogates_before_fragment_extraction() -> None:
+    assert_isolated_surrogate_is_rejected(chr(0xD800), extra_field=True)
+    assert_isolated_surrogate_is_rejected(chr(0xDC00), extra_field=True)
+
+
+def test_findings_contract_rejects_isolated_surrogate_on_complete_path() -> None:
+    assert_isolated_surrogate_is_rejected(chr(0xD800), extra_field=False)
+
+
+def test_finding_values_are_immutable_without_losing_dict_compatibility() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    evaluation = contract.evaluate(json.dumps(finding_payload()), prepared, context)
+    assert evaluation.value is not None
+    fragment_value = evaluation.valid_fragments[0].value
+    evaluation_finding = evaluation.value["findings"][0]
+    original = finding_payload()["findings"][0]
+
+    assert fragment_value is evaluation_finding
+    assert fragment_value == original
+    assert json.loads(json.dumps(fragment_value)) == original
+
+    with pytest.raises(TypeError):
+        fragment_value["title"] = "mutated"
+    with pytest.raises(TypeError):
+        del evaluation_finding["title"]
+    with pytest.raises(TypeError):
+        fragment_value.update({"title": "mutated"})
+
+    assert fragment_value == original
+    assert evaluation_finding == original
