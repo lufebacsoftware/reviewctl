@@ -22,6 +22,19 @@ COMPLETION_CONTEXT_END = "</reviewctl-completion-context>"
 # Pure receipt validation cannot construct the CLI registry, so this allowlist is
 # kept synchronized with build_backend_registry() by a focused registry test.
 SUPPORTED_REVIEW_TRANSPORTS = frozenset({"agy", "codex", "llm", "openrouter", "pi"})
+SUPPORTED_ATTEMPT_RESULTS = frozenset(
+    {
+        "accepted",
+        "incomplete",
+        "timeout",
+        "transport-failed",
+        "missing-response",
+        "model-mismatch",
+        "provider-mismatch",
+        "empty",
+        "missing-conversation",
+    }
+)
 
 
 class _FrozenDict(dict[str, Any]):
@@ -700,6 +713,9 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     )
 
     for index, attempt in enumerate(attempts, start=1):
+        if attempt.get("result") not in SUPPORTED_ATTEMPT_RESULTS:
+            reject("attempt-result")
+
         raw = attempt.get("rawResponse")
         raw_digest: str | None = None
         if raw is not None:
@@ -1046,7 +1062,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 if not (
                     _is_positive_int(source)
                     and _is_positive_int(destination)
-                    and source < destination
+                    and source == destination - 1
                     and destination == target
                     and source <= len(attempts)
                     and destination <= len(attempts)
@@ -1055,15 +1071,15 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and isinstance(ids, list)
                     and all(isinstance(fragment_id, str) for fragment_id in ids)
                     and ids == sorted(set(ids))
-                    and all(
-                        _is_sha256(fragment_id)
-                        and any(
-                            source_attempt < destination
-                            for source_attempt in promoted_attempts_by_id.get(fragment_id, set())
-                        )
-                        for fragment_id in ids
-                    )
                 ):
+                    relationships_valid = False
+                    break
+                expected_ids = sorted(
+                    fragment_id
+                    for fragment_id, source_attempts in promoted_attempts_by_id.items()
+                    if any(source_attempt <= source for source_attempt in source_attempts)
+                )
+                if ids != expected_ids:
                     relationships_valid = False
                     break
                 expected_kind = (

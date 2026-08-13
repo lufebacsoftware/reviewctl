@@ -1430,6 +1430,14 @@ def test_validate_v2_receipt_accepts_invalid_evaluation_state() -> None:
     assert validate_v2_receipt(v2_invalid_findings_receipt()) == ()
 
 
+def test_validate_v2_receipt_rejects_unknown_attempt_result() -> None:
+    receipt = v2_invalid_findings_receipt()
+    receipt["attempts"][0]["result"] = "unavailable"
+    _sign_receipt(receipt)
+
+    assert "attempt-result" in validate_v2_receipt(receipt)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

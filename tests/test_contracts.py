@@ -357,8 +357,11 @@ def test_mixed_findings_extract_only_valid_siblings_and_request_completion() -> 
     assert [fragment.value for fragment in evaluation.valid_fragments] == [valid_finding]
     assert evaluation.coverage is not None
     assert evaluation.coverage.required_fields == ("verdict", "findings")
-    assert evaluation.coverage.covered_fields == ("verdict", "findings")
+    assert evaluation.coverage.covered_fields == ("verdict",)
     assert evaluation.coverage.missing_fields == ("findings",)
+    assert not set(evaluation.coverage.covered_fields).intersection(
+        evaluation.coverage.missing_fields
+    )
     assert evaluation.completion_request is not None
     assert evaluation.completion_request.prepared_digest == prepared.digest
     assert evaluation.completion_request.packet_digest == "packet-sha256"

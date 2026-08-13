@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import time
 from contextlib import closing
+from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -5444,6 +5446,41 @@ def test_generated_incomplete_duplicate_findings_promote_once_and_self_verify(
     assert cli.validate_v2_receipt(receipt) == ()
 
 
+def test_generated_mixed_valid_and_invalid_findings_self_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    valid = {
+        "severity": "medium",
+        "path": "source.py",
+        "line": 1,
+        "title": "Useful sibling",
+        "evidence": "One sibling remains valid evidence.",
+        "reproduction": "Inspect source.py.",
+    }
+    invalid = {**valid, "severity": "urgent"}
+    response = json.dumps({"verdict": "changes-requested", "findings": [invalid, valid]})
+
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": response}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    attempt = receipt["attempts"][0]
+    evaluation = attempt["contractEvaluation"]
+    assert evaluation["status"] == "incomplete"
+    assert len(evaluation["fragments"]) == 1
+    assert evaluation["coverage"]["coveredFields"] == ["verdict"]
+    assert evaluation["coverage"]["missingFields"] == ["findings"]
+    assert len(attempt["promotedFragments"]) == 1
+    assert cli.validate_v2_receipt(receipt) == ()
+
+
 def test_repeated_partial_payload_promotes_identity_only_once_across_attempts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5485,6 +5522,25 @@ def test_repeated_partial_payload_promotes_identity_only_once_across_attempts(
         source["attempt"] for source in receipt["consolidatedReview"]["findings"][0]["sources"]
     ] == [1, 2]
     assert cli.validate_v2_receipt(receipt) == ()
+
+    wrong_source = deepcopy(receipt)
+    wrong_source["fallbackRelationships"][1]["fromAttempt"] = 1
+    wrong_source.pop("sha256")
+    wrong_source["sha256"] = hashlib.sha256(cli.canonical_json(wrong_source)).hexdigest()
+    assert "fallback-relationships" in cli.validate_v2_receipt(wrong_source)
+
+    omitted_context = deepcopy(receipt)
+    omitted_context["fallbackRelationships"][1]["promotedFragmentIds"] = []
+    omitted_context.pop("sha256")
+    omitted_context["sha256"] = hashlib.sha256(cli.canonical_json(omitted_context)).hexdigest()
+    assert "fallback-relationships" in cli.validate_v2_receipt(omitted_context)
+
+    injected_context = deepcopy(receipt)
+    injected_context["fallbackRelationships"][1]["promotedFragmentIds"].append("0" * 64)
+    injected_context["fallbackRelationships"][1]["promotedFragmentIds"].sort()
+    injected_context.pop("sha256")
+    injected_context["sha256"] = hashlib.sha256(cli.canonical_json(injected_context)).hexdigest()
+    assert "fallback-relationships" in cli.validate_v2_receipt(injected_context)
 
 
 def test_invalid_json_findings_receipt_retains_rejected_contract_evaluation(

@@ -397,7 +397,7 @@ class FindingsJsonContract:
             covered_fields.append("verdict")
         else:
             missing_fields.append("verdict")
-        if findings_valid or normalized_findings:
+        if findings_valid:
             covered_fields.append("findings")
         if not findings_valid:
             missing_fields.append("findings")
