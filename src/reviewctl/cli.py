@@ -3339,8 +3339,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     except (ValueError, UnicodeError, OverflowError) as error:
                         exception_name = type(error).__name__
                         evaluation_error = {
-                            "kind": "contract-data-error",
-                            "exception": exception_name,
+                            "type": exception_name,
+                            "message": "response data could not be evaluated safely",
                         }
                         validation_error = (
                             "findings-json: response data could not be evaluated safely "
@@ -3395,6 +3395,12 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     attempt=number,
                     route_index=route_index,
                     raw_response_digest=str(raw_response["sha256"]),
+                )
+                existing_fragment_ids = {fragment.fragment_id for fragment in promoted_fragments}
+                newly_promoted = tuple(
+                    fragment
+                    for fragment in newly_promoted
+                    if fragment.fragment_id not in existing_fragment_ids
                 )
                 if newly_promoted and contract_evaluation.completion_request is not None:
                     promoted_fragments = (*promoted_fragments, *newly_promoted)
@@ -3469,6 +3475,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "payloadSha256": contract_evaluation.payload_digest,
                     "normalizedSha256": contract_evaluation.normalized_digest,
                     "normalizedValue": contract_evaluation.value,
+                    "reviewDeclarationRequired": (contract_context.review_declaration_required),
                     "violations": list(contract_evaluation.violations),
                     "status": contract_evaluation.status.value,
                     "fragments": [

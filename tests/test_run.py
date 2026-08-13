@@ -895,8 +895,8 @@ def test_native_data_decode_failure_emits_stable_invalid_attempt_and_receipt(
         "findings-json: response data could not be evaluated safely (ValueError)"
     )
     assert attempt["evaluationError"] == {
-        "kind": "contract-data-error",
-        "exception": "ValueError",
+        "type": "ValueError",
+        "message": "response data could not be evaluated safely",
     }
     assert "contractEvaluation" not in attempt
     assert attempt["promotedFragments"] == []
@@ -937,7 +937,7 @@ def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
         max_attempts=1,
     )
     assert return_code == 1
-    assert receipt["attempts"][0]["evaluationError"]["exception"] == "ValueError"
+    assert receipt["attempts"][0]["evaluationError"]["type"] == "ValueError"
     assert receipt["attempts"][0]["promotedFragments"] == []
     assert "contractEvaluation" not in receipt["attempts"][0]
     assert cli.validate_v2_receipt(receipt) == ()
@@ -2470,6 +2470,9 @@ def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -
     response_path = Path(receipt["attempts"][0]["evidence"]["response"])
     assert response_path.is_file()
     assert response_path.read_text()
+    verified = run_cli("verify", str(turn / "receipt.json"))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["violations"] == []
 
 
 def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Path) -> None:
@@ -2486,22 +2489,37 @@ def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Pat
                     "reproduction": "Submit it twice.",
                 }
             ],
+            "reviewedFiles": ["source.py"],
         }
     )
-    fake_codex = write_fake_codex(tmp_path, response=response)
+    fake_codex_root = tmp_path.parent / "structured-codex-bin"
+    fake_codex_root.mkdir()
+    fake_codex = write_fake_codex(fake_codex_root, response=response)
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
         "--transport",
         "codex",
+        "--source-class",
+        "proprietary",
         "--response-contract",
         "findings-json",
         env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 0, result.stderr
-    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
     assert receipt["findings"][0]["path"] == "source.py"
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    assert evaluation["reviewDeclarationRequired"] is True
+    assert evaluation["coverage"]["requiredFields"] == [
+        "verdict",
+        "findings",
+        "reviewedFiles",
+    ]
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
 
 
 def test_codex_transport_reads_the_session_identifier_from_stderr(tmp_path: Path) -> None:
@@ -5287,6 +5305,7 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
         "payloadSha256",
         "normalizedSha256",
         "normalizedValue",
+        "reviewDeclarationRequired",
         "violations",
         "status",
         "fragments",
@@ -5295,6 +5314,7 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     }
     assert (evaluation["name"], evaluation["version"]) == ("findings-json", "1")
     assert evaluation["status"] == "complete"
+    assert evaluation["reviewDeclarationRequired"] is False
     assert evaluation["normalizedValue"] == complete_response
     assert evaluation["normalizedSha256"] == cli.sha256_bytes(cli.canonical_json(complete_response))
     assert evaluation["completionRequest"] is None
@@ -5305,6 +5325,95 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     verified = run_cli("verify", str(receipt_path))
     assert verified.returncode == 0, verified.stderr
     assert json.loads(verified.stdout)["valid"] is True
+
+
+def test_generated_complete_duplicate_findings_receipt_self_verifies(tmp_path: Path) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    duplicate = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Duplicate finding",
+        "evidence": "The same finding is intentionally repeated.",
+        "reproduction": "Inspect source.py line 1.",
+    }
+    response = {
+        "verdict": "changes-requested",
+        "findings": [duplicate, duplicate],
+    }
+
+    result = run_cli(
+        *review_arguments(tmp_path, "accepted"),
+        "--response-contract",
+        "findings-json",
+        env={"LLM_BIN": str(fake_llm), "LLM_SCHEMA_RESPONSE": json.dumps(response)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert len(receipt["attempts"][0]["contractEvaluation"]["fragments"]) == 2
+    assert receipt["attempts"][0]["promotedFragments"] == []
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["violations"] == []
+
+
+def test_generated_incomplete_duplicate_findings_promote_once_and_self_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    duplicate = {
+        "severity": "medium",
+        "path": "source.py",
+        "line": 1,
+        "title": "Useful duplicate",
+        "evidence": "The partial response repeats one bounded finding.",
+        "reproduction": "Inspect source.py.",
+    }
+    response = json.dumps({"findings": [duplicate, duplicate]})
+
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": response}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    attempt = receipt["attempts"][0]
+    assert len(attempt["contractEvaluation"]["fragments"]) == 2
+    assert len(attempt["promotedFragments"]) == 1
+    assert cli.validate_v2_receipt(receipt) == ()
+
+
+def test_repeated_partial_payload_promotes_identity_only_once_across_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "low",
+        "path": "source.py",
+        "line": 1,
+        "title": "Repeated partial",
+        "evidence": "Both attempts return the same typed evidence.",
+        "reproduction": "Inspect source.py.",
+    }
+    response = json.dumps({"findings": [finding]})
+
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": response}, {"response": response}],
+    )
+
+    assert return_code == 1
+    assert [len(attempt["promotedFragments"]) for attempt in receipt["attempts"]] == [1, 0]
+    assert cli.validate_v2_receipt(receipt) == ()
 
 
 def test_invalid_json_findings_receipt_retains_rejected_contract_evaluation(
