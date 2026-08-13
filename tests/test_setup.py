@@ -922,7 +922,15 @@ def test_discovery_redacts_exact_separator_delimited_credential_labels(label: st
 
 @pytest.mark.parametrize(
     "label",
-    ["notasecret", "my_tokenization", "secretariat", "tokenizer", "api_keyboard"],
+    [
+        "notasecret",
+        "my_tokenization",
+        "secretariat",
+        "tokenizer",
+        "api_keyboard",
+        "github_access_tokenizer",
+        "openai_api_keynote",
+    ],
 )
 def test_discovery_preserves_benign_substring_labels(label: str) -> None:
     safe_value = f"{label}-ordinary-value"
@@ -984,3 +992,32 @@ def test_discovery_preserves_short_or_embedded_sk_and_ordinary_hyphen_words(
     )
 
     assert installation.version == safe_text
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "OPENAI_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_ACCESS_TOKEN",
+        "AZURE_CLIENT_SECRET",
+        "acme-prod-refresh-token",
+        "company_team_auth_token",
+    ],
+)
+def test_discovery_redacts_provider_prefixed_exact_credential_suffixes(label: str) -> None:
+    secret = f"{label}-must-not-survive"
+    version = json.dumps({label: secret, "version": "tool 8.0"})
+    diagnostic = f"{label}={secret}\nsafe diagnostic"
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (version, diagnostic),
+    )
+
+    assert secret not in repr(asdict(installation))
+    assert installation.version == json.dumps({label: "[REDACTED]", "version": "tool 8.0"})
+    assert installation.diagnostics == (f"{label}=[REDACTED]\nsafe diagnostic",)
+    assert installation.resolved_executable == "/safe/bin/tool"

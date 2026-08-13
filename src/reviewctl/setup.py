@@ -14,12 +14,13 @@ from reviewctl.backends import BackendDescriptor, BackendRegistry, DiscoveryKind
 
 _MAX_OUTPUT_LENGTH = 500
 _WINDOWS_EXECUTABLE_EXTENSIONS = (".COM", ".EXE", ".BAT", ".CMD")
-_SENSITIVE_LABEL = (
+_CREDENTIAL_SUFFIX = (
     r"(?:access[-_]token|auth[-_]token|refresh[-_]token|id[-_]token|"
     r"secret[-_]access[-_]key|access[-_]key[-_]id|client[-_]secret|"
     r"api[-_]key|private[-_]key|password|passwd|authorization|credentials?|"
-    r"tokens?|secrets?|(?:[a-z0-9]+[-_])+secrets?)"
+    r"tokens?|secrets?)"
 )
+_SENSITIVE_LABEL = rf"(?:(?:[a-z0-9]+[-_])+)?{_CREDENTIAL_SUFFIX}"
 _DELIMITED_SENSITIVE_LABEL = rf"(?<![a-z0-9_-]){_SENSITIVE_LABEL}(?![a-z0-9_-])"
 _URI_USERINFO = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _BEARER_CREDENTIAL = re.compile(r"(?i)(\bbearer)(\s+)[^\s,;\"']+")
