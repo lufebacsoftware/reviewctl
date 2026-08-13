@@ -181,6 +181,24 @@ def _valid_completion_manifest(
     return list(invalid_fragment_indexes) == sorted(set(invalid_fragment_indexes))
 
 
+def _valid_incomplete_coverage(
+    required_fields: list[str] | tuple[str, ...],
+    covered_fields: list[str] | tuple[str, ...],
+    missing_fields: list[str] | tuple[str, ...],
+) -> bool:
+    """Reproduce the coverage state that permits findings promotion."""
+    covered = set(covered_fields)
+    missing = set(missing_fields)
+    return (
+        not covered.intersection(missing)
+        and covered.union(missing) == set(required_fields)
+        and list(covered_fields) == [field for field in required_fields if field in covered]
+        and list(missing_fields) == [field for field in required_fields if field in missing]
+        and "findings" not in covered
+        and "findings" in missing
+    )
+
+
 def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | None:
     """Reproduce v1 finding identity at every promoted-fragment trust boundary."""
     if (
@@ -485,16 +503,10 @@ def _valid_incomplete_evaluation(
             or coverage.required_fields != required_fields
         ):
             return False
-        covered = set(coverage.covered_fields)
-        missing = set(coverage.missing_fields)
-        if (
-            covered & missing
-            or covered | missing != set(required_fields)
-            or coverage.covered_fields
-            != tuple(field for field in required_fields if field in covered)
-            or coverage.missing_fields
-            != tuple(field for field in required_fields if field in missing)
-            or "findings" not in missing
+        if not _valid_incomplete_coverage(
+            coverage.required_fields,
+            coverage.covered_fields,
+            coverage.missing_fields,
         ):
             return False
 
@@ -1069,6 +1081,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         if raw is not None:
             if not (
                 type(raw) is dict
+                and set(raw) == {"path", "sha256", "characters"}
                 and isinstance(raw.get("path"), str)
                 and bool(raw["path"])
                 and _is_sha256(raw.get("sha256"))
@@ -1180,7 +1193,14 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     reject("contract-evaluation")
                     fragment_values = []
                 for fragment in fragment_values:
-                    valid = type(fragment) is dict
+                    valid = type(fragment) is dict and set(fragment) == {
+                        "fragmentId",
+                        "fingerprint",
+                        "kind",
+                        "value",
+                        "payloadDigest",
+                        "scope",
+                    }
                     if valid:
                         value = fragment.get("value")
                         scope = fragment.get("scope")
@@ -1269,6 +1289,9 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         coverage_missing=coverage[2],
                         violations=violations_value,
                     )
+                    incomplete_coverage_valid = coverage_valid and _valid_incomplete_coverage(
+                        coverage[0], coverage[1], coverage[2]
+                    )
                     state_valid = (
                         state_valid
                         and normalized_digest is None
@@ -1276,6 +1299,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         and bool(violations_value)
                         and bool(contract_fragments)
                         and completion_valid
+                        and incomplete_coverage_valid
                         and attempt.get("result") == "incomplete"
                     )
                     promotion_eligible = state_valid
@@ -1298,7 +1322,16 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             reject("promoted-fragments")
             promoted_value = []
         for item in promoted_value:
-            if type(item) is not dict:
+            if type(item) is not dict or set(item) != {
+                "fragmentId",
+                "fingerprint",
+                "finding",
+                "sourceAttempt",
+                "routeIndex",
+                "payloadDigest",
+                "rawResponseDigest",
+                "packetDigest",
+            }:
                 reject("promoted-fragments")
                 continue
             try:
@@ -1416,7 +1449,13 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         )
         if relationships_valid:
             for target, relationship in enumerate(relationships, start=2):
-                if type(relationship) is not dict:
+                if type(relationship) is not dict or set(relationship) != {
+                    "fromAttempt",
+                    "toAttempt",
+                    "kind",
+                    "reason",
+                    "promotedFragmentIds",
+                }:
                     relationships_valid = False
                     break
                 source = relationship.get("fromAttempt")

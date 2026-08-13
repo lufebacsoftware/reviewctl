@@ -1386,6 +1386,76 @@ def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> 
     assert validate_v2_receipt(v2_findings_receipt()) == ()
 
 
+def test_validate_v2_receipt_requires_findings_to_remain_missing_when_promotable() -> None:
+    receipt = v2_findings_receipt()
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    evaluation["coverage"]["coveredFields"] = ["verdict", "findings"]
+    evaluation["coverage"]["missingFields"] = []
+    evaluation["completionRequest"]["missingFields"] = []
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("record", "violation"),
+    [
+        ("contract-fragment", "contract-fragments"),
+        ("promoted-fragment", "promoted-fragments"),
+        ("coverage", "contract-evaluation"),
+        ("completion-request", "contract-evaluation"),
+        ("contract-context", "contract-evaluation"),
+        ("fallback-relationship", "fallback-relationships"),
+        ("raw-response", "raw-response"),
+        ("consolidated-review", "consolidated-review"),
+        ("consolidated-finding", "consolidated-review"),
+        ("consolidated-source", "consolidated-review"),
+    ],
+)
+def test_validate_v2_receipt_rejects_extra_typed_record_keys(record: str, violation: str) -> None:
+    receipt = v2_findings_receipt()
+    first = receipt["attempts"][0]
+    evaluation = first["contractEvaluation"]
+    targets = {
+        "contract-fragment": evaluation["fragments"][0],
+        "promoted-fragment": first["promotedFragments"][0],
+        "coverage": evaluation["coverage"],
+        "completion-request": evaluation["completionRequest"],
+        "contract-context": evaluation["contractContext"],
+        "fallback-relationship": receipt["fallbackRelationships"][0],
+        "raw-response": first["rawResponse"],
+        "consolidated-review": receipt["consolidatedReview"],
+        "consolidated-finding": receipt["consolidatedReview"]["findings"][0],
+        "consolidated-source": receipt["consolidatedReview"]["findings"][0]["sources"][0],
+    }
+    targets[record]["unexpected"] = "hostile"
+    _sign_receipt(receipt)
+
+    assert violation in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize("location", ["receipt", "attempt"])
+def test_validate_v2_receipt_preserves_compatible_extension_fields(location: str) -> None:
+    receipt = v2_findings_receipt()
+    target = receipt if location == "receipt" else receipt["attempts"][0]
+    target["extension.example"] = {"version": 1}
+    _sign_receipt(receipt)
+
+    assert validate_v2_receipt(receipt) == ()
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["fragmentId", "fingerprint", "kind", "value", "payloadDigest", "scope"],
+)
+def test_validate_v2_receipt_requires_every_contract_fragment_key(key: str) -> None:
+    receipt = v2_findings_receipt()
+    receipt["attempts"][0]["contractEvaluation"]["fragments"][0].pop(key)
+    _sign_receipt(receipt)
+
+    assert "contract-fragments" in validate_v2_receipt(receipt)
+
+
 @pytest.mark.parametrize("packet_digest", [None, "c" * 64])
 def test_validate_v2_receipt_binds_promoted_fragments_to_packet(
     packet_digest: str | None,
