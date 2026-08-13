@@ -84,6 +84,9 @@ def promoted(*findings: dict[str, object], attempt: int = 1, route_index: int = 
     evaluation = incomplete_evaluation(*findings)
     return promote_fragments(
         evaluation,
+        contract_context=ContractContext(
+            file_names=tuple(sorted({str(item["path"]) for item in findings}))
+        ),
         gate_result="contract-incomplete",
         attempt=attempt,
         route_index=route_index,
@@ -169,6 +172,7 @@ def v2_findings_receipt() -> dict[str, object]:
     complete = contract.evaluate(complete_payload, prepared, context)
     promoted_fragment = promote_fragments(
         partial,
+        contract_context=context,
         gate_result="contract-incomplete",
         attempt=1,
         route_index=0,
@@ -321,6 +325,7 @@ def test_promote_fragments_fails_closed_for_every_non_partial_gate(gate_result: 
     assert (
         promote_fragments(
             evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
             gate_result=gate_result,
             attempt=1,
             route_index=0,
@@ -332,8 +337,10 @@ def test_promote_fragments_fails_closed_for_every_non_partial_gate(gate_result: 
 
 def test_promote_fragments_records_attempt_provenance_only_for_contract_incomplete() -> None:
     evaluation = incomplete_evaluation(finding())
+    contract_context = ContractContext(file_names=("source.py",))
     result = promote_fragments(
         evaluation,
+        contract_context=contract_context,
         gate_result="contract-incomplete",
         attempt=1,
         route_index=0,
@@ -359,11 +366,62 @@ def test_promote_fragments_records_attempt_provenance_only_for_contract_incomple
     assert deepcopy(result[0].finding) is result[0].finding
 
 
+def test_promote_fragments_rejects_reidentified_finding_outside_origin_scope() -> None:
+    outside = finding(path="outside.py")
+    evaluation = incomplete_evaluation(outside)
+    origin_context = ContractContext(file_names=("source.py",))
+    origin_prepared = get_contract("findings-json").prepare(origin_context)
+    completion_request = replace(
+        evaluation.completion_request,
+        prepared_digest=origin_prepared.digest,
+    )
+    forged = replace(
+        evaluation,
+        prepared_digest=origin_prepared.digest,
+        completion_request=completion_request,
+    )
+
+    assert (
+        promote_fragments(
+            forged,
+            contract_context=origin_context,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=forged.payload_digest,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("tamper", ["prepared-digest", "contract-context"])
+def test_promote_fragments_rejects_prepared_identity_mismatch(tamper: str) -> None:
+    evaluation = incomplete_evaluation(finding())
+    origin_context = ContractContext(file_names=("source.py",))
+    if tamper == "prepared-digest":
+        evaluation = replace(evaluation, prepared_digest="0" * 64)
+    else:
+        origin_context = replace(origin_context, review_declaration_required=True)
+
+    assert (
+        promote_fragments(
+            evaluation,
+            contract_context=origin_context,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
 def test_promote_fragments_deduplicates_identical_incomplete_siblings_by_id() -> None:
     evaluation = incomplete_evaluation(finding(), finding())
 
     result = promote_fragments(
         evaluation,
+        contract_context=ContractContext(file_names=("source.py",)),
         gate_result="contract-incomplete",
         attempt=1,
         route_index=0,
@@ -394,6 +452,7 @@ def test_contract_incomplete_gate_cannot_promote_complete_or_invalid_evaluation(
     assert (
         promote_fragments(
             evaluation,
+            contract_context=context,
             gate_result="contract-incomplete",
             attempt=1,
             route_index=0,
@@ -422,6 +481,7 @@ def test_promote_fragments_rejects_tampered_contract_fragment_identity(tamper: s
     assert (
         promote_fragments(
             evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
             gate_result="contract-incomplete",
             attempt=1,
             route_index=0,
@@ -445,6 +505,7 @@ def test_promote_fragments_fails_closed_for_isolated_unicode_surrogate(
     assert (
         promote_fragments(
             replace(evaluation, valid_fragments=(fragment,)),
+            contract_context=ContractContext(file_names=("source.py",)),
             gate_result="contract-incomplete",
             attempt=1,
             route_index=0,
@@ -460,6 +521,7 @@ def test_promote_fragments_requires_raw_response_to_match_evaluated_payload() ->
     assert (
         promote_fragments(
             evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
             gate_result="contract-incomplete",
             attempt=1,
             route_index=0,
@@ -488,6 +550,7 @@ def test_promote_fragments_rejects_invalid_finding_values(
     assert (
         promote_fragments(
             replace(evaluation, valid_fragments=(fragment,)),
+            contract_context=ContractContext(file_names=("source.py",)),
             gate_result="contract-incomplete",
             attempt=1,
             route_index=0,
@@ -503,6 +566,7 @@ def test_promote_fragments_requires_completion_request_even_for_incomplete_statu
     assert (
         promote_fragments(
             evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
             gate_result="contract-incomplete",
             attempt=1,
             route_index=0,
@@ -555,6 +619,7 @@ def test_build_completion_context_rejects_findings_outside_target_scope() -> Non
     evaluation = incomplete_evaluation(finding(path="foreign.py"))
     fragments = promote_fragments(
         evaluation,
+        contract_context=ContractContext(file_names=("foreign.py",)),
         gate_result="contract-incomplete",
         attempt=1,
         route_index=0,
@@ -672,6 +737,7 @@ def test_promote_fragments_rejects_invalid_provenance_coordinates(
     assert (
         promote_fragments(
             evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
             gate_result="contract-incomplete",
             attempt=attempt,  # type: ignore[arg-type]
             route_index=route_index,  # type: ignore[arg-type]
@@ -715,6 +781,7 @@ def test_render_completion_prompt_contains_only_bounded_canonical_context() -> N
     evaluation = incomplete_evaluation(finding(title="Safe extracted title"))
     fragments = promote_fragments(
         evaluation,
+        contract_context=ContractContext(file_names=("source.py",)),
         gate_result="contract-incomplete",
         attempt=1,
         route_index=0,
@@ -903,6 +970,7 @@ def test_render_completion_prompt_escapes_framing_and_instruction_injection_reve
     evaluation = incomplete_evaluation(injected)
     fragments = promote_fragments(
         evaluation,
+        contract_context=ContractContext(file_names=("source.py",)),
         gate_result="contract-incomplete",
         attempt=1,
         route_index=0,
@@ -1148,6 +1216,7 @@ def test_promote_fragments_rejects_non_finding_kind() -> None:
     assert (
         promote_fragments(
             replace(evaluation, valid_fragments=(fragment,)),
+            contract_context=ContractContext(file_names=("source.py",)),
             gate_result="contract-incomplete",
             attempt=1,
             route_index=0,

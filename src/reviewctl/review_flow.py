@@ -439,6 +439,7 @@ class ConsolidatedReview:
 def promote_fragments(
     evaluation: ContractEvaluation,
     *,
+    contract_context: ContractContext,
     gate_result: str,
     attempt: int,
     route_index: int,
@@ -446,6 +447,16 @@ def promote_fragments(
 ) -> tuple[PromotedFragment, ...]:
     """Promote only identity-valid findings from an otherwise eligible partial result."""
     if gate_result != "contract-incomplete" or evaluation.status.value != "incomplete":
+        return ()
+    if evaluation.name != "findings-json" or evaluation.version != "1":
+        return ()
+    try:
+        prepared = get_contract(evaluation.name).prepare(contract_context)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return ()
+    if prepared.name != "findings-json" or prepared.version != "1":
+        return ()
+    if evaluation.prepared_digest != prepared.digest:
         return ()
     if evaluation.completion_request is None:
         return ()
@@ -464,6 +475,8 @@ def promote_fragments(
         if fragment.kind is not FragmentKind.FINDING or not _valid_finding(fragment.value):
             return ()
         finding = _copy_finding(fragment.value)
+        if finding["path"] not in contract_context.file_names:
+            return ()
         expected_scope = (finding["path"],)
         fingerprint = _fragment_fingerprint(
             finding,

@@ -3435,6 +3435,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             if native_contract and contract_evaluation is not None and raw_response is not None:
                 newly_promoted = promote_fragments(
                     contract_evaluation,
+                    contract_context=contract_context,
                     gate_result=gate_result,
                     attempt=number,
                     route_index=route_index,
