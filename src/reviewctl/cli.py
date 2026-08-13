@@ -3007,6 +3007,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         routes=[{"model": route.model, "transport": route.transport} for route in routes],
         source_class=args.source_class,
     )
+    backend_registry = build_backend_registry()
     number = 0
     for route_index, route in enumerate(routes):
         for _ in range(max_attempts):
@@ -3048,85 +3049,29 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 route_index=route_index,
                 transport=transport,
             )
-            if transport == "codex":
-                exit_code, stderr, persisted = invoke_codex(
-                    codex_bin=os.environ.get("CODEX_BIN", "codex"),
-                    prompt=review_prompt,
-                    model=model,
-                    response_contract=args.response_contract,
-                    source_roots=codex_source_roots,
-                    timeout_seconds=timeout_seconds,
-                    workspace=snapshots[0].parent,
-                )
-                # Codex writes its transient response inside the isolated
-                # sandbox, which is removed after the attempt. Persist a copy
-                # in the caller-controlled evidence root so a rejected output
-                # remains diagnosable without weakening the contract gate.
-                response_path = attempt_dir / "response.md"
-                response_path.write_text(persisted.response)
-            elif transport == "openrouter":
-                request_path = attempt_dir / "request.json"
-                response_path = attempt_dir / "response.json"
-                exit_code, stderr, persisted = invoke_openrouter(
-                    api_key=os.environ.get("OPENROUTER_API_KEY"),
+            execution = backend_registry.require(transport).execute(
+                BackendRequest(
                     prompt=review_prompt,
                     model=transport_model,
-                    files=snapshots,
+                    response_contract=args.response_contract,
+                    files=tuple(snapshots),
+                    attempt_dir=attempt_dir,
+                    timeout_seconds=timeout_seconds,
                     max_output_tokens=args.max_output_tokens,
+                    source_class=args.source_class,
+                    source_roots=tuple(codex_source_roots or ()),
                     provider_preferences=provider_preferences,
-                    response_contract=args.response_contract,
-                    timeout_seconds=timeout_seconds,
-                    request_path=request_path,
-                    response_path=response_path,
                 )
-            elif transport == "agy":
-                request_path = attempt_dir / "request.json"
-                response_path = attempt_dir / "response.json"
-                exit_code, stderr, persisted = invoke_agy(
-                    agy_bin=os.environ.get("AGY_BIN", "agy"),
-                    prompt=review_prompt,
-                    model=transport_model,
-                    files=snapshots,
-                    max_output_tokens=args.max_output_tokens,
-                    response_contract=args.response_contract,
-                    timeout_seconds=timeout_seconds,
-                    request_path=request_path,
-                    response_path=response_path,
-                )
-            elif transport == "pi":
-                request_path = attempt_dir / "request.json"
-                response_path = attempt_dir / "events.jsonl"
-                session_path = attempt_dir / "session.jsonl"
-                final_response_path = attempt_dir / "response.md"
-                diagnostic_path = attempt_dir / "stderr.log"
-                exit_code, stderr, persisted = invoke_pi(
-                    pi_bin=os.environ.get("PI_BIN", "pi"),
-                    prompt=review_prompt,
-                    model=transport_model,
-                    files=snapshots,
-                    max_output_tokens=args.max_output_tokens,
-                    response_contract=args.response_contract,
-                    timeout_seconds=timeout_seconds,
-                    request_path=request_path,
-                    response_path=response_path,
-                    session_path=session_path,
-                    diagnostic_path=diagnostic_path,
-                )
-                if persisted.response:
-                    final_response_path.write_text(persisted.response)
-            else:
-                database = attempt_dir / "transport.sqlite3"
-                exit_code, stderr = invoke_llm(
-                    llm_bin=os.environ.get("LLM_BIN", "llm"),
-                    prompt=review_prompt,
-                    model=model,
-                    database=database,
-                    files=snapshots,
-                    max_output_tokens=args.max_output_tokens,
-                    response_contract=args.response_contract,
-                    timeout_seconds=timeout_seconds,
-                )
-                persisted = load_response(database)
+            )
+            exit_code = execution.exit_code
+            stderr = execution.diagnostic
+            persisted = execution.response
+            database = execution.evidence.database
+            request_path = execution.evidence.request
+            response_path = execution.evidence.response
+            session_path = execution.evidence.session
+            final_response_path = execution.evidence.final_response
+            diagnostic_path = execution.evidence.stderr
             contract_evaluation = (
                 native_contract.evaluate(
                     persisted.response, prepared_contract, contract_context

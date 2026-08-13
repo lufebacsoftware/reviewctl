@@ -366,6 +366,57 @@ def test_transport_return_annotations_match_runtime_tuple_shapes() -> None:
     )
 
 
+def test_run_dispatches_frozen_packet_through_registered_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    response_json = '{"verdict":"approved","findings":[]}'
+    captured: list[cli.BackendRequest] = []
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        captured.append(request)
+        evidence_path = request.attempt_dir / "response.md"
+        evidence_path.write_text(response_json)
+        return cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse(
+                "fake-turn", None, 1, 10, "accepted", 2, None, response_json
+            ),
+            cli.BackendEvidence(response=evidence_path),
+        )
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    arguments = [
+        *review_arguments(tmp_path, "accepted"),
+        "--transport",
+        "llm",
+        "--response-contract",
+        "findings-json",
+    ]
+    namespace = cli.build_parser().parse_args(arguments)
+
+    assert namespace.handler(namespace) == 0
+    assert len(captured) == 1
+    request = captured[0]
+    original_source = tmp_path / "source.py"
+    assert request.model == "accepted"
+    assert request.response_contract == "findings-json"
+    assert request.files
+    assert original_source not in request.files
+    assert all(path.parent.name.startswith("reviewctl-input-") for path in request.files)
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    evidence_path = request.attempt_dir / "response.md"
+    assert receipt["transport"] == "llm"
+    assert receipt["acceptedAttempt"] == 1
+    assert attempt["result"] == "accepted"
+    assert attempt["evidence"]["response"] == str(evidence_path)
+    assert evidence_path.read_text() == response_json
+
+
 def test_uses_a_separate_database_for_each_attempt_and_accepts_matching_model(
     tmp_path: Path,
 ) -> None:
