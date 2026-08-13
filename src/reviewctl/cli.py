@@ -3296,53 +3296,9 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "sha256": sha256_bytes(raw_response_bytes),
                     "characters": len(persisted.response),
                 }
-            contract_evaluation = (
-                native_contract.evaluate(
-                    persisted.response,
-                    prepared_contract,
-                    contract_context,
-                    evidence=EvaluationContext(packet_digest=packet_digest),
-                )
-                if persisted is not None
-                and native_contract
-                and prepared_contract
-                and contract_context
-                else None
-            )
-            if contract_evaluation:
-                review = contract_evaluation.value
-                validation_error = (
-                    findings_validation_error(persisted.response, contract_evaluation)
-                    if review is None
-                    else None
-                )
-            else:
-                review = (
-                    validate_review_response(
-                        persisted.response,
-                        args.response_contract,
-                        expected_file_hashes=(
-                            snapshot_hashes
-                            if transport == "codex" and args.source_class == "proprietary"
-                            else None
-                        ),
-                    )
-                    if persisted is not None
-                    else None
-                )
-                validation_error = (
-                    review_validation_error(
-                        persisted.response,
-                        args.response_contract,
-                        expected_file_hashes=(
-                            snapshot_hashes
-                            if transport == "codex" and args.source_class == "proprietary"
-                            else None
-                        ),
-                    )
-                    if persisted is not None and review is None
-                    else None
-                )
+            contract_evaluation = None
+            review = None
+            validation_error = None
             if exit_code == 124:
                 gate_result = "timeout"
             elif exit_code != 0:
@@ -3357,17 +3313,47 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 gate_result = "empty"
             elif not persisted.conversation_id:
                 gate_result = "missing-conversation"
-            elif native_contract and contract_evaluation is not None:
-                if contract_evaluation.status is EvaluationStatus.COMPLETE:
-                    gate_result = "accepted"
-                elif contract_evaluation.status is EvaluationStatus.INCOMPLETE:
-                    gate_result = "contract-incomplete"
-                else:
-                    gate_result = "contract-invalid"
-            elif review is None:
-                gate_result = "incomplete"
             else:
-                gate_result = "accepted"
+                if native_contract and prepared_contract and contract_context:
+                    contract_evaluation = native_contract.evaluate(
+                        persisted.response,
+                        prepared_contract,
+                        contract_context,
+                        evidence=EvaluationContext(packet_digest=packet_digest),
+                    )
+                    review = contract_evaluation.value
+                    validation_error = (
+                        findings_validation_error(persisted.response, contract_evaluation)
+                        if review is None
+                        else None
+                    )
+                    if contract_evaluation.status is EvaluationStatus.COMPLETE:
+                        gate_result = "accepted"
+                    elif contract_evaluation.status is EvaluationStatus.INCOMPLETE:
+                        gate_result = "contract-incomplete"
+                    else:
+                        gate_result = "contract-invalid"
+                else:
+                    expected_file_hashes = (
+                        snapshot_hashes
+                        if transport == "codex" and args.source_class == "proprietary"
+                        else None
+                    )
+                    review = validate_review_response(
+                        persisted.response,
+                        args.response_contract,
+                        expected_file_hashes=expected_file_hashes,
+                    )
+                    validation_error = (
+                        review_validation_error(
+                            persisted.response,
+                            args.response_contract,
+                            expected_file_hashes=expected_file_hashes,
+                        )
+                        if review is None
+                        else None
+                    )
+                    gate_result = "incomplete" if review is None else "accepted"
 
             result = (
                 "incomplete"

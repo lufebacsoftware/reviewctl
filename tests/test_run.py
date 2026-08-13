@@ -581,6 +581,7 @@ def _run_registered_findings_sequence(
     *,
     models: tuple[str, ...] = ("accepted",),
     max_attempts: int = 2,
+    response_contract: str = "findings-json",
 ) -> tuple[int, dict[str, object], list[cli.BackendRequest]]:
     captured: list[cli.BackendRequest] = []
     registry = cli.BackendRegistry()
@@ -619,7 +620,7 @@ def _run_registered_findings_sequence(
             "--transport",
             "llm",
             "--response-contract",
-            "findings-json",
+            response_contract,
             "--max-attempts",
             str(max_attempts),
         ]
@@ -772,49 +773,78 @@ def test_partial_findings_follow_the_actual_route_fallback(
     assert '"event":"attempt_retry"' not in log
 
 
+@pytest.mark.parametrize("response_contract", ["findings-json", "verdict"])
 @pytest.mark.parametrize(
-    ("response_overrides", "expected_gate"),
+    ("response_overrides", "expected_gate", "reject_provider"),
     [
-        ({"model": "wrong-model"}, "model-mismatch"),
-        ({"conversation": ""}, "missing-conversation"),
-        ({"exit_code": 124}, "timeout"),
-        ({"exit_code": 17}, "transport-failed"),
+        ({"response": "partial", "exit_code": 124}, "timeout", False),
+        ({"response": "partial", "exit_code": 17}, "transport-failed", False),
+        ({"response": None}, "missing-response", False),
+        ({"response": "partial", "model": "wrong-model"}, "model-mismatch", False),
+        ({"response": "partial", "provider": "wrong"}, "provider-mismatch", True),
+        ({"response": ""}, "empty", False),
+        ({"response": "partial", "conversation": ""}, "missing-conversation", False),
     ],
-    ids=["model", "conversation", "timeout", "transport"],
+    ids=["timeout", "exit", "missing", "model", "provider", "empty", "conversation"],
 )
-def test_precontract_gate_rejections_never_promote_partial_findings(
+def test_precontract_gates_never_invoke_native_or_legacy_evaluation(
+    response_contract: str,
     response_overrides: dict[str, object],
     expected_gate: str,
+    reject_provider: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    finding = {
-        "severity": "high",
-        "path": "source.py",
-        "line": 1,
-        "title": "Must not promote",
-        "evidence": "The response is rejected by an earlier gate.",
-        "reproduction": "Inspect the gate metadata.",
-    }
-    partial = json.dumps({"findings": [finding]})
+    if reject_provider:
+        monkeypatch.setattr(cli, "resolved_provider_matches", lambda *_: False)
+
+    if response_contract == "findings-json":
+        real_contract = cli.get_contract("findings-json")
+
+        class ExplodingContract:
+            name = real_contract.name
+            version = real_contract.version
+
+            def prepare(self, context: object) -> object:
+                return real_contract.prepare(context)
+
+            def evaluate(self, *_: object, **__: object) -> object:
+                raise AssertionError("native contract evaluation crossed a pre-gate")
+
+        monkeypatch.setattr(cli, "get_contract", lambda _: ExplodingContract())
+    else:
+        def explode(*_: object, **__: object) -> object:
+            raise AssertionError("legacy validation crossed a pre-gate")
+
+        monkeypatch.setattr(cli, "validate_review_response", explode)
+        monkeypatch.setattr(cli, "review_validation_error", explode)
 
     return_code, receipt, requests = _run_registered_findings_sequence(
         monkeypatch,
         tmp_path,
         capsys,
-        [{"response": partial, **response_overrides}],
+        [response_overrides],
         max_attempts=1,
+        response_contract=response_contract,
     )
 
     assert return_code == 1
     assert len(requests) == 1
     attempt = receipt["attempts"][0]
-    assert attempt["contractEvaluation"]["status"] == "incomplete"
     assert attempt["result"] == expected_gate
     assert attempt["promotedFragments"] == []
-    assert receipt["fallbackRelationships"] == []
-    assert receipt["consolidatedReview"]["findings"] == []
+    assert attempt["validationError"] is None
+    assert "contractEvaluation" not in attempt
+    if response_overrides["response"] is None:
+        assert attempt["rawResponse"] is None
+    else:
+        raw_response = attempt["rawResponse"]
+        assert Path(raw_response["path"]).is_file()
+        assert raw_response["characters"] == len(str(response_overrides["response"]))
+    if response_contract == "findings-json":
+        assert receipt["fallbackRelationships"] == []
+        assert receipt["consolidatedReview"]["findings"] == []
 
 
 def test_provider_mismatch_never_promotes_partial_findings(
