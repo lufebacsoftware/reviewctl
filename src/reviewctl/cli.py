@@ -667,6 +667,17 @@ def setup_topology_payload(topology: LocalExecutionTopology) -> dict[str, object
     }
 
 
+def sanitize_setup_human_text(value: str) -> str:
+    """Render terminal controls as inert, single-line escaped text."""
+    escaped_controls = {"\r": r"\r", "\n": r"\n", "\t": r"\t"}
+    return "".join(
+        escaped_controls.get(character, f"\\x{ord(character):02x}")
+        if ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+        else character
+        for character in value
+    )
+
+
 def print_setup_topology(topology: LocalExecutionTopology, output_format: str) -> None:
     """Print stable JSON or concise human-readable local setup observations."""
     if output_format == "json":
@@ -685,9 +696,9 @@ def print_setup_topology(topology: LocalExecutionTopology, output_format: str) -
         )
         if backend.version:
             details = f"{details} version={backend.version}"
-        print(details)
+        print(sanitize_setup_human_text(details))
         for diagnostic in backend.diagnostics:
-            print(f"  diagnostic: {diagnostic}")
+            print(f"  diagnostic: {sanitize_setup_human_text(diagnostic)}")
 
 
 def run_setup(args: argparse.Namespace) -> int:

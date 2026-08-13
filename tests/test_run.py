@@ -1184,6 +1184,49 @@ def test_setup_human_output_is_concise_and_distinguishes_backend_states(
     assert "openrouter: availability=not-applicable qualification=unqualified" in output
 
 
+def test_setup_human_output_escapes_terminal_controls_without_changing_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    version = "codex 1.2\x1b[31m red\x1b[0m\r\nforged\tfield\x9b2J"
+    diagnostic = "warning\x1b]52;c;Y2xpcA==\x07\r\nforged\tline\x00\x80"
+    topology = setup_topology(
+        BackendInstallation(
+            name="codex",
+            requested_executable="codex",
+            resolved_executable="/tools/codex",
+            version=version,
+            availability="available",
+            qualification="unqualified",
+            diagnostics=(diagnostic,),
+            probe_performed=True,
+        )
+    )
+
+    cli.print_setup_topology(topology, "human")
+
+    human_output = capsys.readouterr().out
+    assert human_output.splitlines() == [
+        "local-only: yes",
+        "model probes: no",
+        (
+            "codex: availability=available qualification=unqualified "
+            "version=codex 1.2\\x1b[31m red\\x1b[0m\\r\\nforged\\tfield\\x9b2J"
+        ),
+        "  diagnostic: warning\\x1b]52;c;Y2xpcA==\\x07\\r\\nforged\\tline\\x00\\x80",
+    ]
+    assert not any(
+        (ord(character) < 32 and character != "\n")
+        or 0x7F <= ord(character) <= 0x9F
+        for character in human_output
+    )
+
+    cli.print_setup_topology(topology, "json")
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backends"][0]["version"] == version
+    assert payload["backends"][0]["diagnostics"] == [diagnostic]
+
+
 @pytest.mark.parametrize(
     ("name", "availability", "probe_performed", "expected_exit"),
     [
