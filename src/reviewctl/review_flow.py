@@ -174,6 +174,8 @@ class FallbackRelationship:
     def __post_init__(self) -> None:
         if self.kind not in {"retry", "route-fallback"}:
             raise ValueError(f"unsupported fallback relationship kind: {self.kind}")
+        if not all(isinstance(fragment_id, str) for fragment_id in self.promoted_fragment_ids):
+            raise ValueError("promoted fragment IDs must be strings")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -368,13 +370,17 @@ def consolidate(
     accepted_attempt: int | None,
 ) -> ConsolidatedReview:
     """Combine accepted and partial findings without manufacturing acceptance or dispute."""
-    groups: dict[str, dict[str, Any]] = {}
-    for fragment in sorted(
-        promoted_fragments, key=lambda item: (item.source_attempt, item.fragment_id)
-    ):
+    validated_fragments: list[tuple[PromotedFragment, dict[str, Any]]] = []
+    for fragment in promoted_fragments:
         finding = _validated_promoted_finding(fragment)
-        if finding is None:
-            continue
+        if finding is not None:
+            validated_fragments.append((fragment, finding))
+
+    groups: dict[str, dict[str, Any]] = {}
+    for fragment, finding in sorted(
+        validated_fragments,
+        key=lambda item: (item[0].source_attempt, item[0].fragment_id),
+    ):
         group = groups.setdefault(
             fragment.fingerprint,
             {"finding": finding, "accepted": False, "sources": []},

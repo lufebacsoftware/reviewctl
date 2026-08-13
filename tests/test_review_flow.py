@@ -420,6 +420,17 @@ def test_fallback_relationship_rejects_unknown_kind() -> None:
         )
 
 
+def test_fallback_relationship_validates_fragment_ids_before_sorting() -> None:
+    with pytest.raises(ValueError, match="promoted fragment IDs must be strings"):
+        FallbackRelationship(
+            from_attempt=1,
+            to_attempt=2,
+            kind="retry",
+            reason="contract-incomplete",
+            promoted_fragment_ids=("valid", 7),  # type: ignore[arg-type]
+        )
+
+
 def test_consolidate_without_a_real_accepted_attempt_is_unavailable() -> None:
     fragments = (
         *promoted(finding(), attempt=2),
@@ -529,6 +540,25 @@ def test_consolidate_discards_promoted_fragments_with_divergent_identity(tamper:
 
     assert result.status == "unavailable"
     assert result.findings == ()
+
+
+def test_consolidate_validates_mixed_untrusted_fragments_before_sorting() -> None:
+    valid = promoted(finding(), attempt=2, route_index=1)[0]
+    invalid = (
+        replace(valid, source_attempt="1"),  # type: ignore[arg-type]
+        replace(valid, fragment_id=7),  # type: ignore[arg-type]
+        replace(valid, route_index=True),
+        replace(valid, payload_digest=None),  # type: ignore[arg-type]
+    )
+
+    forward = consolidate(None, (valid, *invalid), None)
+    reverse = consolidate(None, tuple(reversed((valid, *invalid))), None)
+
+    assert canonical_json(forward.to_dict()) == canonical_json(reverse.to_dict())
+    assert forward.status == "unavailable"
+    assert len(forward.findings) == 1
+    assert forward.findings[0].finding == finding()
+    assert [source["attempt"] for source in forward.findings[0].sources] == [2]
 
 
 def test_consolidate_rejects_an_impossible_accepted_verdict_finding_pair() -> None:
