@@ -754,3 +754,121 @@ def test_discovery_redacts_quoted_json_and_key_value_results(label: str) -> None
     assert "[REDACTED]" in installation.diagnostics[0]
     assert len(installation.version) <= 500
     assert all(len(diagnostic) <= 500 for diagnostic in installation.diagnostics)
+
+
+@pytest.mark.parametrize("label", ["SECRET", "SECRETS", "service_secret"])
+def test_discovery_redacts_generic_secret_labels_in_json_and_key_value(label: str) -> None:
+    secret = f"{label}-must-not-survive"
+    version = json.dumps({label: secret, "version": "tool 2.4.0"}) + "x" * 600
+    diagnostic = f"{label}={secret}\nsafe diagnostic" + "y" * 600
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (version, diagnostic),
+    )
+
+    serialized = asdict(installation)
+    assert secret not in repr(serialized)
+    assert installation.resolved_executable == "/safe/bin/tool"
+    assert installation.version is not None
+    assert '"version": "tool 2.4.0"' in installation.version
+    assert '"[REDACTED]"' in installation.version
+    assert installation.diagnostics[0].startswith(f"{label}=[REDACTED]\nsafe diagnostic")
+    assert len(installation.version) <= 500
+    assert all(len(value) <= 500 for value in installation.diagnostics)
+
+
+def test_discovery_redacts_generic_secret_env_shaped_requested_executable() -> None:
+    secret = "generic-env-secret-must-not-survive"
+    requested = f"/safe/tool?BUILD_SECRET={secret}"
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"TOOL_BIN": requested, "PATH": "/safe/bin"},
+        which=lambda executable, path: None,
+    )
+
+    assert secret not in repr(asdict(installation))
+    assert installation.requested_executable == "/safe/tool?BUILD_SECRET=[REDACTED]"
+    assert installation.diagnostics == (
+        "executable not found: /safe/tool?BUILD_SECRET=[REDACTED]",
+    )
+
+
+@pytest.mark.parametrize(
+    ("credential_text", "secret"),
+    [
+        ("Bearer bearer-must-not-survive", "bearer-must-not-survive"),
+        (
+            "Authorization: Bearer authorization-must-not-survive",
+            "authorization-must-not-survive",
+        ),
+        (
+            '"authorization": "Bearer json-bearer-must-not-survive"',
+            "json-bearer-must-not-survive",
+        ),
+    ],
+)
+def test_discovery_redacts_bearer_credentials(credential_text: str, secret: str) -> None:
+    version = f"tool 3.1.0 {credential_text} safe=visible"
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (version, None),
+    )
+
+    assert "must-not-survive" not in repr(asdict(installation))
+    assert secret not in repr(asdict(installation))
+    assert installation.version is not None
+    assert "tool 3.1.0" in installation.version
+    assert "[REDACTED]" in installation.version
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        (
+            "https://alice:uri-password-must-not-survive@example.test/v1",
+            "https://[REDACTED]@example.test/v1",
+        ),
+        (
+            "postgresql://service:db-secret-must-not-survive@db.example.test/reviews",
+            "postgresql://[REDACTED]@db.example.test/reviews",
+        ),
+    ],
+)
+def test_discovery_redacts_uri_userinfo_while_preserving_scheme_and_host(
+    uri: str, expected: str
+) -> None:
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (f"tool 4.0 endpoint={uri}", None),
+    )
+
+    assert "must-not-survive" not in repr(asdict(installation))
+    assert installation.version == f"tool 4.0 endpoint={expected}"
+    assert installation.resolved_executable == "/safe/bin/tool"
+
+
+def test_discovery_does_not_redact_unstructured_secret_prose_or_safe_neighbors() -> None:
+    safe_version = (
+        "tool 5.0 this is no secret; tokenization and api_key naming are ordinary prose"
+    )
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (safe_version, "safe diagnostic"),
+    )
+
+    assert installation.requested_executable == "tool"
+    assert installation.resolved_executable == "/safe/bin/tool"
+    assert installation.version == safe_version
+    assert installation.diagnostics == ("safe diagnostic",)

@@ -16,8 +16,10 @@ _MAX_OUTPUT_LENGTH = 500
 _WINDOWS_EXECUTABLE_EXTENSIONS = (".COM", ".EXE", ".BAT", ".CMD")
 _SENSITIVE_LABEL = (
     r"(?:authorization|credentials?|tokens?|api[-_]?keys?|client[-_]?secret|"
-    r"password|passwd|private[-_]?key)"
+    r"password|passwd|private[-_]?key|[a-z0-9_-]*secrets?)"
 )
+_URI_USERINFO = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
+_BEARER_CREDENTIAL = re.compile(r"(?i)(\bbearer)(\s+)[^\s,;\"']+")
 _QUOTED_SENSITIVE_VALUE = re.compile(
     rf'(?i)("\b{_SENSITIVE_LABEL}\b"\s*:\s*)"(?:\\.|[^"\\])*"'
 )
@@ -26,7 +28,7 @@ _SENSITIVE_VALUE = re.compile(
 )
 _SENSITIVE_ENV_VALUE = re.compile(
     r"(?im)(\b[A-Z][A-Z0-9_]*(?:AUTHORIZATION|CREDENTIALS?|TOKENS?|API_KEY|"
-    r"CLIENT_SECRET|PASSWORD|PASSWD|PRIVATE_KEY)[A-Z0-9_]*)(\s*=\s*)[^\r\n]*"
+    r"CLIENT_SECRET|PASSWORD|PASSWD|PRIVATE_KEY|SECRETS?)[A-Z0-9_]*)(\s*=\s*)[^\r\n]*"
 )
 
 ExecutableLookup = Callable[[str, str | None], str | None]
@@ -56,8 +58,10 @@ class LocalExecutionTopology:
 
 
 def _bounded_output(value: str) -> str:
-    redacted = _SENSITIVE_ENV_VALUE.sub(r"\1\2[REDACTED]", value)
+    redacted = _URI_USERINFO.sub(r"\1[REDACTED]@", value)
+    redacted = _SENSITIVE_ENV_VALUE.sub(r"\1\2[REDACTED]", redacted)
     redacted = _QUOTED_SENSITIVE_VALUE.sub(r'\1"[REDACTED]"', redacted)
+    redacted = _BEARER_CREDENTIAL.sub(r"\1\2[REDACTED]", redacted)
     redacted = _SENSITIVE_VALUE.sub(r"\1\2[REDACTED]", redacted)
     return redacted[:_MAX_OUTPUT_LENGTH]
 
