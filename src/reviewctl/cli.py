@@ -49,6 +49,7 @@ from reviewctl.contracts import (
     ContractEvaluation,
     get_contract,
 )
+from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discover_topology
 
 MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
@@ -499,7 +500,17 @@ def llm_help_payload() -> dict[str, object]:
                     "independently checked"
                 ),
             },
+            "setup": {
+                "discover": "reviewctl setup discover --format json",
+                "show": "reviewctl setup show --format json",
+                "check": "reviewctl setup check --backend NAME --format json",
+            },
             "help-llm": "reviewctl help-llm --format json",
+        },
+        "backendSemantics": {
+            "availabilityIsNotQualification": True,
+            "setupIsLocalOnly": True,
+            "setupCallsModels": False,
         },
         "defaults": {
             "explorationRoot": "~/.cache/reviewctl/explorations",
@@ -630,6 +641,77 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "redacted. After any correction, run `reviewctl verify RECEIPT.json` on the new receipt.\n"
     )
     return 0
+
+
+def setup_installation_payload(installation: BackendInstallation) -> dict[str, object]:
+    """Serialize one observed backend installation with stable public field names."""
+    return {
+        "name": installation.name,
+        "requestedExecutable": installation.requested_executable,
+        "resolvedExecutable": installation.resolved_executable,
+        "version": installation.version,
+        "availability": installation.availability,
+        "qualification": installation.qualification,
+        "diagnostics": list(installation.diagnostics),
+        "probePerformed": installation.probe_performed,
+    }
+
+
+def setup_topology_payload(topology: LocalExecutionTopology) -> dict[str, object]:
+    """Serialize local setup observations without exposing process environment data."""
+    return {
+        "schemaVersion": topology.schema_version,
+        "localOnly": topology.local_only,
+        "modelProbePerformed": topology.model_probe_performed,
+        "backends": [setup_installation_payload(backend) for backend in topology.backends],
+    }
+
+
+def print_setup_topology(topology: LocalExecutionTopology, output_format: str) -> None:
+    """Print stable JSON or concise human-readable local setup observations."""
+    if output_format == "json":
+        print(
+            json.dumps(
+                setup_topology_payload(topology), ensure_ascii=True, indent=2, sort_keys=True
+            )
+        )
+        return
+    print(f"local-only: {'yes' if topology.local_only else 'no'}")
+    print(f"model probes: {'yes' if topology.model_probe_performed else 'no'}")
+    for backend in topology.backends:
+        details = (
+            f"{backend.name}: availability={backend.availability} "
+            f"qualification={backend.qualification}"
+        )
+        if backend.version:
+            details = f"{details} version={backend.version}"
+        print(details)
+        for diagnostic in backend.diagnostics:
+            print(f"  diagnostic: {diagnostic}")
+
+
+def run_setup(args: argparse.Namespace) -> int:
+    """Discover local backend executables and report non-qualifying setup state."""
+    topology = discover_topology(build_backend_registry(), environ=os.environ)
+    selected_names = set(args.backends)
+    selected = tuple(
+        backend
+        for backend in topology.backends
+        if not selected_names or backend.name in selected_names
+    )
+    selected_topology = LocalExecutionTopology(
+        topology.schema_version,
+        topology.local_only,
+        topology.model_probe_performed,
+        selected,
+    )
+    print_setup_topology(selected_topology, args.format)
+    if args.setup_command != "check":
+        return 0
+    checked = selected if selected_names else tuple(
+        backend for backend in selected if backend.availability != "not-applicable"
+    )
+    return 0 if all(backend.availability == "available" for backend in checked) else 1
 
 
 def validate_request(
@@ -3911,6 +3993,34 @@ def build_parser() -> argparse.ArgumentParser:
     explore_promote.add_argument("--output", required=True)
     explore_promote.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
     explore_promote.set_defaults(handler=lambda namespace: promote_exploration(parser, namespace))
+
+    setup = commands.add_parser(
+        "setup",
+        help="inspect local backend executable availability",
+        epilog="Use a setup subcommand with --format human or --format json.",
+    )
+    setup.set_defaults(backends=())
+    setup_commands = setup.add_subparsers(dest="setup_command", required=True)
+    for name, help_text in (
+        ("discover", "discover the observed local backend topology"),
+        ("show", "show the observed local backend topology"),
+    ):
+        setup_command = setup_commands.add_parser(name, help=help_text)
+        setup_command.add_argument("--format", choices=("human", "json"), default="human")
+        setup_command.set_defaults(handler=run_setup)
+    setup_check = setup_commands.add_parser(
+        "check", help="check local executable backend availability"
+    )
+    setup_check.add_argument(
+        "--backend",
+        dest="backends",
+        action="append",
+        choices=tuple(descriptor.name for descriptor in build_backend_registry().descriptors()),
+        default=[],
+        help="backend name to check (repeatable; defaults to all local executables)",
+    )
+    setup_check.add_argument("--format", choices=("human", "json"), default="human")
+    setup_check.set_defaults(handler=run_setup)
 
     help_llm_parser = commands.add_parser(
         "help-llm", help="print concise usage guidance for coding agents"

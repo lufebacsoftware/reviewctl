@@ -45,6 +45,30 @@ For machine-readable guidance:
 reviewctl help-llm --format json
 ```
 
+## Local backend setup
+
+Setup diagnostics are local, read-only, and non-qualifying. They inspect the
+current machine's registered backend executables with version-only probes. They
+do not call models or providers, probe credentials, log in, write configuration,
+or create files. Diagnostic values are bounded and credential-shaped values are
+redacted.
+
+```bash
+reviewctl setup discover --format json
+reviewctl setup show --format json
+reviewctl setup check --backend NAME --format json
+```
+
+`discover` and `show` print the same observed topology and return success.
+`check` accepts repeatable `--backend` options; without them it checks every
+local executable backend. Availability is not qualification: an executable can
+be `available` while its review qualification remains `unqualified`.
+
+Remote API backends have local availability `not-applicable` and are never
+credential-probed by setup. They do not fail an unfiltered check of local
+executables. Explicitly selecting one reports its non-qualifying state and exits
+`1`. Missing or unverified selected executables also exit `1`.
+
 ## Diagnose failures
 
 Do not retry blindly. A failed formal run normally still prints its artifact

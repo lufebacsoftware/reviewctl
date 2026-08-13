@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from reviewctl import cli
+from reviewctl.setup import BackendInstallation, LocalExecutionTopology
 
 REPOSITORY = Path(__file__).parents[1]
 
@@ -1069,6 +1070,264 @@ def test_help_llm_json_is_machine_readable() -> None:
     assert payload["errors"]["redaction"] == (
         "diagnostics are bounded and credential-shaped values are redacted"
     )
+    assert payload["commands"]["setup"] == {
+        "discover": "reviewctl setup discover --format json",
+        "show": "reviewctl setup show --format json",
+        "check": "reviewctl setup check --backend NAME --format json",
+    }
+    assert payload["backendSemantics"] == {
+        "availabilityIsNotQualification": True,
+        "setupIsLocalOnly": True,
+        "setupCallsModels": False,
+    }
+
+
+def setup_topology(*installations: BackendInstallation) -> LocalExecutionTopology:
+    return LocalExecutionTopology(
+        schema_version=1,
+        local_only=True,
+        model_probe_performed=False,
+        backends=installations,
+    )
+
+
+def setup_installation(
+    name: str,
+    availability: str,
+    *,
+    probe_performed: bool = True,
+) -> BackendInstallation:
+    executable = None if availability == "not-applicable" else name
+    resolved = f"/tools/{name}" if availability in {"available", "unverified"} else None
+    version = f"{name} 1.2.3" if availability == "available" else None
+    diagnostics = () if availability in {"available", "not-applicable"} else ("local diagnostic",)
+    return BackendInstallation(
+        name=name,
+        requested_executable=executable,
+        resolved_executable=resolved,
+        version=version,
+        availability=availability,
+        qualification="unqualified",
+        diagnostics=diagnostics,
+        probe_performed=probe_performed,
+    )
+
+
+def invoke_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    topology: LocalExecutionTopology,
+    *arguments: str,
+) -> int:
+    monkeypatch.setattr(cli, "discover_topology", lambda registry, environ: topology, raising=False)
+    parser = cli.build_parser()
+    namespace = parser.parse_args(["setup", *arguments])
+    return namespace.handler(namespace)
+
+
+def test_setup_discover_and_show_return_the_same_stable_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    topology = setup_topology(
+        setup_installation("codex", "available"),
+        setup_installation("openrouter", "not-applicable", probe_performed=False),
+    )
+
+    outputs = []
+    for command in ("discover", "show"):
+        assert invoke_setup(monkeypatch, topology, command, "--format", "json") == 0
+        outputs.append(capsys.readouterr().out)
+
+    assert outputs[0] == outputs[1]
+    assert json.loads(outputs[0]) == {
+        "schemaVersion": 1,
+        "localOnly": True,
+        "modelProbePerformed": False,
+        "backends": [
+            {
+                "name": "codex",
+                "requestedExecutable": "codex",
+                "resolvedExecutable": "/tools/codex",
+                "version": "codex 1.2.3",
+                "availability": "available",
+                "qualification": "unqualified",
+                "diagnostics": [],
+                "probePerformed": True,
+            },
+            {
+                "name": "openrouter",
+                "requestedExecutable": None,
+                "resolvedExecutable": None,
+                "version": None,
+                "availability": "not-applicable",
+                "qualification": "unqualified",
+                "diagnostics": [],
+                "probePerformed": False,
+            },
+        ],
+    }
+
+
+def test_setup_human_output_is_concise_and_distinguishes_backend_states(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    topology = setup_topology(
+        setup_installation("codex", "available"),
+        setup_installation("openrouter", "not-applicable", probe_performed=False),
+    )
+
+    assert invoke_setup(monkeypatch, topology, "show", "--format", "human") == 0
+
+    output = capsys.readouterr().out
+    assert "local-only: yes" in output
+    assert "model probes: no" in output
+    assert "codex: availability=available qualification=unqualified" in output
+    assert "openrouter: availability=not-applicable qualification=unqualified" in output
+
+
+@pytest.mark.parametrize(
+    ("name", "availability", "probe_performed", "expected_exit"),
+    [
+        ("codex", "available", True, 0),
+        ("codex", "missing", False, 1),
+        ("codex", "unverified", True, 1),
+        ("openrouter", "not-applicable", False, 1),
+    ],
+)
+def test_setup_check_explicit_backend_exit_status(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    availability: str,
+    probe_performed: bool,
+    expected_exit: int,
+) -> None:
+    topology = setup_topology(
+        setup_installation(name, availability, probe_performed=probe_performed)
+    )
+
+    assert invoke_setup(
+        monkeypatch, topology, "check", "--backend", name, "--format", "json"
+    ) == expected_exit
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [backend["name"] for backend in payload["backends"]] == [name]
+    assert payload["backends"][0]["availability"] == availability
+    assert payload["backends"][0]["qualification"] == "unqualified"
+    assert payload["modelProbePerformed"] is False
+    assert payload["backends"][0]["probePerformed"] is probe_performed
+
+
+def test_setup_check_all_ignores_remote_not_applicable_backend(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    topology = setup_topology(
+        setup_installation("codex", "available"),
+        setup_installation("openrouter", "not-applicable", probe_performed=False),
+        setup_installation("pi", "available"),
+    )
+
+    assert invoke_setup(monkeypatch, topology, "check", "--format", "human") == 0
+    assert (
+        "openrouter: availability=not-applicable qualification=unqualified"
+        in capsys.readouterr().out
+    )
+
+
+def test_setup_check_repeatable_selection_filters_output_and_checks_every_selected_backend(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    topology = setup_topology(
+        setup_installation("agy", "available"),
+        setup_installation("codex", "missing", probe_performed=False),
+        setup_installation("pi", "available"),
+    )
+
+    assert invoke_setup(
+        monkeypatch,
+        topology,
+        "check",
+        "--backend",
+        "agy",
+        "--backend",
+        "codex",
+        "--format",
+        "json",
+    ) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [backend["name"] for backend in payload["backends"]] == ["agy", "codex"]
+
+
+def test_setup_check_all_fails_when_any_local_executable_is_not_available(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    topology = setup_topology(
+        setup_installation("codex", "available"),
+        setup_installation("llm", "unverified"),
+        setup_installation("openrouter", "not-applicable", probe_performed=False),
+    )
+
+    assert invoke_setup(monkeypatch, topology, "check", "--format", "human") == 1
+    assert "llm: availability=unverified qualification=unqualified" in capsys.readouterr().out
+
+
+def test_setup_does_not_print_credential_shaped_environment(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret = "credential-value-that-must-not-appear"
+    monkeypatch.setenv("OPENROUTER_API_KEY", secret)
+    topology = setup_topology(
+        setup_installation("openrouter", "not-applicable", probe_performed=False)
+    )
+
+    assert invoke_setup(monkeypatch, topology, "discover", "--format", "json") == 0
+
+    output = capsys.readouterr().out
+    assert "OPENROUTER_API_KEY" not in output
+    assert secret not in output
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("setup",),
+        ("setup", "--help"),
+        ("setup", "discover", "--help"),
+        ("setup", "show", "--help"),
+        ("setup", "check", "--help"),
+    ],
+)
+def test_setup_parser_requires_and_documents_subcommands(arguments: tuple[str, ...]) -> None:
+    result = run_cli(*arguments)
+
+    if arguments == ("setup",):
+        assert result.returncode == 2
+        assert "the following arguments are required" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert "--format" in result.stdout
+        if arguments[-2:] == ("check", "--help"):
+            assert "--backend" in result.stdout
+
+
+def test_setup_check_rejects_unknown_backend_as_invocation_error() -> None:
+    result = run_cli("setup", "check", "--backend", "unknown")
+
+    assert result.returncode == 2
+    assert "invalid choice: 'unknown'" in result.stderr
+
+
+def test_help_llm_document_describes_non_qualifying_local_setup_diagnostics() -> None:
+    document = (REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower()
+
+    for command in (
+        "reviewctl setup discover --format json",
+        "reviewctl setup show --format json",
+        "reviewctl setup check --backend name --format json",
+    ):
+        assert command in document
+    for boundary in ("local", "read-only", "redacted", "non-qualifying"):
+        assert boundary in document
 
 
 def test_help_llm_markdown_explains_how_to_diagnose_a_failed_attempt() -> None:
