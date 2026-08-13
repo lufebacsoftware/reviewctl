@@ -29,6 +29,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from reviewctl import __version__
+from reviewctl.backends import PersistedResponse
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
     REVIEWED_FILES_SCHEMA,
@@ -243,20 +244,6 @@ def response_schema(contract: str, *, codex: bool = False) -> dict[str, object] 
     if schema is None:
         return None
     return codex_schema(schema) if codex else schema
-
-
-@dataclass(frozen=True)
-class PersistedResponse:
-    """The response persisted by one isolated `llm` invocation."""
-
-    conversation_id: str
-    cost_usd: float | None
-    duration_ms: int | None
-    input_tokens: int | None
-    model: str
-    output_tokens: int | None
-    provider: str | None
-    response: str
 
 
 @dataclass(frozen=True)
