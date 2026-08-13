@@ -3213,6 +3213,16 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             session_path = execution.evidence.session
             final_response_path = execution.evidence.final_response
             diagnostic_path = execution.evidence.stderr
+            raw_response: dict[str, object] | None = None
+            if persisted is not None:
+                raw_response_path = attempt_dir / "raw-response.txt"
+                raw_response_bytes = persisted.response.encode(errors="surrogatepass")
+                raw_response_path.write_bytes(raw_response_bytes)
+                raw_response = {
+                    "path": str(raw_response_path),
+                    "sha256": sha256_bytes(raw_response_bytes),
+                    "characters": len(persisted.response),
+                }
             contract_evaluation = (
                 native_contract.evaluate(
                     persisted.response, prepared_contract, contract_context
@@ -3318,6 +3328,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "resolved": persisted.provider if persisted else None,
                 },
                 "providerPreferences": provider_preferences,
+                "rawResponse": raw_response,
                 "result": result,
                 "route": {"model": model, "transport": transport},
                 "validationError": validation_error,

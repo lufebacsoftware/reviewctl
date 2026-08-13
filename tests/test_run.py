@@ -436,6 +436,91 @@ def test_run_dispatches_frozen_packet_through_registered_backend(
     assert attempt["result"] == "accepted"
     assert attempt["evidence"]["response"] == str(evidence_path)
     assert evidence_path.read_text() == response_json
+    raw_response = attempt["rawResponse"]
+    raw_response_path = Path(raw_response["path"])
+    assert raw_response_path == request.attempt_dir / "raw-response.txt"
+    assert raw_response_path != evidence_path
+    assert raw_response_path.read_text() == response_json
+    assert raw_response["sha256"] == cli.sha256_bytes(response_json.encode())
+    assert raw_response["characters"] == len(response_json)
+
+
+@pytest.mark.parametrize(
+    ("response_text", "resolved_model", "exit_code", "expected_result"),
+    [
+        ("not-json", "accepted", 0, "incomplete"),
+        ('{"verdict":"approved"}', "accepted", 0, "incomplete"),
+        ('{"verdict":"approved","findings":[]}', "other-model", 0, "model-mismatch"),
+        ('{"verdict":"approved","findings":[]}', "accepted", 17, "transport-failed"),
+        ("", "accepted", 0, "empty"),
+        ("\ud800", "accepted", 0, "incomplete"),
+        (None, None, 0, "missing-response"),
+    ],
+    ids=[
+        "invalid-json",
+        "contract-incomplete",
+        "model-mismatch",
+        "transport-failure-with-payload",
+        "empty-response",
+        "non-scalar-unicode",
+        "no-response",
+    ],
+)
+def test_run_preserves_every_present_raw_backend_response(
+    response_text: str | None,
+    resolved_model: str | None,
+    exit_code: int,
+    expected_result: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        persisted = (
+            cli.PersistedResponse(
+                "conversation", None, 1, 10, resolved_model or "", 2, None, response_text
+            )
+            if response_text is not None
+            else None
+        )
+        return cli.BackendExecution(
+            exit_code, "failed" if exit_code else "", persisted, cli.BackendEvidence()
+        )
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path, "accepted"),
+            "--transport",
+            "llm",
+            "--response-contract",
+            "findings-json",
+        ]
+    )
+
+    assert namespace.handler(namespace) == 1
+    turn = Path(capsys.readouterr().out.strip())
+    receipt = json.loads((turn / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == expected_result
+    assert json.loads((turn / "attempts" / "01" / "attempt.json").read_text()) == attempt
+    raw_response = attempt["rawResponse"]
+    durable_path = turn / "attempts" / "01" / "raw-response.txt"
+    if response_text is None:
+        assert raw_response is None
+        assert not durable_path.exists()
+    else:
+        response_bytes = response_text.encode(errors="surrogatepass")
+        assert raw_response == {
+            "path": str(durable_path),
+            "sha256": cli.sha256_bytes(response_bytes),
+            "characters": len(response_text),
+        }
+        assert durable_path.read_bytes() == response_bytes
 
 
 def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(
@@ -495,6 +580,18 @@ def test_uses_a_separate_database_for_each_attempt_and_accepts_matching_model(
     assert receipt["acceptedAttempt"] == 2
     assert receipt["model"]["resolved"] == "accepted"
     assert receipt["attempts"][0]["database"] != receipt["attempts"][1]["database"]
+    for attempt, expected_response in zip(
+        receipt["attempts"],
+        ["", "VERDICT: approved\n1. No blocking findings."],
+        strict=True,
+    ):
+        assert not Path(attempt["database"]).exists()
+        raw_response = attempt["rawResponse"]
+        raw_response_path = Path(raw_response["path"])
+        assert raw_response_path.is_file()
+        assert raw_response_path.read_text() == expected_response
+        assert raw_response["sha256"] == cli.sha256_bytes(expected_response.encode())
+        assert raw_response["characters"] == len(expected_response)
 
 
 def test_ordered_routes_fallback_after_antigravity_quota_failure(tmp_path: Path) -> None:
