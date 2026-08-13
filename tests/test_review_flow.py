@@ -12,6 +12,8 @@ from reviewctl.contracts import (
     get_contract,
 )
 from reviewctl.review_flow import (
+    COMPLETION_CONTEXT_END,
+    COMPLETION_CONTEXT_START,
     CompletionContext,
     ConsolidatedReview,
     FallbackRelationship,
@@ -57,7 +59,7 @@ def incomplete_evaluation(*findings: dict[str, object]):
         payload,
         prepared,
         context,
-        evidence=EvaluationContext(packet_digest="packet-digest"),
+        evidence=EvaluationContext(packet_digest="b" * 64),
     )
 
 
@@ -498,7 +500,7 @@ def test_build_completion_context_deduplicates_content_but_preserves_provenance(
 
     assert isinstance(context, CompletionContext)
     assert context.prepared_digest == evaluation.prepared_digest
-    assert context.packet_digest == "packet-digest"
+    assert context.packet_digest == "b" * 64
     assert len(context.findings) == 1
     assert context.findings[0].finding == finding()
     assert [item.source_attempt for item in context.findings[0].sources] == [1, 2]
@@ -546,6 +548,32 @@ def test_build_completion_context_requires_canonical_target_scope(
 def test_build_completion_context_requires_a_typed_gap_manifest() -> None:
     with pytest.raises(ValueError, match="completion request"):
         build_completion_context(None, (), allowed_file_names=("source.py",))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prepared_digest", "raw prior response"),
+        ("prepared_digest", "A" * 64),
+        ("prepared_digest", "a" * 63),
+        ("packet_digest", None),
+        ("packet_digest", "A" * 64),
+        ("packet_digest", "b" * 63),
+        ("missing_fields", ("verdict", 7)),
+        ("violations", ("response-fields", False)),
+        ("invalid_fragment_indexes", (1, 0)),
+        ("invalid_fragment_indexes", (0, 0)),
+        ("invalid_fragment_indexes", (True,)),
+    ],
+)
+def test_build_completion_context_rejects_noncanonical_completion_manifest(
+    field: str, value: object
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+    request = replace(evaluation.completion_request, **{field: value})
+
+    with pytest.raises(ValueError, match="invalid completion manifest"):
+        build_completion_context(request, (), allowed_file_names=("source.py",))
 
 
 @pytest.mark.parametrize(
@@ -660,6 +688,37 @@ def test_render_completion_prompt_contains_only_bounded_canonical_context() -> N
         "\n</reviewctl-completion-context>", 1
     )[0]
     assert encoded == canonical_json(context.to_dict()).decode()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prepared_digest", "raw prior response"),
+        ("prepared_digest", "A" * 64),
+        ("packet_digest", None),
+        ("packet_digest", "b" * 63),
+        ("missing_fields", ("verdict", 1)),
+        ("violations", ("response-fields", 1)),
+        ("invalid_fragment_indexes", (2, 1)),
+    ],
+)
+def test_render_completion_prompt_revalidates_direct_completion_context(
+    field: str, value: object
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = build_completion_context(
+        evaluation.completion_request,
+        promoted(finding()),
+        allowed_file_names=("source.py",),
+    )
+    malicious = replace(context, **{field: value})
+
+    with pytest.raises(ValueError, match="^invalid completion manifest$") as error:
+        render_completion_prompt("Review the packet.", malicious)
+
+    assert "raw prior response" not in str(error.value)
+    assert COMPLETION_CONTEXT_START not in str(error.value)
+    assert COMPLETION_CONTEXT_END not in str(error.value)
 
 
 def test_render_completion_prompt_escapes_framing_and_instruction_injection_reversibly() -> None:
@@ -1668,6 +1727,29 @@ def test_validate_v2_receipt_requires_reviewed_files_to_match_context_exactly() 
 
 def test_validate_v2_receipt_accepts_invalid_evaluation_state() -> None:
     assert validate_v2_receipt(v2_invalid_findings_receipt()) == ()
+
+
+@pytest.mark.parametrize(
+    "indexes",
+    [
+        [1, 0],
+        [0, 0],
+        [True],
+        [-1],
+        ["0"],
+        [[]],
+    ],
+)
+def test_validate_v2_receipt_requires_canonical_invalid_fragment_indexes(
+    indexes: list[object],
+) -> None:
+    receipt = v2_findings_receipt()
+    receipt["attempts"][0]["contractEvaluation"]["completionRequest"]["invalidFragmentIndexes"] = (
+        indexes
+    )
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
 
 
 def test_validate_v2_receipt_rejects_unknown_attempt_result() -> None:

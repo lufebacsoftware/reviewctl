@@ -145,6 +145,39 @@ def _is_nonnegative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _valid_completion_manifest(
+    *,
+    prepared_digest: object,
+    packet_digest: object,
+    missing_fields: object,
+    invalid_fragment_indexes: object,
+    violations: object,
+    sequence_type: type[list] | type[tuple],
+    require_packet_digest: bool,
+) -> bool:
+    """Validate the canonical, typed gap manifest at each trust boundary."""
+    if not _is_sha256(prepared_digest):
+        return False
+    if require_packet_digest:
+        if not _is_sha256(packet_digest):
+            return False
+    elif packet_digest is not None and not _is_sha256(packet_digest):
+        return False
+    if type(missing_fields) is not sequence_type or not all(
+        type(field) is str for field in missing_fields
+    ):
+        return False
+    if type(violations) is not sequence_type or not all(
+        type(violation) is str for violation in violations
+    ):
+        return False
+    if type(invalid_fragment_indexes) is not sequence_type or not all(
+        _is_nonnegative_int(index) for index in invalid_fragment_indexes
+    ):
+        return False
+    return list(invalid_fragment_indexes) == sorted(set(invalid_fragment_indexes))
+
+
 def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | None:
     """Reproduce v1 finding identity at every promoted-fragment trust boundary."""
     if (
@@ -371,6 +404,16 @@ def build_completion_context(
     """Build a deterministic, prompt-safe view of typed fragments and contract gaps."""
     if request is None:
         raise ValueError("completion context requires a contract completion request")
+    if not _valid_completion_manifest(
+        prepared_digest=request.prepared_digest,
+        packet_digest=request.packet_digest,
+        missing_fields=request.missing_fields,
+        invalid_fragment_indexes=request.invalid_fragment_indexes,
+        violations=request.violations,
+        sequence_type=tuple,
+        require_packet_digest=True,
+    ):
+        raise ValueError("invalid completion manifest")
     if (
         type(allowed_file_names) not in {tuple, list}
         or not allowed_file_names
@@ -419,6 +462,16 @@ def build_completion_context(
 
 def render_completion_prompt(original_prompt: str, context: CompletionContext) -> str:
     """Append only typed prior evidence, never the raw prior model response."""
+    if not _valid_completion_manifest(
+        prepared_digest=context.prepared_digest,
+        packet_digest=context.packet_digest,
+        missing_fields=context.missing_fields,
+        invalid_fragment_indexes=context.invalid_fragment_indexes,
+        violations=context.violations,
+        sequence_type=tuple,
+        require_packet_digest=True,
+    ):
+        raise ValueError("invalid completion manifest")
     instructions = (
         "Review each extracted finding independently: confirm, replace, or add findings based "
         "on the original packet. Absence is not a dispute. There is no inherited approval. "
@@ -674,10 +727,16 @@ def _receipt_completion_request(
         value.get("preparedDigest") == prepared_digest
         and value.get("packetDigest") == packet_digest
         and value.get("missingFields") == coverage_missing
-        and isinstance(indexes, list)
-        and all(_is_nonnegative_int(index) for index in indexes)
-        and len(indexes) == len(set(indexes))
         and value.get("violations") == violations
+        and _valid_completion_manifest(
+            prepared_digest=value.get("preparedDigest"),
+            packet_digest=value.get("packetDigest"),
+            missing_fields=value.get("missingFields"),
+            invalid_fragment_indexes=indexes,
+            violations=value.get("violations"),
+            sequence_type=list,
+            require_packet_digest=False,
+        )
         and bool(coverage_missing or indexes or violations)
     )
 
