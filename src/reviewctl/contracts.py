@@ -6,6 +6,7 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -84,6 +85,47 @@ class PreparedContract:
         }
 
 
+class EvaluationStatus(StrEnum):
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    INVALID = "invalid"
+
+
+class FragmentKind(StrEnum):
+    FINDING = "finding"
+
+
+@dataclass(frozen=True)
+class EvaluationContext:
+    packet_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class ContractFragment:
+    fragment_id: str
+    fingerprint: str
+    kind: FragmentKind
+    value: dict[str, Any]
+    payload_digest: str
+    scope: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ContractCoverage:
+    required_fields: tuple[str, ...]
+    covered_fields: tuple[str, ...]
+    missing_fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ContractCompletionRequest:
+    prepared_digest: str
+    packet_digest: str | None
+    missing_fields: tuple[str, ...]
+    invalid_fragment_indexes: tuple[int, ...]
+    violations: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class ContractEvaluation:
     """Exact decode and semantic-validation result for one raw payload."""
@@ -95,6 +137,10 @@ class ContractEvaluation:
     normalized_digest: str | None
     value: dict[str, Any] | None
     violations: tuple[str, ...]
+    status: EvaluationStatus = EvaluationStatus.INVALID
+    valid_fragments: tuple[ContractFragment, ...] = ()
+    coverage: ContractCoverage | None = None
+    completion_request: ContractCompletionRequest | None = None
 
 
 class ReviewContract(Protocol):
@@ -106,7 +152,12 @@ class ReviewContract(Protocol):
     def prepare(self, context: ContractContext) -> PreparedContract: ...
 
     def evaluate(
-        self, payload: str, prepared: PreparedContract, context: ContractContext
+        self,
+        payload: str,
+        prepared: PreparedContract,
+        context: ContractContext,
+        *,
+        evidence: EvaluationContext | None = None,
     ) -> ContractEvaluation: ...
 
 
@@ -121,6 +172,27 @@ def exact_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise DuplicateJsonField(key)
         value[key] = item
     return value
+
+
+def _validate_finding(
+    finding: object, context: ContractContext
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(finding, dict) or set(finding) != FINDING_FIELDS:
+        return None, "finding-fields"
+    string_fields = FINDING_FIELDS - {"line"}
+    if not all(
+        isinstance(finding[field], str) and finding[field].strip()
+        for field in string_fields
+    ):
+        return None, "finding-value"
+    if finding["severity"] not in FINDING_SEVERITIES:
+        return None, "finding-value"
+    line = finding["line"]
+    if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+        return None, "finding-value"
+    if context.file_names and finding["path"] not in context.file_names:
+        return None, "finding-path"
+    return dict(finding), None
 
 
 class FindingsJsonContract:
@@ -165,7 +237,12 @@ class FindingsJsonContract:
         )
 
     def evaluate(
-        self, payload: str, prepared: PreparedContract, context: ContractContext
+        self,
+        payload: str,
+        prepared: PreparedContract,
+        context: ContractContext,
+        *,
+        evidence: EvaluationContext | None = None,
     ) -> ContractEvaluation:
         payload_digest = hashlib.sha256(payload.encode()).hexdigest()
 
@@ -192,66 +269,168 @@ class FindingsJsonContract:
         if not isinstance(value, dict):
             return rejected("top-level-not-object")
 
-        expected_fields = {"verdict", "findings"}
+        required_fields = ("verdict", "findings")
         if context.review_declaration_required:
-            expected_fields.add("reviewedFiles")
-        if set(value) != expected_fields:
-            return rejected("response-fields")
+            required_fields += ("reviewedFiles",)
+        expected_fields = set(required_fields)
+        violation = "response-fields" if set(value) != expected_fields else None
 
-        verdict = value["verdict"]
-        if not isinstance(verdict, str) or verdict not in REVIEW_VERDICTS:
-            return rejected("verdict")
-        findings = value["findings"]
-        if not isinstance(findings, list):
-            return rejected("findings-shape")
+        verdict = value.get("verdict")
+        verdict_valid = isinstance(verdict, str) and verdict in REVIEW_VERDICTS
+        if violation is None and not verdict_valid:
+            violation = "verdict"
+
+        findings = value.get("findings")
+        findings_are_list = isinstance(findings, list)
+        if violation is None and not findings_are_list:
+            violation = "findings-shape"
 
         normalized_findings: list[dict[str, Any]] = []
-        for finding in findings:
-            if not isinstance(finding, dict) or set(finding) != FINDING_FIELDS:
-                return rejected("finding-fields")
-            string_fields = FINDING_FIELDS - {"line"}
-            if not all(
-                isinstance(finding[field], str) and finding[field].strip()
-                for field in string_fields
-            ):
-                return rejected("finding-value")
-            if finding["severity"] not in FINDING_SEVERITIES:
-                return rejected("finding-value")
-            line = finding["line"]
-            if not isinstance(line, int) or isinstance(line, bool) or line < 1:
-                return rejected("finding-value")
-            if context.file_names and finding["path"] not in context.file_names:
-                return rejected("finding-path")
-            normalized_findings.append(dict(finding))
-
-        if (verdict == "approved") != (not findings):
-            return rejected("verdict-invariant")
-
-        normalized: dict[str, Any] = {"verdict": verdict, "findings": normalized_findings}
-        if context.review_declaration_required:
-            reviewed_files = value["reviewedFiles"]
-            if not isinstance(reviewed_files, list):
-                return rejected("review-declaration")
-            normalized_files: list[str] = []
-            for reviewed in reviewed_files:
-                if not isinstance(reviewed, str) or not reviewed.strip():
-                    return rejected("review-declaration")
-                declared = reviewed.strip()
-                if declared in context.file_names:
-                    normalized_files.append(declared)
+        invalid_fragment_indexes: list[int] = []
+        first_finding_violation: str | None = None
+        if findings_are_list:
+            for index, finding in enumerate(findings):
+                normalized_finding, finding_violation = _validate_finding(finding, context)
+                if finding_violation is not None:
+                    invalid_fragment_indexes.append(index)
+                    if first_finding_violation is None:
+                        first_finding_violation = finding_violation
                     continue
-                declared_path = Path(declared)
-                if (
-                    not declared_path.is_absolute()
-                    or not declared_path.parent.name.startswith("reviewctl-input-")
-                    or declared_path.name not in context.file_names
-                ):
-                    return rejected("review-declaration")
-                normalized_files.append(declared_path.name)
-            if len(normalized_files) != len(set(normalized_files)) or set(
-                normalized_files
-            ) != set(context.file_names):
-                return rejected("review-declaration")
+                assert normalized_finding is not None
+                normalized_findings.append(normalized_finding)
+        if violation is None and first_finding_violation is not None:
+            violation = first_finding_violation
+
+        verdict_invariant = (
+            verdict_valid
+            and findings_are_list
+            and (verdict == "approved") == (not findings)
+        )
+        if violation is None and not verdict_invariant:
+            violation = "verdict-invariant"
+
+        normalized_files: list[str] | None = None
+        if context.review_declaration_required:
+            reviewed_files = value.get("reviewedFiles")
+            candidate_files: list[str] = []
+            review_declaration_valid = isinstance(reviewed_files, list)
+            if review_declaration_valid:
+                for reviewed in reviewed_files:
+                    if not isinstance(reviewed, str) or not reviewed.strip():
+                        review_declaration_valid = False
+                        break
+                    declared = reviewed.strip()
+                    if declared in context.file_names:
+                        candidate_files.append(declared)
+                        continue
+                    declared_path = Path(declared)
+                    if (
+                        not declared_path.is_absolute()
+                        or not declared_path.parent.name.startswith("reviewctl-input-")
+                        or declared_path.name not in context.file_names
+                    ):
+                        review_declaration_valid = False
+                        break
+                    candidate_files.append(declared_path.name)
+            if review_declaration_valid and (
+                len(candidate_files) != len(set(candidate_files))
+                or set(candidate_files) != set(context.file_names)
+            ):
+                review_declaration_valid = False
+            if review_declaration_valid:
+                normalized_files = candidate_files
+            elif violation is None:
+                violation = "review-declaration"
+
+        findings_valid = findings_are_list and not invalid_fragment_indexes
+        covered_fields: list[str] = []
+        missing_fields: list[str] = []
+        if verdict_invariant:
+            covered_fields.append("verdict")
+        else:
+            missing_fields.append("verdict")
+        if findings_valid or normalized_findings:
+            covered_fields.append("findings")
+        if not findings_valid:
+            missing_fields.append("findings")
+        if context.review_declaration_required:
+            if normalized_files is not None:
+                covered_fields.append("reviewedFiles")
+            else:
+                missing_fields.append("reviewedFiles")
+        coverage = ContractCoverage(
+            required_fields=required_fields,
+            covered_fields=tuple(covered_fields),
+            missing_fields=tuple(missing_fields),
+        )
+
+        fragments: list[ContractFragment] = []
+        for finding in normalized_findings:
+            scope = (finding["path"],)
+            fingerprint = hashlib.sha256(
+                canonical_json(
+                    {
+                        "contract": self.name,
+                        "version": self.version,
+                        "kind": FragmentKind.FINDING.value,
+                        "value": finding,
+                        "scope": scope,
+                    }
+                )
+            ).hexdigest()
+            fragment_id = hashlib.sha256(
+                canonical_json(
+                    {"fingerprint": fingerprint, "payloadDigest": payload_digest}
+                )
+            ).hexdigest()
+            fragments.append(
+                ContractFragment(
+                    fragment_id=fragment_id,
+                    fingerprint=fingerprint,
+                    kind=FragmentKind.FINDING,
+                    value=finding,
+                    payload_digest=payload_digest,
+                    scope=scope,
+                )
+            )
+
+        if violation is not None:
+            violations = (violation,)
+            if not fragments:
+                return ContractEvaluation(
+                    name=self.name,
+                    version=self.version,
+                    prepared_digest=prepared.digest,
+                    payload_digest=payload_digest,
+                    normalized_digest=None,
+                    value=None,
+                    violations=violations,
+                    coverage=coverage,
+                )
+            completion_request = ContractCompletionRequest(
+                prepared_digest=prepared.digest,
+                packet_digest=evidence.packet_digest if evidence is not None else None,
+                missing_fields=coverage.missing_fields,
+                invalid_fragment_indexes=tuple(invalid_fragment_indexes),
+                violations=violations,
+            )
+            return ContractEvaluation(
+                name=self.name,
+                version=self.version,
+                prepared_digest=prepared.digest,
+                payload_digest=payload_digest,
+                normalized_digest=None,
+                value=None,
+                violations=violations,
+                status=EvaluationStatus.INCOMPLETE,
+                valid_fragments=tuple(fragments),
+                coverage=coverage,
+                completion_request=completion_request,
+            )
+
+        assert verdict_valid
+        normalized: dict[str, Any] = {"verdict": verdict, "findings": normalized_findings}
+        if normalized_files is not None:
             normalized["reviewedFiles"] = normalized_files
 
         normalized_digest = hashlib.sha256(canonical_json(normalized)).hexdigest()
@@ -263,6 +442,9 @@ class FindingsJsonContract:
             normalized_digest=normalized_digest,
             value=normalized,
             violations=(),
+            status=EvaluationStatus.COMPLETE,
+            valid_fragments=tuple(fragments),
+            coverage=coverage,
         )
 
 

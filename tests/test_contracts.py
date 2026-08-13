@@ -1,7 +1,15 @@
 import hashlib
 import json
 
-from reviewctl.contracts import ContractContext, canonical_json, get_contract
+from reviewctl.contracts import (
+    ContractContext,
+    ContractEvaluation,
+    EvaluationContext,
+    EvaluationStatus,
+    FragmentKind,
+    canonical_json,
+    get_contract,
+)
 
 
 def test_findings_contract_prepares_a_stable_portable_contract() -> None:
@@ -73,6 +81,16 @@ def test_findings_contract_evaluates_and_hashes_a_normalized_value() -> None:
     assert evaluation.normalized_digest == hashlib.sha256(
         canonical_json(finding_payload())
     ).hexdigest()
+    assert evaluation.status is EvaluationStatus.COMPLETE
+    assert len(evaluation.valid_fragments) == 1
+    assert evaluation.valid_fragments[0].kind is FragmentKind.FINDING
+    assert evaluation.valid_fragments[0].value == finding_payload()["findings"][0]
+    assert evaluation.valid_fragments[0].scope == ("source.py",)
+    assert evaluation.coverage is not None
+    assert evaluation.coverage.required_fields == ("verdict", "findings")
+    assert evaluation.coverage.covered_fields == ("verdict", "findings")
+    assert evaluation.coverage.missing_fields == ()
+    assert evaluation.completion_request is None
 
 
 def test_findings_contract_normalizes_a_required_review_declaration() -> None:
@@ -94,6 +112,18 @@ def test_findings_contract_normalizes_a_required_review_declaration() -> None:
         **finding_payload(),
         "reviewedFiles": ["source.py", "test_source.py"],
     }
+    assert evaluation.status is EvaluationStatus.COMPLETE
+    assert evaluation.coverage is not None
+    assert evaluation.coverage.required_fields == (
+        "verdict",
+        "findings",
+        "reviewedFiles",
+    )
+    assert evaluation.coverage.covered_fields == (
+        "verdict",
+        "findings",
+        "reviewedFiles",
+    )
 
 
 def test_findings_contract_rejects_duplicate_json_fields() -> None:
@@ -110,6 +140,10 @@ def test_findings_contract_rejects_duplicate_json_fields() -> None:
     assert evaluation.value is None
     assert evaluation.normalized_digest is None
     assert evaluation.violations == ("invalid-json",)
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
+    assert evaluation.completion_request is None
 
 
 def test_findings_contract_rejects_mutated_prepared_material() -> None:
@@ -124,6 +158,8 @@ def test_findings_contract_rejects_mutated_prepared_material() -> None:
 
     assert evaluation.value is None
     assert evaluation.violations == ("prepared-contract",)
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.valid_fragments == ()
 
 
 def test_findings_contract_rejects_a_prepared_contract_from_another_context() -> None:
@@ -238,3 +274,199 @@ def test_findings_contract_reports_stable_semantic_violation_codes() -> None:
         assert evaluation.value is None, expected_code
         assert evaluation.normalized_digest is None, expected_code
         assert evaluation.violations == (expected_code,)
+
+
+def test_contract_evaluation_additive_defaults_preserve_positional_compatibility() -> None:
+    evaluation = ContractEvaluation(
+        "findings-json",
+        "1",
+        "prepared",
+        "payload",
+        None,
+        None,
+        ("invalid-json",),
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
+    assert evaluation.completion_request is None
+
+
+def test_finding_fingerprint_ignores_payload_formatting_but_fragment_id_does_not() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    compact = json.dumps(finding_payload(), separators=(",", ":"))
+    formatted = json.dumps(finding_payload(), indent=2)
+
+    compact_fragment = contract.evaluate(compact, prepared, context).valid_fragments[0]
+    formatted_fragment = contract.evaluate(formatted, prepared, context).valid_fragments[0]
+
+    assert compact_fragment.fingerprint == formatted_fragment.fingerprint
+    assert compact_fragment.fragment_id != formatted_fragment.fragment_id
+    assert compact_fragment.payload_digest == hashlib.sha256(compact.encode()).hexdigest()
+    expected_fingerprint = hashlib.sha256(
+        canonical_json(
+            {
+                "contract": "findings-json",
+                "version": "1",
+                "kind": "finding",
+                "value": finding_payload()["findings"][0],
+                "scope": ["source.py"],
+            }
+        )
+    ).hexdigest()
+    assert compact_fragment.fingerprint == expected_fingerprint
+    assert compact_fragment.fragment_id == hashlib.sha256(
+        canonical_json(
+            {
+                "fingerprint": expected_fingerprint,
+                "payloadDigest": compact_fragment.payload_digest,
+            }
+        )
+    ).hexdigest()
+
+
+def test_mixed_findings_extract_only_valid_siblings_and_request_completion() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    valid_finding = finding_payload()["findings"][0]
+    invalid_finding = {**valid_finding, "severity": "urgent"}
+    payload = json.dumps(
+        {
+            "verdict": "changes-requested",
+            "findings": [invalid_finding, valid_finding, {**valid_finding, "path": "other.py"}],
+        }
+    )
+
+    evaluation = contract.evaluate(
+        payload,
+        prepared,
+        context,
+        evidence=EvaluationContext(packet_digest="packet-sha256"),
+    )
+
+    assert evaluation.status is EvaluationStatus.INCOMPLETE
+    assert evaluation.value is None
+    assert evaluation.normalized_digest is None
+    assert evaluation.violations == ("finding-value",)
+    assert [fragment.value for fragment in evaluation.valid_fragments] == [valid_finding]
+    assert evaluation.coverage is not None
+    assert evaluation.coverage.required_fields == ("verdict", "findings")
+    assert evaluation.coverage.covered_fields == ("verdict", "findings")
+    assert evaluation.coverage.missing_fields == ("findings",)
+    assert evaluation.completion_request is not None
+    assert evaluation.completion_request.prepared_digest == prepared.digest
+    assert evaluation.completion_request.packet_digest == "packet-sha256"
+    assert evaluation.completion_request.missing_fields == ("findings",)
+    assert evaluation.completion_request.invalid_fragment_indexes == (0, 2)
+    assert evaluation.completion_request.violations == ("finding-value",)
+
+
+def test_valid_finding_can_survive_invalid_top_level_requirements() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(
+        file_names=("source.py",), review_declaration_required=True
+    )
+    prepared = contract.prepare(context)
+    value = finding_payload()
+    value["verdict"] = "unavailable"
+    value["extra"] = True
+
+    evaluation = contract.evaluate(json.dumps(value), prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INCOMPLETE
+    assert len(evaluation.valid_fragments) == 1
+    assert evaluation.violations == ("response-fields",)
+    assert evaluation.coverage is not None
+    assert evaluation.coverage.required_fields == (
+        "verdict",
+        "findings",
+        "reviewedFiles",
+    )
+    assert evaluation.coverage.covered_fields == ("findings",)
+    assert evaluation.coverage.missing_fields == ("verdict", "reviewedFiles")
+    assert evaluation.completion_request is not None
+    assert evaluation.completion_request.invalid_fragment_indexes == ()
+
+
+def test_verdict_invariant_with_a_valid_finding_is_incomplete_without_verdict_fragment() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    value = finding_payload()
+    value["verdict"] = "approved"
+
+    evaluation = contract.evaluate(json.dumps(value), prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INCOMPLETE
+    assert evaluation.violations == ("verdict-invariant",)
+    assert len(evaluation.valid_fragments) == 1
+    assert all(fragment.kind is FragmentKind.FINDING for fragment in evaluation.valid_fragments)
+    assert evaluation.coverage is not None
+    assert evaluation.coverage.covered_fields == ("findings",)
+    assert evaluation.coverage.missing_fields == ("verdict",)
+
+
+def test_invalid_findings_do_not_extract_or_make_response_incomplete() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+
+    for overrides in (
+        {"severity": "urgent"},
+        {"path": "other.py"},
+        {"title": ""},
+        {"extra": "field"},
+    ):
+        evaluation = contract.evaluate(
+            json.dumps(finding_payload(**overrides)), prepared, context
+        )
+
+        assert evaluation.status is EvaluationStatus.INVALID
+        assert evaluation.valid_fragments == ()
+        assert evaluation.completion_request is None
+
+
+def test_missing_findings_and_approved_response_never_extract_fragments() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext()
+    prepared = contract.prepare(context)
+
+    for value in (
+        {"verdict": "changes-requested"},
+        {"verdict": "approved", "findings": []},
+    ):
+        evaluation = contract.evaluate(json.dumps(value), prepared, context)
+
+        assert evaluation.valid_fragments == ()
+        assert evaluation.completion_request is None
+    assert contract.evaluate(
+        json.dumps({"verdict": "approved", "findings": []}), prepared, context
+    ).status is EvaluationStatus.COMPLETE
+
+
+def test_exact_json_object_and_prepared_contract_are_required_before_extraction() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    finding = json.dumps(finding_payload()["findings"][0])
+    payloads = (
+        f'{{"verdict":"changes-requested","findings":[{finding}],"findings":[]}}',
+        f'[{finding}]',
+        f'{{"verdict":"changes-requested","findings":[{finding}]',
+    )
+
+    for payload in payloads:
+        evaluation = contract.evaluate(payload, prepared, context)
+        assert evaluation.status is EvaluationStatus.INVALID
+        assert evaluation.valid_fragments == ()
+        assert evaluation.coverage is None
+
+    prepared.schema["additionalProperties"] = True
+    evaluation = contract.evaluate(json.dumps(finding_payload()), prepared, context)
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.valid_fragments == ()
+    assert evaluation.violations == ("prepared-contract",)
