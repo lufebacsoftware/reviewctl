@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +29,19 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from reviewctl import __version__
+from reviewctl.backends import (
+    BackendCapabilities,
+    BackendDescriptor,
+    BackendEvidence,
+    BackendExecution,
+    BackendFamily,
+    BackendRegistry,
+    BackendRequest,
+    DiscoveryKind,
+    PersistedResponse,
+    ReadOnlyCapability,
+    SourceIsolation,
+)
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
     REVIEWED_FILES_SCHEMA,
@@ -36,6 +49,7 @@ from reviewctl.contracts import (
     ContractEvaluation,
     get_contract,
 )
+from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discover_topology
 
 MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
@@ -243,20 +257,6 @@ def response_schema(contract: str, *, codex: bool = False) -> dict[str, object] 
     if schema is None:
         return None
     return codex_schema(schema) if codex else schema
-
-
-@dataclass(frozen=True)
-class PersistedResponse:
-    """The response persisted by one isolated `llm` invocation."""
-
-    conversation_id: str
-    cost_usd: float | None
-    duration_ms: int | None
-    input_tokens: int | None
-    model: str
-    output_tokens: int | None
-    provider: str | None
-    response: str
 
 
 @dataclass(frozen=True)
@@ -500,7 +500,17 @@ def llm_help_payload() -> dict[str, object]:
                     "independently checked"
                 ),
             },
+            "setup": {
+                "discover": "reviewctl setup discover --format json",
+                "show": "reviewctl setup show --format json",
+                "check": "reviewctl setup check --backend NAME --format json",
+            },
             "help-llm": "reviewctl help-llm --format json",
+        },
+        "backendSemantics": {
+            "availabilityIsNotQualification": True,
+            "setupIsLocalOnly": True,
+            "setupCallsModels": False,
         },
         "defaults": {
             "explorationRoot": "~/.cache/reviewctl/explorations",
@@ -631,6 +641,92 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "redacted. After any correction, run `reviewctl verify RECEIPT.json` on the new receipt.\n"
     )
     return 0
+
+
+def setup_installation_payload(installation: BackendInstallation) -> dict[str, object]:
+    """Serialize one observed backend installation with stable public field names."""
+    return {
+        "name": installation.name,
+        "requestedExecutable": installation.requested_executable,
+        "resolvedExecutable": installation.resolved_executable,
+        "version": installation.version,
+        "availability": installation.availability,
+        "qualification": installation.qualification,
+        "diagnostics": list(installation.diagnostics),
+        "probePerformed": installation.probe_performed,
+    }
+
+
+def setup_topology_payload(topology: LocalExecutionTopology) -> dict[str, object]:
+    """Serialize local setup observations without exposing process environment data."""
+    return {
+        "schemaVersion": topology.schema_version,
+        "localOnly": topology.local_only,
+        "modelProbePerformed": topology.model_probe_performed,
+        "backends": [setup_installation_payload(backend) for backend in topology.backends],
+    }
+
+
+def sanitize_setup_human_text(value: str) -> str:
+    """Render terminal controls as inert, single-line escaped text."""
+    escaped_controls = {"\r": r"\r", "\n": r"\n", "\t": r"\t"}
+    rendered = []
+    for character in value:
+        code_point = ord(character)
+        if code_point <= 0x1F or 0x7F <= code_point <= 0x9F:
+            rendered.append(escaped_controls.get(character, f"\\x{code_point:02x}"))
+        elif 0xD800 <= code_point <= 0xDFFF:
+            rendered.append(f"\\u{code_point:04x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
+
+
+def print_setup_topology(topology: LocalExecutionTopology, output_format: str) -> None:
+    """Print stable JSON or concise human-readable local setup observations."""
+    if output_format == "json":
+        print(
+            json.dumps(
+                setup_topology_payload(topology), ensure_ascii=True, indent=2, sort_keys=True
+            )
+        )
+        return
+    print(f"local-only: {'yes' if topology.local_only else 'no'}")
+    print(f"model probes: {'yes' if topology.model_probe_performed else 'no'}")
+    for backend in topology.backends:
+        details = (
+            f"{backend.name}: availability={backend.availability} "
+            f"qualification={backend.qualification}"
+        )
+        if backend.version:
+            details = f"{details} version={backend.version}"
+        print(sanitize_setup_human_text(details))
+        for diagnostic in backend.diagnostics:
+            print(f"  diagnostic: {sanitize_setup_human_text(diagnostic)}")
+
+
+def run_setup(args: argparse.Namespace) -> int:
+    """Discover local backend executables and report non-qualifying setup state."""
+    topology = discover_topology(build_backend_registry(), environ=os.environ)
+    selected_names = set(args.backends)
+    selected = tuple(
+        backend
+        for backend in topology.backends
+        if not selected_names or backend.name in selected_names
+    )
+    selected_topology = LocalExecutionTopology(
+        topology.schema_version,
+        topology.local_only,
+        topology.model_probe_performed,
+        selected,
+    )
+    print_setup_topology(selected_topology, args.format)
+    if args.setup_command != "check":
+        return 0
+    checked = selected if selected_names else tuple(
+        backend for backend in selected if backend.availability != "not-applicable"
+    )
+    return 0 if all(backend.availability == "available" for backend in checked) else 1
 
 
 def validate_request(
@@ -1264,6 +1360,38 @@ def account_home() -> Path:
         raise RuntimeError("Codex isolation could not resolve the login account home") from error
 
 
+def codex_process_environment(
+    source_environ: Mapping[str, str], overrides: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Build a Codex child environment from an explicit non-secret operational allowlist.
+
+    Credentials remain file-based through CODEX_AUTH_FILE; API keys, cloud credentials,
+    tokens, proxy URLs, and arbitrary ambient variables are intentionally excluded.
+    """
+    allowed_keys = (
+        "PATH",
+        "SYSTEMROOT",
+        "HOME",
+        "CODEX_HOME",
+        "CODEX_AUTH_FILE",
+        "CODEX_CA_CERTIFICATES",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+    configured = overrides or {}
+    return {
+        key: configured[key] if key in configured else source_environ[key]
+        for key in allowed_keys
+        if key in configured or key in source_environ
+    }
+
+
 @contextmanager
 def codex_isolation(
     source_roots: list[Path], *, auth_path: Path | None = None
@@ -1278,8 +1406,9 @@ def codex_isolation(
     sandbox = shutil.which("sandbox-exec")
     if sandbox is None:
         raise RuntimeError("proprietary Codex reviews require macOS sandbox-exec")
-    source_auth = (
-        auth_path or Path(os.environ.get("CODEX_AUTH_FILE", "~/.codex/auth.json")).expanduser()
+    configured_auth = os.environ.get("CODEX_AUTH_FILE")
+    source_auth = auth_path or (
+        Path(configured_auth) if configured_auth else account_home() / ".codex" / "auth.json"
     )
     if not source_auth.is_file():
         raise RuntimeError(f"Codex isolation requires auth file: {source_auth}")
@@ -1302,8 +1431,10 @@ def codex_isolation(
         home_write_deny = f"(deny file-write* (subpath {sandbox_profile_path(account_home())}))"
         denies = f"{source_denies}\n{home_write_deny}"
         profile.write_text(f"(version 1)\n(allow default)\n{denies}\n")
-        environment = dict(os.environ)
-        environment.update({"CODEX_HOME": str(home), "HOME": str(home), "TMPDIR": str(home)})
+        environment = codex_process_environment(
+            os.environ,
+            {"CODEX_HOME": str(home), "HOME": str(home), "TMPDIR": str(home)},
+        )
         environment.pop("CODEX_AUTH_FILE", None)
         yield CodexIsolation(environment=environment, home=home, profile=profile)
 
@@ -2316,11 +2447,15 @@ def invoke_codex(
 
     started = time.monotonic()
     timed_out = False
+    process_environment = isolation.environment if isolation else codex_process_environment(
+        os.environ,
+        {"HOME": os.environ.get("HOME") or str(account_home())},
+    )
     try:
         process = subprocess.Popen(
             command,
             cwd=workspace,
-            env=isolation.environment if isolation else None,
+            env=process_environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -2402,6 +2537,246 @@ def load_response(database: Path) -> PersistedResponse | None:
         output_tokens=row[4],
         provider=provider if isinstance(provider, str) else None,
     )
+
+
+def execute_llm_backend(request: BackendRequest) -> BackendExecution:
+    database = request.attempt_dir / "transport.sqlite3"
+    exit_code, diagnostic = invoke_llm(
+        llm_bin=os.environ.get("LLM_BIN", "llm"),
+        prompt=request.prompt,
+        model=request.model,
+        database=database,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        load_response(database),
+        BackendEvidence(database=database),
+    )
+
+
+def execute_codex_backend(request: BackendRequest) -> BackendExecution:
+    response_path = request.attempt_dir / "response.md"
+    exit_code, diagnostic, response = invoke_codex(
+        codex_bin=os.environ.get("CODEX_BIN", "codex"),
+        prompt=request.prompt,
+        model=request.model,
+        response_contract=request.response_contract,
+        source_roots=list(request.source_roots) or None,
+        timeout_seconds=request.timeout_seconds,
+        workspace=request.files[0].parent,
+    )
+    response_path.write_text(response.response)
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(response=response_path),
+    )
+
+
+def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    exit_code, diagnostic, response = invoke_openrouter(
+        api_key=os.environ.get("OPENROUTER_API_KEY"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        provider_preferences=request.provider_preferences,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=response_path,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(request=request_path, response=response_path),
+    )
+
+
+def execute_agy_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    exit_code, diagnostic, response = invoke_agy(
+        agy_bin=os.environ.get("AGY_BIN", "agy"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=response_path,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(request=request_path, response=response_path),
+    )
+
+
+def execute_pi_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    events_path = request.attempt_dir / "events.jsonl"
+    session_path = request.attempt_dir / "session.jsonl"
+    final_response_path = request.attempt_dir / "response.md"
+    stderr_path = request.attempt_dir / "stderr.log"
+    exit_code, diagnostic, response = invoke_pi(
+        pi_bin=os.environ.get("PI_BIN", "pi"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=events_path,
+        session_path=session_path,
+        diagnostic_path=stderr_path,
+    )
+    if response.response:
+        final_response_path.write_text(response.response)
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(
+            request=request_path,
+            response=events_path,
+            session=session_path,
+            final_response=final_response_path,
+            stderr=stderr_path,
+        ),
+    )
+
+
+def build_backend_registry() -> BackendRegistry:
+    registry = BackendRegistry()
+    registry.register(
+        BackendDescriptor(
+            "agy",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "AGY_BIN",
+            "agy",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_agy_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "codex",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "CODEX_BIN",
+            "codex",
+            BackendCapabilities(
+                ReadOnlyCapability.SANDBOXED,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                True,
+                SourceIsolation.EXTERNAL_SANDBOX,
+            ),
+            "unqualified",
+        ),
+        execute_codex_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "llm",
+            BackendFamily.GENERIC_MODEL_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "LLM_BIN",
+            "llm",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_llm_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "openrouter",
+            BackendFamily.PROVIDER_GATEWAY,
+            DiscoveryKind.REMOTE_API,
+            "",
+            "",
+            BackendCapabilities(
+                ReadOnlyCapability.UNSUPPORTED,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_openrouter_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "pi",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "PI_BIN",
+            "pi",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_pi_backend,
+    )
+    return registry
 
 
 def response_is_complete(response: str) -> bool:
@@ -2773,6 +3148,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         routes=[{"model": route.model, "transport": route.transport} for route in routes],
         source_class=args.source_class,
     )
+    backend_registry = build_backend_registry()
     number = 0
     for route_index, route in enumerate(routes):
         for _ in range(max_attempts):
@@ -2814,85 +3190,29 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 route_index=route_index,
                 transport=transport,
             )
-            if transport == "codex":
-                exit_code, stderr, persisted = invoke_codex(
-                    codex_bin=os.environ.get("CODEX_BIN", "codex"),
-                    prompt=review_prompt,
-                    model=model,
-                    response_contract=args.response_contract,
-                    source_roots=codex_source_roots,
-                    timeout_seconds=timeout_seconds,
-                    workspace=snapshots[0].parent,
-                )
-                # Codex writes its transient response inside the isolated
-                # sandbox, which is removed after the attempt. Persist a copy
-                # in the caller-controlled evidence root so a rejected output
-                # remains diagnosable without weakening the contract gate.
-                response_path = attempt_dir / "response.md"
-                response_path.write_text(persisted.response)
-            elif transport == "openrouter":
-                request_path = attempt_dir / "request.json"
-                response_path = attempt_dir / "response.json"
-                exit_code, stderr, persisted = invoke_openrouter(
-                    api_key=os.environ.get("OPENROUTER_API_KEY"),
+            execution = backend_registry.require(transport).execute(
+                BackendRequest(
                     prompt=review_prompt,
                     model=transport_model,
-                    files=snapshots,
+                    response_contract=args.response_contract,
+                    files=tuple(snapshots),
+                    attempt_dir=attempt_dir,
+                    timeout_seconds=timeout_seconds,
                     max_output_tokens=args.max_output_tokens,
+                    source_class=args.source_class,
+                    source_roots=tuple(codex_source_roots or ()),
                     provider_preferences=provider_preferences,
-                    response_contract=args.response_contract,
-                    timeout_seconds=timeout_seconds,
-                    request_path=request_path,
-                    response_path=response_path,
                 )
-            elif transport == "agy":
-                request_path = attempt_dir / "request.json"
-                response_path = attempt_dir / "response.json"
-                exit_code, stderr, persisted = invoke_agy(
-                    agy_bin=os.environ.get("AGY_BIN", "agy"),
-                    prompt=review_prompt,
-                    model=transport_model,
-                    files=snapshots,
-                    max_output_tokens=args.max_output_tokens,
-                    response_contract=args.response_contract,
-                    timeout_seconds=timeout_seconds,
-                    request_path=request_path,
-                    response_path=response_path,
-                )
-            elif transport == "pi":
-                request_path = attempt_dir / "request.json"
-                response_path = attempt_dir / "events.jsonl"
-                session_path = attempt_dir / "session.jsonl"
-                final_response_path = attempt_dir / "response.md"
-                diagnostic_path = attempt_dir / "stderr.log"
-                exit_code, stderr, persisted = invoke_pi(
-                    pi_bin=os.environ.get("PI_BIN", "pi"),
-                    prompt=review_prompt,
-                    model=transport_model,
-                    files=snapshots,
-                    max_output_tokens=args.max_output_tokens,
-                    response_contract=args.response_contract,
-                    timeout_seconds=timeout_seconds,
-                    request_path=request_path,
-                    response_path=response_path,
-                    session_path=session_path,
-                    diagnostic_path=diagnostic_path,
-                )
-                if persisted.response:
-                    final_response_path.write_text(persisted.response)
-            else:
-                database = attempt_dir / "transport.sqlite3"
-                exit_code, stderr = invoke_llm(
-                    llm_bin=os.environ.get("LLM_BIN", "llm"),
-                    prompt=review_prompt,
-                    model=model,
-                    database=database,
-                    files=snapshots,
-                    max_output_tokens=args.max_output_tokens,
-                    response_contract=args.response_contract,
-                    timeout_seconds=timeout_seconds,
-                )
-                persisted = load_response(database)
+            )
+            exit_code = execution.exit_code
+            stderr = execution.diagnostic
+            persisted = execution.response
+            database = execution.evidence.database
+            request_path = execution.evidence.request
+            response_path = execution.evidence.response
+            session_path = execution.evidence.session
+            final_response_path = execution.evidence.final_response
+            diagnostic_path = execution.evidence.stderr
             contract_evaluation = (
                 native_contract.evaluate(
                     persisted.response, prepared_contract, contract_context
@@ -3732,6 +4052,34 @@ def build_parser() -> argparse.ArgumentParser:
     explore_promote.add_argument("--output", required=True)
     explore_promote.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
     explore_promote.set_defaults(handler=lambda namespace: promote_exploration(parser, namespace))
+
+    setup = commands.add_parser(
+        "setup",
+        help="inspect local backend executable availability",
+        epilog="Use a setup subcommand with --format human or --format json.",
+    )
+    setup.set_defaults(backends=())
+    setup_commands = setup.add_subparsers(dest="setup_command", required=True)
+    for name, help_text in (
+        ("discover", "discover the observed local backend topology"),
+        ("show", "show the observed local backend topology"),
+    ):
+        setup_command = setup_commands.add_parser(name, help=help_text)
+        setup_command.add_argument("--format", choices=("human", "json"), default="human")
+        setup_command.set_defaults(handler=run_setup)
+    setup_check = setup_commands.add_parser(
+        "check", help="check local executable backend availability"
+    )
+    setup_check.add_argument(
+        "--backend",
+        dest="backends",
+        action="append",
+        choices=tuple(descriptor.name for descriptor in build_backend_registry().descriptors()),
+        default=[],
+        help="backend name to check (repeatable; defaults to all local executables)",
+    )
+    setup_check.add_argument("--format", choices=("human", "json"), default="human")
+    setup_check.set_defaults(handler=run_setup)
 
     help_llm_parser = commands.add_parser(
         "help-llm", help="print concise usage guidance for coding agents"

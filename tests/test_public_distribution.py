@@ -47,6 +47,76 @@ def test_project_integration_assigns_rosters_to_private_evidence_store() -> None
     assert "current operating roster is private evidence" in guide
 
 
+def test_architecture_defines_backend_seam_and_controller_ownership() -> None:
+    architecture = (ROOT / "docs" / "ARCHITECTURE.md").read_text()
+    normalized = " ".join(architecture.lower().split())
+
+    for contract in ("BackendRequest", "BackendExecution", "BackendCapabilities"):
+        assert contract in architecture
+    for invariant in (
+        (
+            "reviewctl keeps the controller, adapter process, evidence handling, "
+            "and setup diagnostics local."
+        ),
+        "provider or model execution may be remote for `remote_api` backends.",
+        "local reviewctl execution does not enable remote controller or adapter dispatch.",
+        (
+            "federation remains deferred and separate from backend execution and "
+            "setup synchronization."
+        ),
+        (
+            "backend adapters only invoke a backend and persist its observed evidence; "
+            "adapters do not decide acceptance."
+        ),
+        (
+            "the controller alone owns policy, contract evaluation, acceptance, fallback, "
+            "and receipt construction."
+        ),
+    ):
+        assert invariant in normalized
+
+    for forbidden_reversal in (
+        "provider or model execution is always local",
+        "remote_api backends make the controller remote",
+        "federation is part of backend setup",
+        "adapters may decide acceptance",
+    ):
+        assert forbidden_reversal not in normalized
+
+
+def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> None:
+    architecture = " ".join(
+        (ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split()
+    )
+
+    for adapter in ("llm", "openrouter", "agy", "pi", "codex"):
+        assert f"`{adapter}`" in architecture
+    assert "five legacy compatibility adapters are explicitly unqualified" in architecture
+    assert (
+        "setup diagnostics observe only executable presence and version for registered "
+        "executable backends."
+    ) in architecture
+    assert (
+        "setup diagnostics never authenticate, call a model or provider, or write configuration."
+    ) in architecture
+    assert "the next gate is backend conformance" in architecture
+    assert "before cursor, claude code, or another native backend can be added" in architecture
+    assert "baml-inspired typed boundary" in architecture
+    assert "native and has no baml dependency" in architecture
+
+    for forbidden_reversal in (
+        "setup diagnostics may write configuration",
+        "setup diagnostics may authenticate",
+        "setup diagnostics may call a model",
+        "availability is qualification",
+    ):
+        assert forbidden_reversal not in architecture
+
+    for product in ("cursor", "claude"):
+        unsupported_claim = " ".join((product, "is", "supported"))
+        assert unsupported_claim not in architecture
+
+
 def test_release_workflow_builds_and_publishes_verified_artifacts() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
 
