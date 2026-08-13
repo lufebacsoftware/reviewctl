@@ -877,6 +877,188 @@ def test_provider_mismatch_never_promotes_partial_findings(
     assert receipt["consolidatedReview"]["findings"] == []
 
 
+def test_native_data_decode_failure_emits_stable_invalid_attempt_and_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hostile = '{"oversized":' + ("9" * 5000) + "}"
+
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": hostile}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "incomplete"
+    assert attempt["validationError"] == (
+        "findings-json: response data could not be evaluated safely (ValueError)"
+    )
+    assert attempt["evaluationError"] == {
+        "kind": "contract-data-error",
+        "exception": "ValueError",
+    }
+    assert "contractEvaluation" not in attempt
+    assert attempt["promotedFragments"] == []
+    raw_response = attempt["rawResponse"]
+    assert Path(raw_response["path"]).read_text() == hostile
+    assert raw_response["sha256"] == cli.sha256_bytes(hostile.encode())
+    assert receipt["acceptedAttempt"] is None
+    assert receipt["result"] == "unavailable"
+
+
+def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    real_contract = cli.get_contract("findings-json")
+
+    class RaisingContract:
+        name = real_contract.name
+        version = real_contract.version
+
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        def prepare(self, context: object) -> object:
+            return real_contract.prepare(context)
+
+        def evaluate(self, *_: object, **__: object) -> object:
+            raise self.error
+
+    monkeypatch.setattr(cli, "get_contract", lambda _: RaisingContract(ValueError("hostile")))
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": "eligible response"}],
+        max_attempts=1,
+    )
+    assert return_code == 1
+    assert receipt["attempts"][0]["evaluationError"]["exception"] == "ValueError"
+
+    monkeypatch.setattr(cli, "get_contract", lambda _: RaisingContract(RuntimeError("bug")))
+    other = tmp_path / "runtime-error"
+    other.mkdir()
+    with pytest.raises(RuntimeError, match="bug"):
+        _run_registered_findings_sequence(
+            monkeypatch,
+            other,
+            capsys,
+            [{"response": "eligible response"}],
+            max_attempts=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_transport", "target_transport", "expected_missing"),
+    [
+        ("codex", "llm", ["verdict"]),
+        ("llm", "codex", ["verdict", "reviewedFiles"]),
+    ],
+)
+def test_completion_prompt_uses_target_route_contract_context(
+    source_transport: str,
+    target_transport: str,
+    expected_missing: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Target-bound context",
+        "evidence": "The first route found bounded evidence.",
+        "reproduction": "Inspect source.py line 1.",
+    }
+    raw_marker = "RAW-SOURCE-PAYLOAD-MUST-NOT-CROSS"
+    partial = json.dumps({"findings": [finding], "untrusted": raw_marker})
+    target_review: dict[str, object] = {
+        "verdict": "changes-requested",
+        "findings": [finding],
+    }
+    if target_transport == "codex":
+        target_review["reviewedFiles"] = ["source.py"]
+    responses = [partial, json.dumps(target_review)]
+    captured: list[cli.BackendRequest] = []
+    real_registry = cli.build_backend_registry()
+    registry = cli.BackendRegistry()
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        captured.append(request)
+        response = responses[len(captured) - 1]
+        return cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse(
+                "conversation", None, 1, 10, request.model, 2, None, response
+            ),
+            cli.BackendEvidence(),
+        )
+
+    for transport in {source_transport, target_transport}:
+        registry.register(real_registry.require(transport).descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path),
+            "--route",
+            f"{source_transport}:source-model",
+            "--route",
+            f"{target_transport}:target-model",
+            "--response-contract",
+            "findings-json",
+            "--source-class",
+            "proprietary",
+            "--max-attempts",
+            "1",
+        ]
+    )
+
+    assert namespace.handler(namespace) == 0
+    receipt = json.loads(
+        (Path(capsys.readouterr().out.strip()) / "receipt.json").read_text()
+    )
+    assert len(captured) == 2
+    first_prompt, target_prompt = (request.prompt for request in captured)
+    encoded_context = target_prompt.split("<reviewctl-completion-context>\n", 1)[1].split(
+        "\n</reviewctl-completion-context>", 1
+    )[0]
+    completion_context = json.loads(encoded_context)
+    target_contract_context = cli.ContractContext(
+        file_names=("source.py",),
+        review_declaration_required=target_transport == "codex",
+    )
+    target_prepared = cli.get_contract("findings-json").prepare(target_contract_context)
+    source_contract_context = cli.ContractContext(
+        file_names=("source.py",),
+        review_declaration_required=source_transport == "codex",
+    )
+    source_prepared = cli.get_contract("findings-json").prepare(source_contract_context)
+
+    assert completion_context["preparedDigest"] == target_prepared.digest
+    assert completion_context["gapManifest"]["missingFields"] == expected_missing
+    assert completion_context["packetDigest"] == receipt["prompt"]["packetSha256"]
+    assert receipt["prompt"]["packetSha256"] == cli.sha256_bytes(first_prompt.encode())
+    assert receipt["attempts"][1]["attemptRequestSha256"] == cli.sha256_bytes(
+        target_prompt.encode()
+    )
+    assert raw_marker not in target_prompt
+    assert partial not in target_prompt
+    first_attempt = receipt["attempts"][0]
+    assert first_attempt["contractEvaluation"]["preparedSha256"] == source_prepared.digest
+    assert first_attempt["promotedFragments"][0]["payloadDigest"] == first_attempt[
+        "rawResponse"
+    ]["sha256"]
+
+
 def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

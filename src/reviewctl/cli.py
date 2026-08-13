@@ -45,6 +45,7 @@ from reviewctl.backends import (
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
     REVIEWED_FILES_SCHEMA,
+    ContractCompletionRequest,
     ContractContext,
     ContractEvaluation,
     EvaluationContext,
@@ -3195,10 +3196,40 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             transport_model = (
                 model.removeprefix("openrouter/") if transport == "openrouter" else model
             )
+            contract_context = (
+                ContractContext(
+                    file_names=tuple(snapshot_hashes),
+                    review_declaration_required=(
+                        transport == "codex" and args.source_class == "proprietary"
+                    ),
+                )
+                if native_contract
+                else None
+            )
+            prepared_contract = (
+                native_contract.prepare(contract_context)
+                if native_contract and contract_context
+                else None
+            )
             attempt_prompt = review_prompt
-            if promoted_fragments and completion_request is not None:
+            if (
+                promoted_fragments
+                and completion_request is not None
+                and prepared_contract is not None
+                and contract_context is not None
+            ):
+                target_missing_fields = ("verdict",)
+                if contract_context.review_declaration_required:
+                    target_missing_fields += ("reviewedFiles",)
+                target_completion_request = ContractCompletionRequest(
+                    prepared_digest=prepared_contract.digest,
+                    packet_digest=packet_digest,
+                    missing_fields=target_missing_fields,
+                    invalid_fragment_indexes=completion_request.invalid_fragment_indexes,
+                    violations=completion_request.violations,
+                )
                 completion_context = build_completion_context(
-                    completion_request, promoted_fragments
+                    target_completion_request, promoted_fragments
                 )
                 attempt_prompt = render_completion_prompt(review_prompt, completion_context)
             if (
@@ -3236,21 +3267,6 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             database: Path | None = None
             request_path: Path | None = None
             response_path: Path | None = None
-            contract_context = (
-                ContractContext(
-                    file_names=tuple(snapshot_hashes),
-                    review_declaration_required=(
-                        transport == "codex" and args.source_class == "proprietary"
-                    ),
-                )
-                if native_contract
-                else None
-            )
-            prepared_contract = (
-                native_contract.prepare(contract_context)
-                if native_contract and contract_context
-                else None
-            )
             session_path: Path | None = None
             final_response_path: Path | None = None
             diagnostic_path: Path | None = None
@@ -3297,6 +3313,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "characters": len(persisted.response),
                 }
             contract_evaluation = None
+            evaluation_error: dict[str, str] | None = None
             review = None
             validation_error = None
             if exit_code == 124:
@@ -3315,24 +3332,37 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 gate_result = "missing-conversation"
             else:
                 if native_contract and prepared_contract and contract_context:
-                    contract_evaluation = native_contract.evaluate(
-                        persisted.response,
-                        prepared_contract,
-                        contract_context,
-                        evidence=EvaluationContext(packet_digest=packet_digest),
-                    )
-                    review = contract_evaluation.value
-                    validation_error = (
-                        findings_validation_error(persisted.response, contract_evaluation)
-                        if review is None
-                        else None
-                    )
-                    if contract_evaluation.status is EvaluationStatus.COMPLETE:
-                        gate_result = "accepted"
-                    elif contract_evaluation.status is EvaluationStatus.INCOMPLETE:
-                        gate_result = "contract-incomplete"
-                    else:
+                    try:
+                        contract_evaluation = native_contract.evaluate(
+                            persisted.response,
+                            prepared_contract,
+                            contract_context,
+                            evidence=EvaluationContext(packet_digest=packet_digest),
+                        )
+                    except (ValueError, UnicodeError, OverflowError) as error:
+                        exception_name = type(error).__name__
+                        evaluation_error = {
+                            "kind": "contract-data-error",
+                            "exception": exception_name,
+                        }
+                        validation_error = (
+                            "findings-json: response data could not be evaluated safely "
+                            f"({exception_name})"
+                        )
                         gate_result = "contract-invalid"
+                    else:
+                        review = contract_evaluation.value
+                        validation_error = (
+                            findings_validation_error(persisted.response, contract_evaluation)
+                            if review is None
+                            else None
+                        )
+                        if contract_evaluation.status is EvaluationStatus.COMPLETE:
+                            gate_result = "accepted"
+                        elif contract_evaluation.status is EvaluationStatus.INCOMPLETE:
+                            gate_result = "contract-incomplete"
+                        else:
+                            gate_result = "contract-invalid"
                 else:
                     expected_file_hashes = (
                         snapshot_hashes
@@ -3485,6 +3515,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                         else None
                     ),
                 }
+            if evaluation_error is not None:
+                attempt["evaluationError"] = evaluation_error
             attempts.append(attempt)
             (attempt_dir / "attempt.json").write_bytes(canonical_json(attempt) + b"\n")
             log_event(
