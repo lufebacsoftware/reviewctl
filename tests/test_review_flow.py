@@ -77,6 +77,7 @@ def _evaluation_dict(evaluation) -> dict[str, object]:
         "preparedSha256": evaluation.prepared_digest,
         "payloadSha256": evaluation.payload_digest,
         "normalizedSha256": evaluation.normalized_digest,
+        "normalizedValue": (deepcopy(evaluation.value) if evaluation.value is not None else None),
         "violations": list(evaluation.violations),
         "status": evaluation.status.value,
         "fragments": [
@@ -90,8 +91,28 @@ def _evaluation_dict(evaluation) -> dict[str, object]:
             }
             for fragment in evaluation.valid_fragments
         ],
-        "coverage": None,
-        "completionRequest": None,
+        "coverage": (
+            {
+                "requiredFields": list(evaluation.coverage.required_fields),
+                "coveredFields": list(evaluation.coverage.covered_fields),
+                "missingFields": list(evaluation.coverage.missing_fields),
+            }
+            if evaluation.coverage is not None
+            else None
+        ),
+        "completionRequest": (
+            {
+                "preparedDigest": evaluation.completion_request.prepared_digest,
+                "packetDigest": evaluation.completion_request.packet_digest,
+                "missingFields": list(evaluation.completion_request.missing_fields),
+                "invalidFragmentIndexes": list(
+                    evaluation.completion_request.invalid_fragment_indexes
+                ),
+                "violations": list(evaluation.completion_request.violations),
+            }
+            if evaluation.completion_request is not None
+            else None
+        ),
     }
 
 
@@ -174,6 +195,41 @@ def v2_findings_receipt() -> dict[str, object]:
             (promoted_fragment,),
             2,
         ).to_dict(),
+    }
+    return _sign_receipt(receipt)
+
+
+def v2_invalid_findings_receipt() -> dict[str, object]:
+    contract = get_contract("findings-json")
+    context = ContractContext()
+    prepared = contract.prepare(context)
+    payload = "not json"
+    evaluation = contract.evaluate(payload, prepared, context)
+    receipt: dict[str, object] = {
+        "receiptSchemaVersion": 2,
+        "result": "unavailable",
+        "acceptedAttempt": None,
+        "reviewContract": "findings-json",
+        "contract": {"name": "findings-json", "version": "1"},
+        "routes": [{"model": "first", "transport": "llm"}],
+        "attempts": [
+            {
+                "number": 1,
+                "routeIndex": 0,
+                "route": {"model": "first", "transport": "llm"},
+                "result": "incomplete",
+                "rawResponse": {
+                    "path": "attempts/01/raw-response.txt",
+                    "sha256": evaluation.payload_digest,
+                    "characters": len(payload),
+                },
+                "contractEvaluation": _evaluation_dict(evaluation),
+                "promotedFragments": [],
+                "findings": [],
+            }
+        ],
+        "fallbackRelationships": [],
+        "consolidatedReview": consolidate(None, (), None).to_dict(),
     }
     return _sign_receipt(receipt)
 
@@ -773,6 +829,20 @@ def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> 
         ("accepted-status", "accepted-attempt"),
         ("duplicate-accepted", "accepted-attempt"),
         ("partial-status-complete", "contract-evaluation"),
+        ("complete-normalized-digest", "contract-evaluation"),
+        ("complete-normalized-value", "contract-evaluation"),
+        ("complete-violations", "contract-evaluation"),
+        ("complete-completion-request", "contract-evaluation"),
+        ("complete-coverage", "contract-evaluation"),
+        ("complete-verdict-invariant", "contract-evaluation"),
+        ("incomplete-normalized", "contract-evaluation"),
+        ("incomplete-normalized-digest", "contract-evaluation"),
+        ("incomplete-violations", "contract-evaluation"),
+        ("incomplete-completion-request", "contract-evaluation"),
+        ("incomplete-completion-packet", "contract-evaluation"),
+        ("incomplete-coverage", "contract-evaluation"),
+        ("accepted-legacy-view", "accepted-attempt"),
+        ("accepted-legacy-findings", "accepted-attempt"),
         ("unavailable-accepted", "result"),
         ("relationship-order", "fallback-relationships"),
         ("relationship-reference", "fallback-relationships"),
@@ -816,6 +886,53 @@ def test_validate_v2_receipt_detects_rehashed_structural_mutations(
         first["result"] = "accepted"
     elif mutation == "partial-status-complete":
         first["contractEvaluation"]["status"] = "complete"
+    elif mutation == "complete-normalized-digest":
+        second["contractEvaluation"]["normalizedSha256"] = "0" * 64
+    elif mutation == "complete-normalized-value":
+        second["contractEvaluation"]["normalizedValue"] = {
+            "verdict": "changes-requested",
+            "findings": [],
+        }
+    elif mutation == "complete-violations":
+        second["contractEvaluation"]["violations"] = ["verdict"]
+    elif mutation == "complete-completion-request":
+        second["contractEvaluation"]["completionRequest"] = {
+            "preparedDigest": second["contractEvaluation"]["preparedSha256"],
+            "packetDigest": None,
+            "missingFields": ["verdict"],
+            "invalidFragmentIndexes": [],
+            "violations": ["response-fields"],
+        }
+    elif mutation == "complete-coverage":
+        second["contractEvaluation"]["coverage"]["missingFields"] = ["verdict"]
+    elif mutation == "complete-verdict-invariant":
+        normalized = {
+            "verdict": "approved",
+            "findings": [finding()],
+        }
+        second["contractEvaluation"]["normalizedValue"] = normalized
+        second["contractEvaluation"]["normalizedSha256"] = hashlib.sha256(
+            canonical_json(normalized)
+        ).hexdigest()
+    elif mutation == "incomplete-normalized":
+        first["contractEvaluation"]["normalizedValue"] = {
+            "verdict": "changes-requested",
+            "findings": [finding()],
+        }
+    elif mutation == "incomplete-normalized-digest":
+        first["contractEvaluation"]["normalizedSha256"] = "0" * 64
+    elif mutation == "incomplete-violations":
+        first["contractEvaluation"]["violations"] = []
+    elif mutation == "incomplete-completion-request":
+        first["contractEvaluation"]["completionRequest"]["preparedDigest"] = "0" * 64
+    elif mutation == "incomplete-completion-packet":
+        first["contractEvaluation"]["completionRequest"]["packetDigest"] = "0" * 64
+    elif mutation == "incomplete-coverage":
+        first["contractEvaluation"]["coverage"]["coveredFields"] = []
+    elif mutation == "accepted-legacy-view":
+        receipt["verdict"] = "changes-requested"
+    elif mutation == "accepted-legacy-findings":
+        receipt["findings"] = [finding()]
     elif mutation == "unavailable-accepted":
         receipt["result"] = "unavailable"
     elif mutation == "relationship-order":
@@ -858,6 +975,92 @@ def test_validate_v2_receipt_detects_rehashed_structural_mutations(
     assert violation in validate_v2_receipt(receipt)
 
 
+def test_validate_v2_receipt_accepts_contract_data_error_without_evaluation() -> None:
+    receipt = v2_findings_receipt()
+    attempt = receipt["attempts"][0]
+    attempt.pop("contractEvaluation")
+    attempt["promotedFragments"] = []
+    attempt["evaluationError"] = {
+        "kind": "contract-data-error",
+        "exception": "ValueError",
+    }
+    receipt["attempts"] = [attempt]
+    receipt["result"] = "unavailable"
+    receipt["acceptedAttempt"] = None
+    receipt["routes"] = [receipt["routes"][0]]
+    receipt["fallbackRelationships"] = []
+    receipt.pop("verdict")
+    receipt.pop("findings")
+    receipt["consolidatedReview"] = consolidate(None, (), None).to_dict()
+    _sign_receipt(receipt)
+
+    assert validate_v2_receipt(receipt) == ()
+
+
+def test_validate_v2_receipt_preserves_reviewed_files_outside_legacy_view() -> None:
+    receipt = v2_findings_receipt()
+    evaluation = receipt["attempts"][1]["contractEvaluation"]
+    normalized = {
+        "verdict": "approved",
+        "findings": [],
+        "reviewedFiles": ["source.py:" + "a" * 64],
+    }
+    evaluation["normalizedValue"] = normalized
+    evaluation["normalizedSha256"] = hashlib.sha256(canonical_json(normalized)).hexdigest()
+    evaluation["coverage"]["requiredFields"].append("reviewedFiles")
+    evaluation["coverage"]["coveredFields"].append("reviewedFiles")
+    _sign_receipt(receipt)
+
+    assert validate_v2_receipt(receipt) == ()
+
+
+def test_validate_v2_receipt_accepts_invalid_evaluation_state() -> None:
+    assert validate_v2_receipt(v2_invalid_findings_receipt()) == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "normalized-digest",
+        "normalized-value",
+        "fragments",
+        "completion-request",
+        "violations",
+        "attempt-result",
+        "coverage",
+    ],
+)
+def test_validate_v2_receipt_rejects_invalid_state_mutations(mutation: str) -> None:
+    receipt = v2_invalid_findings_receipt()
+    attempt = receipt["attempts"][0]
+    evaluation = attempt["contractEvaluation"]
+    if mutation == "normalized-digest":
+        evaluation["normalizedSha256"] = "0" * 64
+    elif mutation == "normalized-value":
+        evaluation["normalizedValue"] = {"verdict": "approved", "findings": []}
+    elif mutation == "fragments":
+        evaluation["fragments"] = deepcopy(
+            v2_findings_receipt()["attempts"][0]["contractEvaluation"]["fragments"]
+        )
+    elif mutation == "completion-request":
+        evaluation["completionRequest"] = {
+            "preparedDigest": evaluation["preparedSha256"],
+            "packetDigest": None,
+            "missingFields": ["verdict"],
+            "invalidFragmentIndexes": [],
+            "violations": ["invalid-json"],
+        }
+    elif mutation == "violations":
+        evaluation["violations"] = []
+    elif mutation == "coverage":
+        evaluation["coverage"] = {"requiredFields": [], "coveredFields": []}
+    else:
+        attempt["result"] = "accepted"
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
 @pytest.mark.parametrize(
     "hostile",
     [
@@ -881,6 +1084,37 @@ def test_validate_v2_receipt_rejects_unhashable_relationship_ids_without_raising
     _sign_receipt(receipt)
 
     assert "fallback-relationships" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_rejects_non_scalar_normalized_unicode_without_raising() -> None:
+    receipt = v2_findings_receipt()
+    evaluation = receipt["attempts"][1]["contractEvaluation"]
+    evaluation["normalizedValue"] = {
+        "verdict": "approved",
+        "findings": [],
+        "reviewedFiles": ["\ud800"],
+    }
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_rejects_unhashable_promoted_identity_without_raising() -> None:
+    receipt = v2_findings_receipt()
+    receipt["attempts"][0]["promotedFragments"][0]["fragmentId"] = []
+    _sign_receipt(receipt)
+
+    assert "promoted-fragments" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize("status", ["complete", "invalid"])
+def test_validate_v2_receipt_rejects_promotion_from_non_incomplete_status(
+    status: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    receipt["attempts"][0]["contractEvaluation"]["status"] = status
+    _sign_receipt(receipt)
+
+    assert "promoted-fragments" in validate_v2_receipt(receipt)
 
 
 def test_validate_v2_receipt_allows_non_findings_without_native_contract_data() -> None:

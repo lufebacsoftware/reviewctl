@@ -905,6 +905,7 @@ def test_native_data_decode_failure_emits_stable_invalid_attempt_and_receipt(
     assert raw_response["sha256"] == cli.sha256_bytes(hostile.encode())
     assert receipt["acceptedAttempt"] is None
     assert receipt["result"] == "unavailable"
+    assert cli.validate_v2_receipt(receipt) == ()
 
 
 def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
@@ -937,6 +938,9 @@ def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
     )
     assert return_code == 1
     assert receipt["attempts"][0]["evaluationError"]["exception"] == "ValueError"
+    assert receipt["attempts"][0]["promotedFragments"] == []
+    assert "contractEvaluation" not in receipt["attempts"][0]
+    assert cli.validate_v2_receipt(receipt) == ()
 
     monkeypatch.setattr(cli, "get_contract", lambda _: RaisingContract(RuntimeError("bug")))
     other = tmp_path / "runtime-error"
@@ -5282,6 +5286,7 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
         "preparedSha256",
         "payloadSha256",
         "normalizedSha256",
+        "normalizedValue",
         "violations",
         "status",
         "fragments",
@@ -5290,6 +5295,8 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     }
     assert (evaluation["name"], evaluation["version"]) == ("findings-json", "1")
     assert evaluation["status"] == "complete"
+    assert evaluation["normalizedValue"] == complete_response
+    assert evaluation["normalizedSha256"] == cli.sha256_bytes(cli.canonical_json(complete_response))
     assert evaluation["completionRequest"] is None
     assert evaluation["violations"] == []
     for field in ("preparedSha256", "payloadSha256", "normalizedSha256"):
@@ -5323,6 +5330,7 @@ def test_invalid_json_findings_receipt_retains_rejected_contract_evaluation(
     assert receipt["acceptedAttempt"] is None
     assert attempt["result"] == "incomplete"
     assert evaluation["normalizedSha256"] is None
+    assert evaluation["normalizedValue"] is None
     assert evaluation["violations"] == ["invalid-json"]
     verified = run_cli("verify", str(receipt_path))
     assert verified.returncode == 0, verified.stderr
@@ -5333,6 +5341,10 @@ def test_invalid_json_findings_receipt_retains_rejected_contract_evaluation(
     ("contents", "expected_violation"),
     [
         ("{", "json-receipt"),
+        ('{"value":NaN}', "json-receipt"),
+        ('{"value":Infinity}', "json-receipt"),
+        ('{"value":-Infinity}', "json-receipt"),
+        ('{"receiptSchemaVersion":2,"attempts":[],"attempts":[]}', "json-receipt"),
         ("[]", "receipt-object"),
         ('{"receiptSchemaVersion":3}', "receipt-schema-version"),
         ('{"receiptSchemaVersion":2,"attempts":[null,true]}', "attempts"),
@@ -5351,6 +5363,17 @@ def test_verify_reports_malformed_and_hostile_receipts_without_traceback(
     result = json.loads(verified.stdout)
     assert result["valid"] is False
     assert expected_violation in result["violations"]
+
+
+def test_verify_reports_huge_json_integer_without_traceback(tmp_path: Path) -> None:
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text('{"receiptSchemaVersion":' + "9" * 5000 + "}")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert "Traceback" not in verified.stderr
+    assert json.loads(verified.stdout)["violations"] == ["json-receipt"]
 
 
 def test_policy_check_and_tournament_complete_when_under_budget(tmp_path: Path) -> None:

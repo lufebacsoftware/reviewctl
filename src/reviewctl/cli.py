@@ -50,6 +50,7 @@ from reviewctl.contracts import (
     ContractEvaluation,
     EvaluationContext,
     EvaluationStatus,
+    exact_json_object,
     get_contract,
 )
 from reviewctl.review_flow import (
@@ -3467,6 +3468,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "preparedSha256": contract_evaluation.prepared_digest,
                     "payloadSha256": contract_evaluation.payload_digest,
                     "normalizedSha256": contract_evaluation.normalized_digest,
+                    "normalizedValue": contract_evaluation.value,
                     "violations": list(contract_evaluation.violations),
                     "status": contract_evaluation.status.value,
                     "fragments": [
@@ -3658,9 +3660,17 @@ def valid_receipt(receipt: dict[str, Any]) -> bool:
 
 def verify_receipt(args: argparse.Namespace) -> int:
     receipt_path = Path(args.receipt)
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
     try:
-        receipt = json.loads(receipt_path.read_text())
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        receipt = json.loads(
+            receipt_path.read_text(),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except (OSError, UnicodeError, ValueError):
         violations = ("json-receipt",)
     else:
         if not isinstance(receipt, dict):
