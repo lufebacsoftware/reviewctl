@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from reviewctl import cli
+from reviewctl import cli, review_flow
 from reviewctl.setup import BackendInstallation, LocalExecutionTopology
 
 REPOSITORY = Path(__file__).parents[1]
@@ -384,6 +384,12 @@ def test_transport_return_annotations_match_runtime_tuple_shapes() -> None:
     assert cli.invoke_pi_exploration.__annotations__["return"] == (
         "tuple[int, str, str, PersistedResponse]"
     )
+
+
+def test_receipt_transport_allowlist_matches_registered_backend_descriptors() -> None:
+    registered = {descriptor.name for descriptor in cli.build_backend_registry().descriptors()}
+
+    assert review_flow.SUPPORTED_REVIEW_TRANSPORTS == frozenset(registered)
 
 
 def test_run_dispatches_frozen_packet_through_registered_backend(

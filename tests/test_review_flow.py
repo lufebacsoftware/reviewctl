@@ -163,6 +163,7 @@ def v2_findings_receipt() -> dict[str, object]:
                 }
             ]
         },
+        "transport": "routed",
         "reviewContract": "findings-json",
         "contract": {"name": "findings-json", "version": "1"},
         "routes": [
@@ -174,6 +175,8 @@ def v2_findings_receipt() -> dict[str, object]:
                 "number": 1,
                 "routeIndex": 0,
                 "route": {"model": "first", "transport": "llm"},
+                "transport": "llm",
+                "model": {"requested": "first", "resolved": "first"},
                 "result": "incomplete",
                 "rawResponse": {
                     "path": "attempts/01/raw-response.txt",
@@ -188,6 +191,8 @@ def v2_findings_receipt() -> dict[str, object]:
                 "number": 2,
                 "routeIndex": 1,
                 "route": {"model": "second", "transport": "codex"},
+                "transport": "codex",
+                "model": {"requested": "second", "resolved": "second"},
                 "result": "accepted",
                 "rawResponse": {
                     "path": "attempts/02/raw-response.txt",
@@ -239,6 +244,7 @@ def v2_invalid_findings_receipt() -> dict[str, object]:
                 }
             ]
         },
+        "transport": "llm",
         "reviewContract": "findings-json",
         "contract": {"name": "findings-json", "version": "1"},
         "routes": [{"model": "first", "transport": "llm"}],
@@ -247,6 +253,8 @@ def v2_invalid_findings_receipt() -> dict[str, object]:
                 "number": 1,
                 "routeIndex": 0,
                 "route": {"model": "first", "transport": "llm"},
+                "transport": "llm",
+                "model": {"requested": "first", "resolved": "first"},
                 "result": "incomplete",
                 "rawResponse": {
                     "path": "attempts/01/raw-response.txt",
@@ -870,6 +878,85 @@ def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> 
 @pytest.mark.parametrize(
     "mutation",
     [
+        "routes-not-list",
+        "route-not-object",
+        "model-empty",
+        "model-list",
+        "model-dict",
+        "transport-empty",
+        "transport-unknown",
+        "transport-list",
+        "transport-dict",
+    ],
+)
+def test_validate_v2_receipt_rejects_invalid_routes(mutation: str) -> None:
+    receipt = v2_findings_receipt()
+    route = receipt["routes"][0]
+    if mutation == "routes-not-list":
+        receipt["routes"] = {}
+    elif mutation == "route-not-object":
+        receipt["routes"][0] = []
+    elif mutation == "model-empty":
+        route["model"] = " "
+    elif mutation == "model-list":
+        route["model"] = []
+    elif mutation == "model-dict":
+        route["model"] = {}
+    elif mutation == "transport-empty":
+        route["transport"] = ""
+    elif mutation == "transport-unknown":
+        route["transport"] = "cursor"
+    elif mutation == "transport-list":
+        route["transport"] = []
+    else:
+        route["transport"] = {}
+    _sign_receipt(receipt)
+
+    assert "routes" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "violation"),
+    [
+        ("route", "attempt-route"),
+        ("transport", "attempt-route"),
+        ("requested-model", "attempt-route"),
+        ("top-unknown", "receipt-transport"),
+        ("top-list", "receipt-transport"),
+        ("top-dict", "receipt-transport"),
+        ("mixed-as-single", "receipt-transport"),
+        ("single-as-routed", "receipt-transport"),
+    ],
+)
+def test_validate_v2_receipt_rejects_route_authority_contradictions(
+    mutation: str, violation: str
+) -> None:
+    receipt = v2_findings_receipt()
+    if mutation == "route":
+        receipt["attempts"][0]["route"]["model"] = "invented"
+    elif mutation == "transport":
+        receipt["attempts"][0]["transport"] = "codex"
+    elif mutation == "requested-model":
+        receipt["attempts"][0]["model"]["requested"] = "invented"
+    elif mutation == "top-unknown":
+        receipt["transport"] = "cursor"
+    elif mutation == "top-list":
+        receipt["transport"] = []
+    elif mutation == "top-dict":
+        receipt["transport"] = {}
+    elif mutation == "mixed-as-single":
+        receipt["transport"] = "llm"
+    else:
+        receipt = v2_invalid_findings_receipt()
+        receipt["transport"] = "routed"
+    _sign_receipt(receipt)
+
+    assert violation in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
         "missing-source-class",
         "unknown-source-class",
         "missing-files",
@@ -1239,6 +1326,7 @@ def test_validate_v2_receipt_accepts_contract_data_error_without_evaluation() ->
     receipt["result"] = "unavailable"
     receipt["acceptedAttempt"] = None
     receipt["routes"] = [receipt["routes"][0]]
+    receipt["transport"] = "llm"
     receipt["fallbackRelationships"] = []
     receipt.pop("verdict")
     receipt.pop("findings")
@@ -1271,6 +1359,7 @@ def test_validate_v2_receipt_rejects_malformed_evaluation_error(field: str, valu
     attempt["evaluationError"][field] = value
     receipt["attempts"] = [attempt]
     receipt["routes"] = [receipt["routes"][0]]
+    receipt["transport"] = "llm"
     receipt["result"] = "unavailable"
     receipt["acceptedAttempt"] = None
     receipt["fallbackRelationships"] = []
@@ -1455,6 +1544,7 @@ def test_validate_v2_receipt_allows_non_findings_without_native_contract_data() 
                     {"name": "source.py", "path": "/bounded/source.py", "sha256": "b" * 64}
                 ]
             },
+            "transport": "llm",
             "result": "accepted",
             "acceptedAttempt": 1,
             "routes": [{"model": "writer", "transport": "llm"}],
@@ -1463,6 +1553,8 @@ def test_validate_v2_receipt_allows_non_findings_without_native_contract_data() 
                     "number": 1,
                     "routeIndex": 0,
                     "route": {"model": "writer", "transport": "llm"},
+                    "transport": "llm",
+                    "model": {"requested": "writer", "resolved": "writer"},
                     "result": "accepted",
                     "rawResponse": {
                         "path": "attempts/01/raw-response.txt",

@@ -19,6 +19,9 @@ from reviewctl.contracts import (
 
 COMPLETION_CONTEXT_START = "<reviewctl-completion-context>"
 COMPLETION_CONTEXT_END = "</reviewctl-completion-context>"
+# Pure receipt validation cannot construct the CLI registry, so this allowlist is
+# kept synchronized with build_backend_registry() by a focused registry test.
+SUPPORTED_REVIEW_TRANSPORTS = frozenset({"agy", "codex", "llm", "openrouter", "pi"})
 
 
 class _FrozenDict(dict[str, Any]):
@@ -568,6 +571,22 @@ def _receipt_source_file_names(receipt: dict[str, Any]) -> tuple[str, ...] | Non
     return tuple(names)
 
 
+def _receipt_route(value: object) -> tuple[str, str] | None:
+    if type(value) is not dict or set(value) != {"model", "transport"}:
+        return None
+    model = value.get("model")
+    transport = value.get("transport")
+    if (
+        type(model) is not str
+        or not model.strip()
+        or type(transport) is not str
+        or not transport.strip()
+        or transport not in SUPPORTED_REVIEW_TRANSPORTS
+    ):
+        return None
+    return model, transport
+
+
 def _receipt_canonical_digest(value: object) -> str | None:
     try:
         return hashlib.sha256(canonical_json(value)).hexdigest()
@@ -654,6 +673,21 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
 
     routes_value = receipt.get("routes")
     routes = routes_value if isinstance(routes_value, list) else []
+    route_identities = [_receipt_route(route) for route in routes]
+    routes_valid = bool(routes) and all(route is not None for route in route_identities)
+    if not routes_valid:
+        reject("routes")
+    top_transport = receipt.get("transport")
+    if (
+        type(top_transport) is not str
+        or top_transport not in SUPPORTED_REVIEW_TRANSPORTS | {"routed"}
+    ):
+        reject("receipt-transport")
+    elif routes_valid:
+        transports = {route[1] for route in route_identities if route is not None}
+        expected_transport = next(iter(transports)) if len(transports) == 1 else "routed"
+        if top_transport != expected_transport:
+            reject("receipt-transport")
     findings_contract = receipt.get("reviewContract") == "findings-json"
     all_promoted: list[PromotedFragment] = []
     promoted_provenance: set[tuple[str, int]] = set()
@@ -685,12 +719,26 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         route: dict[str, Any] | None = None
         if not _is_nonnegative_int(route_index) or route_index >= len(routes):
             reject("attempt-route")
-        elif attempt.get("route") != routes[route_index]:
-            reject("attempt-route")
-        elif type(routes[route_index]) is not dict:
-            reject("attempt-route")
         else:
-            route = routes[route_index]
+            route_identity = route_identities[route_index]
+            attempt_route_identity = _receipt_route(attempt.get("route"))
+            attempt_model = attempt.get("model")
+            attempt_transport = attempt.get("transport")
+            requested_model = (
+                attempt_model.get("requested") if type(attempt_model) is dict else None
+            )
+            if (
+                route_identity is None
+                or attempt_route_identity != route_identity
+                or type(attempt_transport) is not str
+                or attempt_transport != route_identity[1]
+                or type(attempt_model) is not dict
+                or type(requested_model) is not str
+                or requested_model != route_identity[0]
+            ):
+                reject("attempt-route")
+            else:
+                route = routes[route_index]
 
         evaluation = attempt.get("contractEvaluation")
         contract_fragments: list[dict[str, Any]] = []
