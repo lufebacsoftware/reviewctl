@@ -3906,6 +3906,8 @@ def test_seal_failure_and_cli_runtime_error_are_reported(
     ("response", "complete"),
     [
         ("", False),
+        ("VERDICT: approved", True),
+        ("VERDICT: APPROVED", True),
         ("VERDICT: short.", False),
         ("VERDICT: enough text without ending", False),
         ("VERDICT: enough text with terminal punctuation.", True),

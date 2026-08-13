@@ -2403,6 +2403,8 @@ def load_response(database: Path) -> PersistedResponse | None:
 
 def response_is_complete(response: str) -> bool:
     stripped = response.strip()
+    if re.fullmatch(r"VERDICT:\s*(?:approved|changes-requested)[.!?]?", stripped, re.IGNORECASE):
+        return True
     return len(stripped) >= 20 and "VERDICT" in stripped.upper() and stripped[-1] in ".]}"
 
 
