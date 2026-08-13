@@ -5099,10 +5099,10 @@ def test_invoke_openrouter_persists_a_portable_structured_response(
     ("model", "expected_reasoning"),
     [
         ("google/gemini-3.6-flash", {"effort": "minimal"}),
-        ("z-ai/glm-5.2", {"max_tokens": 2048}),
+        ("z-ai/glm-5.2", {"effort": "none"}),
     ],
 )
-def test_invoke_openrouter_requests_minimal_reasoning_for_reasoning_models(
+def test_invoke_openrouter_configures_reasoning_models(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     model: str,

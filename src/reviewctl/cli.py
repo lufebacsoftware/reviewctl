@@ -1472,16 +1472,13 @@ def invoke_openrouter(
             {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
         ],
     }
-    # Gemini 3.6 Flash accepts effort levels, while GLM 5.2 exposes an
-    # explicit reasoning-token budget. Keep formal review responses
-    # responsive instead of allowing reasoning to consume the whole cap.
+    # Gemini 3.6 Flash accepts effort levels. GLM 5.2 may spend the entire
+    # completion cap reasoning even when a small budget is requested, so
+    # formal JSON reviews disable reasoning and reserve the cap for the answer.
     if model == "google/gemini-3.6-flash":
         payload["reasoning"] = {"effort": "minimal"}
     elif model == "z-ai/glm-5.2":
-        if max_output_tokens >= 2048:
-            payload["reasoning"] = {"max_tokens": min(2048, max_output_tokens // 2)}
-        else:
-            payload["reasoning"] = {"effort": "minimal"}
+        payload["reasoning"] = {"effort": "none"}
     if schema := response_schema(response_contract):
         payload["response_format"] = {
             "type": "json_schema",
