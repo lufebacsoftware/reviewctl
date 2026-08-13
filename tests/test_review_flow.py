@@ -876,6 +876,103 @@ def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> 
 
 
 @pytest.mark.parametrize(
+    "review_contract",
+    ["document", "verdict", "product-review-json", "product-judge-json", "unknown"],
+)
+def test_validate_v2_receipt_binds_native_contract_to_review_contract(
+    review_contract: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    receipt["reviewContract"] = review_contract
+    _sign_receipt(receipt)
+
+    assert "review-contract" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_rejects_unknown_review_contract_without_native_fields() -> None:
+    receipt = {
+        "receiptSchemaVersion": 2,
+        "reviewContract": "unknown",
+        "sourceClass": "synthetic",
+        "source": {
+            "files": [{"name": "source.py", "path": "/bounded/source.py", "sha256": "b" * 64}]
+        },
+        "transport": "llm",
+        "result": "accepted",
+        "acceptedAttempt": 1,
+        "routes": [{"model": "writer", "transport": "llm"}],
+        "attempts": [
+            {
+                "number": 1,
+                "routeIndex": 0,
+                "route": {"model": "writer", "transport": "llm"},
+                "transport": "llm",
+                "model": {"requested": "writer", "resolved": "writer"},
+                "result": "accepted",
+                "rawResponse": {
+                    "path": "attempts/01/raw-response.txt",
+                    "sha256": "a" * 64,
+                    "characters": 30,
+                },
+                "promotedFragments": [],
+            }
+        ],
+    }
+
+    assert "review-contract" in validate_v2_receipt(_sign_receipt(receipt))
+
+
+def test_validate_v2_receipt_rejects_reidentified_fragments_outside_contract_scope() -> None:
+    receipt = v2_findings_receipt()
+    attempt = receipt["attempts"][0]
+    contract_fragment = attempt["contractEvaluation"]["fragments"][0]
+    promoted_fragment = attempt["promotedFragments"][0]
+    invented = deepcopy(contract_fragment["value"])
+    invented["path"] = "invented.py"
+    payload_digest = contract_fragment["payloadDigest"]
+    fingerprint = hashlib.sha256(
+        canonical_json(
+            {
+                "contract": "findings-json",
+                "version": "1",
+                "kind": "finding",
+                "value": invented,
+                "scope": ["invented.py"],
+            }
+        )
+    ).hexdigest()
+    fragment_id = hashlib.sha256(
+        canonical_json({"fingerprint": fingerprint, "payloadDigest": payload_digest})
+    ).hexdigest()
+    contract_fragment.update(
+        {
+            "fragmentId": fragment_id,
+            "fingerprint": fingerprint,
+            "value": invented,
+            "scope": ["invented.py"],
+        }
+    )
+    promoted_fragment.update(
+        {
+            "fragmentId": fragment_id,
+            "fingerprint": fingerprint,
+            "finding": invented,
+        }
+    )
+    receipt["fallbackRelationships"][0]["promotedFragmentIds"] = [fragment_id]
+    consolidated = receipt["consolidatedReview"]["findings"][0]
+    consolidated["finding"] = invented
+    consolidated["fingerprint"] = fingerprint
+    consolidated["sources"] = [{**dict(consolidated["sources"][0]), "fragmentId": fragment_id}]
+    _sign_receipt(receipt)
+
+    violations = validate_v2_receipt(receipt)
+
+    assert "contract-fragments" in violations
+    assert "promoted-fragments" in violations
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         "routes-not-list",

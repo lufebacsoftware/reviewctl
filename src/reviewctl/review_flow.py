@@ -22,6 +22,9 @@ COMPLETION_CONTEXT_END = "</reviewctl-completion-context>"
 # Pure receipt validation cannot construct the CLI registry, so this allowlist is
 # kept synchronized with build_backend_registry() by a focused registry test.
 SUPPORTED_REVIEW_TRANSPORTS = frozenset({"agy", "codex", "llm", "openrouter", "pi"})
+SUPPORTED_RESPONSE_CONTRACTS = frozenset(
+    {"document", "verdict", "findings-json", "product-review-json", "product-judge-json"}
+)
 SUPPORTED_ATTEMPT_RESULTS = frozenset(
     {
         "accepted",
@@ -83,6 +86,11 @@ def _valid_finding(value: object) -> bool:
         and not any(0xD800 <= ord(character) <= 0xDFFF for character in value[field])
         for field in FINDING_FIELDS - {"line"}
     )
+
+
+def _receipt_valid_finding(value: object, context: ContractContext | None) -> bool:
+    """Validate a receipt finding against its authoritative frozen input scope."""
+    return context is not None and _valid_finding(value) and value["path"] in context.file_names
 
 
 def _fragment_fingerprint(
@@ -700,7 +708,18 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         expected_transport = next(iter(transports)) if len(transports) == 1 else "routed"
         if top_transport != expected_transport:
             reject("receipt-transport")
-    findings_contract = receipt.get("reviewContract") == "findings-json"
+    review_contract = receipt.get("reviewContract")
+    if not isinstance(review_contract, str) or review_contract not in SUPPORTED_RESPONSE_CONTRACTS:
+        reject("review-contract")
+    contract_identity = receipt.get("contract")
+    native_findings_identity = (
+        type(contract_identity) is dict and contract_identity.get("name") == "findings-json"
+    )
+    if native_findings_identity and review_contract != "findings-json":
+        reject("review-contract")
+    if review_contract == "findings-json" and not native_findings_identity:
+        reject("review-contract")
+    findings_contract = native_findings_identity or review_contract == "findings-json"
     all_promoted: list[PromotedFragment] = []
     promoted_provenance: set[tuple[str, int]] = set()
     promoted_attempts_by_id: dict[str, set[int]] = {}
@@ -759,6 +778,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         contract_fragments: list[dict[str, Any]] = []
         evaluation_status: object = None
         promotion_eligible = False
+        contract_context: ContractContext | None = None
         if findings_contract and evaluation is not None:
             if type(evaluation) is not dict:
                 reject("contract-evaluation")
@@ -831,7 +851,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         scope = fragment.get("scope")
                         valid = (
                             fragment.get("kind") == FragmentKind.FINDING.value
-                            and _valid_finding(value)
+                            and _receipt_valid_finding(value, contract_context)
                             and isinstance(scope, list)
                             and scope == [value["path"]]
                             and fragment.get("payloadDigest") == payload_digest
@@ -853,6 +873,11 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
 
                 coverage = _receipt_coverage(evaluation.get("coverage"))
                 normalized_value = _receipt_normalized_review(evaluation.get("normalizedValue"))
+                if normalized_value is not None and not all(
+                    _receipt_valid_finding(finding, contract_context)
+                    for finding in normalized_value["findings"]
+                ):
+                    normalized_value = None
                 normalized_digest = evaluation.get("normalizedSha256")
                 completion_request = evaluation.get("completionRequest")
                 declaration_required = (
@@ -973,6 +998,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             if (
                 not promotion_eligible
                 or _validated_promoted_finding(fragment) is None
+                or not _receipt_valid_finding(fragment.finding, contract_context)
                 or fragment.source_attempt != index
                 or fragment.route_index != route_index
                 or fragment.raw_response_digest != raw_digest

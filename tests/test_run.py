@@ -394,6 +394,10 @@ def test_receipt_transport_allowlist_matches_registered_backend_descriptors() ->
     assert review_flow.SUPPORTED_REVIEW_TRANSPORTS == frozenset(registered)
 
 
+def test_receipt_contract_allowlist_matches_cli_contract_choices() -> None:
+    assert review_flow.SUPPORTED_RESPONSE_CONTRACTS == frozenset(cli.RESPONSE_CONTRACTS)
+
+
 def test_run_dispatches_frozen_packet_through_registered_backend(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -899,14 +903,10 @@ def test_native_data_decode_failure_emits_stable_invalid_attempt_and_receipt(
     assert return_code == 1
     attempt = receipt["attempts"][0]
     assert attempt["result"] == "incomplete"
-    assert attempt["validationError"] == (
-        "findings-json: response data could not be evaluated safely (ValueError)"
-    )
-    assert attempt["evaluationError"] == {
-        "type": "ValueError",
-        "message": "response data could not be evaluated safely",
-    }
-    assert "contractEvaluation" not in attempt
+    assert attempt["validationError"] == "findings-json: invalid JSON"
+    assert "evaluationError" not in attempt
+    assert attempt["contractEvaluation"]["status"] == "invalid"
+    assert attempt["contractEvaluation"]["violations"] == ["invalid-json"]
     assert attempt["promotedFragments"] == []
     raw_response = attempt["rawResponse"]
     assert Path(raw_response["path"]).read_text() == hostile

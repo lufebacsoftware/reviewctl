@@ -206,14 +206,17 @@ class _FrozenDict(dict[str, Any]):
 
 
 def _contains_surrogate(value: object) -> bool:
-    if isinstance(value, str):
-        return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
-    if isinstance(value, list):
-        return any(_contains_surrogate(item) for item in value)
-    if isinstance(value, dict):
-        return any(
-            _contains_surrogate(key) or _contains_surrogate(item) for key, item in value.items()
-        )
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in current):
+                return True
+        elif isinstance(current, list):
+            pending.extend(current)
+        elif isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
     return False
 
 
@@ -312,7 +315,7 @@ class FindingsJsonContract:
                 object_pairs_hook=exact_json_object,
                 parse_constant=_reject_json_constant,
             )
-        except (json.JSONDecodeError, DuplicateJsonField, _InvalidJsonConstant):
+        except (ValueError, RecursionError):
             return rejected("invalid-json")
         if _contains_surrogate(value):
             return rejected("invalid-json")

@@ -275,6 +275,25 @@ def test_findings_contract_reports_stable_semantic_violation_codes() -> None:
         assert evaluation.violations == (expected_code,)
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_violation"),
+    [
+        ('{"hostile":' + ("9" * 5000) + "}", "invalid-json"),
+        (("[" * 2000) + "0" + ("]" * 2000), "top-level-not-object"),
+    ],
+)
+def test_findings_contract_rejects_hostile_json_parser_limits(
+    payload: str, expected_violation: str
+) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext()
+
+    evaluation = contract.evaluate(payload, contract.prepare(context), context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == (expected_violation,)
+
+
 def test_contract_evaluation_additive_defaults_preserve_positional_compatibility() -> None:
     evaluation = ContractEvaluation(
         "findings-json",
