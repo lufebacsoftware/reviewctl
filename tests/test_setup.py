@@ -139,7 +139,7 @@ def test_executable_discovery_resolves_override_or_default(
         (),
         True,
     )
-    assert which_calls == [(expected_requested, environ.get("PATH"))]
+    assert which_calls == [(expected_requested, environ.get("PATH", ""))]
     assert probe_calls == [(f"/tools/{expected_requested}", {})]
 
 
@@ -415,6 +415,41 @@ def test_discovery_uses_supplied_path_instead_of_ambient_path(
     assert installation.resolved_executable != str(ambient)
     assert installation.resolved_executable == str(supplied)
     assert installation.version == "supplied 2.0"
+
+
+def test_discovery_without_supplied_path_does_not_search_ambient_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ambient_dir = tmp_path / "ambient"
+    ambient_dir.mkdir()
+    ambient = _write_python_executable(ambient_dir, "ambient-probe", "print('ambient 1.0')\n")
+    monkeypatch.setenv("PATH", str(ambient_dir))
+    probe_called = False
+
+    def fake_probe(
+        executable: str, environ: dict[str, str]
+    ) -> tuple[str | None, str | None]:
+        nonlocal probe_called
+        probe_called = True
+        return executable, repr(environ)
+
+    installation = discover_backend(
+        descriptor("probe", default_executable=ambient.name),
+        environ={},
+        probe=fake_probe,
+    )
+
+    assert installation == BackendInstallation(
+        "probe",
+        ambient.name,
+        None,
+        None,
+        "missing",
+        "unqualified",
+        (f"executable not found: {ambient.name}",),
+        False,
+    )
+    assert probe_called is False
 
 
 def test_probe_version_real_child_receives_only_allowed_environment(tmp_path: Path) -> None:

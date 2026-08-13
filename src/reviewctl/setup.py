@@ -128,7 +128,7 @@ def discover_backend(
         )
 
     requested = environ.get(descriptor.executable_env, descriptor.default_executable)
-    resolved = which(requested, environ.get("PATH"))
+    resolved = which(requested, environ.get("PATH", ""))
     serialized_requested = _bounded_output(requested)
     if resolved is None:
         diagnostic = _bounded_output(f"executable not found: {requested}")
