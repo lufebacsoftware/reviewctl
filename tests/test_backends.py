@@ -52,8 +52,23 @@ def test_registry_requires_unique_known_backends_and_sorts_descriptors(tmp_path:
     registry = BackendRegistry()
     registry.register(descriptor("cursor"), execute)
     registry.register(descriptor("claude"), execute)
+    request = BackendRequest(
+        prompt="Review",
+        model="model",
+        response_contract="findings-json",
+        files=(tmp_path / "source.py",),
+        attempt_dir=tmp_path,
+        timeout_seconds=30,
+        max_output_tokens=4096,
+        source_class="synthetic",
+        source_roots=(),
+        provider_preferences=None,
+    )
 
     assert registry.require("cursor").descriptor.name == "cursor"
+    execution = registry.require("cursor").execute(request)
+    assert execution == BackendExecution(0, "", response, BackendEvidence())
+    assert execution.response is response
     assert tuple(item.name for item in registry.descriptors()) == ("claude", "cursor")
     with pytest.raises(ValueError, match="already registered"):
         registry.register(descriptor("cursor"), execute)
