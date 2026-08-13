@@ -3195,7 +3195,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             )
             contract_context = (
                 ContractContext(
-                    file_names=tuple(snapshot_hashes),
+                    file_names=tuple(sorted(snapshot_hashes)),
                     review_declaration_required=(
                         transport == "codex" and args.source_class == "proprietary"
                     ),
@@ -3396,12 +3396,6 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     route_index=route_index,
                     raw_response_digest=str(raw_response["sha256"]),
                 )
-                existing_fragment_ids = {fragment.fragment_id for fragment in promoted_fragments}
-                newly_promoted = tuple(
-                    fragment
-                    for fragment in newly_promoted
-                    if fragment.fragment_id not in existing_fragment_ids
-                )
                 if newly_promoted and contract_evaluation.completion_request is not None:
                     promoted_fragments = (*promoted_fragments, *newly_promoted)
                     completion_request = contract_evaluation.completion_request
@@ -3475,7 +3469,10 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "payloadSha256": contract_evaluation.payload_digest,
                     "normalizedSha256": contract_evaluation.normalized_digest,
                     "normalizedValue": contract_evaluation.value,
-                    "reviewDeclarationRequired": (contract_context.review_declaration_required),
+                    "contractContext": {
+                        "fileNames": list(contract_context.file_names),
+                        "reviewDeclarationRequired": (contract_context.review_declaration_required),
+                    },
                     "violations": list(contract_evaluation.violations),
                     "status": contract_evaluation.status.value,
                     "fragments": [

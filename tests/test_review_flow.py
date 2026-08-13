@@ -71,7 +71,12 @@ def promoted(*findings: dict[str, object], attempt: int = 1, route_index: int = 
     )
 
 
-def _evaluation_dict(evaluation, *, review_declaration_required: bool = False) -> dict[str, object]:
+def _evaluation_dict(
+    evaluation,
+    *,
+    file_names: tuple[str, ...] = (),
+    review_declaration_required: bool = False,
+) -> dict[str, object]:
     return {
         "name": evaluation.name,
         "version": evaluation.version,
@@ -79,7 +84,10 @@ def _evaluation_dict(evaluation, *, review_declaration_required: bool = False) -
         "payloadSha256": evaluation.payload_digest,
         "normalizedSha256": evaluation.normalized_digest,
         "normalizedValue": (deepcopy(evaluation.value) if evaluation.value is not None else None),
-        "reviewDeclarationRequired": review_declaration_required,
+        "contractContext": {
+            "fileNames": list(file_names),
+            "reviewDeclarationRequired": review_declaration_required,
+        },
         "violations": list(evaluation.violations),
         "status": evaluation.status.value,
         "fragments": [
@@ -937,6 +945,12 @@ def test_validate_v2_receipt_allows_pre_gate_attempt_without_evaluation(
         ("complete-completion-request", "contract-evaluation"),
         ("complete-coverage", "contract-evaluation"),
         ("review-declaration-bool", "contract-evaluation"),
+        ("context-file-empty", "contract-evaluation"),
+        ("context-file-duplicate", "contract-evaluation"),
+        ("context-file-unsorted", "contract-evaluation"),
+        ("prepared-context-mismatch", "contract-evaluation"),
+        ("prepared-digest-mismatch", "contract-evaluation"),
+        ("unknown-contract", "contract-evaluation"),
         ("review-declaration-extra-required", "contract-evaluation"),
         ("review-declaration-missing-required", "contract-evaluation"),
         ("complete-verdict-invariant", "contract-evaluation"),
@@ -1011,12 +1025,24 @@ def test_validate_v2_receipt_detects_rehashed_structural_mutations(
     elif mutation == "complete-coverage":
         second["contractEvaluation"]["coverage"]["missingFields"] = ["verdict"]
     elif mutation == "review-declaration-bool":
-        second["contractEvaluation"]["reviewDeclarationRequired"] = 1
+        second["contractEvaluation"]["contractContext"]["reviewDeclarationRequired"] = 1
+    elif mutation == "context-file-empty":
+        second["contractEvaluation"]["contractContext"]["fileNames"] = [""]
+    elif mutation == "context-file-duplicate":
+        second["contractEvaluation"]["contractContext"]["fileNames"] = ["a.py", "a.py"]
+    elif mutation == "context-file-unsorted":
+        second["contractEvaluation"]["contractContext"]["fileNames"] = ["z.py", "a.py"]
+    elif mutation == "prepared-context-mismatch":
+        second["contractEvaluation"]["contractContext"]["fileNames"] = ["source.py"]
+    elif mutation == "prepared-digest-mismatch":
+        second["contractEvaluation"]["preparedSha256"] = "0" * 64
+    elif mutation == "unknown-contract":
+        second["contractEvaluation"]["name"] = "unknown-contract"
     elif mutation == "review-declaration-extra-required":
         second["contractEvaluation"]["coverage"]["requiredFields"].append("reviewedFiles")
         second["contractEvaluation"]["coverage"]["coveredFields"].append("reviewedFiles")
     elif mutation == "review-declaration-missing-required":
-        second["contractEvaluation"]["reviewDeclarationRequired"] = True
+        second["contractEvaluation"]["contractContext"]["reviewDeclarationRequired"] = True
     elif mutation == "complete-verdict-invariant":
         normalized = {
             "verdict": "approved",
@@ -1149,16 +1175,47 @@ def test_validate_v2_receipt_preserves_reviewed_files_outside_legacy_view() -> N
     normalized = {
         "verdict": "approved",
         "findings": [],
-        "reviewedFiles": ["source.py:" + "a" * 64],
+        "reviewedFiles": ["source.py"],
     }
     evaluation["normalizedValue"] = normalized
     evaluation["normalizedSha256"] = hashlib.sha256(canonical_json(normalized)).hexdigest()
-    evaluation["reviewDeclarationRequired"] = True
+    context = ContractContext(file_names=("source.py",), review_declaration_required=True)
+    evaluation["contractContext"] = {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": True,
+    }
+    evaluation["preparedSha256"] = get_contract("findings-json").prepare(context).digest
     evaluation["coverage"]["requiredFields"].append("reviewedFiles")
     evaluation["coverage"]["coveredFields"].append("reviewedFiles")
     _sign_receipt(receipt)
 
     assert validate_v2_receipt(receipt) == ()
+
+
+def test_validate_v2_receipt_requires_reviewed_files_to_match_context_exactly() -> None:
+    receipt = v2_findings_receipt()
+    evaluation = receipt["attempts"][1]["contractEvaluation"]
+    context = ContractContext(file_names=("a.py", "b.py"), review_declaration_required=True)
+    normalized = {
+        "verdict": "approved",
+        "findings": [],
+        "reviewedFiles": ["b.py", "a.py"],
+    }
+    evaluation["contractContext"] = {
+        "fileNames": ["a.py", "b.py"],
+        "reviewDeclarationRequired": True,
+    }
+    evaluation["preparedSha256"] = get_contract("findings-json").prepare(context).digest
+    evaluation["normalizedValue"] = normalized
+    evaluation["normalizedSha256"] = hashlib.sha256(canonical_json(normalized)).hexdigest()
+    evaluation["coverage"] = {
+        "requiredFields": ["verdict", "findings", "reviewedFiles"],
+        "coveredFields": ["verdict", "findings", "reviewedFiles"],
+        "missingFields": [],
+    }
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
 
 
 def test_validate_v2_receipt_accepts_invalid_evaluation_state() -> None:

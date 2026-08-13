@@ -858,7 +858,7 @@ def test_provider_mismatch_never_promotes_partial_findings(
     }
     monkeypatch.setattr(cli, "resolved_provider_matches", lambda *_: False)
 
-    return_code, receipt, _ = _run_registered_findings_sequence(
+    return_code, receipt, requests = _run_registered_findings_sequence(
         monkeypatch,
         tmp_path,
         capsys,
@@ -2512,7 +2512,10 @@ def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Pat
     receipt = json.loads(receipt_path.read_text())
     assert receipt["findings"][0]["path"] == "source.py"
     evaluation = receipt["attempts"][0]["contractEvaluation"]
-    assert evaluation["reviewDeclarationRequired"] is True
+    assert evaluation["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": True,
+    }
     assert evaluation["coverage"]["requiredFields"] == [
         "verdict",
         "findings",
@@ -5305,7 +5308,7 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
         "payloadSha256",
         "normalizedSha256",
         "normalizedValue",
-        "reviewDeclarationRequired",
+        "contractContext",
         "violations",
         "status",
         "fragments",
@@ -5314,7 +5317,10 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     }
     assert (evaluation["name"], evaluation["version"]) == ("findings-json", "1")
     assert evaluation["status"] == "complete"
-    assert evaluation["reviewDeclarationRequired"] is False
+    assert evaluation["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": False,
+    }
     assert evaluation["normalizedValue"] == complete_response
     assert evaluation["normalizedSha256"] == cli.sha256_bytes(cli.canonical_json(complete_response))
     assert evaluation["completionRequest"] is None
@@ -5404,15 +5410,31 @@ def test_repeated_partial_payload_promotes_identity_only_once_across_attempts(
     }
     response = json.dumps({"findings": [finding]})
 
-    return_code, receipt, _ = _run_registered_findings_sequence(
+    return_code, receipt, requests = _run_registered_findings_sequence(
         monkeypatch,
         tmp_path,
         capsys,
-        [{"response": response}, {"response": response}],
+        [{"response": response}, {"response": response}, {"response": "not json"}],
+        max_attempts=3,
     )
 
     assert return_code == 1
-    assert [len(attempt["promotedFragments"]) for attempt in receipt["attempts"]] == [1, 0]
+    assert [len(attempt["promotedFragments"]) for attempt in receipt["attempts"]] == [1, 1, 0]
+    first, second = (attempt["promotedFragments"][0] for attempt in receipt["attempts"][:2])
+    assert first["fragmentId"] == second["fragmentId"]
+    assert [first["sourceAttempt"], second["sourceAttempt"]] == [1, 2]
+    encoded_context = (
+        requests[2]
+        .prompt.split("<reviewctl-completion-context>\n", 1)[1]
+        .split("\n</reviewctl-completion-context>", 1)[0]
+    )
+    context = json.loads(encoded_context)
+    assert len(context["findings"]) == 1
+    assert [source["attempt"] for source in context["findings"][0]["sources"]] == [1, 2]
+    assert receipt["fallbackRelationships"][1]["promotedFragmentIds"] == [first["fragmentId"]]
+    assert [
+        source["attempt"] for source in receipt["consolidatedReview"]["findings"][0]["sources"]
+    ] == [1, 2]
     assert cli.validate_v2_receipt(receipt) == ()
 
 

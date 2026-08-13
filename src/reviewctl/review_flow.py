@@ -10,9 +10,11 @@ from reviewctl.contracts import (
     FINDING_FIELDS,
     FINDING_SEVERITIES,
     ContractCompletionRequest,
+    ContractContext,
     ContractEvaluation,
     FragmentKind,
     canonical_json,
+    get_contract,
 )
 
 COMPLETION_CONTEXT_START = "<reviewctl-completion-context>"
@@ -186,7 +188,7 @@ class FallbackRelationship:
             "toAttempt": self.to_attempt,
             "kind": self.kind,
             "reason": self.reason,
-            "promotedFragmentIds": sorted(self.promoted_fragment_ids),
+            "promotedFragmentIds": sorted(set(self.promoted_fragment_ids)),
         }
 
 
@@ -521,6 +523,24 @@ def _receipt_normalized_review(value: object) -> dict[str, Any] | None:
     return value
 
 
+def _receipt_contract_context(value: object) -> ContractContext | None:
+    if type(value) is not dict or set(value) != {
+        "fileNames",
+        "reviewDeclarationRequired",
+    }:
+        return None
+    file_names = value.get("fileNames")
+    required = value.get("reviewDeclarationRequired")
+    if (
+        not isinstance(file_names, list)
+        or type(required) is not bool
+        or any(not isinstance(file_name, str) or not file_name.strip() for file_name in file_names)
+        or file_names != sorted(set(file_names))
+    ):
+        return None
+    return ContractContext(file_names=tuple(file_names), review_declaration_required=required)
+
+
 def _receipt_canonical_digest(value: object) -> str | None:
     try:
         return hashlib.sha256(canonical_json(value)).hexdigest()
@@ -600,7 +620,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     routes = routes_value if isinstance(routes_value, list) else []
     findings_contract = receipt.get("reviewContract") == "findings-json"
     all_promoted: list[PromotedFragment] = []
-    promoted_ids: dict[str, int] = {}
+    promoted_provenance: set[tuple[str, int]] = set()
+    promoted_attempts_by_id: dict[str, set[int]] = {}
     normalized_by_attempt: dict[int, dict[str, Any]] = {}
     prompt_value = receipt.get("prompt")
     packet_digest = (
@@ -652,7 +673,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         "payloadSha256",
                         "normalizedSha256",
                         "normalizedValue",
-                        "reviewDeclarationRequired",
+                        "contractContext",
                         "violations",
                         "status",
                         "fragments",
@@ -669,7 +690,20 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and all(isinstance(item, str) for item in violations_value)
                     and evaluation_status in {"complete", "incomplete", "invalid"}
                     and isinstance(fragment_values, list)
-                    and type(evaluation.get("reviewDeclarationRequired")) is bool
+                )
+                contract_context = _receipt_contract_context(evaluation.get("contractContext"))
+                prepared_digest: str | None = None
+                if contract_context is not None and isinstance(evaluation.get("name"), str):
+                    try:
+                        prepared = get_contract(evaluation["name"]).prepare(contract_context)
+                    except (KeyError, TypeError, ValueError, UnicodeError):
+                        prepared = None
+                    if prepared is not None and prepared.version == evaluation.get("version"):
+                        prepared_digest = prepared.digest
+                identity_valid = (
+                    identity_valid
+                    and contract_context is not None
+                    and evaluation.get("preparedSha256") == prepared_digest
                 )
                 if not identity_valid:
                     reject("contract-evaluation")
@@ -705,7 +739,11 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 normalized_value = _receipt_normalized_review(evaluation.get("normalizedValue"))
                 normalized_digest = evaluation.get("normalizedSha256")
                 completion_request = evaluation.get("completionRequest")
-                declaration_required = evaluation.get("reviewDeclarationRequired") is True
+                declaration_required = (
+                    contract_context.review_declaration_required
+                    if contract_context is not None
+                    else False
+                )
                 expected_required = ["verdict", "findings"]
                 if declaration_required:
                     expected_required.append("reviewedFiles")
@@ -723,6 +761,11 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         and coverage[1] == coverage[0]
                         and coverage[2] == []
                         and set(coverage[0]) == set(normalized_value)
+                        and (
+                            not declaration_required
+                            or normalized_value.get("reviewedFiles")
+                            == list(contract_context.file_names)
+                        )
                         and attempt.get("result") == "accepted"
                     )
                     if normalized_value is not None:
@@ -826,10 +869,12 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             ):
                 reject("promoted-fragments")
                 continue
-            if fragment.fragment_id in promoted_ids:
+            provenance_key = (fragment.fragment_id, fragment.source_attempt)
+            if provenance_key in promoted_provenance:
                 reject("promoted-fragments")
                 continue
-            promoted_ids[fragment.fragment_id] = index
+            promoted_provenance.add(provenance_key)
+            promoted_attempts_by_id.setdefault(fragment.fragment_id, set()).add(index)
             all_promoted.append(fragment)
         evaluation_error = attempt.get("evaluationError")
         if findings_contract and evaluation_error is not None:
@@ -912,8 +957,10 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and ids == sorted(set(ids))
                     and all(
                         _is_sha256(fragment_id)
-                        and fragment_id in promoted_ids
-                        and promoted_ids[fragment_id] < destination
+                        and any(
+                            source_attempt < destination
+                            for source_attempt in promoted_attempts_by_id.get(fragment_id, set())
+                        )
                         for fragment_id in ids
                     )
                 ):
