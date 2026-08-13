@@ -106,7 +106,7 @@ def test_evidence_contract_documents_raw_and_structural_receipt_evidence() -> No
     )
 
     for invariant in (
-        "`rawresponse` records its relative path, sha-256, and character count",
+        "`rawresponse` records its durable absolute path, sha-256, and character count",
         "a non-null response is retained even when it is empty or rejected",
         "v1 verification is digest-only",
         "v2 verification is structural and offline",
@@ -114,3 +114,13 @@ def test_evidence_contract_documents_raw_and_structural_receipt_evidence() -> No
         "unconfirmed findings remain visible in the consolidated view",
     ):
         assert invariant in document
+
+
+def test_raw_response_docs_describe_the_current_absolute_path_contract() -> None:
+    for name in ("EVIDENCE.md", "HELP-LLM.md"):
+        document = " ".join(
+            (REPOSITORY / "docs" / name).read_text().lower().split()
+        )
+
+        assert "durable absolute path" in document
+        assert "relative path" not in document

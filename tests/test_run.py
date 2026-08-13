@@ -1762,9 +1762,10 @@ def test_help_llm_json_is_machine_readable() -> None:
         "follow the selected command's next step; only run creates a receipt"
     )
     assert payload["errors"]["attemptResults"]["incomplete"]["inspect"] == [
-        "attempt.json:validationError",
-        "attempt.json:contractEvaluation.violations",
-        "attempt evidence response",
+        "attempt.json:contractEvaluation.completionRequest",
+        "attempt.json:promotedFragments",
+        "receipt.json:fallbackRelationships",
+        "attempt.json:rawResponse",
     ]
     assert payload["errors"]["attemptResults"]["transport-failed"]["inspect"] == [
         "attempt.json:exitCode",
@@ -1786,6 +1787,31 @@ def test_help_llm_json_is_machine_readable() -> None:
         "availabilityIsNotQualification": True,
         "setupIsLocalOnly": True,
         "setupCallsModels": False,
+    }
+    assert payload["nextActions"] == {
+        "incomplete": {
+            "inspect": [
+                "attempt.json:contractEvaluation.completionRequest",
+                "attempt.json:promotedFragments",
+                "receipt.json:fallbackRelationships",
+                "attempt.json:rawResponse",
+            ]
+        },
+        "invalid": {
+            "inspect": [
+                "attempt.json:contractEvaluation.violations",
+                "attempt.json:evaluationError",
+                "attempt.json:rawResponse",
+            ]
+        },
+        "accepted": {
+            "inspect": [
+                "receipt.json:verdict",
+                "receipt.json:findings",
+                "receipt.json:consolidatedReview",
+            ],
+            "run": "reviewctl verify RECEIPT.json",
+        },
     }
 
 

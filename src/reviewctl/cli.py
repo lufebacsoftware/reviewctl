@@ -603,9 +603,10 @@ def llm_help_payload() -> dict[str, object]:
                 "incomplete": {
                     "meaning": "response failed the selected response contract",
                     "inspect": [
-                        "attempt.json:validationError",
-                        "attempt.json:contractEvaluation.violations",
-                        "attempt evidence response",
+                        "attempt.json:contractEvaluation.completionRequest",
+                        "attempt.json:promotedFragments",
+                        "receipt.json:fallbackRelationships",
+                        "attempt.json:rawResponse",
                     ],
                 },
             },
@@ -625,6 +626,31 @@ def llm_help_payload() -> dict[str, object]:
                 "verdict-invariant": "verdict and finding count disagree",
             },
             "redaction": "diagnostics are bounded and credential-shaped values are redacted",
+        },
+        "nextActions": {
+            "incomplete": {
+                "inspect": [
+                    "attempt.json:contractEvaluation.completionRequest",
+                    "attempt.json:promotedFragments",
+                    "receipt.json:fallbackRelationships",
+                    "attempt.json:rawResponse",
+                ]
+            },
+            "invalid": {
+                "inspect": [
+                    "attempt.json:contractEvaluation.violations",
+                    "attempt.json:evaluationError",
+                    "attempt.json:rawResponse",
+                ]
+            },
+            "accepted": {
+                "inspect": [
+                    "receipt.json:verdict",
+                    "receipt.json:findings",
+                    "receipt.json:consolidatedReview",
+                ],
+                "run": "reviewctl verify RECEIPT.json",
+            },
         },
         "rules": [
             "Exploration responses are working material, not approvals.",

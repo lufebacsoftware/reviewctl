@@ -103,7 +103,7 @@ retrying blindly:
 - Accepted: inspect both the legacy and consolidated views, then run
   `reviewctl verify`.
 
-`rawResponse` identifies the retained bytes by relative path, SHA-256, and
+`rawResponse` identifies the retained bytes by durable absolute path, SHA-256, and
 character count. A missing response and a present empty response are different
 facts.
 

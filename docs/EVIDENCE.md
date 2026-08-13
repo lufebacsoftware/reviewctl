@@ -17,7 +17,7 @@ receipt, but a new review records the new policy digest.
 
 Every attempt distinguishes an absent backend response from a present response. A non-null response is
 retained even when it is empty or rejected, under the attempt directory. `rawResponse` records its
-relative path, SHA-256, and character count. This durable raw evidence supports diagnosis; it is never
+durable absolute path, SHA-256, and character count. This durable raw evidence supports diagnosis; it is never
 copied into a completion prompt and never qualifies a rejected response for fragment promotion.
 
 Receipt schema versions have deliberately different verification guarantees. V1 verification is
