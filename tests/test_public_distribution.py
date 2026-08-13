@@ -33,11 +33,15 @@ def test_public_tree_excludes_private_review_evidence() -> None:
         )
     )
     forbidden_directories = {"receipts", "sealed", "council"}
+    public_receipt_fixtures = Path("tests/fixtures/receipts")
 
     for path in ROOT.rglob("*"):
         relative_path = path.relative_to(ROOT)
         if path.is_dir():
-            assert path.name.lower() not in forbidden_directories
+            assert (
+                relative_path == public_receipt_fixtures
+                or path.name.lower() not in forbidden_directories
+            )
             continue
         if "__pycache__" in relative_path.parts or path.suffix in {".pyc", ".pyo"}:
             continue

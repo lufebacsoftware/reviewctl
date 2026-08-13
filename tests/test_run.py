@@ -19,6 +19,7 @@ from reviewctl import cli
 from reviewctl.setup import BackendInstallation, LocalExecutionTopology
 
 REPOSITORY = Path(__file__).parents[1]
+V1_RECEIPT_FIXTURES = REPOSITORY / "tests" / "fixtures" / "receipts"
 
 
 def run_cli(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -4529,6 +4530,51 @@ def test_verification_detects_tampered_receipt(tmp_path: Path) -> None:
     receipt_path.write_text(json.dumps(receipt))
     tampered = run_cli("verify", str(receipt_path))
     assert tampered.returncode == 1
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_digest"),
+    [
+        (
+            "accepted-findings-v1.json",
+            "bba561e2704d9a54bc4b911cc71c7071676ba298789fe047bb1971ed9e0a33c8",
+        ),
+        (
+            "unavailable-findings-v1.json",
+            "03c939fdee8aaf58ec2be137c6df5d13e72163b2ff254ab32cf85f7ed0555c06",
+        ),
+        (
+            "legacy-digest-only.json",
+            "d96f6cf66e34cb13404e69c6a5515eadb2354fff65729d03ebedf0a800e1b057",
+        ),
+    ],
+)
+def test_immutable_v1_receipt_fixtures_verify_by_embedded_digest(
+    filename: str, expected_digest: str
+) -> None:
+    fixture_path = V1_RECEIPT_FIXTURES / filename
+    receipt = json.loads(fixture_path.read_text())
+
+    assert "receiptSchemaVersion" not in receipt
+    assert fixture_path.read_bytes() == cli.canonical_json(receipt) + b"\n"
+    assert receipt["sha256"] == expected_digest
+    serialized = fixture_path.read_text().lower()
+    for forbidden in ("/users/", "/home/", "api_key", "bearer ", "password", "sk-"):
+        assert forbidden not in serialized
+    assert cli.valid_receipt(receipt) is True
+    verified = run_cli("verify", str(fixture_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["valid"] is True
+
+
+def test_legacy_digest_only_fixture_is_a_compatibility_routing_sentinel() -> None:
+    receipt = json.loads((V1_RECEIPT_FIXTURES / "legacy-digest-only.json").read_text())
+
+    assert receipt["fixturePurpose"] == "compatibility-routing-sentinel-not-a-valid-review"
+    assert receipt["result"] == "accepted"
+    assert receipt["acceptedAttempt"] == 99
+    assert len(receipt["attempts"]) == 1
+    assert cli.valid_receipt(receipt) is True
 
 
 def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> None:
