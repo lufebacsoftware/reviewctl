@@ -29,7 +29,19 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from reviewctl import __version__
-from reviewctl.backends import PersistedResponse
+from reviewctl.backends import (
+    BackendCapabilities,
+    BackendDescriptor,
+    BackendEvidence,
+    BackendExecution,
+    BackendFamily,
+    BackendRegistry,
+    BackendRequest,
+    DiscoveryKind,
+    PersistedResponse,
+    ReadOnlyCapability,
+    SourceIsolation,
+)
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
     REVIEWED_FILES_SCHEMA,
@@ -2386,6 +2398,246 @@ def load_response(database: Path) -> PersistedResponse | None:
         output_tokens=row[4],
         provider=provider if isinstance(provider, str) else None,
     )
+
+
+def execute_llm_backend(request: BackendRequest) -> BackendExecution:
+    database = request.attempt_dir / "transport.sqlite3"
+    exit_code, diagnostic = invoke_llm(
+        llm_bin=os.environ.get("LLM_BIN", "llm"),
+        prompt=request.prompt,
+        model=request.model,
+        database=database,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        load_response(database),
+        BackendEvidence(database=database),
+    )
+
+
+def execute_codex_backend(request: BackendRequest) -> BackendExecution:
+    response_path = request.attempt_dir / "response.md"
+    exit_code, diagnostic, response = invoke_codex(
+        codex_bin=os.environ.get("CODEX_BIN", "codex"),
+        prompt=request.prompt,
+        model=request.model,
+        response_contract=request.response_contract,
+        source_roots=list(request.source_roots) or None,
+        timeout_seconds=request.timeout_seconds,
+        workspace=request.files[0].parent,
+    )
+    response_path.write_text(response.response)
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(response=response_path),
+    )
+
+
+def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    exit_code, diagnostic, response = invoke_openrouter(
+        api_key=os.environ.get("OPENROUTER_API_KEY"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        provider_preferences=request.provider_preferences,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=response_path,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(request=request_path, response=response_path),
+    )
+
+
+def execute_agy_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    exit_code, diagnostic, response = invoke_agy(
+        agy_bin=os.environ.get("AGY_BIN", "agy"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=response_path,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(request=request_path, response=response_path),
+    )
+
+
+def execute_pi_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    events_path = request.attempt_dir / "events.jsonl"
+    session_path = request.attempt_dir / "session.jsonl"
+    final_response_path = request.attempt_dir / "response.md"
+    stderr_path = request.attempt_dir / "stderr.log"
+    exit_code, diagnostic, response = invoke_pi(
+        pi_bin=os.environ.get("PI_BIN", "pi"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=events_path,
+        session_path=session_path,
+        diagnostic_path=stderr_path,
+    )
+    if response.response:
+        final_response_path.write_text(response.response)
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(
+            request=request_path,
+            response=events_path,
+            session=session_path,
+            final_response=final_response_path,
+            stderr=stderr_path,
+        ),
+    )
+
+
+def build_backend_registry() -> BackendRegistry:
+    registry = BackendRegistry()
+    registry.register(
+        BackendDescriptor(
+            "agy",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "AGY_BIN",
+            "agy",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_agy_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "codex",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "CODEX_BIN",
+            "codex",
+            BackendCapabilities(
+                ReadOnlyCapability.SANDBOXED,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                True,
+                SourceIsolation.EXTERNAL_SANDBOX,
+            ),
+            "unqualified",
+        ),
+        execute_codex_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "llm",
+            BackendFamily.GENERIC_MODEL_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "LLM_BIN",
+            "llm",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_llm_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "openrouter",
+            BackendFamily.PROVIDER_GATEWAY,
+            DiscoveryKind.REMOTE_API,
+            "",
+            "",
+            BackendCapabilities(
+                ReadOnlyCapability.UNSUPPORTED,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_openrouter_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "pi",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "PI_BIN",
+            "pi",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_pi_backend,
+    )
+    return registry
 
 
 def response_is_complete(response: str) -> bool:

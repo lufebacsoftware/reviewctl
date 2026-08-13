@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -119,3 +120,368 @@ def test_descriptor_serialization_uses_enum_values() -> None:
 
 def test_cli_persisted_response_is_backend_contract() -> None:
     assert cli.PersistedResponse is backends.PersistedResponse
+
+
+def backend_request(tmp_path: Path) -> BackendRequest:
+    source_dir = tmp_path / "source"
+    return BackendRequest(
+        prompt="Review this change",
+        model="example/model",
+        response_contract="findings-json",
+        files=(source_dir / "source.py", source_dir / "test_source.py"),
+        attempt_dir=tmp_path / "attempt",
+        timeout_seconds=45,
+        max_output_tokens=8192,
+        source_class="proprietary",
+        source_roots=(source_dir, tmp_path / "shared"),
+        provider_preferences={"only": ["example"]},
+    )
+
+
+def assert_execution_has_transport_semantics_only(execution: BackendExecution) -> None:
+    assert set(execution.__dataclass_fields__) == {
+        "exit_code",
+        "diagnostic",
+        "response",
+        "evidence",
+    }
+    assert not hasattr(execution, "acceptance")
+    assert not hasattr(execution, "result")
+
+
+def test_build_backend_registry_has_exact_inventory_and_unqualified_descriptors() -> None:
+    descriptors = cli.build_backend_registry().descriptors()
+
+    assert tuple(item.name for item in descriptors) == ("agy", "codex", "llm", "openrouter", "pi")
+    assert {item.qualification for item in descriptors} == {"unqualified"}
+
+
+@pytest.mark.parametrize(
+    ("name", "family", "discovery_kind", "executable_env", "default_executable", "capabilities"),
+    [
+        (
+            "agy",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "AGY_BIN",
+            "agy",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+        ),
+        (
+            "codex",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "CODEX_BIN",
+            "codex",
+            BackendCapabilities(
+                ReadOnlyCapability.SANDBOXED,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                True,
+                SourceIsolation.EXTERNAL_SANDBOX,
+            ),
+        ),
+        (
+            "llm",
+            BackendFamily.GENERIC_MODEL_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "LLM_BIN",
+            "llm",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+        ),
+        (
+            "openrouter",
+            BackendFamily.PROVIDER_GATEWAY,
+            DiscoveryKind.REMOTE_API,
+            "",
+            "",
+            BackendCapabilities(
+                ReadOnlyCapability.UNSUPPORTED,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+        ),
+        (
+            "pi",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "PI_BIN",
+            "pi",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+        ),
+    ],
+)
+def test_build_backend_registry_declares_exact_descriptor_capabilities(
+    name: str,
+    family: BackendFamily,
+    discovery_kind: DiscoveryKind,
+    executable_env: str,
+    default_executable: str,
+    capabilities: BackendCapabilities,
+) -> None:
+    descriptor = cli.build_backend_registry().require(name).descriptor
+
+    assert descriptor == BackendDescriptor(
+        name=name,
+        family=family,
+        discovery_kind=discovery_kind,
+        executable_env=executable_env,
+        default_executable=default_executable,
+        capabilities=capabilities,
+        qualification="unqualified",
+    )
+
+
+def test_execute_llm_backend_invokes_legacy_transport_and_maps_database_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    expected_response = PersistedResponse("turn", 0.1, 10, 20, "resolved", 30, "provider", "ok")
+    calls: dict[str, Any] = {}
+
+    def fake_invoke_llm(**kwargs: object) -> tuple[int, str]:
+        calls["invoke"] = kwargs
+        return 17, "diagnostic"
+
+    def fake_load_response(database: Path) -> PersistedResponse:
+        calls["load"] = database
+        return expected_response
+
+    monkeypatch.delenv("LLM_BIN", raising=False)
+    monkeypatch.setattr(cli, "invoke_llm", fake_invoke_llm)
+    monkeypatch.setattr(cli, "load_response", fake_load_response)
+
+    execution = cli.execute_llm_backend(request)
+    database = request.attempt_dir / "transport.sqlite3"
+
+    assert calls == {
+        "invoke": {
+            "llm_bin": "llm",
+            "prompt": request.prompt,
+            "model": request.model,
+            "database": database,
+            "files": list(request.files),
+            "max_output_tokens": request.max_output_tokens,
+            "response_contract": request.response_contract,
+            "timeout_seconds": request.timeout_seconds,
+        },
+        "load": database,
+    }
+    assert execution == BackendExecution(
+        17, "diagnostic", expected_response, BackendEvidence(database=database)
+    )
+    assert_execution_has_transport_semantics_only(execution)
+
+
+def test_execute_codex_backend_persists_rejected_response_and_maps_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    expected_response = PersistedResponse(
+        "turn", None, 10, None, "resolved", None, None, "rejected"
+    )
+    calls: dict[str, object] = {}
+
+    def fake_invoke_codex(**kwargs: object) -> tuple[int, str, PersistedResponse]:
+        calls.update(kwargs)
+        return 23, "rejected output", expected_response
+
+    request.attempt_dir.mkdir()
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setattr(cli, "invoke_codex", fake_invoke_codex)
+
+    execution = cli.execute_codex_backend(request)
+    response_path = request.attempt_dir / "response.md"
+
+    assert calls == {
+        "codex_bin": "codex",
+        "prompt": request.prompt,
+        "model": request.model,
+        "response_contract": request.response_contract,
+        "source_roots": list(request.source_roots),
+        "timeout_seconds": request.timeout_seconds,
+        "workspace": request.files[0].parent,
+    }
+    assert response_path.read_text() == "rejected"
+    assert execution == BackendExecution(
+        23, "rejected output", expected_response, BackendEvidence(response=response_path)
+    )
+    assert_execution_has_transport_semantics_only(execution)
+
+
+def test_execute_openrouter_backend_invokes_legacy_transport_and_maps_json_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    expected_response = PersistedResponse("turn", 0.2, 10, 20, "resolved", 30, "provider", "ok")
+    calls: dict[str, object] = {}
+
+    def fake_invoke_openrouter(**kwargs: object) -> tuple[int, str, PersistedResponse]:
+        calls.update(kwargs)
+        return 0, "", expected_response
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cli, "invoke_openrouter", fake_invoke_openrouter)
+
+    execution = cli.execute_openrouter_backend(request)
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+
+    assert calls == {
+        "api_key": "test-key",
+        "prompt": request.prompt,
+        "model": request.model,
+        "files": list(request.files),
+        "max_output_tokens": request.max_output_tokens,
+        "provider_preferences": request.provider_preferences,
+        "response_contract": request.response_contract,
+        "timeout_seconds": request.timeout_seconds,
+        "request_path": request_path,
+        "response_path": response_path,
+    }
+    assert execution == BackendExecution(
+        0,
+        "",
+        expected_response,
+        BackendEvidence(request=request_path, response=response_path),
+    )
+    assert_execution_has_transport_semantics_only(execution)
+
+
+def test_execute_agy_backend_invokes_legacy_transport_and_maps_json_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    expected_response = PersistedResponse("turn", None, 10, 20, "resolved", 30, "provider", "ok")
+    calls: dict[str, object] = {}
+
+    def fake_invoke_agy(**kwargs: object) -> tuple[int, str, PersistedResponse]:
+        calls.update(kwargs)
+        return 0, "", expected_response
+
+    monkeypatch.delenv("AGY_BIN", raising=False)
+    monkeypatch.setattr(cli, "invoke_agy", fake_invoke_agy)
+
+    execution = cli.execute_agy_backend(request)
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+
+    assert calls == {
+        "agy_bin": "agy",
+        "prompt": request.prompt,
+        "model": request.model,
+        "files": list(request.files),
+        "max_output_tokens": request.max_output_tokens,
+        "response_contract": request.response_contract,
+        "timeout_seconds": request.timeout_seconds,
+        "request_path": request_path,
+        "response_path": response_path,
+    }
+    assert execution == BackendExecution(
+        0,
+        "",
+        expected_response,
+        BackendEvidence(request=request_path, response=response_path),
+    )
+    assert_execution_has_transport_semantics_only(execution)
+
+
+@pytest.mark.parametrize("response_text", ["final response", ""])
+def test_execute_pi_backend_invokes_legacy_transport_and_maps_all_evidence(
+    response_text: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    expected_response = PersistedResponse(
+        "turn", None, 10, 20, "resolved", 30, "provider", response_text
+    )
+    calls: dict[str, object] = {}
+
+    def fake_invoke_pi(**kwargs: object) -> tuple[int, str, PersistedResponse]:
+        calls.update(kwargs)
+        return 0, "", expected_response
+
+    request.attempt_dir.mkdir()
+    monkeypatch.delenv("PI_BIN", raising=False)
+    monkeypatch.setattr(cli, "invoke_pi", fake_invoke_pi)
+
+    execution = cli.execute_pi_backend(request)
+    request_path = request.attempt_dir / "request.json"
+    events_path = request.attempt_dir / "events.jsonl"
+    session_path = request.attempt_dir / "session.jsonl"
+    final_response_path = request.attempt_dir / "response.md"
+    stderr_path = request.attempt_dir / "stderr.log"
+
+    assert calls == {
+        "pi_bin": "pi",
+        "prompt": request.prompt,
+        "model": request.model,
+        "files": list(request.files),
+        "max_output_tokens": request.max_output_tokens,
+        "response_contract": request.response_contract,
+        "timeout_seconds": request.timeout_seconds,
+        "request_path": request_path,
+        "response_path": events_path,
+        "session_path": session_path,
+        "diagnostic_path": stderr_path,
+    }
+    assert final_response_path.is_file() is bool(response_text)
+    if response_text:
+        assert final_response_path.read_text() == response_text
+    assert execution == BackendExecution(
+        0,
+        "",
+        expected_response,
+        BackendEvidence(
+            request=request_path,
+            response=events_path,
+            session=session_path,
+            final_response=final_response_path,
+            stderr=stderr_path,
+        ),
+    )
+    assert_execution_has_transport_semantics_only(execution)
