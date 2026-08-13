@@ -165,6 +165,14 @@ class DuplicateJsonField(ValueError):
     """Raised when exact JSON decoding encounters the same object key twice."""
 
 
+class _InvalidJsonConstant(ValueError):
+    """Raised when JSON decoding encounters a non-standard numeric constant."""
+
+
+def _reject_json_constant(value: str) -> None:
+    raise _InvalidJsonConstant(value)
+
+
 def exact_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -263,8 +271,12 @@ class FindingsJsonContract:
             return rejected("prepared-contract")
 
         try:
-            value = json.loads(payload, object_pairs_hook=exact_json_object)
-        except (json.JSONDecodeError, DuplicateJsonField):
+            value = json.loads(
+                payload,
+                object_pairs_hook=exact_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (json.JSONDecodeError, DuplicateJsonField, _InvalidJsonConstant):
             return rejected("invalid-json")
         if not isinstance(value, dict):
             return rejected("top-level-not-object")

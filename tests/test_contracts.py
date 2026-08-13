@@ -470,3 +470,34 @@ def test_exact_json_object_and_prepared_contract_are_required_before_extraction(
     assert evaluation.status is EvaluationStatus.INVALID
     assert evaluation.valid_fragments == ()
     assert evaluation.violations == ("prepared-contract",)
+
+
+def assert_non_finite_json_is_rejected(constant: str) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    finding = json.dumps(finding_payload()["findings"][0])
+    payload = (
+        f'{{"verdict":"changes-requested","findings":[{finding}],'
+        f'"nonFinite":{constant}}}'
+    )
+
+    evaluation = contract.evaluate(payload, prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+    assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
+    assert evaluation.completion_request is None
+
+
+def test_findings_contract_rejects_nan_before_fragment_extraction() -> None:
+    assert_non_finite_json_is_rejected("NaN")
+
+
+def test_findings_contract_rejects_infinity_before_fragment_extraction() -> None:
+    assert_non_finite_json_is_rejected("Infinity")
+
+
+def test_findings_contract_rejects_negative_infinity_before_fragment_extraction() -> None:
+    assert_non_finite_json_is_rejected("-Infinity")
