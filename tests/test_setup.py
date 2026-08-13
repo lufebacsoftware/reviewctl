@@ -23,6 +23,7 @@ from reviewctl.backends import (
 from reviewctl.setup import (
     BackendInstallation,
     LocalExecutionTopology,
+    _which,
     discover_backend,
     discover_topology,
     probe_version,
@@ -450,6 +451,122 @@ def test_discovery_without_supplied_path_does_not_search_ambient_path(
         False,
     )
     assert probe_called is False
+
+
+def test_windows_lookup_checks_only_explicit_path_directories_and_never_cwd() -> None:
+    checked: list[str] = []
+    files = {r"tool.EXE", r"D:\safe\tool.CMD"}
+
+    def fake_is_file(candidate: str) -> bool:
+        checked.append(candidate)
+        return candidate in files
+
+    resolved = _which(
+        "tool",
+        r"C:\first;D:\safe",
+        windows=True,
+        is_file=fake_is_file,
+        is_executable=lambda candidate: True,
+    )
+
+    assert resolved == r"D:\safe\tool.CMD"
+    assert r"tool.EXE" not in checked
+    assert all(candidate.startswith(("C:\\first\\", "D:\\safe\\")) for candidate in checked)
+
+
+def test_windows_lookup_uses_safe_extensions_without_ambient_pathext() -> None:
+    checked: list[str] = []
+
+    def fake_is_file(candidate: str) -> bool:
+        checked.append(candidate)
+        return candidate == r"C:\tools\review.CMD"
+
+    resolved = _which(
+        "review",
+        r"C:\tools",
+        windows=True,
+        is_file=fake_is_file,
+        is_executable=lambda candidate: True,
+    )
+
+    assert resolved == r"C:\tools\review.CMD"
+    assert checked == [
+        r"C:\tools\review.COM",
+        r"C:\tools\review.EXE",
+        r"C:\tools\review.BAT",
+        r"C:\tools\review.CMD",
+    ]
+
+
+def test_windows_lookup_rejects_suffix_outside_safe_extension_set() -> None:
+    checked: list[str] = []
+
+    assert (
+        _which(
+            "review.py",
+            r"C:\tools",
+            windows=True,
+            is_file=lambda candidate: checked.append(candidate) is None,
+            is_executable=lambda candidate: True,
+        )
+        is None
+    )
+    assert checked == []
+
+
+def test_lookup_with_empty_path_does_not_check_any_search_candidate() -> None:
+    checked: list[str] = []
+
+    assert (
+        _which(
+            "review",
+            "",
+            windows=True,
+            is_file=lambda candidate: checked.append(candidate) is None,
+            is_executable=lambda candidate: True,
+        )
+        is None
+    )
+    assert checked == []
+
+
+def test_windows_lookup_handles_direct_executable_path_without_path_search() -> None:
+    direct = r"C:\chosen\review.exe"
+    checked: list[str] = []
+
+    def fake_is_file(candidate: str) -> bool:
+        checked.append(candidate)
+        return candidate == direct
+
+    resolved = _which(
+        direct,
+        r"C:\ignored",
+        windows=True,
+        is_file=fake_is_file,
+        is_executable=lambda candidate: True,
+    )
+
+    assert resolved == direct
+    assert checked == [direct]
+
+
+def test_posix_lookup_allows_explicit_relative_path_entry() -> None:
+    checked: list[str] = []
+
+    def fake_is_file(candidate: str) -> bool:
+        checked.append(candidate)
+        return candidate == "relative-bin/review"
+
+    resolved = _which(
+        "review",
+        "relative-bin",
+        windows=False,
+        is_file=fake_is_file,
+        is_executable=lambda candidate: True,
+    )
+
+    assert resolved == "relative-bin/review"
+    assert checked == ["relative-bin/review"]
 
 
 def test_probe_version_real_child_receives_only_allowed_environment(tmp_path: Path) -> None:

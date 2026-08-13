@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ntpath
+import os
+import posixpath
 import re
-import shutil
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -11,6 +13,7 @@ from dataclasses import asdict, dataclass
 from reviewctl.backends import BackendDescriptor, BackendRegistry, DiscoveryKind
 
 _MAX_OUTPUT_LENGTH = 500
+_WINDOWS_EXECUTABLE_EXTENSIONS = (".COM", ".EXE", ".BAT", ".CMD")
 _SENSITIVE_LABEL = (
     r"(?:authorization|credentials?|tokens?|api[-_]?keys?|client[-_]?secret|"
     r"password|passwd|private[-_]?key)"
@@ -104,8 +107,52 @@ def probe_version(executable: str, environ: Mapping[str, str]) -> tuple[str | No
     return None, _bounded_output(diagnostic)
 
 
-def _which(executable: str, path: str | None) -> str | None:
-    return shutil.which(executable, path=path)
+def _is_executable(path: str) -> bool:
+    return os.access(path, os.X_OK)
+
+
+def _which(
+    executable: str,
+    path: str | None,
+    *,
+    windows: bool | None = None,
+    is_file: Callable[[str], bool] = os.path.isfile,
+    is_executable: Callable[[str], bool] = _is_executable,
+) -> str | None:
+    """Resolve only direct paths or directories explicitly listed in ``path``.
+
+    Empty path entries are ignored. Relative entries intentionally resolve from the
+    current directory because the caller explicitly supplied those entries.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    path_module = ntpath if windows else posixpath
+
+    def executable_candidates(candidate: str) -> tuple[str, ...]:
+        if not windows:
+            return (candidate,)
+        extension = path_module.splitext(candidate)[1]
+        if extension:
+            return (candidate,) if extension.upper() in _WINDOWS_EXECUTABLE_EXTENSIONS else ()
+        return tuple(candidate + extension for extension in _WINDOWS_EXECUTABLE_EXTENSIONS)
+
+    directories: tuple[str | None, ...]
+    if path_module.dirname(executable):
+        directories = (None,)
+    elif path:
+        separator = ";" if windows else ":"
+        directories = tuple(directory for directory in path.split(separator) if directory)
+    else:
+        directories = ()
+
+    for directory in directories:
+        base_candidate = (
+            executable if directory is None else path_module.join(directory, executable)
+        )
+        for candidate in executable_candidates(base_candidate):
+            if is_file(candidate) and (windows or is_executable(candidate)):
+                return candidate
+    return None
 
 
 def discover_backend(
