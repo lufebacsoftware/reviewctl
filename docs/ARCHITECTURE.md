@@ -26,8 +26,12 @@ a project's canonical history, or a federation peer's trust policy.
 
 ## Backend execution boundary
 
-Backend execution and setup stay on the same machine. This is a local-only setup:
-it does not introduce remote dispatch, synchronization, or shared credentials.
+reviewctl keeps the controller, adapter process, evidence handling, and setup
+diagnostics local. Provider or model execution may be remote for `REMOTE_API`
+backends. Local reviewctl execution does not enable remote controller or adapter
+dispatch. Federation remains deferred and separate from backend execution and
+setup synchronization.
+
 The BAML-inspired typed boundary is native and has no BAML dependency; this
 phase does not expand the existing contract work.
 
@@ -40,17 +44,18 @@ The boundary has three provider-neutral types:
 - **BackendCapabilities** declares what an adapter can report or enforce; it is
   not proof that the adapter is qualified for review.
 
-Backend adapters invoke a backend and persist its observed evidence only;
-adapters do not decide acceptance. The controller owns policy, contract
+Backend adapters only invoke a backend and persist its observed evidence;
+adapters do not decide acceptance. The controller alone owns policy, contract
 evaluation, acceptance, fallback, and receipt construction.
 
 The five legacy compatibility adapters are explicitly unqualified: `llm`,
 `openrouter`, `agy`, `pi`, and `codex`. They preserve existing route behavior
 without claiming conformance. Availability is not qualification.
 
-Setup observes only executable presence and version. It never authenticates,
-calls a model, or writes configuration. The next gate is backend conformance
-before Cursor, Claude Code, or another native backend can be added.
+Setup diagnostics observe only executable presence and version for registered
+executable backends. Setup diagnostics never authenticate, call a model or
+provider, or write configuration. The next gate is backend conformance before
+Cursor, Claude Code, or another native backend can be added.
 
 ## Canonical terms
 

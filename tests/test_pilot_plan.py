@@ -44,7 +44,9 @@ def test_pi_transcript_is_not_review_evidence() -> None:
 
 
 def test_help_llm_carries_setup_and_nonqualification_invariants() -> None:
-    document = (REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower()
+    document = " ".join(
+        (REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower().split()
+    )
 
     for command in (
         "reviewctl setup discover --format json",
@@ -52,15 +54,33 @@ def test_help_llm_carries_setup_and_nonqualification_invariants() -> None:
         "reviewctl setup check --backend name --format json",
     ):
         assert command in document
-    for boundary in (
-        "local",
-        "read-only",
-        "non-qualifying",
-        "availability is not qualification",
-        "do not call models",
-        "write configuration",
+    for invariant in (
+        "setup diagnostics are local, read-only, and non-qualifying.",
+        (
+            "setup diagnostics observe only executable presence and version for registered "
+            "executable backends."
+        ),
+        (
+            "setup diagnostics never authenticate, call a model or provider, or write "
+            "configuration."
+        ),
+        "availability is not qualification.",
+        (
+            "remote api backends may execute providers or models remotely, but setup never "
+            "credential-probes them."
+        ),
     ):
-        assert boundary in document
+        assert invariant in document
+
+    for forbidden_reversal in (
+        "setup diagnostics may write configuration",
+        "setup diagnostics may authenticate",
+        "setup diagnostics may call a model",
+        "availability is qualification",
+        "provider or model execution is always local",
+    ):
+        assert forbidden_reversal not in document
+
     for product in ("cursor", "claude"):
         unsupported_claim = " ".join((product, "is", "supported"))
         assert unsupported_claim not in document
