@@ -148,22 +148,41 @@ def mock_openrouter_curl(
     return captured
 
 
-def write_fake_codex(path: Path) -> Path:
+def write_fake_codex(
+    path: Path,
+    *,
+    arguments_log: Path | None = None,
+    response: str | None = None,
+    skip_read_proof: bool = False,
+    session_on_stderr: bool = False,
+    resolved_model: str | None = None,
+    sleep: bool = False,
+    write_before_sleep: bool = False,
+) -> Path:
+    configuration = {
+        "arguments_log": str(arguments_log) if arguments_log else None,
+        "response": response,
+        "skip_read_proof": skip_read_proof,
+        "session_on_stderr": session_on_stderr,
+        "resolved_model": resolved_model,
+        "sleep": sleep,
+        "write_before_sleep": write_before_sleep,
+    }
     return write_fake_python_executable(
         path,
         "codex",
         """import json
-import os
 import sys
 import time
 from pathlib import Path
 
+configuration = __CONFIGURATION__
 arguments = sys.argv[1:]
 output = Path(arguments[arguments.index('--output-last-message') + 1])
 model = arguments[arguments.index('--model') + 1]
-if log := os.environ.get('CODEX_ARGUMENTS_LOG'):
+if log := configuration['arguments_log']:
     Path(log).write_text(json.dumps(arguments))
-response = os.environ.get('CODEX_RESPONSE', 'VERDICT: approved without blocking findings.')
+response = configuration['response'] or 'VERDICT: approved without blocking findings.'
 if '--output-schema' in arguments:
     if response == 'VERDICT: approved without blocking findings.':
         response = json.dumps({'verdict': 'approved', 'findings': [], 'reviewedFiles': []})
@@ -173,7 +192,7 @@ if '--output-schema' in arguments:
     if (
         requires_read_proof
         and not payload.get('reviewedFiles')
-        and not os.environ.get('CODEX_SKIP_READ_PROOF')
+        and not configuration['skip_read_proof']
     ):
         workspace = Path(arguments[arguments.index('-C') + 1])
         payload['reviewedFiles'] = [
@@ -187,17 +206,17 @@ if '--output-schema' in arguments:
             }
         ]
     response = json.dumps(payload)
-if os.environ.get('CODEX_WRITE_BEFORE_SLEEP'):
+if configuration['write_before_sleep']:
     output.write_text(response)
-if os.environ.get('CODEX_SLEEP'):
+if configuration['sleep']:
     time.sleep(60)
 output.write_text(response)
 print(
     'session id: codex-conversation',
-    file=sys.stderr if os.environ.get('CODEX_SESSION_ON_STDERR') else sys.stdout,
+    file=sys.stderr if configuration['session_on_stderr'] else sys.stdout,
 )
-print(f"model: {os.environ.get('CODEX_RESOLVED_MODEL', model)}")
-""",
+print(f"model: {configuration['resolved_model'] or model}")
+""".replace("__CONFIGURATION__", repr(configuration)),
     )
 
 
@@ -1749,8 +1768,8 @@ def test_rejects_an_invalid_run_attempt_limit(tmp_path: Path) -> None:
 def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -> None:
     fake_codex_root = tmp_path.parent / "codex-bin"
     fake_codex_root.mkdir()
-    fake_codex = write_fake_codex(fake_codex_root)
     arguments_log = tmp_path.parent / "codex-arguments.json"
+    fake_codex = write_fake_codex(fake_codex_root, arguments_log=arguments_log)
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
@@ -1758,7 +1777,7 @@ def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -
         "codex",
         "--source-class",
         "proprietary",
-        env={"CODEX_BIN": str(fake_codex), "CODEX_ARGUMENTS_LOG": str(arguments_log)},
+        env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 0, result.stderr
@@ -1783,7 +1802,6 @@ def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -
 
 
 def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Path) -> None:
-    fake_codex = write_fake_codex(tmp_path)
     response = json.dumps(
         {
             "verdict": "changes-requested",
@@ -1799,6 +1817,7 @@ def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Pat
             ],
         }
     )
+    fake_codex = write_fake_codex(tmp_path, response=response)
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
@@ -1806,7 +1825,7 @@ def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Pat
         "codex",
         "--response-contract",
         "findings-json",
-        env={"CODEX_BIN": str(fake_codex), "CODEX_RESPONSE": response},
+        env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 0, result.stderr
@@ -1815,13 +1834,13 @@ def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Pat
 
 
 def test_codex_transport_reads_the_session_identifier_from_stderr(tmp_path: Path) -> None:
-    fake_codex = write_fake_codex(tmp_path)
+    fake_codex = write_fake_codex(tmp_path, session_on_stderr=True)
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
         "--transport",
         "codex",
-        env={"CODEX_BIN": str(fake_codex), "CODEX_SESSION_ON_STDERR": "1"},
+        env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 0, result.stderr
@@ -1830,13 +1849,13 @@ def test_codex_transport_reads_the_session_identifier_from_stderr(tmp_path: Path
 
 
 def test_codex_transport_rejects_a_model_substituted_by_the_provider(tmp_path: Path) -> None:
-    fake_codex = write_fake_codex(tmp_path)
+    fake_codex = write_fake_codex(tmp_path, resolved_model="gpt-5.6-luna")
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
         "--transport",
         "codex",
-        env={"CODEX_BIN": str(fake_codex), "CODEX_RESOLVED_MODEL": "gpt-5.6-luna"},
+        env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 1
@@ -1897,7 +1916,6 @@ def test_findings_contract_rejects_non_verdicts_and_incoherent_findings(response
 
 
 def test_codex_receipt_records_why_a_structured_response_is_rejected(tmp_path: Path) -> None:
-    fake_codex = write_fake_codex(tmp_path)
     malformed = json.dumps(
         {
             "verdict": "changes_requested",
@@ -1913,6 +1931,7 @@ def test_codex_receipt_records_why_a_structured_response_is_rejected(tmp_path: P
             ],
         }
     )
+    fake_codex = write_fake_codex(tmp_path, response=malformed)
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
@@ -1922,7 +1941,7 @@ def test_codex_receipt_records_why_a_structured_response_is_rejected(tmp_path: P
         "synthetic",
         "--response-contract",
         "findings-json",
-        env={"CODEX_BIN": str(fake_codex), "CODEX_RESPONSE": malformed},
+        env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 1
@@ -1934,9 +1953,14 @@ def test_codex_receipt_records_why_a_structured_response_is_rejected(tmp_path: P
 
 
 def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) -> None:
-    fake_codex = write_fake_codex(tmp_path)
     arguments_log = tmp_path / "codex-arguments.json"
     response = json.dumps({"verdict": "approved", "findings": []})
+    fake_codex = write_fake_codex(
+        tmp_path,
+        arguments_log=arguments_log,
+        response=response,
+        skip_read_proof=True,
+    )
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
@@ -1944,12 +1968,7 @@ def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) ->
         "codex",
         "--response-contract",
         "findings-json",
-        env={
-            "CODEX_BIN": str(fake_codex),
-            "CODEX_ARGUMENTS_LOG": str(arguments_log),
-            "CODEX_RESPONSE": response,
-            "CODEX_SKIP_READ_PROOF": "1",
-        },
+        env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 0, result.stderr
@@ -2315,11 +2334,11 @@ def test_product_tournament_runs_mixed_native_and_metered_candidates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_llm = write_fake_llm(tmp_path)
-    fake_codex = write_fake_codex(tmp_path)
     fake_agy = write_fake_agy(tmp_path)
     brief = tmp_path / "brief.md"
     brief.write_text("Synthetic product brief.\n")
     payload = json.dumps(product_review_payload())
+    fake_codex = write_fake_codex(tmp_path, response=payload)
     tournament = tmp_path / "product.toml"
     tournament.write_text(
         f'''budget_usd = 1
@@ -2381,7 +2400,6 @@ files = ["{brief}"]
     monkeypatch.setenv("LLM_BIN", str(fake_llm))
     monkeypatch.setenv("LLM_SCHEMA_RESPONSE", payload)
     monkeypatch.setenv("CODEX_BIN", str(fake_codex))
-    monkeypatch.setenv("CODEX_RESPONSE", payload)
     monkeypatch.setenv("AGY_BIN", str(fake_agy))
     monkeypatch.setenv("AGY_RESPONSE", payload)
     parser = cli.build_parser()
@@ -3392,6 +3410,12 @@ def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home
     auth.write_text('{"access_token":"test"}')
     monkeypatch.setattr(cli.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
     monkeypatch.setenv("HOME", str(tmp_path / "spoofed-home"))
+    monkeypatch.setenv("PATH", "/opt/reviewctl/bin")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "ca.pem"))
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("ARBITRARY_SECRET", "arbitrary-secret")
 
     with cli.codex_isolation([source_root], auth_path=auth) as isolation:
         profile = isolation.profile.read_text()
@@ -3403,6 +3427,67 @@ def test_codex_isolation_denies_the_original_source_root_and_uses_a_minimal_home
         assert isolation.home.joinpath("auth.json").read_text() == auth.read_text()
         assert isolation.environment["CODEX_HOME"] == str(isolation.home)
         assert isolation.environment["HOME"] == str(isolation.home)
+        assert isolation.environment["TMPDIR"] == str(isolation.home)
+        assert isolation.environment["PATH"] == "/opt/reviewctl/bin"
+        assert isolation.environment["LANG"] == "en_US.UTF-8"
+        assert isolation.environment["SSL_CERT_FILE"] == str(tmp_path / "ca.pem")
+        assert "CODEX_AUTH_FILE" not in isolation.environment
+        assert "AWS_SECRET_ACCESS_KEY" not in isolation.environment
+        assert "OPENAI_API_KEY" not in isolation.environment
+        assert "ARBITRARY_SECRET" not in isolation.environment
+
+
+def test_invoke_codex_passes_an_explicit_allowlisted_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, timeout: int) -> tuple[bytes, bytes]:
+            command = captured["command"]
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("VERDICT: approved.")
+            return b"session id: test-session\nmodel: gpt-5.6-terra\n", b""
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        captured["command"] = command
+        captured["environment"] = kwargs["env"]
+        return Process()
+
+    codex_home = tmp_path / "codex-home"
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("PATH", "/opt/reviewctl/bin")
+    monkeypatch.setenv("HOME", str(tmp_path / "account-home"))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("CODEX_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("ARBITRARY_SECRET", "arbitrary-secret")
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+
+    exit_code, _, response = cli.invoke_codex(
+        codex_bin="/opt/reviewctl/bin/codex",
+        prompt="Review the synthetic fixture.",
+        model="gpt-5.6-terra",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=1,
+        workspace=tmp_path,
+    )
+
+    environment = captured["environment"]
+    assert environment is not None
+    assert environment["PATH"] == "/opt/reviewctl/bin"
+    assert environment["HOME"] == str(tmp_path / "account-home")
+    assert environment["CODEX_HOME"] == str(codex_home)
+    assert environment["CODEX_AUTH_FILE"] == str(auth_file)
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert "OPENAI_API_KEY" not in environment
+    assert "ARBITRARY_SECRET" not in environment
+    assert exit_code == 0
+    assert response.response == "VERDICT: approved."
 
 
 @pytest.mark.skipif(cli.shutil.which("sandbox-exec") is None, reason="macOS integration")
@@ -3592,7 +3677,7 @@ def test_codex_transport_applies_source_root_isolation_for_proprietary_reviews(
 
 
 def test_codex_transport_times_out_without_retaining_a_raw_response(tmp_path: Path) -> None:
-    fake_codex = write_fake_codex(tmp_path)
+    fake_codex = write_fake_codex(tmp_path, sleep=True)
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
@@ -3600,7 +3685,7 @@ def test_codex_transport_times_out_without_retaining_a_raw_response(tmp_path: Pa
         "codex",
         "--timeout-seconds",
         "1",
-        env={"CODEX_BIN": str(fake_codex), "CODEX_SLEEP": "1"},
+        env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 1
@@ -3613,7 +3698,6 @@ def test_codex_transport_times_out_without_retaining_a_raw_response(tmp_path: Pa
 def test_codex_timeout_discards_a_partial_response_written_before_termination(
     tmp_path: Path,
 ) -> None:
-    fake_codex = write_fake_codex(tmp_path)
     partial = json.dumps(
         {
             "verdict": "changes-requested",
@@ -3629,6 +3713,12 @@ def test_codex_timeout_discards_a_partial_response_written_before_termination(
             ],
         }
     )
+    fake_codex = write_fake_codex(
+        tmp_path,
+        response=partial,
+        sleep=True,
+        write_before_sleep=True,
+    )
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
@@ -3638,12 +3728,7 @@ def test_codex_timeout_discards_a_partial_response_written_before_termination(
         "findings-json",
         "--timeout-seconds",
         "1",
-        env={
-            "CODEX_BIN": str(fake_codex),
-            "CODEX_RESPONSE": partial,
-            "CODEX_SLEEP": "1",
-            "CODEX_WRITE_BEFORE_SLEEP": "1",
-        },
+        env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 1

@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1360,6 +1360,37 @@ def account_home() -> Path:
         raise RuntimeError("Codex isolation could not resolve the login account home") from error
 
 
+def codex_process_environment(
+    source_environ: Mapping[str, str], overrides: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Build a Codex child environment from an explicit non-secret operational allowlist.
+
+    Credentials remain file-based through CODEX_AUTH_FILE; API keys, cloud credentials,
+    tokens, proxy URLs, and arbitrary ambient variables are intentionally excluded.
+    """
+    allowed_keys = (
+        "PATH",
+        "SYSTEMROOT",
+        "HOME",
+        "CODEX_HOME",
+        "CODEX_AUTH_FILE",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+    configured = overrides or {}
+    return {
+        key: configured[key] if key in configured else source_environ[key]
+        for key in allowed_keys
+        if key in configured or key in source_environ
+    }
+
+
 @contextmanager
 def codex_isolation(
     source_roots: list[Path], *, auth_path: Path | None = None
@@ -1398,8 +1429,10 @@ def codex_isolation(
         home_write_deny = f"(deny file-write* (subpath {sandbox_profile_path(account_home())}))"
         denies = f"{source_denies}\n{home_write_deny}"
         profile.write_text(f"(version 1)\n(allow default)\n{denies}\n")
-        environment = dict(os.environ)
-        environment.update({"CODEX_HOME": str(home), "HOME": str(home), "TMPDIR": str(home)})
+        environment = codex_process_environment(
+            os.environ,
+            {"CODEX_HOME": str(home), "HOME": str(home), "TMPDIR": str(home)},
+        )
         environment.pop("CODEX_AUTH_FILE", None)
         yield CodexIsolation(environment=environment, home=home, profile=profile)
 
@@ -2409,11 +2442,15 @@ def invoke_codex(
 
     started = time.monotonic()
     timed_out = False
+    process_environment = isolation.environment if isolation else codex_process_environment(
+        os.environ,
+        {"HOME": os.environ.get("HOME") or str(account_home())},
+    )
     try:
         process = subprocess.Popen(
             command,
             cwd=workspace,
-            env=isolation.environment if isolation else None,
+            env=process_environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
