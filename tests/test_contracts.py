@@ -1,5 +1,6 @@
 import hashlib
 import json
+from copy import copy, deepcopy
 
 import pytest
 
@@ -518,8 +519,9 @@ def assert_isolated_surrogate_is_rejected(surrogate: str, *, extra_field: bool) 
     )
 
     assert evaluation.status is EvaluationStatus.INVALID
-    assert evaluation.violations == ("finding-value",)
+    assert evaluation.violations == ("invalid-json",)
     assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
     assert evaluation.completion_request is None
 
 
@@ -530,6 +532,72 @@ def test_findings_contract_rejects_isolated_surrogates_before_fragment_extractio
 
 def test_findings_contract_rejects_isolated_surrogate_on_complete_path() -> None:
     assert_isolated_surrogate_is_rejected(chr(0xD800), extra_field=False)
+
+
+def test_findings_contract_rejects_escaped_surrogate_in_top_level_extra() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    value = {**finding_payload(), "extra": chr(0xD800)}
+
+    evaluation = contract.evaluate(
+        json.dumps(value, ensure_ascii=True), prepared, context
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+    assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
+    assert evaluation.completion_request is None
+
+
+def test_findings_contract_rejects_literal_surrogate_with_stable_payload_digest() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    payload = json.dumps(finding_payload())[:-1] + f', "extra": "{chr(0xD800)}"}}'
+
+    evaluation = contract.evaluate(payload, prepared, context)
+
+    assert evaluation.payload_digest == hashlib.sha256(
+        payload.encode(errors="surrogatepass")
+    ).hexdigest()
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+    assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
+    assert evaluation.completion_request is None
+
+
+def test_findings_contract_rejects_surrogate_in_reviewed_files() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(
+        file_names=("source.py",), review_declaration_required=True
+    )
+    prepared = contract.prepare(context)
+    value = {**finding_payload(), "reviewedFiles": [chr(0xDC00)]}
+
+    evaluation = contract.evaluate(
+        json.dumps(value, ensure_ascii=True), prepared, context
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+    assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
+    assert evaluation.completion_request is None
+
+
+def test_valid_unicode_payload_digest_is_unchanged() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    payload = json.dumps(finding_payload(title="Résumé"), ensure_ascii=False)
+
+    evaluation = contract.evaluate(payload, prepared, context)
+
+    assert evaluation.status is EvaluationStatus.COMPLETE
+    assert evaluation.payload_digest == hashlib.sha256(payload.encode()).hexdigest()
 
 
 def test_finding_values_are_immutable_without_losing_dict_compatibility() -> None:
@@ -555,3 +623,11 @@ def test_finding_values_are_immutable_without_losing_dict_compatibility() -> Non
 
     assert fragment_value == original
     assert evaluation_finding == original
+
+    assert copy(fragment_value) is fragment_value
+    assert deepcopy(fragment_value) is fragment_value
+    copied_evaluation = deepcopy(evaluation)
+    assert copied_evaluation == evaluation
+    assert copied_evaluation.valid_fragments[0].value is fragment_value
+    assert copied_evaluation.value is not None
+    assert copied_evaluation.value["findings"][0] is fragment_value

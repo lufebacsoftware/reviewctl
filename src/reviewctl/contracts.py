@@ -197,17 +197,25 @@ class _FrozenDict(dict[str, Any]):
     update = _reject_mutation
     __ior__ = _reject_mutation
 
+    def __copy__(self) -> _FrozenDict:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenDict:
+        memo[id(self)] = self
+        return self
+
 
 def _contains_surrogate(value: object) -> bool:
-    return isinstance(value, str) and any(
-        0xD800 <= ord(character) <= 0xDFFF for character in value
-    )
-
-
-def _finding_contains_surrogate(finding: object) -> bool:
-    return isinstance(finding, dict) and any(
-        _contains_surrogate(value) for value in finding.values()
-    )
+    if isinstance(value, str):
+        return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+    if isinstance(value, list):
+        return any(_contains_surrogate(item) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _contains_surrogate(key) or _contains_surrogate(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 def _validate_finding(
@@ -220,8 +228,6 @@ def _validate_finding(
         isinstance(finding[field], str) and finding[field].strip()
         for field in string_fields
     ):
-        return None, "finding-value"
-    if any(_contains_surrogate(finding[field]) for field in string_fields):
         return None, "finding-value"
     if finding["severity"] not in FINDING_SEVERITIES:
         return None, "finding-value"
@@ -282,7 +288,7 @@ class FindingsJsonContract:
         *,
         evidence: EvaluationContext | None = None,
     ) -> ContractEvaluation:
-        payload_digest = hashlib.sha256(payload.encode()).hexdigest()
+        payload_digest = hashlib.sha256(payload.encode(errors="surrogatepass")).hexdigest()
 
         def rejected(code: str) -> ContractEvaluation:
             return ContractEvaluation(
@@ -308,6 +314,8 @@ class FindingsJsonContract:
             )
         except (json.JSONDecodeError, DuplicateJsonField, _InvalidJsonConstant):
             return rejected("invalid-json")
+        if _contains_surrogate(value):
+            return rejected("invalid-json")
         if not isinstance(value, dict):
             return rejected("top-level-not-object")
 
@@ -330,23 +338,18 @@ class FindingsJsonContract:
         normalized_findings: list[dict[str, Any]] = []
         invalid_fragment_indexes: list[int] = []
         first_finding_violation: str | None = None
-        surrogate_finding_invalid = False
         if findings_are_list:
             for index, finding in enumerate(findings):
                 normalized_finding, finding_violation = _validate_finding(finding, context)
                 if finding_violation is not None:
                     invalid_fragment_indexes.append(index)
-                    surrogate_finding_invalid |= _finding_contains_surrogate(finding)
                     if first_finding_violation is None:
                         first_finding_violation = finding_violation
                     continue
                 assert normalized_finding is not None
                 normalized_findings.append(normalized_finding)
-        if first_finding_violation is not None:
-            if violation is None:
-                violation = first_finding_violation
-            elif violation == "response-fields" and surrogate_finding_invalid:
-                violation = "finding-value"
+        if violation is None and first_finding_violation is not None:
+            violation = first_finding_violation
 
         verdict_invariant = (
             verdict_valid
