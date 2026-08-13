@@ -1826,6 +1826,78 @@ def test_validate_v2_receipt_requires_exact_non_findings_contract_identity() -> 
 
 
 @pytest.mark.parametrize(
+    "native_residue",
+    [
+        "fallback-relationships",
+        "consolidated-review",
+        "top-findings",
+        "top-verdict",
+        "contract-evaluation",
+        "evaluation-error",
+        "promoted-fragments",
+    ],
+)
+def test_validate_v2_receipt_rejects_findings_native_residue_after_contract_swap(
+    native_residue: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    receipt["reviewContract"] = "document"
+    receipt["contract"] = {"name": "document", "version": "legacy-1"}
+
+    findings_evaluation = deepcopy(receipt["attempts"][0]["contractEvaluation"])
+    promoted = deepcopy(receipt["attempts"][0]["promotedFragments"])
+    for attempt in receipt["attempts"]:
+        attempt.pop("contractEvaluation", None)
+        attempt.pop("evaluationError", None)
+        attempt["promotedFragments"] = []
+    receipt.pop("fallbackRelationships", None)
+    receipt.pop("consolidatedReview", None)
+    receipt.pop("findings", None)
+    receipt.pop("verdict", None)
+
+    if native_residue == "fallback-relationships":
+        receipt["fallbackRelationships"] = []
+    elif native_residue == "consolidated-review":
+        receipt["consolidatedReview"] = {"status": "unavailable"}
+    elif native_residue == "top-findings":
+        receipt["findings"] = []
+    elif native_residue == "top-verdict":
+        receipt["verdict"] = "unstructured"
+    elif native_residue == "contract-evaluation":
+        receipt["attempts"][0]["contractEvaluation"] = findings_evaluation
+    elif native_residue == "evaluation-error":
+        receipt["attempts"][0]["evaluationError"] = {
+            "type": "ValueError",
+            "message": "synthetic",
+        }
+    else:
+        receipt["attempts"][0]["promotedFragments"] = promoted
+
+    _sign_receipt(receipt)
+
+    violations = validate_v2_receipt(receipt)
+    expected = (
+        "contract-evaluation"
+        if native_residue in {"contract-evaluation", "evaluation-error"}
+        else "review-contract"
+    )
+    assert expected in violations
+
+
+def test_validate_v2_receipt_rejects_contract_swap_with_multiple_native_residues() -> None:
+    receipt = v2_findings_receipt()
+    receipt["reviewContract"] = "document"
+    receipt["contract"] = {"name": "document", "version": "legacy-1"}
+    for attempt in receipt["attempts"]:
+        attempt["promotedFragments"] = []
+    _sign_receipt(receipt)
+
+    violations = validate_v2_receipt(receipt)
+    assert "review-contract" in violations
+    assert "contract-evaluation" in violations
+
+
+@pytest.mark.parametrize(
     ("field", "hostile"),
     [("severity", ["high"]), ("verdict", ["approved"])],
 )

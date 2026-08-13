@@ -185,6 +185,17 @@ def test_architecture_defines_partial_review_and_consolidation_semantics() -> No
         assert deferred in architecture
 
 
+def test_evidence_docs_bound_digest_and_structural_verification_trust() -> None:
+    evidence = " ".join((ROOT / "docs" / "EVIDENCE.md").read_text().lower().split())
+
+    for boundary in (
+        "not a digital signature",
+        "not a trust root",
+        "authorized to rewrite",
+    ):
+        assert boundary in evidence
+
+
 def test_public_docs_do_not_claim_deferred_integrations_or_publish_private_rosters() -> None:
     public_docs = "\n".join(
         (ROOT / "docs" / name).read_text().lower()

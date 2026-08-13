@@ -762,6 +762,22 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     ):
         reject("review-contract")
     findings_contract = review_contract == "findings-json"
+    if not findings_contract:
+        if any(
+            field in receipt
+            for field in (
+                "fallbackRelationships",
+                "consolidatedReview",
+                "findings",
+                "verdict",
+            )
+        ):
+            reject("review-contract")
+        for attempt in attempts:
+            if "contractEvaluation" in attempt or "evaluationError" in attempt:
+                reject("contract-evaluation")
+            if attempt.get("promotedFragments") != []:
+                reject("review-contract")
     all_promoted: list[PromotedFragment] = []
     promoted_provenance: set[tuple[str, int]] = set()
     promoted_attempts_by_id: dict[str, set[int]] = {}

@@ -3033,7 +3033,9 @@ def test_usage_synthetic_prompt_only_product_review(tmp_path: Path) -> None:
     }
 
 
-@pytest.mark.parametrize("contract", ["document", "product-review-json"])
+@pytest.mark.parametrize(
+    "contract", ["verdict", "document", "product-review-json", "product-judge-json"]
+)
 def test_generated_unavailable_non_findings_v2_receipt_verifies(
     tmp_path: Path, contract: str
 ) -> None:

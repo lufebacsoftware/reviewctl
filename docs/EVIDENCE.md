@@ -26,6 +26,12 @@ V2 verification is structural and offline: after checking the digest, it validat
 contract identity, gates and evaluation state, fallback relationships, promoted-fragment identity, the
 accepted attempt, and consolidation without calling a provider or model.
 
+The receipt SHA-256 is tamper detection, not a digital signature and not a trust root. Structural
+verification detects internally incompatible facts, including mixing native findings state into a legacy
+contract receipt. It does not prove who authored the receipt or defend against an actor authorized to
+rewrite every fact and recompute the digest; signatures and organizational trust policy remain separate
+concerns.
+
 ## Sealed audit payload
 
 The runner never copies source files into its artifact directory. It writes private temporary snapshots
