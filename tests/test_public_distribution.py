@@ -6,6 +6,21 @@ from pathlib import Path
 import reviewctl
 
 ROOT = Path(__file__).parents[1]
+PUBLIC_RECEIPT_FIXTURES = Path("tests/fixtures/receipts")
+REVIEWED_PUBLIC_RECEIPT_FIXTURES = {
+    "accepted-findings-v1.json",
+    "legacy-digest-only.json",
+    "unavailable-findings-v1.json",
+}
+
+
+def is_reviewed_public_receipt_fixture(relative_path: Path, *, is_dir: bool) -> bool:
+    if is_dir:
+        return relative_path == PUBLIC_RECEIPT_FIXTURES
+    return (
+        relative_path.parent == PUBLIC_RECEIPT_FIXTURES
+        and relative_path.name in REVIEWED_PUBLIC_RECEIPT_FIXTURES
+    )
 
 
 def test_runtime_version_matches_project_metadata() -> None:
@@ -33,13 +48,16 @@ def test_public_tree_excludes_private_review_evidence() -> None:
         )
     )
     forbidden_directories = {"receipts", "sealed", "council"}
-    public_receipt_fixtures = Path("tests/fixtures/receipts")
 
     for path in ROOT.rglob("*"):
         relative_path = path.relative_to(ROOT)
+        if PUBLIC_RECEIPT_FIXTURES in relative_path.parents:
+            assert is_reviewed_public_receipt_fixture(
+                relative_path, is_dir=path.is_dir()
+            ), f"unreviewed public receipt fixture: {relative_path}"
         if path.is_dir():
             assert (
-                relative_path == public_receipt_fixtures
+                is_reviewed_public_receipt_fixture(relative_path, is_dir=True)
                 or path.name.lower() not in forbidden_directories
             )
             continue
@@ -50,6 +68,19 @@ def test_public_tree_excludes_private_review_evidence() -> None:
         contents = path.read_text(errors="ignore").lower()
         for fragment in forbidden_fragments:
             assert fragment not in contents, f"{fragment!r} leaked through {relative_path}"
+
+
+def test_public_receipt_fixture_guard_rejects_unreviewed_paths() -> None:
+    for filename in REVIEWED_PUBLIC_RECEIPT_FIXTURES:
+        assert is_reviewed_public_receipt_fixture(
+            PUBLIC_RECEIPT_FIXTURES / filename, is_dir=False
+        )
+    for relative_path, is_dir in (
+        (PUBLIC_RECEIPT_FIXTURES / "unexpected.json", False),
+        (PUBLIC_RECEIPT_FIXTURES / "nested", True),
+        (PUBLIC_RECEIPT_FIXTURES / "nested" / "accepted-findings-v1.json", False),
+    ):
+        assert not is_reviewed_public_receipt_fixture(relative_path, is_dir=is_dir)
 
 
 def test_project_integration_assigns_rosters_to_private_evidence_store() -> None:
