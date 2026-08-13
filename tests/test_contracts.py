@@ -429,8 +429,12 @@ def test_valid_finding_can_survive_invalid_top_level_requirements() -> None:
         "findings",
         "reviewedFiles",
     )
-    assert evaluation.coverage.covered_fields == ("findings",)
-    assert evaluation.coverage.missing_fields == ("verdict", "reviewedFiles")
+    assert evaluation.coverage.covered_fields == ()
+    assert evaluation.coverage.missing_fields == (
+        "verdict",
+        "findings",
+        "reviewedFiles",
+    )
     assert evaluation.completion_request is not None
     assert evaluation.completion_request.invalid_fragment_indexes == ()
 
@@ -449,8 +453,8 @@ def test_verdict_invariant_with_a_valid_finding_is_incomplete_without_verdict_fr
     assert len(evaluation.valid_fragments) == 1
     assert all(fragment.kind is FragmentKind.FINDING for fragment in evaluation.valid_fragments)
     assert evaluation.coverage is not None
-    assert evaluation.coverage.covered_fields == ("findings",)
-    assert evaluation.coverage.missing_fields == ("verdict",)
+    assert evaluation.coverage.covered_fields == ()
+    assert evaluation.coverage.missing_fields == ("verdict", "findings")
 
 
 def test_invalid_findings_do_not_extract_or_make_response_incomplete() -> None:

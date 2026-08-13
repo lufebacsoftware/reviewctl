@@ -8,6 +8,7 @@ import pytest
 from reviewctl.contracts import (
     ContractContext,
     EvaluationContext,
+    EvaluationStatus,
     canonical_json,
     get_contract,
 )
@@ -574,6 +575,161 @@ def test_promote_fragments_requires_completion_request_even_for_incomplete_statu
         )
         == ()
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("status", EvaluationStatus.COMPLETE),
+        ("status", "incomplete"),
+        ("value", {"verdict": "changes-requested", "findings": []}),
+        ("normalized_digest", "a" * 64),
+        ("violations", ()),
+        ("violations", ("response-fields", 7)),
+        ("coverage", None),
+        ("completion_request", None),
+        ("valid_fragments", ()),
+    ],
+)
+def test_promote_fragments_requires_canonical_incomplete_state(field: str, value: object) -> None:
+    evaluation = incomplete_evaluation(finding())
+
+    assert (
+        promote_fragments(
+            replace(evaluation, **{field: value}),
+            contract_context=ContractContext(file_names=("source.py",)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("required_fields", ("findings", "verdict")),
+        ("required_fields", ("verdict", "findings", "reviewedFiles")),
+        ("covered_fields", ("verdict", "findings")),
+        ("covered_fields", ("verdict", "verdict")),
+        ("covered_fields", ("verdict", "foreign")),
+        ("missing_fields", ()),
+        ("missing_fields", ("verdict", "findings")),
+        ("missing_fields", ("findings", "foreign")),
+    ],
+)
+def test_promote_fragments_requires_exact_incomplete_coverage(field: str, value: object) -> None:
+    evaluation = incomplete_evaluation(finding())
+    coverage = replace(evaluation.coverage, **{field: value})
+
+    assert (
+        promote_fragments(
+            replace(evaluation, coverage=coverage),
+            contract_context=ContractContext(file_names=("source.py",)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prepared_digest", "a" * 64),
+        ("packet_digest", None),
+        ("packet_digest", "A" * 64),
+        ("missing_fields", ("verdict", "findings")),
+        ("violations", ("finding-value",)),
+        ("invalid_fragment_indexes", (1, 0)),
+        ("invalid_fragment_indexes", (0, 0)),
+        ("invalid_fragment_indexes", (True,)),
+    ],
+)
+def test_promote_fragments_requires_completion_request_to_reproduce_evaluation(
+    field: str, value: object
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+    request = replace(evaluation.completion_request, **{field: value})
+
+    assert (
+        promote_fragments(
+            replace(evaluation, completion_request=request),
+            contract_context=ContractContext(file_names=("source.py",)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+def test_promote_fragments_rejects_complete_evaluation_relabel_attack() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    complete = contract.evaluate(
+        json.dumps({"verdict": "changes-requested", "findings": [finding()]}),
+        prepared,
+        context,
+    )
+    partial = incomplete_evaluation(finding())
+    forged = replace(
+        complete,
+        status=EvaluationStatus.INCOMPLETE,
+        completion_request=partial.completion_request,
+    )
+
+    assert (
+        promote_fragments(
+            forged,
+            contract_context=context,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=forged.payload_digest,
+        )
+        == ()
+    )
+
+
+def test_promote_fragments_accepts_genuine_mixed_findings_with_missing_declaration() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(
+        file_names=("source.py",),
+        review_declaration_required=True,
+    )
+    prepared = contract.prepare(context)
+    evaluation = contract.evaluate(
+        json.dumps(
+            {
+                "verdict": "changes-requested",
+                "findings": [finding(), {"severity": "urgent"}],
+            }
+        ),
+        prepared,
+        context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
+
+    result = promote_fragments(
+        evaluation,
+        contract_context=context,
+        gate_result="contract-incomplete",
+        attempt=1,
+        route_index=0,
+        raw_response_digest=evaluation.payload_digest,
+    )
+
+    assert len(result) == 1
+    assert result[0].finding == finding()
+    assert evaluation.coverage.missing_fields == ("findings", "reviewedFiles")
+    assert evaluation.completion_request.invalid_fragment_indexes == (1,)
 
 
 def test_build_completion_context_deduplicates_content_but_preserves_provenance() -> None:

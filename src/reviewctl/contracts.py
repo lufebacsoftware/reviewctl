@@ -393,7 +393,7 @@ class FindingsJsonContract:
             elif violation is None:
                 violation = "review-declaration"
 
-        findings_valid = findings_are_list and not invalid_fragment_indexes
+        findings_valid = findings_are_list and not invalid_fragment_indexes and violation is None
         covered_fields: list[str] = []
         missing_fields: list[str] = []
         if verdict_invariant:

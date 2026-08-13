@@ -11,7 +11,9 @@ from reviewctl.contracts import (
     FINDING_SEVERITIES,
     ContractCompletionRequest,
     ContractContext,
+    ContractCoverage,
     ContractEvaluation,
+    EvaluationStatus,
     FragmentKind,
     canonical_json,
     get_contract,
@@ -436,6 +438,84 @@ class ConsolidatedReview:
         }
 
 
+def _valid_incomplete_evaluation(
+    evaluation: ContractEvaluation,
+    context: ContractContext,
+) -> bool:
+    """Reproduce the complete state that authorizes fragment promotion."""
+    try:
+        required_fields = ("verdict", "findings")
+        if context.review_declaration_required:
+            required_fields += ("reviewedFiles",)
+        prepared = get_contract("findings-json").prepare(context)
+        coverage = evaluation.coverage
+        request = evaluation.completion_request
+        if (
+            evaluation.status is not EvaluationStatus.INCOMPLETE
+            or evaluation.name != "findings-json"
+            or evaluation.version != "1"
+            or evaluation.value is not None
+            or evaluation.normalized_digest is not None
+            or not _is_sha256(evaluation.prepared_digest)
+            or evaluation.prepared_digest != prepared.digest
+            or not _is_sha256(evaluation.payload_digest)
+            or type(evaluation.violations) is not tuple
+            or not evaluation.violations
+            or not all(type(violation) is str for violation in evaluation.violations)
+            or type(evaluation.valid_fragments) is not tuple
+            or not evaluation.valid_fragments
+            or not isinstance(coverage, ContractCoverage)
+            or not isinstance(request, ContractCompletionRequest)
+        ):
+            return False
+
+        if (
+            type(coverage.required_fields) is not tuple
+            or type(coverage.covered_fields) is not tuple
+            or type(coverage.missing_fields) is not tuple
+            or not all(
+                type(field) is str
+                for fields in (
+                    coverage.required_fields,
+                    coverage.covered_fields,
+                    coverage.missing_fields,
+                )
+                for field in fields
+            )
+            or coverage.required_fields != required_fields
+        ):
+            return False
+        covered = set(coverage.covered_fields)
+        missing = set(coverage.missing_fields)
+        if (
+            covered & missing
+            or covered | missing != set(required_fields)
+            or coverage.covered_fields
+            != tuple(field for field in required_fields if field in covered)
+            or coverage.missing_fields
+            != tuple(field for field in required_fields if field in missing)
+            or "findings" not in missing
+        ):
+            return False
+
+        return (
+            _valid_completion_manifest(
+                prepared_digest=request.prepared_digest,
+                packet_digest=request.packet_digest,
+                missing_fields=request.missing_fields,
+                invalid_fragment_indexes=request.invalid_fragment_indexes,
+                violations=request.violations,
+                sequence_type=tuple,
+                require_packet_digest=True,
+            )
+            and request.prepared_digest == evaluation.prepared_digest
+            and request.missing_fields == coverage.missing_fields
+            and request.violations == evaluation.violations
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
 def promote_fragments(
     evaluation: ContractEvaluation,
     *,
@@ -446,28 +526,18 @@ def promote_fragments(
     raw_response_digest: str,
 ) -> tuple[PromotedFragment, ...]:
     """Promote only identity-valid findings from an otherwise eligible partial result."""
-    if gate_result != "contract-incomplete" or evaluation.status.value != "incomplete":
+    if gate_result != "contract-incomplete":
         return ()
-    if evaluation.name != "findings-json" or evaluation.version != "1":
-        return ()
-    try:
-        prepared = get_contract(evaluation.name).prepare(contract_context)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return ()
-    if prepared.name != "findings-json" or prepared.version != "1":
-        return ()
-    if evaluation.prepared_digest != prepared.digest:
-        return ()
-    if evaluation.completion_request is None:
+    if not _valid_incomplete_evaluation(evaluation, contract_context):
         return ()
     if (
         raw_response_digest != evaluation.payload_digest
         or not _is_sha256(raw_response_digest)
         or not _is_positive_int(attempt)
         or not _is_nonnegative_int(route_index)
-        or not _is_sha256(evaluation.completion_request.packet_digest)
     ):
         return ()
+    assert evaluation.completion_request is not None
 
     promoted: list[PromotedFragment] = []
     promoted_ids: set[str] = set()
