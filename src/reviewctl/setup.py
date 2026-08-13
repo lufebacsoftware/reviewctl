@@ -11,9 +11,15 @@ from dataclasses import asdict, dataclass
 from reviewctl.backends import BackendDescriptor, BackendRegistry, DiscoveryKind
 
 _MAX_OUTPUT_LENGTH = 500
+_SENSITIVE_LABEL = (
+    r"(?:authorization|credentials?|tokens?|api[-_]?keys?|client[-_]?secret|"
+    r"password|passwd|private[-_]?key)"
+)
+_QUOTED_SENSITIVE_VALUE = re.compile(
+    rf'(?i)("\b{_SENSITIVE_LABEL}\b"\s*:\s*)"(?:\\.|[^"\\])*"'
+)
 _SENSITIVE_VALUE = re.compile(
-    r"(?im)(\b(?:authorization|credentials?|tokens?|api[-_]?keys?|client[-_]?secret|"
-    r"password|passwd|private[-_]?key)\b)(\s*[:=]\s*)[^\r\n]*"
+    rf"(?im)(\b{_SENSITIVE_LABEL}\b)(\s*[:=]\s*)[^\r\n]*"
 )
 _SENSITIVE_ENV_VALUE = re.compile(
     r"(?im)(\b[A-Z][A-Z0-9_]*(?:AUTHORIZATION|CREDENTIALS?|TOKENS?|API_KEY|"
@@ -48,6 +54,7 @@ class LocalExecutionTopology:
 
 def _bounded_output(value: str) -> str:
     redacted = _SENSITIVE_ENV_VALUE.sub(r"\1\2[REDACTED]", value)
+    redacted = _QUOTED_SENSITIVE_VALUE.sub(r'\1"[REDACTED]"', redacted)
     redacted = _SENSITIVE_VALUE.sub(r"\1\2[REDACTED]", redacted)
     return redacted[:_MAX_OUTPUT_LENGTH]
 

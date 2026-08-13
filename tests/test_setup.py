@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import shlex
 import subprocess
+import sys
 from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
 from typing import Any
@@ -366,10 +370,30 @@ def test_probe_version_bounds_timeout_and_os_error_diagnostics(
     assert "super-secret" not in diagnostic
 
 
-def _write_executable(path: Path, body: str) -> Path:
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
-    path.chmod(0o755)
-    return path
+def _write_python_executable(directory: Path, name: str, source: str) -> Path:
+    payload = directory / f"{name}.py"
+    payload.write_text(source, encoding="utf-8")
+    python_executable = str(Path(sys.executable).resolve())
+    if os.name == "nt":
+        launcher = directory / f"{name}.cmd"
+        command = subprocess.list2cmdline([python_executable, str(payload)])
+        launcher.write_text(f"@echo off\r\n{command} %*\r\n", encoding="utf-8")
+        return launcher
+    launcher = directory / name
+    launcher.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(python_executable)} {shlex.quote(str(payload))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    return launcher
+
+
+def _real_child_environment(path: str | None = None) -> dict[str, str]:
+    environ = {"PATH": path if path is not None else os.environ.get("PATH", "")}
+    if "SYSTEMROOT" in os.environ:
+        environ["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+    return environ
 
 
 def test_discovery_uses_supplied_path_instead_of_ambient_path(
@@ -379,30 +403,34 @@ def test_discovery_uses_supplied_path_instead_of_ambient_path(
     supplied_dir = tmp_path / "supplied"
     ambient_dir.mkdir()
     supplied_dir.mkdir()
-    _write_executable(ambient_dir / "review-probe", "printf 'ambient 1.0\\n'")
-    supplied = _write_executable(supplied_dir / "review-probe", "printf 'supplied 2.0\\n'")
+    ambient = _write_python_executable(ambient_dir, "review-probe", "print('ambient 1.0')\n")
+    supplied = _write_python_executable(supplied_dir, "review-probe", "print('supplied 2.0')\n")
     monkeypatch.setenv("PATH", str(ambient_dir))
 
     installation = discover_backend(
-        descriptor("probe", default_executable="review-probe"),
-        environ={"PATH": str(supplied_dir)},
+        descriptor("probe", default_executable=supplied.name),
+        environ=_real_child_environment(str(supplied_dir)),
     )
 
+    assert installation.resolved_executable != str(ambient)
     assert installation.resolved_executable == str(supplied)
     assert installation.version == "supplied 2.0"
 
 
 def test_probe_version_real_child_receives_only_allowed_environment(tmp_path: Path) -> None:
-    executable = _write_executable(
-        tmp_path / "environment-probe",
-        "if [ -z \"$DISCOVERY_SECRET\" ]; then printf 'isolated 1.0\\n'; "
-        "else printf 'secret leaked\\n'; exit 9; fi",
+    executable = _write_python_executable(
+        tmp_path,
+        "environment-probe",
+        "import os\n"
+        "if 'DISCOVERY_SECRET' in os.environ:\n"
+        "    print('secret leaked')\n"
+        "    raise SystemExit(9)\n"
+        "print('isolated 1.0')\n",
     )
 
-    result = probe_version(
-        str(executable),
-        {"PATH": "/usr/bin:/bin", "SYSTEMROOT": "safe", "DISCOVERY_SECRET": "do-not-leak"},
-    )
+    child_environment = _real_child_environment()
+    child_environment["DISCOVERY_SECRET"] = "do-not-leak"
+    result = probe_version(str(executable), child_environment)
 
     assert result == ("isolated 1.0", None)
 
@@ -410,9 +438,13 @@ def test_probe_version_real_child_receives_only_allowed_environment(tmp_path: Pa
 def test_probe_version_real_child_combines_stdout_stderr_and_nonzero_status(
     tmp_path: Path,
 ) -> None:
-    executable = _write_executable(
-        tmp_path / "failing-probe",
-        "printf 'stdout detail\\n'; printf 'stderr detail\\n' >&2; exit 7",
+    executable = _write_python_executable(
+        tmp_path,
+        "failing-probe",
+        "import sys\n"
+        "print('stdout detail')\n"
+        "print('stderr detail', file=sys.stderr)\n"
+        "raise SystemExit(7)\n",
     )
 
     assert probe_version(str(executable), {}) == (
@@ -422,7 +454,11 @@ def test_probe_version_real_child_combines_stdout_stderr_and_nonzero_status(
 
 
 def test_probe_version_replaces_invalid_utf8_from_real_child(tmp_path: Path) -> None:
-    executable = _write_executable(tmp_path / "invalid-output", "printf '\\377version 1.0\\n'")
+    executable = _write_python_executable(
+        tmp_path,
+        "invalid-output",
+        "import os\nos.write(1, b'\\xffversion 1.0\\n')\n",
+    )
 
     version, diagnostic = probe_version(str(executable), {})
 
@@ -532,3 +568,37 @@ def test_discovery_sanitizes_injected_probe_results_without_changing_safe_paths(
     assert installation.version == "tool 1.0 CLIENT_SECRET=[REDACTED]"
     assert installation.diagnostics == ("PRIVATE_KEY=[REDACTED]",)
     assert secret not in repr(installation)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "client_secret",
+        "password",
+        "passwd",
+        "private_key",
+        "api_key",
+        "token",
+        "authorization",
+    ],
+)
+def test_discovery_redacts_quoted_json_and_key_value_results(label: str) -> None:
+    secret = f"{label}-must-not-survive"
+    structured = json.dumps({label: secret, "safe": "visible"}) + "x" * 600
+    key_value = f"{label}={secret}\n" + "y" * 600
+
+    installation = discover_backend(
+        descriptor("tool"),
+        environ={"PATH": "/safe/bin"},
+        which=lambda executable, path: "/safe/bin/tool",
+        probe=lambda executable, environ: (structured, key_value),
+    )
+
+    serialized = asdict(installation)
+    assert secret not in repr(serialized)
+    assert installation.version is not None
+    assert '"[REDACTED]"' in installation.version
+    assert installation.diagnostics
+    assert "[REDACTED]" in installation.diagnostics[0]
+    assert len(installation.version) <= 500
+    assert all(len(diagnostic) <= 500 for diagnostic in installation.diagnostics)
