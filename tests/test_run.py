@@ -573,6 +573,280 @@ def test_run_preserves_every_present_raw_backend_response(
         assert durable_path.read_bytes() == response_bytes
 
 
+def _run_registered_findings_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    responses: list[dict[str, object]],
+    *,
+    models: tuple[str, ...] = ("accepted",),
+    max_attempts: int = 2,
+) -> tuple[int, dict[str, object], list[cli.BackendRequest]]:
+    captured: list[cli.BackendRequest] = []
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        captured.append(request)
+        item = responses[len(captured) - 1]
+        response = item.get("response")
+        persisted = (
+            cli.PersistedResponse(
+                str(item.get("conversation", "conversation")),
+                None,
+                1,
+                10,
+                str(item.get("model", request.model)),
+                2,
+                item.get("provider") if isinstance(item.get("provider"), str) else None,
+                response,
+            )
+            if isinstance(response, str)
+            else None
+        )
+        return cli.BackendExecution(
+            int(item.get("exit_code", 0)),
+            str(item.get("diagnostic", "")),
+            persisted,
+            cli.BackendEvidence(),
+        )
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path, *models),
+            "--transport",
+            "llm",
+            "--response-contract",
+            "findings-json",
+            "--max-attempts",
+            str(max_attempts),
+        ]
+    )
+
+    return_code = namespace.handler(namespace)
+    turn = Path(capsys.readouterr().out.strip())
+    return return_code, json.loads((turn / "receipt.json").read_text()), captured
+
+
+def test_partial_findings_complete_with_typed_same_route_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Partial finding",
+        "evidence": "The first response identified this evidence.",
+        "reproduction": "Inspect source.py line 1.",
+    }
+    raw_partial_marker = "RAW-PRIOR-RESPONSE-MUST-NOT-BE-INJECTED"
+    partial = json.dumps({"findings": [finding], "untrusted": raw_partial_marker})
+    complete = json.dumps({"verdict": "approved", "findings": []})
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": partial}, {"response": complete}],
+    )
+
+    assert return_code == 0
+    assert len(requests) == 2
+    first_prompt, second_prompt = (request.prompt for request in requests)
+    assert raw_partial_marker not in second_prompt
+    assert partial not in second_prompt
+    assert "<reviewctl-completion-context>" in second_prompt
+    assert finding["title"] in second_prompt
+    assert receipt["prompt"]["packetSha256"] == cli.sha256_bytes(first_prompt.encode())
+    assert receipt["attempts"][0]["attemptRequestSha256"] == cli.sha256_bytes(
+        first_prompt.encode()
+    )
+    assert receipt["attempts"][1]["attemptRequestSha256"] == cli.sha256_bytes(
+        second_prompt.encode()
+    )
+    assert receipt["acceptedAttempt"] == 2
+    assert [attempt["result"] for attempt in receipt["attempts"]] == [
+        "incomplete",
+        "accepted",
+    ]
+    first_evaluation = receipt["attempts"][0]["contractEvaluation"]
+    assert first_evaluation["status"] == "incomplete"
+    assert first_evaluation["completionRequest"]["packetDigest"] == receipt["prompt"][
+        "packetSha256"
+    ]
+    promoted = receipt["attempts"][0]["promotedFragments"]
+    assert len(promoted) == 1
+    assert receipt["fallbackRelationships"] == [
+        {
+            "fromAttempt": 1,
+            "toAttempt": 2,
+            "kind": "retry",
+            "reason": "contract-incomplete",
+            "promotedFragmentIds": [promoted[0]["fragmentId"]],
+        }
+    ]
+    assert receipt["verdict"] == "approved"
+    assert receipt["findings"] == []
+    assert receipt["consolidatedReview"]["status"] == "accepted"
+    assert receipt["consolidatedReview"]["verdict"] == "approved"
+    assert receipt["consolidatedReview"]["approved"] is False
+    assert receipt["consolidatedReview"]["acceptedAttempt"] == 2
+    assert len(receipt["consolidatedReview"]["findings"]) == 1
+    log = Path(receipt["logging"]["path"]).read_text()
+    assert '"event":"attempt_retry"' in log
+    assert '"from_attempt":1' in log
+    assert '"to_attempt":2' in log
+    assert '"event":"route_fallback"' not in log
+
+
+def test_partial_then_invalid_preserves_only_consolidated_partial_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "medium",
+        "path": "source.py",
+        "line": 1,
+        "title": "Useful partial finding",
+        "evidence": "The partial response contains bounded evidence.",
+        "reproduction": "Inspect the source.",
+    }
+    partial = json.dumps({"findings": [finding]})
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": partial}, {"response": "not json"}],
+    )
+
+    assert return_code == 1
+    assert len(requests) == 2
+    assert receipt["result"] == "unavailable"
+    assert receipt["acceptedAttempt"] is None
+    assert [
+        attempt["contractEvaluation"]["status"] for attempt in receipt["attempts"]
+    ] == ["incomplete", "invalid"]
+    assert receipt["attempts"][1]["promotedFragments"] == []
+    assert receipt["consolidatedReview"]["status"] == "unavailable"
+    assert receipt["consolidatedReview"]["approved"] is False
+    assert len(receipt["consolidatedReview"]["findings"]) == 1
+
+
+def test_partial_findings_follow_the_actual_route_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "low",
+        "path": "source.py",
+        "line": 1,
+        "title": "Cross-route finding",
+        "evidence": "The first route returned useful evidence.",
+        "reproduction": "Inspect source.py.",
+    }
+    partial = json.dumps({"findings": [finding]})
+    complete = json.dumps({"verdict": "changes-requested", "findings": [finding]})
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": partial}, {"response": complete}],
+        models=("route-one", "route-two"),
+        max_attempts=1,
+    )
+
+    assert return_code == 0
+    assert [request.model for request in requests] == ["route-one", "route-two"]
+    assert receipt["fallbackRelationships"][0]["kind"] == "route-fallback"
+    assert receipt["fallbackRelationships"][0]["reason"] == "contract-incomplete"
+    log = Path(receipt["logging"]["path"]).read_text()
+    assert '"event":"route_fallback"' in log
+    assert '"event":"attempt_retry"' not in log
+
+
+@pytest.mark.parametrize(
+    ("response_overrides", "expected_gate"),
+    [
+        ({"model": "wrong-model"}, "model-mismatch"),
+        ({"conversation": ""}, "missing-conversation"),
+        ({"exit_code": 124}, "timeout"),
+        ({"exit_code": 17}, "transport-failed"),
+    ],
+    ids=["model", "conversation", "timeout", "transport"],
+)
+def test_precontract_gate_rejections_never_promote_partial_findings(
+    response_overrides: dict[str, object],
+    expected_gate: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Must not promote",
+        "evidence": "The response is rejected by an earlier gate.",
+        "reproduction": "Inspect the gate metadata.",
+    }
+    partial = json.dumps({"findings": [finding]})
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": partial, **response_overrides}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    assert len(requests) == 1
+    attempt = receipt["attempts"][0]
+    assert attempt["contractEvaluation"]["status"] == "incomplete"
+    assert attempt["result"] == expected_gate
+    assert attempt["promotedFragments"] == []
+    assert receipt["fallbackRelationships"] == []
+    assert receipt["consolidatedReview"]["findings"] == []
+
+
+def test_provider_mismatch_never_promotes_partial_findings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Wrong provider partial",
+        "evidence": "This payload came from a rejected provider.",
+        "reproduction": "Inspect provider resolution.",
+    }
+    monkeypatch.setattr(cli, "resolved_provider_matches", lambda *_: False)
+
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": json.dumps({"findings": [finding]}), "provider": "wrong"}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "provider-mismatch"
+    assert attempt["promotedFragments"] == []
+    assert receipt["consolidatedReview"]["findings"] == []
+
+
 def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4755,12 +5029,9 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     receipt = json.loads(receipt_path.read_text())
     attempt = receipt["attempts"][0]
     evaluation = attempt["contractEvaluation"]
-    for future_field in (
-        "receiptSchemaVersion",
-        "consolidatedReview",
-        "fallbackRelationships",
-    ):
-        assert future_field not in receipt
+    assert "receiptSchemaVersion" not in receipt
+    assert receipt["fallbackRelationships"] == []
+    assert receipt["consolidatedReview"]["status"] == "accepted"
     assert receipt["acceptedAttempt"] == 1
     assert receipt["result"] == "accepted"
     assert attempt["result"] == "accepted"
@@ -4775,8 +5046,14 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
         "payloadSha256",
         "normalizedSha256",
         "violations",
+        "status",
+        "fragments",
+        "coverage",
+        "completionRequest",
     }
     assert (evaluation["name"], evaluation["version"]) == ("findings-json", "1")
+    assert evaluation["status"] == "complete"
+    assert evaluation["completionRequest"] is None
     assert evaluation["violations"] == []
     for field in ("preparedSha256", "payloadSha256", "normalizedSha256"):
         assert len(evaluation[field]) == 64

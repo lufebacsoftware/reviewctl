@@ -47,7 +47,17 @@ from reviewctl.contracts import (
     REVIEWED_FILES_SCHEMA,
     ContractContext,
     ContractEvaluation,
+    EvaluationContext,
+    EvaluationStatus,
     get_contract,
+)
+from reviewctl.review_flow import (
+    FallbackRelationship,
+    PromotedFragment,
+    build_completion_context,
+    consolidate,
+    promote_fragments,
+    render_completion_prompt,
 )
 from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discover_topology
 
@@ -3090,6 +3100,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         parser, getattr(args, "config", None), transport_default_key
     )
     review_prompt = packet_prompt(prompt, files, args.response_contract)
+    packet_digest = sha256_bytes(review_prompt.encode())
     try:
         provider_preferences = provider_preferences_from_args(args)
     except ValueError as error:
@@ -3132,6 +3143,12 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     accepted: PersistedResponse | None = None
     accepted_review: dict[str, Any] | None = None
     accepted_attempt: int | None = None
+    promoted_fragments: tuple[PromotedFragment, ...] = ()
+    fallback_relationships: list[FallbackRelationship] = []
+    completion_request = None
+    previous_attempt: int | None = None
+    previous_route_index: int | None = None
+    previous_gate_result: str | None = None
 
     profile_settings = route_profile.get("settings", {}) if route_profile else {}
     configured_timeout = (
@@ -3178,6 +3195,42 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             transport_model = (
                 model.removeprefix("openrouter/") if transport == "openrouter" else model
             )
+            attempt_prompt = review_prompt
+            if promoted_fragments and completion_request is not None:
+                completion_context = build_completion_context(
+                    completion_request, promoted_fragments
+                )
+                attempt_prompt = render_completion_prompt(review_prompt, completion_context)
+            if (
+                previous_attempt is not None
+                and previous_route_index is not None
+                and previous_gate_result is not None
+            ):
+                relationship_kind = (
+                    "retry" if previous_route_index == route_index else "route-fallback"
+                )
+                relationship = FallbackRelationship(
+                    from_attempt=previous_attempt,
+                    to_attempt=number,
+                    kind=relationship_kind,
+                    reason=previous_gate_result,
+                    promoted_fragment_ids=tuple(
+                        fragment.fragment_id for fragment in promoted_fragments
+                    ),
+                )
+                fallback_relationships.append(relationship)
+                log_event(
+                    logger,
+                    "attempt_retry" if relationship_kind == "retry" else "route_fallback",
+                    from_attempt=previous_attempt,
+                    to_attempt=number,
+                    from_model=routes[previous_route_index].model,
+                    from_transport=routes[previous_route_index].transport,
+                    to_model=model,
+                    to_transport=transport,
+                    reason=previous_gate_result,
+                    review_id=args.review_id,
+                )
             attempt_dir = attempts_dir / f"{number:02d}"
             attempt_dir.mkdir()
             database: Path | None = None
@@ -3212,7 +3265,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             )
             execution = backend_registry.require(transport).execute(
                 BackendRequest(
-                    prompt=review_prompt,
+                    prompt=attempt_prompt,
                     model=transport_model,
                     response_contract=args.response_contract,
                     files=tuple(snapshots),
@@ -3245,7 +3298,10 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 }
             contract_evaluation = (
                 native_contract.evaluate(
-                    persisted.response, prepared_contract, contract_context
+                    persisted.response,
+                    prepared_contract,
+                    contract_context,
+                    evidence=EvaluationContext(packet_digest=packet_digest),
                 )
                 if persisted is not None
                 and native_contract
@@ -3288,23 +3344,52 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     else None
                 )
             if exit_code == 124:
-                result = "timeout"
+                gate_result = "timeout"
             elif exit_code != 0:
-                result = "transport-failed"
+                gate_result = "transport-failed"
             elif persisted is None:
-                result = "missing-response"
+                gate_result = "missing-response"
             elif persisted.model != transport_model:
-                result = "model-mismatch"
+                gate_result = "model-mismatch"
             elif not resolved_provider_matches(provider_preferences, persisted.provider):
-                result = "provider-mismatch"
+                gate_result = "provider-mismatch"
             elif not persisted.response.strip():
-                result = "empty"
+                gate_result = "empty"
             elif not persisted.conversation_id:
-                result = "missing-conversation"
+                gate_result = "missing-conversation"
+            elif native_contract and contract_evaluation is not None:
+                if contract_evaluation.status is EvaluationStatus.COMPLETE:
+                    gate_result = "accepted"
+                elif contract_evaluation.status is EvaluationStatus.INCOMPLETE:
+                    gate_result = "contract-incomplete"
+                else:
+                    gate_result = "contract-invalid"
             elif review is None:
-                result = "incomplete"
+                gate_result = "incomplete"
             else:
-                result = "accepted"
+                gate_result = "accepted"
+
+            result = (
+                "incomplete"
+                if gate_result in {"contract-incomplete", "contract-invalid"}
+                else gate_result
+            )
+            newly_promoted: tuple[PromotedFragment, ...] = ()
+            if (
+                native_contract
+                and contract_evaluation is not None
+                and raw_response is not None
+            ):
+                newly_promoted = promote_fragments(
+                    contract_evaluation,
+                    gate_result=gate_result,
+                    attempt=number,
+                    route_index=route_index,
+                    raw_response_digest=str(raw_response["sha256"]),
+                )
+                if newly_promoted and contract_evaluation.completion_request is not None:
+                    promoted_fragments = (*promoted_fragments, *newly_promoted)
+                    completion_request = contract_evaluation.completion_request
 
             attempt = {
                 "database": str(database) if database else None,
@@ -3349,6 +3434,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 },
                 "providerPreferences": provider_preferences,
                 "rawResponse": raw_response,
+                "attemptRequestSha256": sha256_bytes(attempt_prompt.encode()),
+                "promotedFragments": [fragment.to_dict() for fragment in newly_promoted],
                 "result": result,
                 "route": {"model": model, "transport": transport},
                 "validationError": validation_error,
@@ -3371,6 +3458,46 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "payloadSha256": contract_evaluation.payload_digest,
                     "normalizedSha256": contract_evaluation.normalized_digest,
                     "violations": list(contract_evaluation.violations),
+                    "status": contract_evaluation.status.value,
+                    "fragments": [
+                        {
+                            "fragmentId": fragment.fragment_id,
+                            "fingerprint": fragment.fingerprint,
+                            "kind": fragment.kind.value,
+                            "value": fragment.value,
+                            "payloadDigest": fragment.payload_digest,
+                            "scope": list(fragment.scope),
+                        }
+                        for fragment in contract_evaluation.valid_fragments
+                    ],
+                    "coverage": (
+                        {
+                            "requiredFields": list(contract_evaluation.coverage.required_fields),
+                            "coveredFields": list(contract_evaluation.coverage.covered_fields),
+                            "missingFields": list(contract_evaluation.coverage.missing_fields),
+                        }
+                        if contract_evaluation.coverage is not None
+                        else None
+                    ),
+                    "completionRequest": (
+                        {
+                            "preparedDigest": (
+                                contract_evaluation.completion_request.prepared_digest
+                            ),
+                            "packetDigest": contract_evaluation.completion_request.packet_digest,
+                            "missingFields": list(
+                                contract_evaluation.completion_request.missing_fields
+                            ),
+                            "invalidFragmentIndexes": list(
+                                contract_evaluation.completion_request.invalid_fragment_indexes
+                            ),
+                            "violations": list(
+                                contract_evaluation.completion_request.violations
+                            ),
+                        }
+                        if contract_evaluation.completion_request is not None
+                        else None
+                    ),
                 }
             attempts.append(attempt)
             (attempt_dir / "attempt.json").write_bytes(canonical_json(attempt) + b"\n")
@@ -3392,17 +3519,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 accepted_review = review
                 accepted_attempt = number
                 break
+            previous_attempt = number
+            previous_route_index = route_index
+            previous_gate_result = gate_result
             if result not in RETRIABLE_REVIEW_RESULTS:
                 break
-            log_event(
-                logger,
-                "route_fallback",
-                attempt=number,
-                from_model=model,
-                from_transport=transport,
-                reason=result,
-                review_id=args.review_id,
-            )
         if accepted is not None:
             break
 
@@ -3430,7 +3551,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         "prompt": {
             "sha256": sha256_bytes(prompt.encode()),
             "characters": len(prompt),
-            "packetSha256": sha256_bytes(review_prompt.encode()),
+            "packetSha256": packet_digest,
         },
         "result": "accepted" if accepted else "unavailable",
         "reviewContract": args.response_contract,
@@ -3459,6 +3580,12 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "name": native_contract.name,
             "version": native_contract.version,
         }
+        receipt["fallbackRelationships"] = [
+            relationship.to_dict() for relationship in fallback_relationships
+        ]
+        receipt["consolidatedReview"] = consolidate(
+            accepted_review, promoted_fragments, accepted_attempt
+        ).to_dict()
     if accepted:
         receipt["response"] = {
             "sha256": sha256_bytes(accepted.response.encode()),
