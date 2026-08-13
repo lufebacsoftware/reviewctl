@@ -24,6 +24,34 @@ a project's canonical history, or a federation peer's trust policy.
    reproducible projections. It is not canonical storage for private origin
    evidence.
 
+## Backend execution boundary
+
+Backend execution and setup stay on the same machine. This is a local-only setup:
+it does not introduce remote dispatch, synchronization, or shared credentials.
+The BAML-inspired typed boundary is native and has no BAML dependency; this
+phase does not expand the existing contract work.
+
+The boundary has three provider-neutral types:
+
+- **BackendRequest** carries the prepared prompt, frozen source paths, requested
+  model, limits, and attempt location into an adapter.
+- **BackendExecution** returns only observed transport outcome, response, and
+  persisted evidence locations.
+- **BackendCapabilities** declares what an adapter can report or enforce; it is
+  not proof that the adapter is qualified for review.
+
+Backend adapters invoke a backend and persist its observed evidence only;
+adapters do not decide acceptance. The controller owns policy, contract
+evaluation, acceptance, fallback, and receipt construction.
+
+The five legacy compatibility adapters are explicitly unqualified: `llm`,
+`openrouter`, `agy`, `pi`, and `codex`. They preserve existing route behavior
+without claiming conformance. Availability is not qualification.
+
+Setup observes only executable presence and version. It never authenticates,
+calls a model, or writes configuration. The next gate is backend conformance
+before Cursor, Claude Code, or another native backend can be added.
+
 ## Canonical terms
 
 - **ReviewContract:** versioned native definition of one typed review response.

@@ -156,6 +156,12 @@ def test_build_backend_registry_has_exact_inventory_and_unqualified_descriptors(
     assert {item.qualification for item in descriptors} == {"unqualified"}
 
 
+def test_route_transports_match_registered_backend_names() -> None:
+    assert set(cli.ROUTE_TRANSPORTS) == {
+        descriptor.name for descriptor in cli.build_backend_registry().descriptors()
+    }
+
+
 @pytest.mark.parametrize(
     ("name", "family", "discovery_kind", "executable_env", "default_executable", "capabilities"),
     [

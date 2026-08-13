@@ -47,6 +47,48 @@ def test_project_integration_assigns_rosters_to_private_evidence_store() -> None
     assert "current operating roster is private evidence" in guide
 
 
+def test_architecture_defines_backend_seam_and_controller_ownership() -> None:
+    architecture = (ROOT / "docs" / "ARCHITECTURE.md").read_text()
+    normalized = " ".join(architecture.lower().split())
+
+    for contract in ("BackendRequest", "BackendExecution", "BackendCapabilities"):
+        assert contract in architecture
+    for boundary in (
+        "local-only setup",
+        "availability is not qualification",
+        "adapters do not decide acceptance",
+    ):
+        assert boundary in normalized
+    for controller_responsibility in (
+        "policy",
+        "contract evaluation",
+        "acceptance",
+        "fallback",
+        "receipt",
+    ):
+        assert controller_responsibility in normalized
+
+
+def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> None:
+    architecture = " ".join(
+        (ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split()
+    )
+
+    for adapter in ("llm", "openrouter", "agy", "pi", "codex"):
+        assert f"`{adapter}`" in architecture
+    assert "five legacy compatibility adapters are explicitly unqualified" in architecture
+    assert "setup observes only executable presence and version" in architecture
+    assert "never authenticates, calls a model, or writes configuration" in architecture
+    assert "the next gate is backend conformance" in architecture
+    assert "before cursor, claude code, or another native backend can be added" in architecture
+    assert "baml-inspired typed boundary" in architecture
+    assert "native and has no baml dependency" in architecture
+
+    for product in ("cursor", "claude"):
+        unsupported_claim = " ".join((product, "is", "supported"))
+        assert unsupported_claim not in architecture
+
+
 def test_release_workflow_builds_and_publishes_verified_artifacts() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
 

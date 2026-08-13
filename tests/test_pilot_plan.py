@@ -41,3 +41,26 @@ def test_pi_transcript_is_not_review_evidence() -> None:
     assert "approval" in document
     assert "transcript" in document
     assert "artifact root" in document
+
+
+def test_help_llm_carries_setup_and_nonqualification_invariants() -> None:
+    document = (REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower()
+
+    for command in (
+        "reviewctl setup discover --format json",
+        "reviewctl setup show --format json",
+        "reviewctl setup check --backend name --format json",
+    ):
+        assert command in document
+    for boundary in (
+        "local",
+        "read-only",
+        "non-qualifying",
+        "availability is not qualification",
+        "do not call models",
+        "write configuration",
+    ):
+        assert boundary in document
+    for product in ("cursor", "claude"):
+        unsupported_claim = " ".join((product, "is", "supported"))
+        assert unsupported_claim not in document
