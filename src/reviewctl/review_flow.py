@@ -541,6 +541,33 @@ def _receipt_contract_context(value: object) -> ContractContext | None:
     return ContractContext(file_names=tuple(file_names), review_declaration_required=required)
 
 
+def _receipt_source_file_names(receipt: dict[str, Any]) -> tuple[str, ...] | None:
+    source = receipt.get("source")
+    if type(source) is not dict:
+        return None
+    files = source.get("files")
+    if not isinstance(files, list) or not files:
+        return None
+    names: list[str] = []
+    for file in files:
+        if type(file) is not dict:
+            return None
+        name = file.get("name")
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or not _is_sha256(file.get("sha256"))
+        ):
+            return None
+        names.append(name)
+    if names != sorted(set(names)):
+        return None
+    return tuple(names)
+
+
 def _receipt_canonical_digest(value: object) -> str | None:
     try:
         return hashlib.sha256(canonical_json(value)).hexdigest()
@@ -602,6 +629,15 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     ):
         reject("receipt-schema-version")
 
+    source_class = receipt.get("sourceClass")
+    source_file_names = _receipt_source_file_names(receipt)
+    if (
+        not isinstance(source_class, str)
+        or source_class not in ("proprietary", "synthetic")
+        or source_file_names is None
+    ):
+        reject("receipt-source")
+
     attempts_value = receipt.get("attempts")
     if (
         not isinstance(attempts_value, list)
@@ -646,10 +682,15 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 raw_digest = raw["sha256"]
 
         route_index = attempt.get("routeIndex")
+        route: dict[str, Any] | None = None
         if not _is_nonnegative_int(route_index) or route_index >= len(routes):
             reject("attempt-route")
         elif attempt.get("route") != routes[route_index]:
             reject("attempt-route")
+        elif type(routes[route_index]) is not dict:
+            reject("attempt-route")
+        else:
+            route = routes[route_index]
 
         evaluation = attempt.get("contractEvaluation")
         contract_fragments: list[dict[str, Any]] = []
@@ -693,7 +734,19 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 )
                 contract_context = _receipt_contract_context(evaluation.get("contractContext"))
                 prepared_digest: str | None = None
-                if contract_context is not None and isinstance(evaluation.get("name"), str):
+                context_is_authoritative = (
+                    contract_context is not None
+                    and source_file_names is not None
+                    and contract_context.file_names == source_file_names
+                    and route is not None
+                    and contract_context.review_declaration_required
+                    == (
+                        type(route.get("transport")) is str
+                        and route["transport"] == "codex"
+                        and source_class == "proprietary"
+                    )
+                )
+                if context_is_authoritative and isinstance(evaluation.get("name"), str):
                     try:
                         prepared = get_contract(evaluation["name"]).prepare(contract_context)
                     except (KeyError, TypeError, ValueError, UnicodeError):
@@ -702,7 +755,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         prepared_digest = prepared.digest
                 identity_valid = (
                     identity_valid
-                    and contract_context is not None
+                    and context_is_authoritative
                     and evaluation.get("preparedSha256") == prepared_digest
                 )
                 if not identity_valid:

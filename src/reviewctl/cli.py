@@ -1354,11 +1354,17 @@ def frozen_review_files(files: list[Path]) -> Iterator[tuple[list[dict[str, str]
         root = Path(directory)
         source: list[dict[str, str]] = []
         snapshots: list[Path] = []
-        for file in files:
+        for file in sorted(files, key=lambda item: item.name):
             contents = file.read_bytes()
             snapshot = root / file.name
             snapshot.write_bytes(contents)
-            source.append({"path": str(file), "sha256": sha256_bytes(contents)})
+            source.append(
+                {
+                    "name": file.name,
+                    "path": str(file),
+                    "sha256": sha256_bytes(contents),
+                }
+            )
             snapshots.append(snapshot)
         yield source, snapshots
 
@@ -3129,6 +3135,14 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     )
     snapshots_context = frozen_review_files(files)
     source_files, snapshots = snapshots_context.__enter__()
+    if not source_files:
+        prompt_source: dict[str, str] = {
+            "name": Path(args.prompt_file).name if args.prompt_file else "prompt.txt",
+            "sha256": sha256_bytes(prompt.encode()),
+        }
+        if args.prompt_file:
+            prompt_source["path"] = str(Path(args.prompt_file))
+        source_files.append(prompt_source)
     snapshot_hashes = {file.name: sha256_bytes(file.read_bytes()) for file in snapshots}
     native_contract = (
         get_contract(args.response_contract) if args.response_contract == "findings-json" else None
@@ -3195,7 +3209,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             )
             contract_context = (
                 ContractContext(
-                    file_names=tuple(sorted(snapshot_hashes)),
+                    file_names=tuple(item["name"] for item in source_files),
                     review_declaration_required=(
                         transport == "codex" and args.source_class == "proprietary"
                     ),
@@ -3573,6 +3587,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         "result": "accepted" if accepted else "unavailable",
         "reviewContract": args.response_contract,
         "reviewId": args.review_id,
+        "sourceClass": args.source_class,
         "source": source,
         "tool": {"name": "reviewctl", "version": __version__},
         "executionSettings": {

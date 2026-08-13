@@ -134,7 +134,7 @@ def _sign_receipt(receipt: dict[str, object]) -> dict[str, object]:
 
 def v2_findings_receipt() -> dict[str, object]:
     contract = get_contract("findings-json")
-    context = ContractContext()
+    context = ContractContext(file_names=("source.py",))
     prepared = contract.prepare(context)
     partial_payload = json.dumps(
         {"verdict": "changes-requested", "findings": [finding()], "extra": True}
@@ -153,6 +153,16 @@ def v2_findings_receipt() -> dict[str, object]:
         "receiptSchemaVersion": 2,
         "result": "accepted",
         "acceptedAttempt": 2,
+        "sourceClass": "synthetic",
+        "source": {
+            "files": [
+                {
+                    "name": "source.py",
+                    "path": "/bounded/source.py",
+                    "sha256": "a" * 64,
+                }
+            ]
+        },
         "reviewContract": "findings-json",
         "contract": {"name": "findings-json", "version": "1"},
         "routes": [
@@ -170,7 +180,7 @@ def v2_findings_receipt() -> dict[str, object]:
                     "sha256": partial.payload_digest,
                     "characters": len(partial_payload),
                 },
-                "contractEvaluation": _evaluation_dict(partial),
+                "contractEvaluation": _evaluation_dict(partial, file_names=("source.py",)),
                 "promotedFragments": [promoted_fragment.to_dict()],
                 "findings": [],
             },
@@ -184,7 +194,7 @@ def v2_findings_receipt() -> dict[str, object]:
                     "sha256": complete.payload_digest,
                     "characters": len(complete_payload),
                 },
-                "contractEvaluation": _evaluation_dict(complete),
+                "contractEvaluation": _evaluation_dict(complete, file_names=("source.py",)),
                 "promotedFragments": [],
                 "findings": [],
             },
@@ -211,7 +221,7 @@ def v2_findings_receipt() -> dict[str, object]:
 
 def v2_invalid_findings_receipt() -> dict[str, object]:
     contract = get_contract("findings-json")
-    context = ContractContext()
+    context = ContractContext(file_names=("source.py",))
     prepared = contract.prepare(context)
     payload = "not json"
     evaluation = contract.evaluate(payload, prepared, context)
@@ -219,6 +229,16 @@ def v2_invalid_findings_receipt() -> dict[str, object]:
         "receiptSchemaVersion": 2,
         "result": "unavailable",
         "acceptedAttempt": None,
+        "sourceClass": "synthetic",
+        "source": {
+            "files": [
+                {
+                    "name": "source.py",
+                    "path": "/bounded/source.py",
+                    "sha256": "a" * 64,
+                }
+            ]
+        },
         "reviewContract": "findings-json",
         "contract": {"name": "findings-json", "version": "1"},
         "routes": [{"model": "first", "transport": "llm"}],
@@ -233,7 +253,10 @@ def v2_invalid_findings_receipt() -> dict[str, object]:
                     "sha256": evaluation.payload_digest,
                     "characters": len(payload),
                 },
-                "contractEvaluation": _evaluation_dict(evaluation),
+                "contractEvaluation": _evaluation_dict(
+                    evaluation,
+                    file_names=("source.py",),
+                ),
                 "promotedFragments": [],
                 "findings": [],
             }
@@ -844,6 +867,96 @@ def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> 
     assert validate_v2_receipt(v2_findings_receipt()) == ()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-source-class",
+        "unknown-source-class",
+        "missing-files",
+        "empty-files",
+        "non-object-file",
+        "missing-name",
+        "non-basename",
+        "empty-name",
+        "invalid-digest",
+        "duplicate-name",
+        "noncanonical-order",
+    ],
+)
+def test_validate_v2_receipt_rejects_invalid_authoritative_source(mutation: str) -> None:
+    receipt = v2_findings_receipt()
+    files = receipt["source"]["files"]
+    if mutation == "missing-source-class":
+        receipt.pop("sourceClass")
+    elif mutation == "unknown-source-class":
+        receipt["sourceClass"] = "confidential"
+    elif mutation == "missing-files":
+        receipt["source"] = {}
+    elif mutation == "empty-files":
+        receipt["source"]["files"] = []
+    elif mutation == "non-object-file":
+        files[0] = "source.py"
+    elif mutation == "missing-name":
+        files[0].pop("name")
+    elif mutation == "non-basename":
+        files[0]["name"] = "nested/source.py"
+    elif mutation == "empty-name":
+        files[0]["name"] = " "
+    elif mutation == "invalid-digest":
+        files[0]["sha256"] = "A" * 64
+    elif mutation == "duplicate-name":
+        files.append(deepcopy(files[0]))
+    else:
+        files.insert(
+            0,
+            {"name": "z.py", "path": "/bounded/z.py", "sha256": "b" * 64},
+        )
+    _sign_receipt(receipt)
+
+    assert "receipt-source" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_rejects_context_names_invented_beyond_source() -> None:
+    receipt = v2_findings_receipt()
+    evaluation = receipt["attempts"][1]["contractEvaluation"]
+    invented = ContractContext(file_names=("invented.py",))
+    evaluation["contractContext"]["fileNames"] = ["invented.py"]
+    evaluation["preparedSha256"] = get_contract("findings-json").prepare(invented).digest
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_derives_declaration_requirement_from_source_and_route() -> None:
+    receipt = v2_findings_receipt()
+    receipt["sourceClass"] = "proprietary"
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_rejects_transport_that_contradicts_declaration_flag() -> None:
+    receipt = v2_findings_receipt()
+    receipt["sourceClass"] = "proprietary"
+    evaluation = receipt["attempts"][1]["contractEvaluation"]
+    context = ContractContext(file_names=("source.py",), review_declaration_required=True)
+    normalized = {"verdict": "approved", "findings": [], "reviewedFiles": ["source.py"]}
+    evaluation["contractContext"]["reviewDeclarationRequired"] = True
+    evaluation["preparedSha256"] = get_contract("findings-json").prepare(context).digest
+    evaluation["normalizedValue"] = normalized
+    evaluation["normalizedSha256"] = hashlib.sha256(canonical_json(normalized)).hexdigest()
+    evaluation["coverage"] = {
+        "requiredFields": ["verdict", "findings", "reviewedFiles"],
+        "coveredFields": ["verdict", "findings", "reviewedFiles"],
+        "missingFields": [],
+    }
+    receipt["routes"][1]["transport"] = "agy"
+    receipt["attempts"][1]["route"]["transport"] = "agy"
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
 def test_validate_v2_receipt_preserves_duplicate_contract_fragments() -> None:
     receipt = v2_findings_receipt()
     evaluation = receipt["attempts"][0]["contractEvaluation"]
@@ -1033,7 +1146,7 @@ def test_validate_v2_receipt_detects_rehashed_structural_mutations(
     elif mutation == "context-file-unsorted":
         second["contractEvaluation"]["contractContext"]["fileNames"] = ["z.py", "a.py"]
     elif mutation == "prepared-context-mismatch":
-        second["contractEvaluation"]["contractContext"]["fileNames"] = ["source.py"]
+        second["contractEvaluation"]["contractContext"]["fileNames"] = ["invented.py"]
     elif mutation == "prepared-digest-mismatch":
         second["contractEvaluation"]["preparedSha256"] = "0" * 64
     elif mutation == "unknown-contract":
@@ -1171,6 +1284,7 @@ def test_validate_v2_receipt_rejects_malformed_evaluation_error(field: str, valu
 
 def test_validate_v2_receipt_preserves_reviewed_files_outside_legacy_view() -> None:
     receipt = v2_findings_receipt()
+    receipt["sourceClass"] = "proprietary"
     evaluation = receipt["attempts"][1]["contractEvaluation"]
     normalized = {
         "verdict": "approved",
@@ -1194,6 +1308,11 @@ def test_validate_v2_receipt_preserves_reviewed_files_outside_legacy_view() -> N
 
 def test_validate_v2_receipt_requires_reviewed_files_to_match_context_exactly() -> None:
     receipt = v2_findings_receipt()
+    receipt["sourceClass"] = "proprietary"
+    receipt["source"]["files"] = [
+        {"name": "a.py", "path": "/bounded/a.py", "sha256": "a" * 64},
+        {"name": "b.py", "path": "/bounded/b.py", "sha256": "b" * 64},
+    ]
     evaluation = receipt["attempts"][1]["contractEvaluation"]
     context = ContractContext(file_names=("a.py", "b.py"), review_declaration_required=True)
     normalized = {
@@ -1330,6 +1449,12 @@ def test_validate_v2_receipt_allows_non_findings_without_native_contract_data() 
         {
             "receiptSchemaVersion": 2,
             "reviewContract": "document",
+            "sourceClass": "synthetic",
+            "source": {
+                "files": [
+                    {"name": "source.py", "path": "/bounded/source.py", "sha256": "b" * 64}
+                ]
+            },
             "result": "accepted",
             "acceptedAttempt": 1,
             "routes": [{"model": "writer", "transport": "llm"}],

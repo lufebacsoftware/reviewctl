@@ -2510,6 +2510,7 @@ def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Pat
     assert result.returncode == 0, result.stderr
     receipt_path = Path(result.stdout.strip()) / "receipt.json"
     receipt = json.loads(receipt_path.read_text())
+    assert receipt["sourceClass"] == "proprietary"
     assert receipt["findings"][0]["path"] == "source.py"
     evaluation = receipt["attempts"][0]["contractEvaluation"]
     assert evaluation["contractContext"] == {
@@ -2670,6 +2671,14 @@ def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) ->
     assert "--dangerously-bypass-approvals-and-sandbox" not in arguments
     assert receipt["result"] == "accepted"
     assert receipt["findings"] == []
+    assert receipt["sourceClass"] == "synthetic"
+    assert receipt["attempts"][0]["contractEvaluation"]["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": False,
+    }
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
 
 
 def test_findings_contract_rejects_a_severity_outside_the_shared_taxonomy() -> None:
@@ -4671,7 +4680,13 @@ def test_freezes_source_bytes_before_the_model_receives_them(tmp_path: Path) -> 
         source.write_text("after\n")
 
         assert snapshots[0].read_text() == "before\n"
-        assert provenance == [{"path": str(source), "sha256": cli.sha256_bytes(b"before\n")}]
+        assert provenance == [
+            {
+                "name": "source.py",
+                "path": str(source),
+                "sha256": cli.sha256_bytes(b"before\n"),
+            }
+        ]
 
 
 def test_tournament_budgets_the_assembled_packet_not_only_the_user_prompt(tmp_path: Path) -> None:
@@ -5290,6 +5305,8 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     attempt = receipt["attempts"][0]
     evaluation = attempt["contractEvaluation"]
     assert receipt["receiptSchemaVersion"] == 2
+    assert receipt["sourceClass"] == "synthetic"
+    assert receipt["source"]["files"][0]["name"] == "source.py"
     assert attempt["number"] == 1
     assert attempt["routeIndex"] == 0
     assert receipt["fallbackRelationships"] == []
