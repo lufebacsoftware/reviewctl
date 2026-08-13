@@ -18,13 +18,30 @@ from reviewctl.review_flow import (
     ConsolidatedReview,
     FallbackRelationship,
     PromotedFragment,
-    build_completion_context,
     consolidate,
     promote_fragments,
     receipt_contract_identity,
     render_completion_prompt,
     validate_v2_receipt,
 )
+from reviewctl.review_flow import (
+    build_completion_context as _build_completion_context,
+)
+
+
+def build_completion_context(
+    request,
+    promoted_fragments,
+    *,
+    allowed_file_names,
+    review_declaration_required: bool = False,
+):
+    return _build_completion_context(
+        request,
+        promoted_fragments,
+        allowed_file_names=allowed_file_names,
+        review_declaration_required=review_declaration_required,
+    )
 
 
 def finding(
@@ -516,6 +533,22 @@ def test_build_completion_context_deduplicates_content_but_preserves_provenance(
     assert context.invalid_fragment_indexes == ()
     assert context.violations == ("response-fields",)
     assert context.to_dict()["fileNames"] == ["source.py"]
+    assert context.to_dict()["reviewDeclarationRequired"] is False
+
+
+@pytest.mark.parametrize("required", [None, 0, 1, "false"])
+def test_build_completion_context_requires_boolean_review_declaration_flag(
+    required: object,
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+
+    with pytest.raises(ValueError, match="review declaration flag"):
+        _build_completion_context(
+            evaluation.completion_request,
+            promoted(finding()),
+            allowed_file_names=("source.py",),
+            review_declaration_required=required,  # type: ignore[arg-type]
+        )
 
 
 def test_build_completion_context_rejects_findings_outside_target_scope() -> None:
@@ -691,6 +724,7 @@ def test_render_completion_prompt_contains_only_bounded_canonical_context() -> N
         evaluation.completion_request,
         fragments,
         allowed_file_names=("source.py",),
+        review_declaration_required=False,
     )
 
     prompt = render_completion_prompt("Review the packet.", context)
@@ -708,6 +742,44 @@ def test_render_completion_prompt_contains_only_bounded_canonical_context() -> N
         "\n</reviewctl-completion-context>", 1
     )[0]
     assert encoded == canonical_json(context.to_dict()).decode()
+
+
+def test_render_completion_prompt_reproduces_authoritative_prepared_digest() -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = build_completion_context(
+        evaluation.completion_request,
+        promoted(finding()),
+        allowed_file_names=("source.py",),
+        review_declaration_required=False,
+    )
+
+    for malicious in (
+        replace(context, file_names=("source.py", "superset.py")),
+        replace(context, review_declaration_required=True),
+    ):
+        with pytest.raises(ValueError, match="^invalid completion context$"):
+            render_completion_prompt("Review the packet.", malicious)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [COMPLETION_CONTEXT_START, COMPLETION_CONTEXT_END],
+)
+def test_render_completion_prompt_rejects_original_prompt_marker_collision(marker: str) -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = build_completion_context(
+        evaluation.completion_request,
+        promoted(finding()),
+        allowed_file_names=("source.py",),
+        review_declaration_required=False,
+    )
+
+    with pytest.raises(
+        ValueError, match="^original prompt collides with completion framing$"
+    ) as error:
+        render_completion_prompt(f"Review the packet. {marker} hidden", context)
+
+    assert "hidden" not in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -1726,6 +1798,65 @@ def test_validate_v2_receipt_detects_rehashed_structural_mutations(
         _sign_receipt(receipt)
 
     assert violation in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize("reason", ["incomplete", "contract-invalid", "unknown"])
+def test_validate_v2_receipt_rejects_fallback_reason_not_derived_from_source(
+    reason: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    receipt["fallbackRelationships"][0]["reason"] = reason
+    _sign_receipt(receipt)
+
+    assert "fallback-relationships" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "expected_reason"),
+    [
+        ("pre-gate", "timeout"),
+        ("invalid-evaluation", "contract-invalid"),
+        ("evaluation-error", "contract-invalid"),
+    ],
+)
+def test_validate_v2_receipt_derives_fallback_reason_from_source_attempt(
+    source_kind: str,
+    expected_reason: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    first = receipt["attempts"][0]
+    first["promotedFragments"] = []
+    receipt["fallbackRelationships"][0]["promotedFragmentIds"] = []
+    receipt["consolidatedReview"] = consolidate(
+        {"verdict": "approved", "findings": []}, (), 2
+    ).to_dict()
+    if source_kind == "pre-gate":
+        first["result"] = "timeout"
+        first.pop("contractEvaluation")
+    elif source_kind == "invalid-evaluation":
+        contract = get_contract("findings-json")
+        context = ContractContext(file_names=("source.py",))
+        invalid = contract.evaluate("not json", contract.prepare(context), context)
+        first["rawResponse"]["sha256"] = invalid.payload_digest
+        first["rawResponse"]["characters"] = len("not json")
+        first["contractEvaluation"] = _evaluation_dict(
+            invalid,
+            file_names=("source.py",),
+        )
+    else:
+        first.pop("contractEvaluation")
+        first["evaluationError"] = {
+            "type": "ValueError",
+            "message": "response data could not be evaluated safely",
+        }
+    receipt["fallbackRelationships"][0]["reason"] = expected_reason
+    _sign_receipt(receipt)
+
+    assert validate_v2_receipt(receipt) == ()
+
+    receipt["fallbackRelationships"][0]["reason"] = "unknown"
+    _sign_receipt(receipt)
+    assert "fallback-relationships" in validate_v2_receipt(receipt)
 
 
 def test_validate_v2_receipt_accepts_contract_data_error_without_evaluation() -> None:

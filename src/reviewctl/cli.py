@@ -3270,6 +3270,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     target_completion_request,
                     promoted_fragments,
                     allowed_file_names=contract_context.file_names,
+                    review_declaration_required=(contract_context.review_declaration_required),
                 )
                 attempt_prompt = render_completion_prompt(review_prompt, completion_context)
             if (

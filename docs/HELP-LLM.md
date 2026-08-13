@@ -99,6 +99,9 @@ retrying blindly:
 
 - Incomplete: inspect `completionRequest`, `fallbackRelationships`, and
   `rawResponse`.
+- If completion fails with `original prompt collides with completion framing`,
+  remove the reserved `<reviewctl-completion-context>` marker (opening or
+  closing form) from the original prompt and start a fresh bounded review.
 - Invalid: inspect `violations`, `evaluationError`, and `rawResponse`.
 - Accepted: inspect both the legacy and consolidated views, then run
   `reviewctl verify`.

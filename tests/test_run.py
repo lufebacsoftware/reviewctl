@@ -1054,6 +1054,7 @@ def test_completion_prompt_uses_target_route_contract_context(
     source_prepared = cli.get_contract("findings-json").prepare(source_contract_context)
 
     assert completion_context["preparedDigest"] == target_prepared.digest
+    assert completion_context["reviewDeclarationRequired"] is (target_transport == "codex")
     assert completion_context["gapManifest"]["missingFields"] == expected_missing
     assert completion_context["packetDigest"] == receipt["prompt"]["packetSha256"]
     assert receipt["prompt"]["packetSha256"] == cli.sha256_bytes(first_prompt.encode())

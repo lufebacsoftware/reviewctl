@@ -43,6 +43,7 @@ SUPPORTED_ATTEMPT_RESULTS = frozenset(
         "missing-conversation",
     }
 )
+PRECONTRACT_ATTEMPT_RESULTS = SUPPORTED_ATTEMPT_RESULTS - {"accepted", "incomplete"}
 
 
 class _FrozenDict(dict[str, Any]):
@@ -286,6 +287,7 @@ class CompletionContext:
     prepared_digest: str
     packet_digest: str | None
     file_names: tuple[str, ...]
+    review_declaration_required: bool
     missing_fields: tuple[str, ...]
     invalid_fragment_indexes: tuple[int, ...]
     violations: tuple[str, ...]
@@ -296,6 +298,7 @@ class CompletionContext:
             "preparedDigest": self.prepared_digest,
             "packetDigest": self.packet_digest,
             "fileNames": list(self.file_names),
+            "reviewDeclarationRequired": self.review_declaration_required,
             "gapManifest": {
                 "missingFields": list(self.missing_fields),
                 "invalidFragmentIndexes": list(self.invalid_fragment_indexes),
@@ -333,7 +336,20 @@ def _validate_completion_context(context: object) -> bool:
         require_packet_digest=True,
     ):
         return False
-    if not _valid_completion_file_names(context.file_names) or type(context.findings) is not tuple:
+    if (
+        not _valid_completion_file_names(context.file_names)
+        or type(context.review_declaration_required) is not bool
+        or type(context.findings) is not tuple
+    ):
+        return False
+    authoritative_context = ContractContext(
+        file_names=context.file_names,
+        review_declaration_required=context.review_declaration_required,
+    )
+    if (
+        get_contract("findings-json").prepare(authoritative_context).digest
+        != context.prepared_digest
+    ):
         return False
 
     seen_fingerprints: set[str] = set()
@@ -485,6 +501,7 @@ def build_completion_context(
     promoted_fragments: tuple[PromotedFragment, ...],
     *,
     allowed_file_names: tuple[str, ...] | list[str],
+    review_declaration_required: bool,
 ) -> CompletionContext:
     """Build a deterministic, prompt-safe view of typed fragments and contract gaps."""
     if request is None:
@@ -499,6 +516,8 @@ def build_completion_context(
         require_packet_digest=True,
     ):
         raise ValueError("invalid completion manifest")
+    if type(review_declaration_required) is not bool:
+        raise ValueError("completion context requires a review declaration flag")
     if (
         type(allowed_file_names) not in {tuple, list}
         or not allowed_file_names
@@ -540,6 +559,7 @@ def build_completion_context(
         prepared_digest=request.prepared_digest,
         packet_digest=request.packet_digest,
         file_names=target_file_names,
+        review_declaration_required=review_declaration_required,
         missing_fields=tuple(request.missing_fields),
         invalid_fragment_indexes=tuple(request.invalid_fragment_indexes),
         violations=tuple(request.violations),
@@ -552,6 +572,8 @@ def build_completion_context(
 
 def render_completion_prompt(original_prompt: str, context: CompletionContext) -> str:
     """Append only typed prior evidence, never the raw prior model response."""
+    if COMPLETION_CONTEXT_START in original_prompt or COMPLETION_CONTEXT_END in original_prompt:
+        raise ValueError("original prompt collides with completion framing")
     if not _validate_completion_context(context):
         raise ValueError("invalid completion context")
     instructions = (
@@ -786,6 +808,30 @@ def _receipt_canonical_digest(value: object) -> str | None:
         return hashlib.sha256(canonical_json(value)).hexdigest()
     except (TypeError, ValueError, UnicodeError, OverflowError):
         return None
+
+
+def _fallback_reason_for_attempt(attempt: object) -> str | None:
+    """Derive the only valid fallback reason from persisted source-attempt evidence."""
+    if type(attempt) is not dict:
+        return None
+    result = attempt.get("result")
+    if type(result) is not str:
+        return None
+    if result in PRECONTRACT_ATTEMPT_RESULTS:
+        return result
+    if result != "incomplete":
+        return None
+    if attempt.get("evaluationError") is not None:
+        return "contract-invalid"
+    evaluation = attempt.get("contractEvaluation")
+    if type(evaluation) is dict:
+        status = evaluation.get("status")
+        if status == "incomplete":
+            return "contract-incomplete"
+        if status == "invalid":
+            return "contract-invalid"
+        return None
+    return "incomplete"
 
 
 def _receipt_completion_request(
@@ -1303,7 +1349,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and destination <= len(attempts)
                     and isinstance(kind, str)
                     and kind in {"retry", "route-fallback"}
-                    and isinstance(relationship.get("reason"), str)
+                    and relationship.get("reason")
+                    == _fallback_reason_for_attempt(attempts[source - 1])
                     and isinstance(ids, list)
                     and all(isinstance(fragment_id, str) for fragment_id in ids)
                     and ids == sorted(set(ids))
