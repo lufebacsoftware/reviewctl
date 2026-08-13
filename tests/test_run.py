@@ -5095,6 +5095,40 @@ def test_invoke_openrouter_persists_a_portable_structured_response(
     assert captured["timeout"] == 8
 
 
+@pytest.mark.parametrize("model", ["google/gemini-3.6-flash", "z-ai/glm-5.2"])
+def test_invoke_openrouter_requests_minimal_reasoning_for_reasoning_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(
+        monkeypatch,
+        body=json.dumps(
+            {
+                "model": model,
+                "choices": [{"message": {"content": "VERDICT: approved"}}],
+            }
+        ).encode(),
+    )
+
+    exit_code, error, _ = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Return JSON.",
+        model=model,
+        files=[source],
+        max_output_tokens=64,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert (exit_code, error) == (0, "")
+    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == {
+        "effort": "minimal"
+    }
+
+
 def test_invoke_openrouter_rejects_a_malformed_choice_shape(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -1472,9 +1472,9 @@ def invoke_openrouter(
             {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
         ],
     }
-    # Gemini 3.6 Flash requires reasoning and can consume a short fallback
-    # budget without emitting a final answer. Keep the fallback responsive.
-    if model == "google/gemini-3.6-flash":
+    # These reasoning models can consume the whole fallback budget without
+    # emitting a final answer. Keep formal review responses responsive.
+    if model in {"google/gemini-3.6-flash", "z-ai/glm-5.2"}:
         payload["reasoning"] = {"effort": "minimal"}
     if schema := response_schema(response_contract):
         payload["response_format"] = {
