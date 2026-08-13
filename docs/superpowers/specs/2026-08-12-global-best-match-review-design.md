@@ -188,6 +188,163 @@ advisory rollout no agent-specific hook may turn a best-effort unavailable
 result into a hard global block. Later enforcement hooks are allowed only for
 the critical dimensions and authorization rules defined by policy.
 
+## Execution Backends
+
+Agent compatibility and execution backends are separate concerns. Cursor,
+Codex, Pi, or Claude may invoke `reviewctl`; independently, `reviewctl` may use
+one of those tools as the bounded runner that reaches an LLM.
+
+The current `llm`, `openrouter`, `agy`, `pi`, and `codex` transports become
+adapters behind one execution-backend seam rather than permanent branches in
+the orchestration CLI. The initial backend families are:
+
+| Family | Initial adapters | Purpose |
+| --- | --- | --- |
+| Agent CLI | `pi`, `codex`, `claude`, `cursor`, `agy` | Reuse an installed agent, its authentication, subscriptions, and model access. |
+| Provider gateway | `openrouter`, `openai-compatible` | Call a provider or local gateway directly when request and response identity are observable. |
+| Generic model CLI | `llm` | Preserve the existing generic plugin-based route. |
+| Agent protocol | `acp` | Future adapter for agents exposing a stable Agent Client Protocol server. |
+
+Antigravity remains the `agy` adapter name until a compatibility migration is
+designed. Gemini CLI, GitHub Copilot CLI, OpenCode, Aider, or another popular
+runner are candidates, not automatically supported backends. A candidate must
+first prove bounded noninteractive execution, durable output, timeout control,
+model/backend identity to the extent claimed, and source-containment behavior.
+
+### Backend interface
+
+Every adapter consumes one provider-neutral request and returns one observed
+result:
+
+```text
+BackendRequest
+├── preparedContract
+├── frozenPacket
+├── requestedModel
+├── timeout
+├── executionMode: review | change
+└── toolPolicy
+
+BackendResult
+├── exitStatus
+├── rawResponse
+├── conversationIdentity
+├── requestedIdentity
+├── observedIdentity
+├── usage
+├── mutationObservation
+└── retainedEvidence
+```
+
+The adapter does not decide acceptance, fallback, waiver, or consolidation.
+Those remain reviewctl core semantics.
+
+### Backend capabilities
+
+Discovery produces claims that selection can evaluate:
+
+```text
+BackendCapabilities
+├── reviewReadOnly: enforced | sandboxed | advisory | unsupported
+├── editableExecution: supported | unsupported
+├── structuredOutput
+├── resolvedModelIdentity
+├── resolvedProviderIdentity
+├── conversationIdentity
+├── usageReporting
+├── timeoutControl
+├── toolControl
+└── sourceIsolation: backend-enforced | external-sandbox | unavailable
+```
+
+Capabilities are qualified facts bound to adapter version, runner version,
+machine-local setup, synthetic fixture, and observation time. An absent or
+opaque model/provider identity lowers assurance; it is never filled by guess.
+
+Pi is the preferred broker when it can reach the requested provider/model and
+preserve the required identity, limits, contract, and evidence. A native
+adapter remains justified when it can reuse a subscription or login Pi cannot,
+exposes a capability Pi lacks, or provides stronger evidence. Pi is therefore
+preferred by capability match, not a mandatory dependency.
+
+### Review and editable execution
+
+A formal review attempt is non-editable and never runs a backend against the
+source checkout. reviewctl first creates a separate staging area containing
+only the frozen packet, then makes every original source root inaccessible to
+the backend through a qualified backend-native boundary or an OS/container
+sandbox. Merely changing cwd or instructing the model not to write is not
+source isolation.
+
+The staging area is filesystem-read-only when the platform and backend support
+enforcement; otherwise it is a disposable writable copy inside the sandbox.
+Write and shell tools are also disabled where supported, but behavioral
+instructions alone are insufficient.
+
+reviewctl hashes the staged packet before and after execution. An unexpected
+mutation produces `source-mutated`, discards the staging area, and prevents
+acceptance or fragment promotion from that attempt. A backend with
+`reviewReadOnly: advisory` is eligible for formal review only when reviewctl
+supplies a qualified `external-sandbox` that denies all original source roots.
+`reviewReadOnly: unsupported` or `sourceIsolation: unavailable` is ineligible
+for formal review and remains exploratory/editable only.
+
+Editable execution is a separate change-producing operation:
+
+```text
+snapshot A
+  -> formal ReviewAttempt
+  -> consolidated findings
+  -> editable ChangeAttempt
+  -> patch or commit B
+  -> new formal review of B
+```
+
+A `ChangeAttempt` may use Pi, Cursor, Claude, Codex, Antigravity, or another
+qualified editable backend. It produces a patch/commit and execution evidence,
+never a review approval. The initial stabilization phase specifies this type
+and capability but does not need to implement autonomous review-fix-review
+loops.
+
+## Local Execution Setup
+
+All execution is local to the machine running `reviewctl`. Eloísa and Amélia
+discover and invoke only their own executables and credentials. Models and
+provider endpoints may be remote, but reviewctl does not dispatch over SSH,
+copy source to another machine, or synchronize credentials.
+
+```text
+LocalExecutionTopology
+├── installationIdentity
+├── actorIdentity
+├── evidenceRoot
+├── projectStores[]
+├── backends[]
+│   ├── adapter
+│   ├── executable and version
+│   ├── authentication mechanism/status
+│   └── capabilities
+└── diagnostics[]
+```
+
+Machine identity is a local installation identity, not a public hostname.
+Authentication checks report only mechanism and status; credentials are never
+persisted in setup output.
+
+Add read-only discovery commands:
+
+```text
+reviewctl setup discover --format human|json
+reviewctl setup check --format human|json
+reviewctl setup show --format human|json
+```
+
+`discover` observes local executables and declarative configuration. `check`
+runs adapter-specific synthetic probes when explicitly requested or already
+authorized by policy. `show` renders the effective topology. Discovery never
+installs tools, logs in, changes global agent rules, or promotes a backend to
+supported without conformance evidence.
+
 Initial globally recognized dimensions are:
 
 - correctness;
@@ -211,7 +368,7 @@ ReviewPlan
 ├── packetIdentity
 ├── sourceClass
 ├── requiredDimensions[]
-├── routes[]
+├── routes[]: backend + requested model/provider + capabilities
 ├── fallbackLimit
 ├── independenceRequirement
 └── criticalAuthorizationRequirement
@@ -292,9 +449,17 @@ Fallback is an ordered, bounded attempt chain.
 ```text
 best-match reviewer
   ├── complete and accepted ──> consolidate
+  ├── complete but rejected ──> fallback without fragment promotion
   ├── incomplete ─────────────> fragment extraction ──> fallback
   └── unavailable/invalid ────> fallback
 ```
+
+A contract-complete response rejected by a later mutation, identity, policy,
+conversation, provider, or transport gate is not an accepted value. Its raw
+evidence and rejection remain persisted, but none of its content is promoted
+as a valid fragment. If another authorized route remains, orchestration
+restages the original frozen packet and continues; otherwise the chain ends
+`unavailable`.
 
 The fallback reviewer receives:
 
@@ -313,7 +478,8 @@ Every fallback attempt records:
 
 - the attempt it follows;
 - the reason for fallback;
-- whether it replaces an invalid result or complements an incomplete one;
+- whether it replaces an unavailable, invalid, or complete-but-rejected result,
+  or complements an incomplete one;
 - which fragments it confirmed, disputed, replaced, or added;
 - its own provider, model, policy, request, response, and receipt evidence.
 
@@ -358,12 +524,21 @@ its own typed response, and appears as another attempt with its own receipt.
 
 ### Effective verdict
 
-- `approved`: at least one complete accepted attempt exists, required coverage
-  is complete, no unresolved material finding exists, and the receipt verifies;
-- `changes-requested`: a material finding remains active in any valid fragment
-  or complete attempt;
-- `needs-adjudication`: valid attempts materially disagree;
-- `unavailable`: bounded routes were exhausted without complete coverage.
+The consolidator evaluates these conditions in order and selects exactly one:
+
+1. `changes-requested` when an undisputed, unreplaced, unresolved material
+   finding remains active in any valid fragment or complete attempt;
+2. `needs-adjudication` when no such finding exists but valid attempts retain a
+   material disagreement without an independently verified resolution;
+3. `approved` when at least one complete accepted attempt exists, required
+   coverage is complete, no unresolved material finding or disagreement exists,
+   and the receipt verifies;
+4. `unavailable` otherwise, including route exhaustion, incomplete coverage,
+   or a complete response rejected by mutation, identity, policy, transport, or
+   another acceptance gate.
+
+Lower-priority conditions remain visible in findings, disagreements, gaps, and
+attempt outcomes even when a higher-priority verdict is selected.
 
 `assurance` is independently `standard` or `degraded`. A review completed
 through an allowed lower-assurance fallback can therefore be
@@ -397,6 +572,51 @@ Private source, credentials, raw responses, model rosters, and organization-only
 qualification evidence remain subject to export policy and are not implied by a
 federation bundle.
 
+### Project and origin identity
+
+A project carries a stable, non-secret `ProjectId`; repository paths,
+worktrees, remotes, and machine names are aliases rather than identity. Eloísa
+and Amélia may use the same `ProjectId` and `ActorId` while retaining distinct
+`OriginId` values and append-only origin sequences. Two origins owned by one
+actor are not two independent human reviewers.
+
+The repository may carry only portable, non-secret identity and project review
+requirements in `.reviewctl/project.toml`. Journals, raw evidence, signing keys,
+backend setup, and credentials remain outside the source repository.
+
+Each machine writes its own local journal. Imported facts preserve the original
+`OriginId`, sequence, event identity, signature, and causal links. Import is
+idempotent and rejects an event identity reused with different bytes.
+
+### Portable exchange
+
+reviewctl owns a self-contained, signed `ReviewExchangeBundle` format. It may
+contain a project/case manifest, receipts, review events, consolidations,
+signatures, and export-policy-permitted blobs. Omitted or sealed blobs remain
+explicit; importing a summary bundle never implies possession of raw source or
+responses.
+
+The core exchange interface is transport-neutral:
+
+```text
+EvidenceExchange
+├── export(project, cursor, exportPolicy) -> SignedBundle
+├── inspect(bundle) -> BundleSummary
+└── import(bundle, trustPolicy) -> ImportResult
+```
+
+Initial sharing is manual file export/import. Optional later transports may
+publish, fetch, and list opaque bundle bytes. Potzal is one possible artifact
+transport and store: it may retain and distribute a complete
+ReviewExchangeBundle as an immutable generic artifact, but reviewctl never
+depends on Potzal types, catalogs, lifecycle, availability, or validity
+decisions. Filesystem, removable media, a private object store, or a future
+protocol adapter remain possible.
+
+No transport decides whether a review is valid, accepted, independent,
+consolidable, or waived. There is no multi-primary review database, remote
+execution, or automatic synchronization in the stabilization phase.
+
 ## Waivers and Critical Changes
 
 A waiver is a substitution record, not an absence of review.
@@ -421,6 +641,21 @@ result remains unavailable rather than approved.
 
 The first implementation should deepen existing commands rather than add a
 parallel review client.
+
+Project identity and manual exchange use explicit commands:
+
+```text
+reviewctl project init --project-id ID
+reviewctl project show --format human|json
+reviewctl exchange export --project ID --output BUNDLE
+reviewctl exchange inspect BUNDLE --format human|json
+reviewctl exchange import BUNDLE
+```
+
+`project init` writes only the non-secret project identity after explicit user
+invocation. `exchange inspect` does not import or trust a bundle. Import verifies
+the bundle, signature, origin continuity, export classification, and local trust
+policy before appending any event.
 
 ### `reviewctl run`
 
@@ -470,7 +705,8 @@ that reports without exposing secrets:
 
 - executable and version;
 - config and policy discoverability;
-- available transports and required binaries;
+- available execution backends and required binaries;
+- discovered backend capabilities and their qualification status;
 - evidence-root writability;
 - whether the user-local binary directory is in `PATH`;
 - detected Cursor, Codex, Pi, and Claude instruction locations and contract
@@ -484,15 +720,17 @@ checks fail.
 
 ### Phase 0: Baseline
 
-Inventory current local and Amélia installations, paths, versions, global
-instructions for all four supported agents, project pointers, and representative
-tasks. Record baseline CLI and receipt fixtures.
+Inventory current local and Amélia installations independently: paths,
+versions, global instructions for all four supported agents, executable
+backends, observed capabilities, project pointers, and representative tasks.
+Record baseline CLI and receipt fixtures. Do not dispatch between machines.
 
 ### Phase 1: Stabilize
 
 Implement additive result types, partial evaluation, fallback relationships,
-consolidation, diagnostics, and compatibility tests. Do not change global agent
-requirements yet.
+consolidation, the backend seam, local setup diagnostics, deterministic local
+journals, and manual ReviewExchangeBundle export/import. Defer transport-backed
+and automatic federation. Do not change global agent requirements yet.
 
 ### Phase 2: Document
 
@@ -502,6 +740,8 @@ Update:
 - installation and Amélia discovery guidance;
 - Cursor, Codex, Pi, and Claude compatibility and instruction-rendering
   guidance;
+- backend capability, read-only execution, and native-adapter guidance;
+- local setup and manual ReviewExchangeBundle guidance;
 - the reusable project-integration template;
 - migration guidance from direct `llm-review` or copied model rosters.
 
@@ -521,6 +761,27 @@ loads the expected contract digest. Do not hand-maintain four semantic copies.
 During this phase, failures are collected as stabilization evidence rather than
 treated as universal blockers.
 
+The advisory rollout stores each workflow defect as a typed local journal
+event:
+
+```text
+WorkflowDefect
+├── defectId
+├── severity: critical | high | medium | low
+├── affectedVersion
+├── reproduction
+├── status: open | resolved | superseded
+└── resolutionEvidence[]
+```
+
+`critical` means the defect can produce false approval, unauthorized source
+disclosure, credential disclosure, or destructive mutation of the source
+checkout. `high` means it can corrupt or lose durable evidence, or prevent a
+claimed-supported backend from completing its documented bounded flow.
+Resolution evidence names the regression test or synthetic reproduction, its
+result, and the candidate version/commit. `superseded` additionally names the
+replacement defect or design event.
+
 ### Phase 4: Enforced global instruction
 
 After representative local and Amélia tasks pass, require a persisted
@@ -536,6 +797,10 @@ Project-specific hard gates remain stricter where defined.
   synthetic merge of incomplete attempts.
 - Consolidated findings may include valid fragments from earlier incomplete
   attempts, each with provenance.
+- Existing transport names remain accepted aliases while their implementations
+  move behind the backend seam.
+- Exchange and Potzal integration are optional and cannot change local receipt
+  verification.
 - Project instructions continue to reference the reusable integration guide and
   do not embed current model rosters or provider prices.
 
@@ -566,6 +831,11 @@ must persist the bounded attempt state first when safe to do so.
   not enter project instructions or public receipts.
 - Global instructions name behavior and authority, not provider secrets or
   model tables.
+- Formal review backends operate against frozen or disposable source and fail
+  acceptance when an unexpected mutation is observed.
+- Editable attempts cannot be promoted into review attempts or approvals.
+- Exchange bundles disclose only fields and blobs permitted by export policy;
+  transports receive opaque bytes and locators, never backend credentials.
 
 ## Testing Strategy
 
@@ -598,7 +868,35 @@ must persist the bounded attempt state first when safe to do so.
 - old receipts still verify;
 - existing top-level fields retain meaning;
 - `help-llm` schema changes are additive;
-- human CLI output remains script-safe where currently documented.
+- human CLI output remains script-safe where currently documented;
+- legacy `llm`, `openrouter`, `agy`, `pi`, and `codex` invocations preserve
+  their receipt meaning through backend adapters.
+
+### Backend conformance tests
+
+- Pi, Codex, Cursor, Claude, and Antigravity noninteractive invocation through
+  their declared supported modes;
+- unavailable executable, unauthenticated login, timeout, empty output, and
+  malformed structured output;
+- requested versus observed model/provider identity and degraded assurance;
+- read-only enforcement or disposable-copy isolation and mutation detection;
+- a negative source-root probe proving that an absolute-path write outside the
+  staging area is denied for every formally supported backend/platform pair;
+- adapter version and capability qualification bound to a synthetic fixture;
+- Pi preference only when it preserves the route's required capabilities;
+- editable attempts produce patches/commits but never accepted review fields.
+
+### Exchange tests
+
+- deterministic self-contained bundle identity;
+- signature and trust-policy verification before journal append;
+- idempotent repeated import and conflicting-event rejection;
+- per-origin monotonic sequence and preserved causal links;
+- summary-only, sealed-blob, and full-evidence export policies;
+- identical consolidated projection after importing the same origin streams in
+  different orders;
+- filesystem transport first; optional Potzal transport treats the bundle as
+  opaque and is not required for local verification.
 
 ### Environment tests
 
@@ -614,6 +912,8 @@ must persist the bounded attempt state first when safe to do so.
   and a reference to the canonical contract rather than a second semantic copy;
 - each agent can run `help-llm --format json`, `doctor --format json`, and a
   synthetic best-match/fallback smoke test;
+- setup discovery remains machine-local and reports no secrets;
+- Eloísa and Amélia may expose different backend sets under the same schema;
 - representative project reviews with project-specific triggers;
 - no secrets in diagnostics, receipts, logs, or instruction files.
 
@@ -624,15 +924,31 @@ The design is ready for global enforcement only when:
 1. local and Amélia installations expose the same supported CLI and help schema;
 2. representative Cursor, Codex, Pi, and Claude tasks discover and invoke
    `reviewctl` without hard-coded repository paths or divergent semantics;
-3. incomplete responses contribute validated fragments to a later fallback;
-4. consolidated output retains exact provenance and disagreements;
-5. no incomplete attempt is accepted;
-6. degraded assurance is visible and critical changes require human
+3. on a machine where Cursor is the only available LLM access path and its
+   native execution backend has passed conformance, a human or any supported
+   invoking agent can complete a bounded local review with honest identity and
+   assurance fields;
+4. incomplete responses contribute validated fragments to a later fallback;
+5. consolidated output retains exact provenance and disagreements;
+6. no incomplete attempt is accepted;
+7. degraded assurance is visible and critical changes require human
    authorization;
-7. old receipts verify and existing project integrations remain compatible;
-8. expected errors provide machine-readable recovery without tracebacks;
-9. the full test suite, lint, public-distribution checks, and formal review pass;
-10. the advisory rollout produces no unresolved high-impact workflow defects.
+8. old receipts verify and existing project integrations remain compatible;
+9. expected errors provide machine-readable recovery without tracebacks;
+10. formal review cannot mutate the reviewed source, while editable execution
+    remains a separate non-approval artifact;
+11. local setup on Eloísa and Amélia requires no remote dispatch or shared
+    credentials;
+12. the candidate commit passes the repository-versioned commands
+    `uv run pytest` and `uv run ruff check .`; every backend claimed supported
+    has a passing conformance case in that committed test suite and a receipt
+    bound to the candidate commit or one of its ancestors;
+13. a formal findings-json review of the candidate commit is accepted, its
+    receipt verifies, and every reported material finding is resolved or
+    independently rejected with recorded evidence;
+14. every advisory `WorkflowDefect` classified `critical` or `high` has status
+    `resolved` or `superseded` and satisfies the required `resolutionEvidence`;
+    none remains open, merely acknowledged, or deferred at global enforcement.
 
 Compatibility means equivalent review behavior and evidence, not identical
 agent UX. Failure of one agent adapter does not authorize changing receipt
@@ -646,4 +962,8 @@ semantics for that agent.
 - treating fallback consensus as proof that a finding is true;
 - replacing project tests, source inspection, runtime evidence, or human
   authorization;
-- deploying a networked review service in this phase.
+- deploying a networked review service in this phase;
+- dispatching review execution to another machine;
+- requiring Potzal or any other federation transport for local correctness;
+- automatic cross-machine synchronization in the stabilization phase;
+- treating two machines owned by one actor as independent human approval.
