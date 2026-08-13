@@ -773,6 +773,12 @@ def test_partial_findings_follow_the_actual_route_fallback(
 
     assert return_code == 0
     assert [request.model for request in requests] == ["route-one", "route-two"]
+    encoded_context = (
+        requests[1]
+        .prompt.split("<reviewctl-completion-context>\n", 1)[1]
+        .split("\n</reviewctl-completion-context>", 1)[0]
+    )
+    assert json.loads(encoded_context)["fileNames"] == ["source.py"]
     assert receipt["fallbackRelationships"][0]["kind"] == "route-fallback"
     assert receipt["fallbackRelationships"][0]["reason"] == "contract-incomplete"
     log = Path(receipt["logging"]["path"]).read_text()

@@ -489,7 +489,11 @@ def test_build_completion_context_deduplicates_content_but_preserves_provenance(
     second = promoted(finding(), attempt=1, route_index=0)
     evaluation = incomplete_evaluation(finding())
 
-    context = build_completion_context(evaluation.completion_request, (*first, *second))
+    context = build_completion_context(
+        evaluation.completion_request,
+        (*first, *second),
+        allowed_file_names=("source.py",),
+    )
 
     assert isinstance(context, CompletionContext)
     assert context.prepared_digest == evaluation.prepared_digest
@@ -500,11 +504,47 @@ def test_build_completion_context_deduplicates_content_but_preserves_provenance(
     assert context.missing_fields == evaluation.completion_request.missing_fields
     assert context.invalid_fragment_indexes == ()
     assert context.violations == ("response-fields",)
+    assert context.to_dict()["fileNames"] == ["source.py"]
+
+
+def test_build_completion_context_rejects_findings_outside_target_scope() -> None:
+    evaluation = incomplete_evaluation(finding(path="foreign.py"))
+    fragments = promote_fragments(
+        evaluation,
+        gate_result="contract-incomplete",
+        attempt=1,
+        route_index=0,
+        raw_response_digest=evaluation.payload_digest,
+    )
+
+    with pytest.raises(ValueError, match="target review scope"):
+        build_completion_context(
+            evaluation.completion_request,
+            fragments,
+            allowed_file_names=("source.py",),
+        )
+
+
+@pytest.mark.parametrize(
+    "allowed_file_names",
+    [(), [], ("",), ("source.py", "source.py"), ("z.py", "a.py"), "source.py"],
+)
+def test_build_completion_context_requires_canonical_target_scope(
+    allowed_file_names: object,
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+
+    with pytest.raises(ValueError, match="allowed file names"):
+        build_completion_context(
+            evaluation.completion_request,
+            (),
+            allowed_file_names=allowed_file_names,  # type: ignore[arg-type]
+        )
 
 
 def test_build_completion_context_requires_a_typed_gap_manifest() -> None:
     with pytest.raises(ValueError, match="completion request"):
-        build_completion_context(None, ())
+        build_completion_context(None, (), allowed_file_names=("source.py",))
 
 
 @pytest.mark.parametrize(
@@ -531,7 +571,11 @@ def test_build_completion_context_rejects_invalid_promoted_fragment_identity(
     fragment = replace(promoted(finding())[0], **{field: value})
 
     with pytest.raises(ValueError, match="^invalid promoted fragment identity$"):
-        build_completion_context(evaluation.completion_request, (fragment,))
+        build_completion_context(
+            evaluation.completion_request,
+            (fragment,),
+            allowed_file_names=("source.py",),
+        )
 
 
 @pytest.mark.parametrize(
@@ -561,7 +605,9 @@ def test_completion_context_orders_unique_content_by_first_canonical_source() ->
     evaluation = incomplete_evaluation(finding())
 
     context = build_completion_context(
-        evaluation.completion_request, tuple(reversed((*earlier, *later)))
+        evaluation.completion_request,
+        tuple(reversed((*earlier, *later))),
+        allowed_file_names=("source.py",),
     )
 
     assert [item.finding["title"] for item in context.findings] == ["Zed", "Alpha"]
@@ -592,7 +638,11 @@ def test_render_completion_prompt_contains_only_bounded_canonical_context() -> N
         route_index=0,
         raw_response_digest=evaluation.payload_digest,
     )
-    context = build_completion_context(evaluation.completion_request, fragments)
+    context = build_completion_context(
+        evaluation.completion_request,
+        fragments,
+        allowed_file_names=("source.py",),
+    )
 
     prompt = render_completion_prompt("Review the packet.", context)
 
@@ -626,7 +676,11 @@ def test_render_completion_prompt_escapes_framing_and_instruction_injection_reve
         route_index=0,
         raw_response_digest=evaluation.payload_digest,
     )
-    context = build_completion_context(evaluation.completion_request, fragments)
+    context = build_completion_context(
+        evaluation.completion_request,
+        fragments,
+        allowed_file_names=("source.py",),
+    )
 
     prompt = render_completion_prompt("Review the packet.", context)
 
@@ -873,6 +927,67 @@ def test_promote_fragments_rejects_non_finding_kind() -> None:
 
 def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> None:
     assert validate_v2_receipt(v2_findings_receipt()) == ()
+
+
+@pytest.mark.parametrize("attempt_index", [0, 1])
+def test_validate_v2_receipt_requires_raw_response_for_contract_evaluation(
+    attempt_index: int,
+) -> None:
+    receipt = v2_findings_receipt()
+    receipt["attempts"][attempt_index]["rawResponse"] = None
+    _sign_receipt(receipt)
+
+    violations = validate_v2_receipt(receipt)
+
+    assert "raw-response" in violations
+    assert "contract-evaluation" in violations
+
+
+def test_validate_v2_receipt_binds_contract_payload_to_raw_response_digest() -> None:
+    receipt = v2_findings_receipt()
+    receipt["attempts"][1]["rawResponse"]["sha256"] = "0" * 64
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_requires_raw_response_for_evaluation_error() -> None:
+    receipt = v2_invalid_findings_receipt()
+    attempt = receipt["attempts"][0]
+    attempt.pop("contractEvaluation")
+    attempt["evaluationError"] = {
+        "type": "ValueError",
+        "message": "response data could not be evaluated safely",
+    }
+    attempt["rawResponse"] = None
+    _sign_receipt(receipt)
+
+    violations = validate_v2_receipt(receipt)
+
+    assert "raw-response" in violations
+    assert "contract-evaluation" in violations
+
+
+@pytest.mark.parametrize(
+    "contract_identity",
+    [None, {}, {"name": "hostile", "version": "1"}, {"name": "findings-json", "version": "999"}],
+)
+def test_validate_v2_receipt_requires_exact_native_contract_identity_before_gates(
+    contract_identity: object,
+) -> None:
+    receipt = v2_invalid_findings_receipt()
+    attempt = receipt["attempts"][0]
+    attempt.pop("contractEvaluation")
+    attempt["rawResponse"] = None
+    attempt["result"] = "timeout"
+    attempt["exitCode"] = 124
+    if contract_identity is None:
+        receipt.pop("contract")
+    else:
+        receipt["contract"] = contract_identity
+    _sign_receipt(receipt)
+
+    assert "review-contract" in validate_v2_receipt(receipt)
 
 
 @pytest.mark.parametrize(

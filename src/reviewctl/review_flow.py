@@ -234,6 +234,7 @@ class CompletionFinding:
 class CompletionContext:
     prepared_digest: str
     packet_digest: str | None
+    file_names: tuple[str, ...]
     missing_fields: tuple[str, ...]
     invalid_fragment_indexes: tuple[int, ...]
     violations: tuple[str, ...]
@@ -243,6 +244,7 @@ class CompletionContext:
         return {
             "preparedDigest": self.prepared_digest,
             "packetDigest": self.packet_digest,
+            "fileNames": list(self.file_names),
             "gapManifest": {
                 "missingFields": list(self.missing_fields),
                 "invalidFragmentIndexes": list(self.invalid_fragment_indexes),
@@ -349,15 +351,34 @@ def promote_fragments(
 def build_completion_context(
     request: ContractCompletionRequest | None,
     promoted_fragments: tuple[PromotedFragment, ...],
+    *,
+    allowed_file_names: tuple[str, ...] | list[str],
 ) -> CompletionContext:
     """Build a deterministic, prompt-safe view of typed fragments and contract gaps."""
     if request is None:
         raise ValueError("completion context requires a contract completion request")
+    if (
+        type(allowed_file_names) not in {tuple, list}
+        or not allowed_file_names
+        or any(
+            type(file_name) is not str
+            or not file_name.strip()
+            or file_name in {".", ".."}
+            or "/" in file_name
+            or "\\" in file_name
+            for file_name in allowed_file_names
+        )
+        or list(allowed_file_names) != sorted(set(allowed_file_names))
+    ):
+        raise ValueError("completion context requires canonical allowed file names")
+    target_file_names = tuple(allowed_file_names)
     validated: list[tuple[PromotedFragment, dict[str, Any]]] = []
     for fragment in promoted_fragments:
         finding = _validated_promoted_finding(fragment)
         if finding is None:
             raise ValueError("invalid promoted fragment identity")
+        if finding["path"] not in target_file_names:
+            raise ValueError("promoted finding is outside target review scope")
         validated.append((fragment, finding))
     ordered = sorted(validated, key=lambda item: (item[0].source_attempt, item[0].fragment_id))
     grouped: dict[str, list[tuple[PromotedFragment, dict[str, Any]]]] = {}
@@ -374,6 +395,7 @@ def build_completion_context(
     return CompletionContext(
         prepared_digest=request.prepared_digest,
         packet_digest=request.packet_digest,
+        file_names=target_file_names,
         missing_fields=tuple(request.missing_fields),
         invalid_fragment_indexes=tuple(request.invalid_fragment_indexes),
         violations=tuple(request.violations),
@@ -712,14 +734,18 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     if not isinstance(review_contract, str) or review_contract not in SUPPORTED_RESPONSE_CONTRACTS:
         reject("review-contract")
     contract_identity = receipt.get("contract")
+    findings_contract_definition = get_contract("findings-json")
     native_findings_identity = (
-        type(contract_identity) is dict and contract_identity.get("name") == "findings-json"
+        type(contract_identity) is dict
+        and set(contract_identity) == {"name", "version"}
+        and contract_identity.get("name") == findings_contract_definition.name
+        and contract_identity.get("version") == findings_contract_definition.version
     )
     if native_findings_identity and review_contract != "findings-json":
         reject("review-contract")
     if review_contract == "findings-json" and not native_findings_identity:
         reject("review-contract")
-    findings_contract = native_findings_identity or review_contract == "findings-json"
+    findings_contract = review_contract == "findings-json"
     all_promoted: list[PromotedFragment] = []
     promoted_provenance: set[tuple[str, int]] = set()
     promoted_attempts_by_id: dict[str, set[int]] = {}
@@ -748,6 +774,11 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 reject("raw-response")
             else:
                 raw_digest = raw["sha256"]
+        evaluation = attempt.get("contractEvaluation")
+        evaluation_error = attempt.get("evaluationError")
+        if findings_contract and (evaluation is not None or evaluation_error is not None):
+            if raw_digest is None:
+                reject("raw-response")
 
         route_index = attempt.get("routeIndex")
         route: dict[str, Any] | None = None
@@ -774,7 +805,6 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             else:
                 route = routes[route_index]
 
-        evaluation = attempt.get("contractEvaluation")
         contract_fragments: list[dict[str, Any]] = []
         evaluation_status: object = None
         promotion_eligible = False
@@ -809,7 +839,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and evaluation.get("version") == contract_identity.get("version")
                     and _is_sha256(evaluation.get("preparedSha256"))
                     and _is_sha256(payload_digest)
-                    and (raw_digest is None or raw_digest == payload_digest)
+                    and raw_digest is not None
+                    and raw_digest == payload_digest
                     and isinstance(violations_value, list)
                     and all(isinstance(item, str) for item in violations_value)
                     and evaluation_status in {"complete", "incomplete", "invalid"}
@@ -1018,7 +1049,6 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             promoted_provenance.add(provenance_key)
             promoted_attempts_by_id.setdefault(fragment.fragment_id, set()).add(index)
             all_promoted.append(fragment)
-        evaluation_error = attempt.get("evaluationError")
         if findings_contract and evaluation_error is not None:
             if not (
                 type(evaluation_error) is dict
@@ -1027,6 +1057,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 and bool(evaluation_error["type"].strip())
                 and isinstance(evaluation_error.get("message"), str)
                 and bool(evaluation_error["message"].strip())
+                and raw_digest is not None
                 and evaluation is None
                 and attempt.get("result") == "incomplete"
                 and promoted_value == []
