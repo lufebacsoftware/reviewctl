@@ -1549,30 +1549,46 @@ def reap_process(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def reap_process_without_blocking(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.wait(timeout=0)
+    except subprocess.TimeoutExpired:
+        threading.Thread(
+            target=reap_process,
+            args=(process,),
+            daemon=True,
+            name=f"reviewctl-reap-{process.pid}",
+        ).start()
+    except (ChildProcessError, OSError):
+        pass
+
+
 def terminate_process_group(process: subprocess.Popen[bytes], *, grace_seconds: float = 5) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        if grace_seconds <= 0:
-            os.killpg(process.pid, signal.SIGKILL)
-            try:
-                process.wait(timeout=0)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                threading.Thread(
-                    target=reap_process,
-                    args=(process,),
-                    daemon=True,
-                    name=f"reviewctl-reap-{process.pid}",
-                ).start()
-            return
-        process.wait(timeout=grace_seconds)
     except ProcessLookupError:
+        reap_process_without_blocking(process)
         return
+    if grace_seconds <= 0:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        reap_process_without_blocking(process)
+        return
+    try:
+        process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
             process.wait(timeout=1)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            return
+        except subprocess.TimeoutExpired:
+            reap_process_without_blocking(process)
+        except (ChildProcessError, OSError):
+            pass
 
 
 def packet_prompt(prompt: str, files: list[Path], response_contract: str = "verdict") -> str:

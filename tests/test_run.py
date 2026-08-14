@@ -5636,12 +5636,16 @@ def test_terminate_process_group_handles_missing_and_stubborn_processes(
 ) -> None:
     class MissingProcess:
         pid = 1
+        waited = False
 
         def wait(self, timeout: int | None = None) -> None:
-            raise AssertionError("wait should not run after ProcessLookupError")
+            assert timeout == 0
+            self.waited = True
 
     monkeypatch.setattr(cli.os, "killpg", lambda *_: (_ for _ in ()).throw(ProcessLookupError()))
-    cli.terminate_process_group(MissingProcess())
+    missing = MissingProcess()
+    cli.terminate_process_group(missing)
+    assert missing.waited is True
 
     signals: list[int] = []
 
@@ -5662,7 +5666,8 @@ def test_terminate_process_group_handles_missing_and_stubborn_processes(
         pid = 3
 
         def wait(self, timeout: int | None = None) -> None:
-            assert timeout is not None
+            if timeout is None:
+                return
             raise subprocess.TimeoutExpired("llm", timeout)
 
     signals.clear()
@@ -5684,6 +5689,26 @@ def test_terminate_process_group_handles_missing_and_stubborn_processes(
     cli.terminate_process_group(DeferredReapProcess(), grace_seconds=0)
     assert signals == [cli.signal.SIGTERM, cli.signal.SIGKILL]
     assert reaped.wait(timeout=1)
+
+    race_signals: list[int] = []
+
+    def exit_between_signals(_pid: int, value: int) -> None:
+        race_signals.append(value)
+        if value == cli.signal.SIGKILL:
+            raise ProcessLookupError
+
+    class TerminatedProcess:
+        pid = 5
+        waits: list[int | None] = []
+
+        def wait(self, timeout: int | None = None) -> None:
+            self.waits.append(timeout)
+
+    monkeypatch.setattr(cli.os, "killpg", exit_between_signals)
+    terminated = TerminatedProcess()
+    cli.terminate_process_group(terminated, grace_seconds=0)
+    assert race_signals == [cli.signal.SIGTERM, cli.signal.SIGKILL]
+    assert terminated.waits == [0]
 
 
 def test_seal_failure_and_cli_runtime_error_are_reported(
