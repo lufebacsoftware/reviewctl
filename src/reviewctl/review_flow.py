@@ -42,6 +42,9 @@ RECEIPT_RESULT_VIEW_FIELDS = {
     "product-judge-json": frozenset({"review"}),
 }
 RECEIPT_RESULT_VIEW_FIELD_NAMES = frozenset().union(*RECEIPT_RESULT_VIEW_FIELDS.values())
+RECEIPT_NON_ROOT_FIELDS = frozenset(
+    {"contractEvaluation", "evaluationError", "promotedFragments", "completionRequest"}
+)
 SUPPORTED_RESPONSE_CONTRACTS = frozenset(RECEIPT_CONTRACT_VERSIONS)
 SUPPORTED_ATTEMPT_RESULTS = frozenset(
     {
@@ -1225,6 +1228,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     receipt_schema_version = receipt.get("receiptSchemaVersion")
     if type(receipt_schema_version) is not int or receipt_schema_version != 2:
         reject("receipt-schema-version")
+    if RECEIPT_NON_ROOT_FIELDS.intersection(receipt):
+        reject("receipt-field-location")
 
     source_class = receipt.get("sourceClass")
     source_file_names = _receipt_source_file_names(receipt)

@@ -2149,14 +2149,48 @@ def test_validate_v2_receipt_rejects_extra_typed_record_keys(record: str, violat
     assert violation in validate_v2_receipt(receipt)
 
 
+@pytest.mark.parametrize("review_contract", ["document", "product-review-json", "findings-json"])
 @pytest.mark.parametrize("location", ["receipt", "attempt"])
-def test_validate_v2_receipt_preserves_compatible_extension_fields(location: str) -> None:
-    receipt = v2_findings_receipt()
+def test_validate_v2_receipt_preserves_compatible_extension_fields(
+    review_contract: str,
+    location: str,
+) -> None:
+    receipt = (
+        v2_findings_receipt()
+        if review_contract == "findings-json"
+        else v2_legacy_receipt(review_contract)
+    )
     target = receipt if location == "receipt" else receipt["attempts"][0]
     target["extension.example"] = {"version": 1}
     _sign_receipt(receipt)
 
     assert validate_v2_receipt(receipt) == ()
+
+
+@pytest.mark.parametrize("review_contract", ["document", "product-review-json", "findings-json"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("contractEvaluation", {}),
+        ("evaluationError", {"type": "ValueError", "message": "synthetic"}),
+        ("promotedFragments", []),
+        ("completionRequest", {}),
+    ],
+)
+def test_validate_v2_receipt_rejects_attempt_only_fields_at_root(
+    review_contract: str,
+    field: str,
+    value: object,
+) -> None:
+    receipt = (
+        v2_findings_receipt()
+        if review_contract == "findings-json"
+        else v2_legacy_receipt(review_contract)
+    )
+    receipt[field] = value
+    _sign_receipt(receipt)
+
+    assert validate_v2_receipt(receipt) == ("receipt-field-location",)
 
 
 @pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
