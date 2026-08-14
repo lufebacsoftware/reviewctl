@@ -19,6 +19,7 @@ from reviewctl.review_flow import (
     ConsolidatedReview,
     FallbackRelationship,
     PromotedFragment,
+    _receipt_canonical_digest,
     _receipt_coverage,
     consolidate,
     promote_fragments,
@@ -33,6 +34,11 @@ from reviewctl.review_flow import (
 
 class ReceiptVersionInt(int):
     pass
+
+
+class RecursiveProductReview(dict):
+    def values(self):
+        raise RecursionError("hostile recursive product review")
 
 
 def build_completion_context(
@@ -2935,6 +2941,160 @@ def test_validate_v2_receipt_requires_exact_integer_schema_version(version: obje
     _sign_receipt(receipt)
 
     assert "receipt-schema-version" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_product_receipt_contains_recursive_serialization_failure() -> None:
+    receipt = v2_legacy_receipt("product-review-json")
+    receipt["review"] = RecursiveProductReview(receipt["review"])
+
+    violations = validate_v2_receipt(receipt)
+
+    assert "receipt-digest" in violations
+    assert "accepted-attempt" in violations
+
+
+def test_validate_v2_product_receipt_rejects_actual_cycle_without_hanging() -> None:
+    receipt = v2_legacy_receipt("product-review-json")
+    review = dict(receipt["review"])
+    review["cycle"] = review
+    receipt["review"] = review
+
+    violations = validate_v2_receipt(receipt)
+
+    assert "receipt-digest" in violations
+    assert "accepted-attempt" in violations
+
+
+def test_receipt_canonical_digest_contains_recursion_error() -> None:
+    assert _receipt_canonical_digest(RecursiveProductReview()) is None
+
+
+@pytest.mark.parametrize("kind", ["float", "bool", "subclass"])
+@pytest.mark.parametrize(
+    ("location", "base", "violation"),
+    [
+        ("attempt-number", 1, "attempt-numbering"),
+        ("accepted-attempt", 2, "accepted-attempt"),
+        ("attempt-route", 0, "attempt-route"),
+        ("fallback-from", 1, "fallback-relationships"),
+        ("fallback-to", 2, "fallback-relationships"),
+        ("invalid-index", 0, "contract-evaluation"),
+        ("promoted-source", 1, "promoted-fragments"),
+        ("promoted-route", 0, "promoted-fragments"),
+        ("promoted-line", 3, "promoted-fragments"),
+        ("raw-characters", 100, "raw-response"),
+        ("consolidated-accepted", 2, "consolidated-review"),
+        ("consolidated-line", 3, "consolidated-review"),
+        ("consolidated-source", 1, "consolidated-review"),
+        ("consolidated-route", 0, "consolidated-review"),
+    ],
+)
+def test_validate_v2_receipt_requires_exact_structural_integer_types(
+    location: str,
+    base: int,
+    violation: str,
+    kind: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    hostile: object
+    if kind == "float":
+        hostile = float(base)
+    elif kind == "bool":
+        hostile = bool(base)
+    else:
+        hostile = ReceiptVersionInt(base)
+
+    first = receipt["attempts"][0]
+    relationship = receipt["fallbackRelationships"][0]
+    promoted = first["promotedFragments"][0]
+    consolidated = receipt["consolidatedReview"]
+    consolidated_finding = consolidated["findings"][0]
+    consolidated_source = consolidated_finding["sources"][0]
+    if location == "attempt-number":
+        first["number"] = hostile
+    elif location == "accepted-attempt":
+        receipt["acceptedAttempt"] = hostile
+    elif location == "attempt-route":
+        first["routeIndex"] = hostile
+    elif location == "fallback-from":
+        relationship["fromAttempt"] = hostile
+    elif location == "fallback-to":
+        relationship["toAttempt"] = hostile
+    elif location == "invalid-index":
+        first["contractEvaluation"]["completionRequest"]["invalidFragmentIndexes"] = [hostile]
+    elif location == "promoted-source":
+        promoted["sourceAttempt"] = hostile
+    elif location == "promoted-route":
+        promoted["routeIndex"] = hostile
+    elif location == "promoted-line":
+        promoted["finding"] = {**promoted["finding"], "line": hostile}
+    elif location == "raw-characters":
+        first["rawResponse"]["characters"] = hostile
+    elif location == "consolidated-accepted":
+        consolidated["acceptedAttempt"] = hostile
+    elif location == "consolidated-line":
+        consolidated_finding["finding"] = {
+            **consolidated_finding["finding"],
+            "line": hostile,
+        }
+    elif location == "consolidated-source":
+        consolidated_source["attempt"] = hostile
+    else:
+        consolidated_source["routeIndex"] = hostile
+    _sign_receipt(receipt)
+
+    assert violation in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("location", "value", "violation"),
+    [
+        ("attempt-number", 0, "attempt-numbering"),
+        ("attempt-number", -1, "attempt-numbering"),
+        ("accepted-attempt", 0, "accepted-attempt"),
+        ("accepted-attempt", -1, "accepted-attempt"),
+        ("attempt-route", -1, "attempt-route"),
+        ("fallback-from", 0, "fallback-relationships"),
+        ("fallback-to", 0, "fallback-relationships"),
+        ("invalid-index", -1, "contract-evaluation"),
+        ("promoted-source", 0, "promoted-fragments"),
+        ("promoted-route", -1, "promoted-fragments"),
+        ("promoted-line", 0, "promoted-fragments"),
+        ("raw-characters", -1, "raw-response"),
+    ],
+)
+def test_validate_v2_receipt_enforces_structural_integer_ranges(
+    location: str,
+    value: int,
+    violation: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    first = receipt["attempts"][0]
+    relationship = receipt["fallbackRelationships"][0]
+    promoted = first["promotedFragments"][0]
+    if location == "attempt-number":
+        first["number"] = value
+    elif location == "accepted-attempt":
+        receipt["acceptedAttempt"] = value
+    elif location == "attempt-route":
+        first["routeIndex"] = value
+    elif location == "fallback-from":
+        relationship["fromAttempt"] = value
+    elif location == "fallback-to":
+        relationship["toAttempt"] = value
+    elif location == "invalid-index":
+        first["contractEvaluation"]["completionRequest"]["invalidFragmentIndexes"] = [value]
+    elif location == "promoted-source":
+        promoted["sourceAttempt"] = value
+    elif location == "promoted-route":
+        promoted["routeIndex"] = value
+    elif location == "promoted-line":
+        promoted["finding"] = {**promoted["finding"], "line": value}
+    else:
+        first["rawResponse"]["characters"] = value
+    _sign_receipt(receipt)
+
+    assert violation in validate_v2_receipt(receipt)
 
 
 @pytest.mark.parametrize("reason", ["incomplete", "contract-invalid", "unknown"])

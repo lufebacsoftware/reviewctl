@@ -147,11 +147,11 @@ def receipt_contract_identity(review_contract: str) -> dict[str, str]:
 
 
 def _is_positive_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    return type(value) is int and value > 0
 
 
 def _is_nonnegative_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    return type(value) is int and value >= 0
 
 
 def _valid_completion_manifest(
@@ -1085,8 +1085,34 @@ def _receipt_route(value: object) -> tuple[str, str] | None:
 def _receipt_canonical_digest(value: object) -> str | None:
     try:
         return hashlib.sha256(canonical_json(value)).hexdigest()
-    except (TypeError, ValueError, UnicodeError, OverflowError):
+    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
         return None
+
+
+def _receipt_has_exact_integer_types(value: object) -> bool:
+    pending = [value]
+    seen_containers: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, int) and type(current) not in {bool, int}:
+            return False
+        if not isinstance(current, dict | list | tuple):
+            continue
+        identity = id(current)
+        if identity in seen_containers:
+            continue
+        seen_containers.add(identity)
+        pending.extend(current.values() if isinstance(current, dict) else current)
+    return True
+
+
+def _receipt_canonical_equal(left: object, right: object) -> bool:
+    left_digest = _receipt_canonical_digest(left)
+    return (
+        left_digest is not None
+        and _receipt_has_exact_integer_types(left)
+        and left_digest == _receipt_canonical_digest(right)
+    )
 
 
 def _receipt_product_contract_output(
@@ -1220,7 +1246,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     attempts: list[dict[str, Any]] = attempts_value
     expected_numbers = list(range(1, len(attempts) + 1))
     numbers = [attempt.get("number") for attempt in attempts]
-    if numbers != expected_numbers or any(isinstance(number, bool) for number in numbers):
+    if not all(_is_positive_int(number) for number in numbers) or numbers != expected_numbers:
         reject("attempt-numbering")
 
     routes_value = receipt.get("routes")
@@ -1602,7 +1628,9 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 reject("promoted-fragments")
             else:
                 expected_promoted = reproduced
-        if promoted_value != [fragment.to_dict() for fragment in expected_promoted]:
+        if not _receipt_canonical_equal(
+            promoted_value, [fragment.to_dict() for fragment in expected_promoted]
+        ):
             reject("promoted-fragments")
         else:
             all_promoted.extend(expected_promoted)
@@ -1781,8 +1809,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 normalized is None
                 or accepted is None
                 or verdict != normalized["verdict"]
-                or findings != normalized["findings"]
-                or accepted.get("findings") != findings
+                or not _receipt_canonical_equal(findings, normalized["findings"])
+                or not _receipt_canonical_equal(accepted.get("findings"), findings)
             ):
                 reject("accepted-attempt")
             else:
@@ -1800,7 +1828,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             accepted_attempt if _is_positive_int(accepted_attempt) else None,
             contract_context=consolidation_context,
         ).to_dict()
-        if receipt.get("consolidatedReview") != expected_consolidation:
+        if not _receipt_canonical_equal(receipt.get("consolidatedReview"), expected_consolidation):
             reject("consolidated-review")
 
     return tuple(violations)

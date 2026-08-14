@@ -64,15 +64,26 @@ REVIEWED_FILES_SCHEMA: dict[str, Any] = {
 
 def require_string_json_object_keys(value: object) -> None:
     """Reject Python mappings that JSON would silently coerce into another identity."""
-    pending = [value]
+    pending = [(value, False)]
+    active_containers: set[int] = set()
     while pending:
-        current = pending.pop()
+        current, exiting = pending.pop()
+        if not isinstance(current, dict | list | tuple):
+            continue
+        identity = id(current)
+        if exiting:
+            active_containers.remove(identity)
+            continue
+        if identity in active_containers:
+            raise ValueError("circular JSON value")
+        active_containers.add(identity)
+        pending.append((current, True))
         if isinstance(current, dict):
             if any(type(key) is not str for key in current):
                 raise ValueError("JSON object keys must be strings")
-            pending.extend(current.values())
-        elif isinstance(current, list | tuple):
-            pending.extend(current)
+            pending.extend((item, False) for item in current.values())
+        else:
+            pending.extend((item, False) for item in current)
 
 
 def canonical_json(value: object) -> bytes:
