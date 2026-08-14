@@ -720,6 +720,36 @@ def test_proprietary_kiro_accepts_transport_scoped_policy(tmp_path: Path) -> Non
     assert receipt["extension.kiroUnresolvedIdentityWaiver"] is True
 
 
+def test_proprietary_local_cli_transports_require_policy_and_honor_exact_denials(
+    tmp_path: Path,
+) -> None:
+    fake_gemini = write_fake_gemini(tmp_path)
+    arguments = [
+        *review_arguments(tmp_path, "gemini-3.6-flash"),
+        "--transport",
+        "gemini",
+        "--source-class",
+        "proprietary",
+        "--response-contract",
+        "findings-json",
+    ]
+
+    missing = run_cli(*arguments, env={"GEMINI_BIN": str(fake_gemini)})
+    assert missing.returncode == 2
+    assert "proprietary local transport reviews require --policy" in missing.stderr.lower()
+
+    policy = tmp_path / "denied-gemini.toml"
+    policy.write_text('[models."gemini-3.6-flash"]\nsource_allowed = false\n')
+    denied = run_cli(
+        *arguments,
+        "--policy",
+        str(policy),
+        env={"GEMINI_BIN": str(fake_gemini)},
+    )
+    assert denied.returncode == 2
+    assert "does not allow gemini model gemini-3.6-flash" in denied.stderr.lower()
+
+
 def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_identity(
     tmp_path: Path,
 ) -> None:

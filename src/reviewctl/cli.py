@@ -97,6 +97,7 @@ TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
 ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"}
 LOCAL_POLICY_TRANSPORTS = frozenset({"codex", "gemini", "kiro", "pi"})
+REQUIRED_LOCAL_POLICY_TRANSPORTS = frozenset({"gemini", "kiro", "pi"})
 RETRIABLE_REVIEW_RESULTS = {
     "timeout",
     "transport-failed",
@@ -1578,15 +1579,6 @@ def unresolved_identity_waived(
     policy: dict[str, Any], model: str, *, transport: str | None = None
 ) -> bool:
     return policy_entry(policy, model, transport=transport).get("allow_unresolved_identity") is True
-
-
-def transport_policy_configured(policy: dict[str, Any], transport: str) -> bool:
-    transports = policy.get("transports")
-    return (
-        transport in LOCAL_POLICY_TRANSPORTS
-        and type(transports) is dict
-        and transport in transports
-    )
 
 
 def reap_process(process: subprocess.Popen[bytes]) -> None:
@@ -3851,19 +3843,19 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     if args.policy:
         loaded_policy = load_policy(args.policy)
         policy_digest = policy_sha256(args.policy)
-    kiro_routes = [route for route in routes if route.transport == "kiro"]
+    local_policy_routes = [route for route in routes if route.transport in LOCAL_POLICY_TRANSPORTS]
+    kiro_routes = [route for route in local_policy_routes if route.transport == "kiro"]
     if args.source_class == "proprietary":
-        scoped_routes = [
-            route
-            for route in routes
-            if route.transport == "kiro"
-            or (
-                loaded_policy is not None
-                and transport_policy_configured(loaded_policy, route.transport)
-            )
-        ]
+        scoped_routes = local_policy_routes if loaded_policy is not None else []
         if kiro_routes and loaded_policy is None:
             parser.error("proprietary Kiro reviews require --policy")
+        if (
+            any(
+                route.transport in REQUIRED_LOCAL_POLICY_TRANSPORTS for route in local_policy_routes
+            )
+            and loaded_policy is None
+        ):
+            parser.error("proprietary local transport reviews require --policy")
         for route in scoped_routes:
             if loaded_policy is None or not source_allowed(
                 loaded_policy, route.model, transport=route.transport

@@ -55,6 +55,11 @@ An exact `[models."MODEL_ID"]` entry overrides its transport default. This
 scope is still advisory and does not authorize OpenRouter or make a backend a
 merge gate. The policy file and digest remain part of the receipt.
 
+Gemini, Pi, and Kiro proprietary routes require an explicit policy. Codex
+retains its existing policy-optional proprietary route for backwards
+compatibility; when a policy is supplied, its exact model and transport entries
+are enforced for Codex too.
+
 A formal result requires `receipt.result` to be `accepted`, `acceptedAttempt`
 to name the accepted attempt, successful receipt verification, and independent
 checking of material findings. A missing, empty, unavailable, rejected, or
