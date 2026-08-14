@@ -7961,6 +7961,68 @@ def test_invoke_kiro_uses_one_deadline_across_all_processes(
     ]
 
 
+def test_kiro_inventory_receives_the_full_remaining_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    observed_timeouts: list[float] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, command: list[str], *, cwd: Path, **_kwargs: object) -> None:
+            self.command = command
+            self.cwd = Path(cwd)
+
+        def communicate(
+            self, input: bytes | None = None, timeout: float | None = None
+        ) -> tuple[bytes, bytes]:
+            assert timeout is not None
+            observed_timeouts.append(timeout)
+            if "--list-models" in self.command:
+                return (
+                    json.dumps(
+                        {
+                            "models": [{"model_id": "claude-sonnet-5"}],
+                            "default_model": "claude-sonnet-5",
+                        }
+                    ).encode(),
+                    b"",
+                )
+            if "--list-sessions" in self.command:
+                return (
+                    json.dumps(
+                        [
+                            {
+                                "cwd": str(self.cwd.resolve()),
+                                "sessions": [{"sessionId": "123e4567-e89b-12d3-a456-426614174000"}],
+                            }
+                        ]
+                    ).encode(),
+                    b"",
+                )
+            assert input is not None
+            return b'> {"verdict": "approved", "findings": []}\n', b""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", FakeProcess)
+
+    exit_code, error, response = cli.invoke_kiro(
+        kiro_bin="kiro-cli",
+        prompt="Review synthetic source.",
+        model="claude-sonnet-5",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=90,
+        **kiro_paths(tmp_path),
+    )
+
+    assert exit_code == 0, error
+    assert response.response
+    assert observed_timeouts[0] > 80
+
+
 @pytest.mark.parametrize(
     ("inventory_mode", "model", "expected_code"),
     [
