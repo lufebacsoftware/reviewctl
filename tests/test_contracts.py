@@ -17,6 +17,10 @@ from reviewctl.contracts import (
 )
 
 
+class TextSubclass(str):
+    pass
+
+
 def test_findings_contract_prepares_a_stable_portable_contract() -> None:
     prepared = get_contract("findings-json").prepare(ContractContext())
 
@@ -167,6 +171,25 @@ def test_contract_registry_rejects_unknown_contracts() -> None:
         raise AssertionError("unknown contract was accepted")
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        None,
+        b"findings-json",
+        bytearray(b"findings-json"),
+        [],
+        {},
+        1,
+        True,
+        object(),
+        TextSubclass("findings-json"),
+    ],
+)
+def test_contract_registry_rejects_non_text_names_deterministically(name: object) -> None:
+    with pytest.raises(KeyError):
+        get_contract(name)  # type: ignore[arg-type]
+
+
 def finding_payload(**finding_overrides: object) -> dict[str, object]:
     finding = {
         "severity": "high",
@@ -212,6 +235,40 @@ def test_findings_contract_evaluates_and_hashes_a_normalized_value() -> None:
     assert evaluation.coverage.required_fields == ("verdict", "findings")
     assert evaluation.coverage.covered_fields == ("verdict", "findings")
     assert evaluation.coverage.missing_fields == ()
+    assert evaluation.completion_request is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        b"{}",
+        bytearray(b"{}"),
+        [],
+        {},
+        1,
+        True,
+        object(),
+        TextSubclass("{}"),
+    ],
+)
+def test_findings_contract_rejects_non_text_payloads_deterministically(
+    payload: object,
+) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+
+    evaluation = contract.evaluate(payload, prepared, context)  # type: ignore[arg-type]
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+    assert evaluation.prepared_digest == prepared.digest
+    assert evaluation.payload_digest == hashlib.sha256(b"").hexdigest()
+    assert evaluation.normalized_digest is None
+    assert evaluation.value is None
+    assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
     assert evaluation.completion_request is None
 
 

@@ -392,7 +392,9 @@ class FindingsJsonContract:
         *,
         evidence: EvaluationContext | None = None,
     ) -> ContractEvaluation:
-        payload_digest = hashlib.sha256(payload.encode(errors="surrogatepass")).hexdigest()
+        payload_is_text = type(payload) is str
+        payload_bytes = payload.encode(errors="surrogatepass") if payload_is_text else b""
+        payload_digest = hashlib.sha256(payload_bytes).hexdigest()
         prepared_digest = prepared.digest if isinstance(prepared, PreparedContract) else ""
 
         def rejected(code: str) -> ContractEvaluation:
@@ -406,6 +408,8 @@ class FindingsJsonContract:
                 violations=(code,),
             )
 
+        if not payload_is_text:
+            return rejected("invalid-json")
         if not isinstance(prepared, PreparedContract) or not valid_contract_context(context):
             return rejected("prepared-contract")
         if (
@@ -592,4 +596,6 @@ _CONTRACTS: dict[str, ReviewContract] = {"findings-json": FindingsJsonContract()
 
 def get_contract(name: str) -> ReviewContract:
     """Return a native contract by its stable name."""
+    if type(name) is not str:
+        raise KeyError(name)
     return _CONTRACTS[name]
