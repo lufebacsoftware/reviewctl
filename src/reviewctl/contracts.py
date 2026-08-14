@@ -433,6 +433,10 @@ class FindingsJsonContract:
             )
         except (ValueError, RecursionError):
             return rejected("invalid-json")
+        try:
+            canonical_json(value)
+        except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+            return rejected("invalid-json")
         if _contains_surrogate(value):
             return rejected("invalid-json")
         if not isinstance(value, dict):

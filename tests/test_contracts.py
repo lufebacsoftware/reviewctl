@@ -871,17 +871,79 @@ def test_findings_contract_rejects_oversized_integer_without_exception() -> None
     assert evaluation.valid_fragments == ()
 
 
-def test_findings_contract_rejects_overflowing_finite_syntax_without_exception() -> None:
+@pytest.mark.parametrize(
+    "payload_template",
+    [
+        '{"verdict":"changes-requested","findings":[$FINDING],"extra":1e400}',
+        '{"verdict":"changes-requested","findings":[$FINDING],"extra":{"nested":-1e400}}',
+        '{"verdict":"changes-requested","findings":[$FINDING],"extra":[0,{"nested":1e400}]}',
+        '{"verdict":"changes-requested","findings":[$OVERFLOW,$FINDING]}',
+        '[{"nested":-1e400}]',
+    ],
+)
+def test_findings_contract_rejects_decoded_nonfinite_tree_before_extraction(
+    payload_template: str,
+) -> None:
     contract = get_contract("findings-json")
     context = ContractContext(file_names=("source.py",))
     prepared = contract.prepare(context)
-    payload = json.dumps(finding_payload()).replace('"line": 3', '"line": 1e400')
+    finding = json.dumps(finding_payload()["findings"][0], separators=(",", ":"))
+    overflowing_finding = finding.replace('"line":3', '"line":1e400')
+    payload = payload_template.replace("$OVERFLOW", overflowing_finding).replace(
+        "$FINDING", finding
+    )
 
     evaluation = contract.evaluate(payload, prepared, context)
 
     assert evaluation.status is EvaluationStatus.INVALID
-    assert evaluation.violations == ("finding-value",)
+    assert evaluation.violations == ("invalid-json",)
     assert evaluation.valid_fragments == ()
+    assert evaluation.coverage is None
+    assert evaluation.completion_request is None
+
+
+@pytest.mark.parametrize(
+    ("payload_template", "expected_violation"),
+    [
+        (
+            '{"verdict":"changes-requested","findings":[$FINDING],"extra":{"nested":[1e308]}}',
+            "response-fields",
+        ),
+        (
+            '{"verdict":"changes-requested","findings":[$FINITE,$FINDING]}',
+            "finding-value",
+        ),
+    ],
+)
+def test_large_finite_decoded_numbers_follow_normal_contract_semantics(
+    payload_template: str,
+    expected_violation: str,
+) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    finding = json.dumps(finding_payload()["findings"][0], separators=(",", ":"))
+    finite_finding = finding.replace('"line":3', '"line":1e308')
+    payload = payload_template.replace("$FINITE", finite_finding).replace("$FINDING", finding)
+
+    evaluation = contract.evaluate(payload, prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INCOMPLETE
+    assert evaluation.violations == (expected_violation,)
+    assert len(evaluation.valid_fragments) == 1
+
+
+def test_large_schema_valid_integer_remains_complete() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    payload = json.dumps(finding_payload(line=10**100))
+
+    evaluation = contract.evaluate(payload, prepared, context)
+
+    assert evaluation.status is EvaluationStatus.COMPLETE
+    assert evaluation.value is not None
+    assert evaluation.value["findings"][0]["line"] == 10**100
 
 
 def assert_isolated_surrogate_is_rejected(surrogate: str, *, extra_field: bool) -> None:
