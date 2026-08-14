@@ -8,7 +8,6 @@ from typing import Any, NoReturn
 
 from reviewctl.contracts import (
     FINDING_FIELDS,
-    FINDING_SEVERITIES,
     FINDINGS_CONTRACT_VIOLATION_CODES,
     ContractCompletionRequest,
     ContractContext,
@@ -21,6 +20,7 @@ from reviewctl.contracts import (
     findings_required_fields,
     get_contract,
     valid_contract_context,
+    valid_finding,
 )
 
 COMPLETION_CONTEXT_START = "<reviewctl-completion-context>"
@@ -95,26 +95,9 @@ def _freeze_source(value: dict[str, object]) -> dict[str, object]:
     return _FrozenDict(value)
 
 
-def _valid_finding(value: object) -> bool:
-    if not isinstance(value, dict) or set(value) != FINDING_FIELDS:
-        return False
-    if not isinstance(value["severity"], str) or value["severity"] not in FINDING_SEVERITIES:
-        return False
-    if not isinstance(value["line"], int) or isinstance(value["line"], bool):
-        return False
-    if value["line"] < 1:
-        return False
-    return all(
-        isinstance(value[field], str)
-        and bool(value[field].strip())
-        and not any(0xD800 <= ord(character) <= 0xDFFF for character in value[field])
-        for field in FINDING_FIELDS - {"line"}
-    )
-
-
 def _receipt_valid_finding(value: object, context: ContractContext | None) -> bool:
     """Validate a receipt finding against its authoritative frozen input scope."""
-    return context is not None and _valid_finding(value) and value["path"] in context.file_names
+    return context is not None and valid_finding(value) and value["path"] in context.file_names
 
 
 def _fragment_fingerprint(
@@ -271,7 +254,7 @@ def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | 
     """Reproduce v1 finding identity at every promoted-fragment trust boundary."""
     if (
         not isinstance(fragment, PromotedFragment)
-        or not _valid_finding(fragment.finding)
+        or not valid_finding(fragment.finding)
         or not _is_sha256(fragment.fingerprint)
         or not _is_sha256(fragment.fragment_id)
         or not _is_sha256(fragment.payload_digest)
@@ -452,7 +435,7 @@ def _validate_completion_context(context: object) -> bool:
         if (
             not isinstance(item, CompletionFinding)
             or not _is_sha256(item.fingerprint)
-            or not _valid_finding(item.finding)
+            or not valid_finding(item.finding)
             or item.finding["path"] not in context.file_names
             or type(item.sources) is not tuple
             or not item.sources
@@ -636,7 +619,7 @@ def promote_fragments(
     promoted: list[PromotedFragment] = []
     promoted_ids: set[str] = set()
     for fragment in evaluation.valid_fragments:
-        if fragment.kind is not FragmentKind.FINDING or not _valid_finding(fragment.value):
+        if fragment.kind is not FragmentKind.FINDING or not valid_finding(fragment.value):
             return ()
         finding = _copy_finding(fragment.value)
         if finding["path"] not in contract_context.file_names:
@@ -859,7 +842,7 @@ def consolidate(
 
     for accepted_finding in accepted_findings:
         if (
-            not _valid_finding(accepted_finding)
+            not valid_finding(accepted_finding)
             or accepted_finding["path"] not in contract_context.file_names
         ):
             return ConsolidatedReview(
@@ -929,7 +912,7 @@ def _receipt_normalized_review(value: object) -> dict[str, Any] | None:
         not isinstance(verdict, str)
         or verdict not in {"approved", "changes-requested"}
         or not isinstance(findings, list)
-        or not all(_valid_finding(finding) for finding in findings)
+        or not all(valid_finding(finding) for finding in findings)
         or (verdict == "approved") != (not findings)
     ):
         return None

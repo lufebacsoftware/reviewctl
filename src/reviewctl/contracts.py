@@ -309,20 +309,32 @@ def _contains_surrogate(value: object) -> bool:
     return False
 
 
+def valid_finding(value: object) -> bool:
+    """Validate one finding before any canonical identity operation."""
+    if not isinstance(value, dict) or set(value) != FINDING_FIELDS:
+        return False
+    if not isinstance(value["severity"], str) or value["severity"] not in FINDING_SEVERITIES:
+        return False
+    if type(value["line"]) is not int or value["line"] < 1:
+        return False
+    if not all(
+        isinstance(value[field], str) and bool(value[field].strip())
+        for field in FINDING_FIELDS - {"line"}
+    ):
+        return False
+    try:
+        canonical_json(value)
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        return False
+    return True
+
+
 def _validate_finding(
     finding: object, context: ContractContext
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(finding, dict) or set(finding) != FINDING_FIELDS:
         return None, "finding-fields"
-    string_fields = FINDING_FIELDS - {"line"}
-    if not all(
-        isinstance(finding[field], str) and finding[field].strip() for field in string_fields
-    ):
-        return None, "finding-value"
-    if finding["severity"] not in FINDING_SEVERITIES:
-        return None, "finding-value"
-    line = finding["line"]
-    if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+    if not valid_finding(finding):
         return None, "finding-value"
     if context.file_names and finding["path"] not in context.file_names:
         return None, "finding-path"

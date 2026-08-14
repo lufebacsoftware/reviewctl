@@ -13,6 +13,7 @@ from reviewctl.contracts import (
     FragmentKind,
     canonical_json,
     get_contract,
+    valid_finding,
 )
 
 
@@ -177,6 +178,14 @@ def finding_payload(**finding_overrides: object) -> dict[str, object]:
     }
     finding.update(finding_overrides)
     return {"verdict": "changes-requested", "findings": [finding]}
+
+
+def test_valid_finding_requires_strict_canonical_serializability() -> None:
+    legitimate = finding_payload()["findings"][0]
+
+    assert valid_finding(legitimate) is True
+    assert valid_finding({**legitimate, "line": 10**5000}) is False
+    assert valid_finding({**legitimate, "title": chr(0xD800)}) is False
 
 
 def test_findings_contract_evaluates_and_hashes_a_normalized_value() -> None:
@@ -635,6 +644,32 @@ def test_findings_contract_rejects_infinity_before_fragment_extraction() -> None
 
 def test_findings_contract_rejects_negative_infinity_before_fragment_extraction() -> None:
     assert_non_finite_json_is_rejected("-Infinity")
+
+
+def test_findings_contract_rejects_oversized_integer_without_exception() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    payload = json.dumps(finding_payload()).replace('"line": 3', f'"line": {"1" * 5001}')
+
+    evaluation = contract.evaluate(payload, prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+    assert evaluation.valid_fragments == ()
+
+
+def test_findings_contract_rejects_overflowing_finite_syntax_without_exception() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    payload = json.dumps(finding_payload()).replace('"line": 3', '"line": 1e400')
+
+    evaluation = contract.evaluate(payload, prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("finding-value",)
+    assert evaluation.valid_fragments == ()
 
 
 def assert_isolated_surrogate_is_rejected(surrogate: str, *, extra_field: bool) -> None:

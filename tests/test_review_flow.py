@@ -1022,6 +1022,18 @@ def test_build_completion_context_rejects_invalid_promoted_fragment_identity(
         )
 
 
+def test_build_completion_context_rejects_unencodable_promoted_finding_without_exception() -> None:
+    evaluation = incomplete_evaluation(finding())
+    fragment = replace(promoted(finding())[0], finding={**finding(), "line": 10**5000})
+
+    with pytest.raises(ValueError, match="^invalid promoted fragment identity$"):
+        build_completion_context(
+            evaluation.completion_request,
+            (fragment,),
+            allowed_file_names=("source.py",),
+        )
+
+
 @pytest.mark.parametrize(
     ("attempt", "route_index"),
     [(True, 0), (0, 0), (-1, 0), ("1", 0), (1, True), (1, -1), (1, "0")],
@@ -1038,6 +1050,25 @@ def test_promote_fragments_rejects_invalid_provenance_coordinates(
             gate_result="contract-incomplete",
             attempt=attempt,  # type: ignore[arg-type]
             route_index=route_index,  # type: ignore[arg-type]
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+def test_promote_fragments_rejects_unencodable_manual_finding_without_exception() -> None:
+    evaluation = incomplete_evaluation(finding())
+    hostile = {**finding(), "line": 10**5000}
+    fragment = replace(evaluation.valid_fragments[0], value=hostile)
+    malicious = replace(evaluation, valid_fragments=(fragment,))
+
+    assert (
+        promote_fragments(
+            malicious,
+            contract_context=ContractContext(file_names=("source.py",)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
             raw_response_digest=evaluation.payload_digest,
         )
         == ()
@@ -1194,6 +1225,23 @@ def test_render_completion_prompt_revalidates_direct_completion_context(
     assert "raw prior response" not in str(error.value)
     assert COMPLETION_CONTEXT_START not in str(error.value)
     assert COMPLETION_CONTEXT_END not in str(error.value)
+
+
+def test_render_completion_prompt_rejects_unencodable_manual_finding_without_exception() -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = build_completion_context(
+        evaluation.completion_request,
+        promoted(finding()),
+        allowed_file_names=("source.py",),
+    )
+    hostile = {**finding(), "line": 10**5000}
+    malicious = replace(
+        context,
+        findings=(replace(context.findings[0], finding=hostile),),
+    )
+
+    with pytest.raises(ValueError, match="^invalid completion context$"):
+        render_completion_prompt("Review the packet.", malicious)
 
 
 def test_build_completion_context_validates_gap_fields_against_declaration_context() -> None:
@@ -1691,6 +1739,69 @@ def test_consolidate_ignores_invalid_untrusted_promoted_object() -> None:
 
     assert result.status == "accepted"
     assert result.findings == ()
+
+
+def test_consolidate_ignores_unencodable_promoted_finding_without_exception() -> None:
+    fragment = replace(promoted(finding())[0], finding={**finding(), "line": 10**5000})
+
+    result = consolidate(
+        {"verdict": "approved", "findings": []},
+        (fragment,),
+        accepted_attempt=2,
+        contract_context=ContractContext(file_names=("source.py",)),
+    )
+
+    assert result.status == "accepted"
+    assert result.findings == ()
+
+
+def test_consolidate_rejects_unencodable_accepted_finding_without_exception() -> None:
+    result = consolidate(
+        {
+            "verdict": "changes-requested",
+            "findings": [{**finding(), "line": 10**5000}],
+        },
+        (),
+        accepted_attempt=2,
+        contract_context=ContractContext(file_names=("source.py",)),
+    )
+
+    assert result.status == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("location", "expected_violation"),
+    [
+        ("contract-fragment", "contract-fragments"),
+        ("promoted-fragment", "promoted-fragments"),
+        ("consolidated-finding", "consolidated-review"),
+    ],
+)
+def test_validate_v2_receipt_rejects_unencodable_finding_without_exception(
+    location: str, expected_violation: str
+) -> None:
+    receipt = v2_findings_receipt()
+    targets = {
+        "contract-fragment": (
+            receipt["attempts"][0]["contractEvaluation"]["fragments"][0],
+            "value",
+        ),
+        "promoted-fragment": (
+            receipt["attempts"][0]["promotedFragments"][0],
+            "finding",
+        ),
+        "consolidated-finding": (
+            receipt["consolidatedReview"]["findings"][0],
+            "finding",
+        ),
+    }
+    record, field = targets[location]
+    record[field] = {**record[field], "line": 10**5000}
+
+    violations = validate_v2_receipt(receipt)
+
+    assert "receipt-digest" in violations
+    assert expected_violation in violations
 
 
 def test_consolidation_is_canonical_across_input_permutations_and_keeps_duplicates() -> None:
