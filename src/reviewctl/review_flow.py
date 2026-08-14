@@ -1101,6 +1101,9 @@ def _receipt_product_contract_output(
     context: ContractContext,
 ) -> str | None:
     """Validate COMPLETE product-output metadata and return its normalized digest."""
+    output_context = (
+        _receipt_contract_context(value.get("contractContext")) if type(value) is dict else None
+    )
     if (
         type(value) is not dict
         or set(value) != {"name", "version", "status", "normalizedSha256", "contractContext"}
@@ -1111,11 +1114,9 @@ def _receipt_product_contract_output(
         or value.get("name") != contract_identity.get("name")
         or value.get("version") != contract_identity.get("version")
         or value.get("status") != "complete"
-        or value.get("contractContext")
-        != {
-            "fileNames": list(context.file_names),
-            "reviewDeclarationRequired": context.review_declaration_required,
-        }
+        or output_context is None
+        or output_context.file_names != context.file_names
+        or output_context.review_declaration_required is not context.review_declaration_required
         or not _is_sha256(value.get("normalizedSha256"))
     ):
         return None

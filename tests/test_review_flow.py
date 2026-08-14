@@ -4323,7 +4323,7 @@ def test_validate_v2_receipt_binds_product_review_view_to_accepted_result(
     assert "accepted-attempt" in validate_v2_receipt(receipt)
 
 
-@pytest.mark.parametrize("mutation", ["missing", "identity", "context", "extra"])
+@pytest.mark.parametrize("mutation", ["missing", "identity", "context", "context-bool", "extra"])
 def test_validate_v2_receipt_requires_exact_product_contract_output_metadata(
     mutation: str,
 ) -> None:
@@ -4335,6 +4335,8 @@ def test_validate_v2_receipt_requires_exact_product_contract_output_metadata(
         output["name"] = "product-review-json"
     elif mutation == "context":
         output["contractContext"]["fileNames"] = ["other.py"]
+    elif mutation == "context-bool":
+        output["contractContext"]["reviewDeclarationRequired"] = 0
     else:
         output["invented"] = True
     _sign_receipt(receipt)

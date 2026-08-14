@@ -136,7 +136,8 @@ def valid_review_basename(value: object) -> bool:
     """Return whether a value is a safe printable basename for review identity."""
     return (
         type(value) is str
-        and bool(value.strip())
+        and bool(value)
+        and value == value.strip()
         and value not in {".", ".."}
         and "/" not in value
         and "\\" not in value
@@ -146,7 +147,7 @@ def valid_review_basename(value: object) -> bool:
 
 def valid_contract_context(value: object, *, require_file_names: bool = False) -> bool:
     """Validate canonical contract facts before they affect identity or semantics."""
-    if not isinstance(value, ContractContext):
+    if type(value) is not ContractContext:
         return False
     file_names = value.file_names
     return (

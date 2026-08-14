@@ -47,6 +47,11 @@ class PreparedContractSubclass(PreparedContract):
     pass
 
 
+class HostileContractContext(ContractContext):
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("hostile context equality executed")
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -75,6 +80,18 @@ def test_review_basename_accepts_printable_unicode(name: str) -> None:
 )
 def test_review_basename_requires_an_exact_safe_basename(name: object) -> None:
     assert valid_review_basename(name) is False
+
+
+@pytest.mark.parametrize("name", [" source.py", "source.py ", "\tsource.py"])
+def test_review_basename_rejects_surrounding_whitespace(name: str) -> None:
+    assert valid_review_basename(name) is False
+    assert valid_contract_context(ContractContext(file_names=(name,))) is False
+
+
+def test_contract_context_requires_exact_type_without_invoking_subclass_equality() -> None:
+    context = HostileContractContext(file_names=("source.py",))
+
+    assert valid_contract_context(context, require_file_names=True) is False
 
 
 @pytest.mark.parametrize("name", ["source.py\0", "source.py\n", "source.py\t", "source\u202e.py"])
