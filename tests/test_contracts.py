@@ -43,6 +43,11 @@ class HostileDict(dict[str, object]):
         raise AssertionError("hostile dictionary iteration executed")
 
 
+class HostileSchema(dict[str, object]):
+    def values(self):
+        raise AssertionError("hostile schema values executed")
+
+
 class PreparedContractSubclass(PreparedContract):
     pass
 
@@ -230,6 +235,17 @@ def test_findings_contract_evaluate_rejects_malformed_prepared_without_exception
 
     assert evaluation.status is EvaluationStatus.INVALID
     assert evaluation.prepared_digest == ""
+    assert evaluation.violations == ("prepared-contract",)
+
+
+def test_findings_contract_evaluate_rejects_hostile_prepared_schema_without_exception() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = replace(contract.prepare(context), schema=HostileSchema())
+
+    evaluation = contract.evaluate("{}", prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
     assert evaluation.violations == ("prepared-contract",)
 
 

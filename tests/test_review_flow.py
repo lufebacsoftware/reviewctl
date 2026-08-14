@@ -7,6 +7,7 @@ import pytest
 
 from reviewctl.contracts import (
     ContractContext,
+    ContractFragment,
     EvaluationContext,
     EvaluationStatus,
     canonical_json,
@@ -56,6 +57,11 @@ class HostileText(str):
 
     def __str__(self) -> str:
         raise AssertionError("hostile string conversion executed")
+
+
+class HostileContractFragment(ContractFragment):
+    def __getattribute__(self, name: str) -> object:
+        raise RuntimeError("hostile fragment attribute access")
 
 
 class HostileKey(str):
@@ -617,6 +623,24 @@ def test_promote_fragments_rejects_hostile_fragment_metadata(field: str) -> None
     if field == "scope":
         value = (HostileText(fragment.scope[0]),)
     evaluation = replace(evaluation, valid_fragments=(replace(fragment, **{field: value}),))
+
+    assert (
+        promote_fragments(
+            evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+def test_promote_fragments_rejects_fragment_subclass_before_attribute_access() -> None:
+    evaluation = incomplete_evaluation(finding())
+    hostile = object.__new__(HostileContractFragment)
+    evaluation = replace(evaluation, valid_fragments=(hostile,))
 
     assert (
         promote_fragments(

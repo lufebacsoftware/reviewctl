@@ -266,7 +266,7 @@ def _coverage_matches_violation(
 def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | None:
     """Reproduce v1 finding identity at every promoted-fragment trust boundary."""
     if (
-        not isinstance(fragment, PromotedFragment)
+        type(fragment) is not PromotedFragment
         or not valid_finding(fragment.finding)
         or not _is_sha256(fragment.fingerprint)
         or not _is_sha256(fragment.fragment_id)
@@ -417,7 +417,7 @@ class CompletionContext:
 
 def _validate_completion_context(context: object) -> bool:
     """Reproduce every identity and ordering invariant before prompt serialization."""
-    if not isinstance(context, CompletionContext) or not _valid_completion_manifest(
+    if type(context) is not CompletionContext or not _valid_completion_manifest(
         prepared_digest=context.prepared_digest,
         packet_digest=context.packet_digest,
         missing_fields=context.missing_fields,
@@ -446,7 +446,7 @@ def _validate_completion_context(context: object) -> bool:
     finding_order: list[tuple[int, str, str]] = []
     for item in context.findings:
         if (
-            not isinstance(item, CompletionFinding)
+            type(item) is not CompletionFinding
             or not _is_sha256(item.fingerprint)
             or not valid_finding(item.finding)
             or item.finding["path"] not in context.file_names
@@ -467,7 +467,7 @@ def _validate_completion_context(context: object) -> bool:
 
         source_order: list[tuple[int, str]] = []
         for source in item.sources:
-            if not isinstance(source, PromotedFragment):
+            if type(source) is not PromotedFragment:
                 return False
             source_finding = _validated_promoted_finding(source)
             provenance = (source.source_attempt, source.fragment_id)
@@ -530,7 +530,7 @@ class ConsolidatedReview:
 def _contract_fragments_are_canonical(value: object) -> bool:
     """Require one unique ascending fragment-id sequence at every trust boundary."""
     if type(value) is not tuple or not all(
-        isinstance(fragment, ContractFragment) and type(fragment.fragment_id) is str
+        type(fragment) is ContractFragment and type(fragment.fragment_id) is str
         for fragment in value
     ):
         return False
@@ -543,7 +543,9 @@ def _valid_incomplete_evaluation(
     context: ContractContext,
 ) -> bool:
     """Reproduce the complete state that authorizes fragment promotion."""
-    if not valid_contract_context(context, require_file_names=True):
+    if type(evaluation) is not ContractEvaluation or not valid_contract_context(
+        context, require_file_names=True
+    ):
         return False
     try:
         required_fields = findings_required_fields(context.review_declaration_required)
@@ -566,8 +568,8 @@ def _valid_incomplete_evaluation(
             or not all(type(violation) is str for violation in evaluation.violations)
             or not evaluation.valid_fragments
             or not _contract_fragments_are_canonical(evaluation.valid_fragments)
-            or not isinstance(coverage, ContractCoverage)
-            or not isinstance(request, ContractCompletionRequest)
+            or type(coverage) is not ContractCoverage
+            or type(request) is not ContractCompletionRequest
         ):
             return False
 
@@ -697,7 +699,7 @@ def _promote_contract_fragments(
     promoted_ids: set[str] = set()
     for fragment in fragments:
         if (
-            not isinstance(fragment, ContractFragment)
+            type(fragment) is not ContractFragment
             or fragment.kind is not FragmentKind.FINDING
             or not valid_finding(fragment.value)
             or type(fragment.scope) is not tuple

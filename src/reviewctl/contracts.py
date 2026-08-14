@@ -71,6 +71,12 @@ def require_string_json_object_keys(value: object) -> None:
         current, exiting = pending.pop()
         if not isinstance(current, dict | list | tuple):
             continue
+        if isinstance(current, dict) and type(current) not in {dict, FrozenDict}:
+            raise ValueError("unsupported JSON object type")
+        if isinstance(current, list) and type(current) is not list:
+            raise ValueError("unsupported JSON array type")
+        if isinstance(current, tuple) and type(current) is not tuple:
+            raise ValueError("unsupported JSON sequence type")
         identity = id(current)
         if exiting:
             active_containers.remove(identity)
@@ -109,8 +115,16 @@ def has_exact_json_scalar_types(value: object) -> bool:
             return False
         if isinstance(current, int) and type(current) not in {bool, int}:
             return False
+        if isinstance(current, float) and type(current) is not float:
+            return False
         if not isinstance(current, dict | list | tuple):
             continue
+        if isinstance(current, dict) and type(current) not in {dict, FrozenDict}:
+            return False
+        if isinstance(current, list) and type(current) is not list:
+            return False
+        if isinstance(current, tuple) and type(current) is not tuple:
+            return False
         identity = id(current)
         if identity in seen_containers:
             continue
