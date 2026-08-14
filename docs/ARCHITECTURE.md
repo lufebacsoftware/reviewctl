@@ -55,9 +55,10 @@ entry under `[models.<id>]` overrides that default. This permits a
 runtime-owned local inventory without publishing a roster; it does not open
 OpenRouter, resolve an otherwise unresolved identity, or qualify a backend.
 
-The local CLI adapters are explicitly unqualified: `llm`, `openrouter`, `agy`,
-`gemini`, `pi`, and `codex`. They preserve route behavior without claiming
-conformance. Availability is not qualification.
+The registered CLI adapters are explicitly unqualified: `llm`, `agy`,
+`gemini`, `pi`, and `codex`; the direct `openrouter` transport is also
+unqualified. They preserve route behavior without claiming conformance.
+Availability is not qualification.
 
 Gemini CLI is a separate native adapter from Antigravity (`agy`). It runs the
 installed `gemini` executable in headless JSON mode with `--approval-mode plan`

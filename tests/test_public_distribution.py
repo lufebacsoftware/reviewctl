@@ -130,7 +130,7 @@ def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> N
 
     for adapter in ("llm", "openrouter", "agy", "gemini", "pi", "codex"):
         assert f"`{adapter}`" in architecture
-    assert "the local cli adapters are explicitly unqualified" in architecture
+    assert "the registered cli adapters are explicitly unqualified" in architecture
     assert (
         "setup diagnostics observe only executable presence and version for registered "
         "executable backends."
