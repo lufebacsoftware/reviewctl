@@ -8058,7 +8058,12 @@ def test_kiro_timeout_returns_partial_evidence_without_a_second_communicate(
             )
 
     monkeypatch.setattr(cli.subprocess, "Popen", TimedOutProcess)
-    monkeypatch.setattr(cli, "terminate_process_group", lambda _process: None)
+    cleanup_graces: list[float] = []
+    monkeypatch.setattr(
+        cli,
+        "terminate_process_group",
+        lambda _process, *, grace_seconds: cleanup_graces.append(grace_seconds),
+    )
 
     exit_code, error, response = cli.invoke_kiro(
         kiro_bin="kiro-cli",
@@ -8075,6 +8080,7 @@ def test_kiro_timeout_returns_partial_evidence_without_a_second_communicate(
     assert error == "review attempt timed out"
     assert response.response == ""
     assert communicate_calls == 1
+    assert cleanup_graces == [0]
     assert (tmp_path / "models.json").read_bytes() == b"partial inventory"
     assert (tmp_path / "stderr.log").read_bytes() == b"partial diagnostic"
 

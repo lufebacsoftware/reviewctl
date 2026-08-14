@@ -1536,10 +1536,17 @@ def source_allowed(policy: dict[str, Any], model: str) -> bool:
     return bool(policy.get("models", {}).get(model, {}).get("source_allowed", False))
 
 
-def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+def terminate_process_group(process: subprocess.Popen[bytes], *, grace_seconds: float = 5) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=5)
+        if grace_seconds <= 0:
+            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                process.wait(timeout=0)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+            return
+        process.wait(timeout=grace_seconds)
     except ProcessLookupError:
         return
     except subprocess.TimeoutExpired:
@@ -1802,7 +1809,7 @@ def invoke_kiro(
                 stdout, stderr = process.communicate(input=input_bytes, timeout=remaining)
                 return process.returncode, stdout, stderr, ""
             except subprocess.TimeoutExpired as error:
-                terminate_process_group(process)
+                terminate_process_group(process, grace_seconds=0)
                 stdout = error.output if isinstance(error.output, bytes) else b""
                 stderr = error.stderr if isinstance(error.stderr, bytes) else b""
                 return 124, stdout, stderr, "review attempt timed out"
