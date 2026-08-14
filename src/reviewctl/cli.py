@@ -1677,6 +1677,8 @@ def normalize_kiro_output(stdout: bytes) -> str:
     lines = lines[start:]
     while lines and (not lines[-1].strip() or lines[-1].strip().startswith("▸ Credits:")):
         lines.pop()
+    if len(lines) > 1 and lines[0].strip() == "json" and lines[1].lstrip().startswith(("{", "[")):
+        lines.pop(0)
     return "\n".join(lines)
 
 
@@ -1818,7 +1820,6 @@ def invoke_kiro(
             kiro_bin,
             "chat",
             "--no-interactive",
-            "--trust-tools=",
             "--agent",
             "kiro_default",
             "--model",

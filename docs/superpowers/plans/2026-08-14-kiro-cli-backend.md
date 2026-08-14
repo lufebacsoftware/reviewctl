@@ -85,7 +85,7 @@ Create `write_fake_kiro()` in `tests/test_run.py`. It must record argv, cwd, sel
 ```python
 assert command[:2] == [str(fake_kiro), "chat"]
 assert "--no-interactive" in command
-assert "--trust-tools=" in command
+assert "--trust-all-tools" not in command
 assert command[command.index("--model") + 1] == "requested-model"
 assert Path(observed_cwd).is_relative_to(Path("/private/tmp")) or observed_cwd != str(source.parent)
 assert original_source_path not in prompt
@@ -143,7 +143,7 @@ def kiro_session_id(payload: bytes, cwd: Path) -> str:
 Add `invoke_kiro(...) -> tuple[int, str, PersistedResponse]` with the same keyword fields used by `invoke_pi`, except that it receives no session path. It must use `tempfile.TemporaryDirectory(prefix="reviewctl-kiro-")`, call:
 
 ```text
-kiro-cli chat --no-interactive --trust-tools= --model MODEL --wrap never INLINE_PACKET
+kiro-cli chat --no-interactive --model MODEL --wrap never INLINE_PACKET
 ```
 
 and then call `kiro-cli chat --list-sessions --format json` in the same directory. Use `openrouter_packet()` only as the existing generic inline-packet builder; do not call OpenRouter or persist any OpenRouter credential/provider configuration. Record `requestedMaxOutputTokens` with `outputTokenLimitEnforced: false`. Strip only terminal framing known from Kiro, retain raw stdout/stderr separately, and return no response if a session identity cannot be reproduced.

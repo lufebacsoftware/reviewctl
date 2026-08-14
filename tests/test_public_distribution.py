@@ -171,7 +171,7 @@ def test_architecture_documents_the_unqualified_kiro_backend_boundary() -> None:
         "disposable empty working directory",
         "reduced environment",
         "`kiro_default`",
-        "`--trust-tools=`",
+        "without granting tool trust",
         "inline frozen packet",
         "one total timeout",
         "mode `0600`",

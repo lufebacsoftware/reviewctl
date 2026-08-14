@@ -7778,8 +7778,16 @@ def invoke_fake_kiro(
 
 def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
     stdout = "\x1b[36mKiro CLI\x1b[0m\r\n> first line\r\nbody\r\n\r\n▸ Credits: 0.25\r\n".encode()
+    fenced_json = (
+        b"\x1b[38;5;141m> \x1b[0m\x1b[1mjson\n"
+        b'\x1b[0m\x1b[38;5;10m{\n  "verdict": "approved",\n  "findings": []\n}\n'
+        b"\x1b[0m"
+    )
 
     assert cli.normalize_kiro_output(stdout) == "first line\nbody"
+    assert cli.normalize_kiro_output(fenced_json) == (
+        '{\n  "verdict": "approved",\n  "findings": []\n}'
+    )
     assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n") == ""
 
 
@@ -7830,7 +7838,6 @@ def test_invoke_kiro_uses_isolated_exact_commands_and_persists_evidence(
     assert observations[1]["argv"] == [
         "chat",
         "--no-interactive",
-        "--trust-tools=",
         "--agent",
         "kiro_default",
         "--model",
