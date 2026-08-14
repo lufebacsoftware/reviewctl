@@ -430,6 +430,7 @@ if arguments == ["chat", "--list-models", "--format", "json"]:
                 {{"model_id": "absent-session"}},
                 {{"model_id": "nonzero-session"}},
                 {{"model_id": "timeout-session"}},
+                {{"model_id": "invalid-utf8"}},
             ],
             "default_model": "claude-sonnet-5",
         }}))
@@ -464,6 +465,13 @@ if model == "nonzero":
     print("token=super-secret-token-value", file=sys.stderr)
     raise SystemExit(17)
 if model == "empty":
+    raise SystemExit(0)
+if model == "invalid-utf8":
+    sys.stdout.buffer.write(
+        b'> {{"verdict":"approved","findings":[],"value":"}}'
+        + bytes([255])
+        + b'"}}\\n'
+    )
     raise SystemExit(0)
 response = json.dumps({{"verdict": "approved", "findings": []}})
 sys.stdout.write("\\x1b[36mKiro CLI\\x1b[0m\\n> " + response + "\\n\\n▸ Credits: 0.25\\n")
@@ -7929,6 +7937,8 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
     )
     with pytest.raises(ValueError, match="only findings-json"):
         cli.normalize_kiro_output(fenced_json, "document")
+    with pytest.raises(UnicodeDecodeError):
+        cli.normalize_kiro_output(b'> {"value":"\xff"}\n', "findings-json")
     assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n", "findings-json") == ""
 
 
@@ -8308,6 +8318,17 @@ def test_invoke_kiro_preserves_empty_output_with_a_valid_session(
     assert response.response == ""
     assert (tmp_path / "response.log").read_bytes() == b""
     assert (tmp_path / "stderr.log").read_bytes() == b""
+
+
+def test_invoke_kiro_rejects_non_utf8_output_without_rewriting_raw_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(tmp_path, monkeypatch, model="invalid-utf8")
+
+    assert exit_code == 502
+    assert error == "Kiro returned non-UTF-8 terminal output"
+    assert response.response == ""
+    assert b"\xff" in (tmp_path / "response.log").read_bytes()
 
 
 def test_usage_private_gemini_product_review(tmp_path: Path) -> None:

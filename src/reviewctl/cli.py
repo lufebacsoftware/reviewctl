@@ -1735,7 +1735,7 @@ def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
     """Decode known Kiro UI framing for the JSON-only review contract."""
     if response_contract != "findings-json":
         raise ValueError("Kiro output normalization supports only findings-json")
-    text = ANSI_ESCAPE.sub("", stdout.decode(errors="replace")).replace("\r\n", "\n")
+    text = ANSI_ESCAPE.sub("", stdout.decode()).replace("\r\n", "\n")
     lines = text.split("\n")
     start = next((index for index, line in enumerate(lines) if line.startswith("> ")), None)
     if start is None:
@@ -1956,6 +1956,10 @@ def invoke_kiro(
         session = kiro_session_id(session_stdout, cwd)
         if not session:
             return 502, "Kiro returned no coherent session for the review directory", blank
+        try:
+            normalized_response = normalize_kiro_output(stdout, response_contract)
+        except UnicodeDecodeError:
+            return 502, "Kiro returned non-UTF-8 terminal output", blank
         return (
             0,
             stderr,
@@ -1967,7 +1971,7 @@ def invoke_kiro(
                 model,
                 None,
                 None,
-                normalize_kiro_output(stdout, response_contract),
+                normalized_response,
             ),
         )
 
