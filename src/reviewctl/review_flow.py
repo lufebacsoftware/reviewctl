@@ -63,9 +63,9 @@ _VIOLATION_COVERAGE_RULES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "response-fields": (frozenset(), frozenset({"findings"})),
     "verdict": (frozenset(), frozenset({"verdict", "findings"})),
     "findings-shape": (frozenset(), frozenset({"verdict", "findings"})),
-    "finding-fields": (frozenset(), frozenset({"findings"})),
-    "finding-value": (frozenset(), frozenset({"findings"})),
-    "finding-path": (frozenset(), frozenset({"findings"})),
+    "finding-fields": (frozenset({"verdict"}), frozenset({"findings"})),
+    "finding-value": (frozenset({"verdict"}), frozenset({"findings"})),
+    "finding-path": (frozenset({"verdict"}), frozenset({"findings"})),
     "verdict-invariant": (frozenset(), frozenset({"verdict", "findings"})),
     "review-declaration": (frozenset({"verdict"}), frozenset({"findings", "reviewedFiles"})),
 }
@@ -623,28 +623,84 @@ def promote_fragments(
         return ()
     assert evaluation.completion_request is not None
 
+    return (
+        _promote_contract_fragments(
+            evaluation.valid_fragments,
+            contract_name=evaluation.name,
+            contract_version=evaluation.version,
+            prepared_digest=evaluation.prepared_digest,
+            payload_digest=evaluation.payload_digest,
+            packet_digest=evaluation.completion_request.packet_digest,
+            contract_context=contract_context,
+            attempt=attempt,
+            route_index=route_index,
+            raw_response_digest=raw_response_digest,
+        )
+        or ()
+    )
+
+
+def _promote_contract_fragments(
+    fragments: tuple[ContractFragment, ...],
+    *,
+    contract_name: object,
+    contract_version: object,
+    prepared_digest: object,
+    payload_digest: object,
+    packet_digest: object,
+    contract_context: object,
+    attempt: object,
+    route_index: object,
+    raw_response_digest: object,
+) -> tuple[PromotedFragment, ...] | None:
+    """Reproduce the exact promoted list from validated contract fragments."""
+    if (
+        type(fragments) is not tuple
+        or contract_name != "findings-json"
+        or contract_version != "1"
+        or not valid_contract_context(contract_context, require_file_names=True)
+        or not _is_sha256(prepared_digest)
+        or not _is_sha256(payload_digest)
+        or not _is_sha256(packet_digest)
+        or raw_response_digest != payload_digest
+        or not _is_sha256(raw_response_digest)
+        or not _is_positive_int(attempt)
+        or not _is_nonnegative_int(route_index)
+    ):
+        return None
+    try:
+        expected_prepared = get_contract("findings-json").prepare(contract_context)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if prepared_digest != expected_prepared.digest:
+        return None
+
     promoted: list[PromotedFragment] = []
     promoted_ids: set[str] = set()
-    for fragment in evaluation.valid_fragments:
-        if fragment.kind is not FragmentKind.FINDING or not valid_finding(fragment.value):
-            return ()
+    for fragment in fragments:
+        if (
+            not isinstance(fragment, ContractFragment)
+            or fragment.kind is not FragmentKind.FINDING
+            or not valid_finding(fragment.value)
+        ):
+            return None
         finding = _copy_finding(fragment.value)
         if finding["path"] not in contract_context.file_names:
-            return ()
+            return None
         expected_scope = (finding["path"],)
         fingerprint = _fragment_fingerprint(
             finding,
-            contract=evaluation.name,
-            version=evaluation.version,
+            contract=contract_name,
+            version=contract_version,
             scope=expected_scope,
         )
         if (
             fragment.scope != expected_scope
-            or fragment.payload_digest != evaluation.payload_digest
+            or fragment.payload_digest != payload_digest
             or fragment.fingerprint != fingerprint
-            or fragment.fragment_id != _fragment_id(fingerprint, evaluation.payload_digest)
+            or fragment.fragment_id != _fragment_id(fingerprint, payload_digest)
         ):
-            return ()
+            return None
         if fragment.fragment_id in promoted_ids:
             continue
         promoted_ids.add(fragment.fragment_id)
@@ -657,8 +713,8 @@ def promote_fragments(
                 route_index=route_index,
                 payload_digest=fragment.payload_digest,
                 raw_response_digest=raw_response_digest,
-                packet_digest=evaluation.completion_request.packet_digest,
-                prepared_digest=evaluation.prepared_digest,
+                packet_digest=packet_digest,
+                prepared_digest=prepared_digest,
                 contract_context=contract_context,
             )
         )
@@ -1179,7 +1235,6 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             if attempt.get("promotedFragments") != []:
                 reject("review-contract")
     all_promoted: list[PromotedFragment] = []
-    promoted_provenance: set[tuple[str, int]] = set()
     normalized_by_attempt: dict[int, dict[str, Any]] = {}
     prompt_value = receipt.get("prompt")
     packet_digest = (
@@ -1466,80 +1521,42 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         if not isinstance(promoted_value, list):
             reject("promoted-fragments")
             promoted_value = []
-        for item in promoted_value:
-            if type(item) is not dict or set(item) != {
-                "fragmentId",
-                "fingerprint",
-                "finding",
-                "sourceAttempt",
-                "routeIndex",
-                "payloadDigest",
-                "rawResponseDigest",
-                "packetDigest",
-                "preparedDigest",
-                "contractContext",
-            }:
-                reject("promoted-fragments")
-                continue
+        expected_promoted: tuple[PromotedFragment, ...] = ()
+        if promotion_eligible:
             try:
-                fragment = PromotedFragment(
-                    fragment_id=item.get("fragmentId"),
-                    fingerprint=item.get("fingerprint"),
-                    finding=item.get("finding"),
-                    source_attempt=item.get("sourceAttempt"),
-                    route_index=item.get("routeIndex"),
-                    payload_digest=item.get("payloadDigest"),
-                    raw_response_digest=item.get("rawResponseDigest"),
-                    packet_digest=item.get("packetDigest"),
-                    prepared_digest=item.get("preparedDigest"),
-                    contract_context=_receipt_contract_context(item.get("contractContext")),
+                source_fragments = tuple(
+                    ContractFragment(
+                        fragment_id=fragment["fragmentId"],
+                        fingerprint=fragment["fingerprint"],
+                        kind=FragmentKind.FINDING,
+                        value=fragment["value"],
+                        payload_digest=fragment["payloadDigest"],
+                        scope=tuple(fragment["scope"]),
+                    )
+                    for fragment in contract_fragments
                 )
-            except Exception:
-                reject("promoted-fragments")
-                continue
-            if not all(
-                _is_sha256(value)
-                for value in (
-                    fragment.fragment_id,
-                    fragment.fingerprint,
-                    fragment.payload_digest,
-                    fragment.raw_response_digest,
-                    fragment.packet_digest,
-                    fragment.prepared_digest,
+                reproduced = _promote_contract_fragments(
+                    source_fragments,
+                    contract_name=evaluation.get("name"),
+                    contract_version=evaluation.get("version"),
+                    prepared_digest=prepared_digest,
+                    payload_digest=evaluation.get("payloadSha256"),
+                    packet_digest=packet_digest,
+                    contract_context=contract_context,
+                    attempt=index,
+                    route_index=route_index,
+                    raw_response_digest=raw_digest,
                 )
-            ):
+            except (AttributeError, KeyError, TypeError, ValueError):
+                reproduced = None
+            if reproduced is None:
                 reject("promoted-fragments")
-                continue
-            source_fragments = [
-                source
-                for source in contract_fragments
-                if source.get("fragmentId") == fragment.fragment_id
-            ]
-            if (
-                not promotion_eligible
-                or _validated_promoted_finding(fragment) is None
-                or not _receipt_valid_finding(fragment.finding, contract_context)
-                or fragment.source_attempt != index
-                or fragment.route_index != route_index
-                or fragment.raw_response_digest != raw_digest
-                or fragment.packet_digest != packet_digest
-                or fragment.prepared_digest != prepared_digest
-                or fragment.contract_context != contract_context
-                or not source_fragments
-                or any(
-                    source.get("fingerprint") != fragment.fingerprint
-                    or source.get("value") != fragment.finding
-                    for source in source_fragments
-                )
-            ):
-                reject("promoted-fragments")
-                continue
-            provenance_key = (fragment.fragment_id, fragment.source_attempt)
-            if provenance_key in promoted_provenance:
-                reject("promoted-fragments")
-                continue
-            promoted_provenance.add(provenance_key)
-            all_promoted.append(fragment)
+            else:
+                expected_promoted = reproduced
+        if promoted_value != [fragment.to_dict() for fragment in expected_promoted]:
+            reject("promoted-fragments")
+        else:
+            all_promoted.extend(expected_promoted)
         if findings_contract and evaluation_error is not None:
             if not (
                 type(evaluation_error) is dict

@@ -319,6 +319,45 @@ def v2_findings_receipt() -> dict[str, object]:
     return _sign_receipt(receipt)
 
 
+def v2_two_promotions_receipt() -> tuple[dict[str, object], tuple[PromotedFragment, ...]]:
+    receipt = v2_findings_receipt()
+    context = ContractContext(file_names=("source.py",))
+    contract = get_contract("findings-json")
+    findings = (finding(title="First finding"), finding(line=9, title="Second finding"))
+    payload = json.dumps(
+        {"verdict": "changes-requested", "findings": list(findings), "extra": True}
+    )
+    evaluation = contract.evaluate(
+        payload,
+        contract.prepare(context),
+        context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
+    promoted_fragments = promote_fragments(
+        evaluation,
+        contract_context=context,
+        gate_result="contract-incomplete",
+        attempt=1,
+        route_index=0,
+        raw_response_digest=evaluation.payload_digest,
+    )
+    first = receipt["attempts"][0]
+    first["rawResponse"]["sha256"] = evaluation.payload_digest
+    first["rawResponse"]["characters"] = len(payload)
+    first["contractEvaluation"] = _evaluation_dict(evaluation, file_names=context.file_names)
+    first["promotedFragments"] = [fragment.to_dict() for fragment in promoted_fragments]
+    receipt["fallbackRelationships"][0]["promotedFragmentIds"] = sorted(
+        fragment.fragment_id for fragment in promoted_fragments
+    )
+    receipt["consolidatedReview"] = consolidate(
+        {"verdict": "approved", "findings": []},
+        promoted_fragments,
+        2,
+        contract_context=context,
+    ).to_dict()
+    return _sign_receipt(receipt), promoted_fragments
+
+
 def v2_invalid_findings_receipt() -> dict[str, object]:
     contract = get_contract("findings-json")
     context = ContractContext(file_names=("source.py",))
@@ -2493,6 +2532,37 @@ def test_validate_v2_receipt_preserves_duplicate_contract_fragments() -> None:
     assert validate_v2_receipt(receipt) == ()
 
 
+@pytest.mark.parametrize("mutation", ["omission", "reorder", "duplicate", "reidentified"])
+def test_validate_v2_receipt_requires_exact_complete_fragment_promotion(mutation: str) -> None:
+    receipt, promoted = v2_two_promotions_receipt()
+    first = receipt["attempts"][0]
+    serialized = first["promotedFragments"]
+    retained = promoted
+    if mutation == "omission":
+        serialized.pop()
+        retained = promoted[:1]
+    elif mutation == "reorder":
+        serialized.reverse()
+        retained = tuple(reversed(promoted))
+    elif mutation == "duplicate":
+        serialized.append(deepcopy(serialized[0]))
+        retained = (*promoted, promoted[0])
+    else:
+        serialized[1]["finding"] = deepcopy(serialized[0]["finding"])
+    receipt["fallbackRelationships"][0]["promotedFragmentIds"] = sorted(
+        {fragment["fragmentId"] for fragment in serialized}
+    )
+    receipt["consolidatedReview"] = consolidate(
+        {"verdict": "approved", "findings": []},
+        retained,
+        2,
+        contract_context=ContractContext(file_names=("source.py",)),
+    ).to_dict()
+    _sign_receipt(receipt)
+
+    assert "promoted-fragments" in validate_v2_receipt(receipt), mutation
+
+
 def test_validate_v2_receipt_accepts_complete_duplicate_findings() -> None:
     receipt = v2_findings_receipt()
     accepted = receipt["attempts"][1]
@@ -3135,7 +3205,16 @@ def test_validate_v2_receipt_accepts_generated_invalid_evaluation_shapes(
     assert validate_v2_receipt(receipt) == ()
 
 
-def semantic_violation_cases() -> list[tuple[str, ContractContext, str, tuple[str, ...]]]:
+def semantic_violation_cases() -> list[
+    tuple[
+        str,
+        ContractContext,
+        str,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ]
+]:
     valid = finding()
     missing_title = {**valid}
     del missing_title["title"]
@@ -3155,6 +3234,8 @@ def semantic_violation_cases() -> list[tuple[str, ContractContext, str, tuple[st
             ),
             ContractContext(file_names=("source.py",)),
             "response-fields",
+            ("verdict",),
+            ("findings",),
             ("findings",),
         ),
         (
@@ -3167,42 +3248,56 @@ def semantic_violation_cases() -> list[tuple[str, ContractContext, str, tuple[st
             ),
             declaration_context,
             "response-fields",
+            ("reviewedFiles",),
+            ("verdict", "findings"),
             ("findings",),
         ),
         (
             json.dumps({"verdict": "unavailable", "findings": [valid]}),
             ContractContext(file_names=("source.py",)),
             "verdict",
+            (),
+            ("verdict", "findings"),
             ("verdict", "findings"),
         ),
         (
             json.dumps({"verdict": "changes-requested", "findings": {}}),
             ContractContext(file_names=("source.py",)),
             "findings-shape",
+            (),
+            ("verdict", "findings"),
             ("verdict", "findings"),
         ),
         (
             json.dumps({"verdict": "changes-requested", "findings": [missing_title, valid]}),
             ContractContext(file_names=("source.py",)),
             "finding-fields",
+            ("verdict",),
+            ("findings",),
             ("findings",),
         ),
         (
             json.dumps({"verdict": "changes-requested", "findings": [invalid_value, valid]}),
             ContractContext(file_names=("source.py",)),
             "finding-value",
+            ("verdict",),
+            ("findings",),
             ("findings",),
         ),
         (
             json.dumps({"verdict": "changes-requested", "findings": [invalid_path, valid]}),
             ContractContext(file_names=("source.py",)),
             "finding-path",
+            ("verdict",),
+            ("findings",),
             ("findings",),
         ),
         (
             json.dumps({"verdict": "approved", "findings": [valid]}),
             ContractContext(file_names=("source.py",)),
             "verdict-invariant",
+            (),
+            ("verdict", "findings"),
             ("verdict", "findings"),
         ),
         (
@@ -3215,6 +3310,8 @@ def semantic_violation_cases() -> list[tuple[str, ContractContext, str, tuple[st
             ),
             declaration_context,
             "review-declaration",
+            ("verdict",),
+            ("findings", "reviewedFiles"),
             ("findings", "reviewedFiles"),
         ),
     ]
@@ -3245,24 +3342,50 @@ def receipt_for_semantic_evaluation(
         file_names=context.file_names,
         review_declaration_required=context.review_declaration_required,
     )
+    promoted_fragments = promote_fragments(
+        evaluation,
+        contract_context=context,
+        gate_result="contract-incomplete",
+        attempt=1,
+        route_index=0,
+        raw_response_digest=evaluation.payload_digest,
+    )
+    attempt["promotedFragments"] = [fragment.to_dict() for fragment in promoted_fragments]
+    receipt["consolidatedReview"] = consolidate(
+        None,
+        promoted_fragments,
+        None,
+        contract_context=context,
+    ).to_dict()
     _sign_receipt(receipt)
     return receipt, evaluation
 
 
 @pytest.mark.parametrize(
-    ("payload", "context", "expected_violation", "mandatory_missing"),
+    (
+        "payload",
+        "context",
+        "expected_violation",
+        "expected_covered",
+        "expected_missing",
+        "mandatory_missing",
+    ),
     semantic_violation_cases(),
 )
 def test_validate_v2_receipt_accepts_exact_producer_semantic_coverage(
     payload: str,
     context: ContractContext,
     expected_violation: str,
+    expected_covered: tuple[str, ...],
+    expected_missing: tuple[str, ...],
     mandatory_missing: tuple[str, ...],
 ) -> None:
     receipt, evaluation = receipt_for_semantic_evaluation(payload, context)
 
     assert evaluation.violations == (expected_violation,)
     assert evaluation.coverage is not None
+    assert evaluation.coverage.covered_fields == expected_covered
+    assert evaluation.coverage.missing_fields == expected_missing
     assert set(mandatory_missing).issubset(evaluation.coverage.missing_fields)
     assert validate_v2_receipt(receipt) == ()
 
@@ -3271,7 +3394,7 @@ def test_validate_v2_receipt_accepts_exact_producer_semantic_coverage(
     ("payload", "context", "expected_violation", "mandatory_missing"),
     [
         (payload, context, violation, field)
-        for payload, context, violation, fields in semantic_violation_cases()
+        for payload, context, violation, _, _, fields in semantic_violation_cases()
         for field in fields
     ],
 )
@@ -3289,6 +3412,32 @@ def test_validate_v2_receipt_rejects_semantic_coverage_that_covers_mandatory_gap
     covered = set(coverage["coveredFields"])
     covered.add(mandatory_missing)
     coverage["coveredFields"] = [field for field in required if field in covered]
+    if serialized["completionRequest"] is not None:
+        serialized["completionRequest"]["missingFields"] = list(coverage["missingFields"])
+    _sign_receipt(receipt)
+
+    assert evaluation.violations == (expected_violation,)
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("payload", "context", "expected_violation"),
+    [
+        (payload, context, violation)
+        for payload, context, violation, _, _, _ in semantic_violation_cases()
+        if violation in {"finding-fields", "finding-value", "finding-path"}
+    ],
+)
+def test_validate_v2_receipt_rejects_finding_violation_with_missing_verdict(
+    payload: str,
+    context: ContractContext,
+    expected_violation: str,
+) -> None:
+    receipt, evaluation = receipt_for_semantic_evaluation(payload, context)
+    serialized = receipt["attempts"][0]["contractEvaluation"]
+    coverage = serialized["coverage"]
+    coverage["coveredFields"].remove("verdict")
+    coverage["missingFields"].insert(0, "verdict")
     if serialized["completionRequest"] is not None:
         serialized["completionRequest"]["missingFields"] = list(coverage["missingFields"])
     _sign_receipt(receipt)

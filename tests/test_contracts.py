@@ -638,6 +638,30 @@ def test_mixed_findings_extract_only_valid_siblings_and_request_completion() -> 
     assert evaluation.completion_request.violations == ("finding-value",)
 
 
+@pytest.mark.parametrize(
+    "invalid_finding",
+    [
+        {key: value for key, value in finding_payload()["findings"][0].items() if key != "title"},
+        {**finding_payload()["findings"][0], "severity": "urgent"},
+        {**finding_payload()["findings"][0], "path": "other.py"},
+    ],
+)
+def test_finding_violations_require_a_covered_verdict(invalid_finding: dict[str, object]) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    valid = finding_payload()["findings"][0]
+    evaluation = contract.evaluate(
+        json.dumps({"verdict": "approved", "findings": [invalid_finding, valid]}),
+        contract.prepare(context),
+        context,
+    )
+
+    assert evaluation.violations == ("verdict-invariant",)
+    assert evaluation.coverage is not None
+    assert evaluation.coverage.covered_fields == ()
+    assert evaluation.coverage.missing_fields == ("verdict", "findings")
+
+
 def test_valid_finding_can_survive_invalid_top_level_requirements() -> None:
     contract = get_contract("findings-json")
     context = ContractContext(file_names=("source.py",), review_declaration_required=True)

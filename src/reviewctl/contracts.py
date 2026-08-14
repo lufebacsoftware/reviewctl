@@ -465,14 +465,13 @@ class FindingsJsonContract:
                     continue
                 assert normalized_finding is not None
                 normalized_findings.append(normalized_finding)
-        if violation is None and first_finding_violation is not None:
-            violation = first_finding_violation
-
         verdict_invariant = (
             verdict_valid and findings_are_list and (verdict == "approved") == (not findings)
         )
         if violation is None and not verdict_invariant:
             violation = "verdict-invariant"
+        if violation is None and first_finding_violation is not None:
+            violation = first_finding_violation
 
         normalized_files: list[str] | None = None
         if context.review_declaration_required:
