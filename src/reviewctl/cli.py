@@ -1754,8 +1754,7 @@ def invoke_kiro(
 
     def persist_stderr() -> str:
         stderr = b"".join(stderr_chunks).decode(errors="replace")
-        if stderr:
-            diagnostic_path.write_text(redact_diagnostic(stderr, limit=100_000))
+        diagnostic_path.write_text(redact_diagnostic(stderr, limit=100_000))
         return stderr
 
     def run_process(command: list[str], cwd: Path, timeout: int) -> tuple[int, bytes, bytes, str]:

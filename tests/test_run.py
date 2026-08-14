@@ -622,6 +622,27 @@ def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_
     )
 
 
+def test_empty_kiro_response_records_zero_byte_stderr_evidence(tmp_path: Path) -> None:
+    fake_kiro = write_fake_kiro(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "empty",
+        env={"KIRO_BIN": str(fake_kiro)},
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    stderr_path = Path(attempt["evidence"]["stderr"])
+    assert attempt["result"] == "empty"
+    assert stderr_path.name == "stderr.log"
+    assert stderr_path.read_bytes() == b""
+
+
 def test_proprietary_kiro_runs_with_an_authorizing_policy(tmp_path: Path) -> None:
     fake_kiro = write_fake_kiro(tmp_path)
     policy = tmp_path / "allowed.toml"
@@ -7899,6 +7920,7 @@ def test_invoke_kiro_preserves_empty_output_with_a_valid_session(
     assert response.conversation_id == "123e4567-e89b-12d3-a456-426614174000"
     assert response.response == ""
     assert (tmp_path / "response.log").read_bytes() == b""
+    assert (tmp_path / "stderr.log").read_bytes() == b""
 
 
 def test_usage_private_gemini_product_review(tmp_path: Path) -> None:

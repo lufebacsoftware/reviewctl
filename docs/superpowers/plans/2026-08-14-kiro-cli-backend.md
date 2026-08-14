@@ -210,8 +210,8 @@ git commit -m "docs: describe kiro backend boundary"
 ### Task 4: Verify, smoke-test, and review externally
 
 **Files:**
-- Create outside repository: `/Users/luisfernando/Code/reviews/kiro-cli-review-request.md`
-- Create outside repository: `/Users/luisfernando/Code/reviews/kiro-cli-external/**`
+- Create outside repository: `<review-request.md>`
+- Create outside repository: `<artifact-root>/**`
 
 - [ ] **Step 1: Run complete local verification**
 
