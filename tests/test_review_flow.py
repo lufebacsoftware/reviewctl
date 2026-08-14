@@ -62,6 +62,50 @@ def finding(
     }
 
 
+def product_output(review_contract: str) -> dict[str, object]:
+    if review_contract == "product-judge-json":
+        return {
+            "scores": {
+                "delivery": 4,
+                "domainIntegrity": 4,
+                "operationalCorrectness": 4,
+                "problemFidelity": 4,
+                "scopeDiscipline": 4,
+            },
+            "hardConstraintViolations": [],
+            "rationale": "The proposal satisfies the bounded criteria.",
+        }
+    return {
+        "summary": "A bounded product review.",
+        "userJobs": ["Review one proposal."],
+        "mvp": ["Persist the accepted review."],
+        "nonGoals": ["Do not execute provider effects."],
+        "interactionFlow": [{"actor": "reviewer", "action": "review", "outcome": "decision"}],
+        "domainEntities": [{"name": "Review", "purpose": "Accepted product output."}],
+        "stateTransitions": [{"from": "draft", "to": "accepted", "guard": "valid"}],
+        "architecture": [
+            {
+                "boundary": "review",
+                "owns": "decision",
+                "commands": ["review"],
+                "events": ["review.accepted"],
+                "readModels": ["accepted review"],
+            }
+        ],
+        "operationalControls": [{"control": "integrity", "approach": "canonical digest"}],
+        "constraintChecks": [
+            {
+                "constraintId": "bounded",
+                "disposition": "satisfied",
+                "rationale": "Only the supplied proposal is reviewed.",
+            }
+        ],
+        "risks": ["A stale proposal could be reviewed."],
+        "acceptanceTests": ["The receipt binds the accepted output."],
+        "openQuestions": [],
+    }
+
+
 def incomplete_evaluation(*findings: dict[str, object]):
     contract = get_contract("findings-json")
     context = ContractContext(file_names=tuple(sorted({str(item["path"]) for item in findings})))
@@ -368,6 +412,20 @@ def v2_legacy_receipt(review_contract: str = "document") -> dict[str, object]:
             }
         ],
     }
+    if review_contract in {"product-review-json", "product-judge-json"}:
+        value = product_output(review_contract)
+        attempt = receipt["attempts"][0]
+        attempt["contractOutput"] = {
+            "name": review_contract,
+            "version": "legacy-1",
+            "status": "complete",
+            "normalizedSha256": hashlib.sha256(canonical_json(value)).hexdigest(),
+            "contractContext": {
+                "fileNames": ["source.py"],
+                "reviewDeclarationRequired": False,
+            },
+        }
+        receipt["review"] = value
     return _sign_receipt(receipt)
 
 
@@ -1639,6 +1697,59 @@ def test_consolidate_approved_only_from_real_accepted_review() -> None:
     assert result.approved is True
 
 
+@pytest.mark.parametrize(
+    "accepted_review",
+    [
+        {"verdict": "approved", "findings": []},
+        {
+            "verdict": "approved",
+            "findings": [],
+            "reviewedFiles": ["source.py"],
+            "invented": True,
+        },
+        {
+            "verdict": "approved",
+            "findings": [],
+            "reviewedFiles": ["source.py", "other.py"],
+        },
+    ],
+)
+def test_consolidate_rejects_non_complete_accepted_review_for_authoritative_context(
+    accepted_review: dict[str, object],
+) -> None:
+    context = ContractContext(
+        file_names=("other.py", "source.py"), review_declaration_required=True
+    )
+
+    result = consolidate(
+        accepted_review,
+        (),
+        accepted_attempt=2,
+        contract_context=context,
+    )
+
+    assert result.status == "unavailable"
+    assert result.approved is False
+
+
+def test_consolidate_accepts_exact_canonical_review_declaration() -> None:
+    result = consolidate(
+        {
+            "verdict": "approved",
+            "findings": [],
+            "reviewedFiles": ["other.py", "source.py"],
+        },
+        (),
+        accepted_attempt=2,
+        contract_context=ContractContext(
+            file_names=("other.py", "source.py"), review_declaration_required=True
+        ),
+    )
+
+    assert result.status == "accepted"
+    assert result.approved is True
+
+
 def test_consolidate_does_not_approve_when_unconfirmed_partial_findings_remain() -> None:
     result = consolidate(
         {"verdict": "approved", "findings": []},
@@ -2825,7 +2936,7 @@ def test_validate_v2_receipt_preserves_reviewed_files_outside_legacy_view() -> N
         ),
     )
     receipt["consolidatedReview"] = consolidate(
-        {"verdict": "approved", "findings": []},
+        normalized,
         (prior_fragment,),
         2,
         contract_context=context,
@@ -3375,9 +3486,24 @@ def test_validate_v2_receipt_binds_product_review_view_to_accepted_result(
     review_contract: str,
 ) -> None:
     receipt = v2_legacy_receipt(review_contract)
-    receipt["review"] = {"producer": "normalized"}
+    assert validate_v2_receipt(receipt) == ()
+
+    receipt["review"] = dict(reversed(list(receipt["review"].items())))
     _sign_receipt(receipt)
     assert validate_v2_receipt(receipt) == ()
+
+    invented = deepcopy(receipt)
+    if review_contract == "product-review-json":
+        invented["review"]["summary"] = "An invented top-level review."
+    else:
+        invented["review"]["rationale"] = "An invented top-level judgment."
+    _sign_receipt(invented)
+    assert "accepted-attempt" in validate_v2_receipt(invented)
+
+    extra = deepcopy(receipt)
+    extra["review"]["invented"] = True
+    _sign_receipt(extra)
+    assert "accepted-attempt" in validate_v2_receipt(extra)
 
     receipt.pop("review")
     _sign_receipt(receipt)
@@ -3386,8 +3512,28 @@ def test_validate_v2_receipt_binds_product_review_view_to_accepted_result(
     receipt["result"] = "unavailable"
     receipt["acceptedAttempt"] = None
     receipt["attempts"][0]["result"] = "timeout"
-    receipt["review"] = {"producer": "normalized"}
+    receipt["attempts"][0].pop("contractOutput")
+    receipt["review"] = product_output(review_contract)
     _sign_receipt(receipt)
+    assert "accepted-attempt" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "identity", "context", "extra"])
+def test_validate_v2_receipt_requires_exact_product_contract_output_metadata(
+    mutation: str,
+) -> None:
+    receipt = v2_legacy_receipt("product-judge-json")
+    output = receipt["attempts"][0]["contractOutput"]
+    if mutation == "missing":
+        receipt["attempts"][0].pop("contractOutput")
+    elif mutation == "identity":
+        output["name"] = "product-review-json"
+    elif mutation == "context":
+        output["contractContext"]["fileNames"] = ["other.py"]
+    else:
+        output["invented"] = True
+    _sign_receipt(receipt)
+
     assert "accepted-attempt" in validate_v2_receipt(receipt)
 
 

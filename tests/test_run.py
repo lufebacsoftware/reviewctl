@@ -3019,6 +3019,17 @@ def test_usage_synthetic_prompt_only_product_review(tmp_path: Path) -> None:
     }
     assert receipt["attempts"][0]["number"] == 1
     assert receipt["review"] == payload
+    output = receipt["attempts"][0]["contractOutput"]
+    assert output == {
+        "name": "product-review-json",
+        "version": "legacy-1",
+        "status": "complete",
+        "normalizedSha256": cli.sha256_bytes(cli.canonical_json(receipt["review"])),
+        "contractContext": {
+            "fileNames": ["prompt.md"],
+            "reviewDeclarationRequired": False,
+        },
+    }
     verified = run_cli("verify", str(receipt_path))
     assert verified.returncode == 0, verified.stderr
     assert json.loads(verified.stdout) == {

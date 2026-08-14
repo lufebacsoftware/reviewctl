@@ -3534,6 +3534,24 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 "conversationId": persisted.conversation_id if persisted else None,
                 "findings": review.get("findings", []) if review else [],
             }
+            if (
+                args.response_contract in {"product-review-json", "product-judge-json"}
+                and result == "accepted"
+                and review is not None
+            ):
+                contract_identity = receipt_contract_identity(args.response_contract)
+                attempt["contractOutput"] = {
+                    "name": contract_identity["name"],
+                    "version": contract_identity["version"],
+                    "status": "complete",
+                    "normalizedSha256": sha256_bytes(canonical_json(review)),
+                    "contractContext": {
+                        "fileNames": [item["name"] for item in source_files],
+                        "reviewDeclarationRequired": (
+                            transport == "codex" and args.source_class == "proprietary"
+                        ),
+                    },
+                }
             if contract_evaluation:
                 attempt["contractEvaluation"] = {
                     "name": contract_evaluation.name,

@@ -830,13 +830,19 @@ def consolidate(
             findings=consolidated_findings(),
         )
 
-    verdict = accepted_review.get("verdict")
-    accepted_findings = accepted_review.get("findings")
+    contract = get_contract("findings-json")
+    try:
+        accepted_evaluation = contract.evaluate(
+            canonical_json(accepted_review).decode(),
+            contract.prepare(contract_context),
+            contract_context,
+        )
+    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+        accepted_evaluation = None
     if (
-        not isinstance(verdict, str)
-        or verdict not in {"approved", "changes-requested"}
-        or not isinstance(accepted_findings, list)
-        or (verdict == "approved") != (not accepted_findings)
+        accepted_evaluation is None
+        or accepted_evaluation.status is not EvaluationStatus.COMPLETE
+        or accepted_evaluation.value != accepted_review
     ):
         return ConsolidatedReview(
             status="unavailable",
@@ -845,19 +851,10 @@ def consolidate(
             accepted_attempt=None,
             findings=consolidated_findings(),
         )
+    verdict = accepted_evaluation.value["verdict"]
+    accepted_findings = accepted_evaluation.value["findings"]
 
     for accepted_finding in accepted_findings:
-        if (
-            not valid_finding(accepted_finding)
-            or accepted_finding["path"] not in contract_context.file_names
-        ):
-            return ConsolidatedReview(
-                status="unavailable",
-                verdict=None,
-                approved=False,
-                accepted_attempt=None,
-                findings=consolidated_findings(),
-            )
         normalized = _copy_finding(accepted_finding)
         scope = (normalized["path"],)
         fingerprint = _fragment_fingerprint(
@@ -994,6 +991,31 @@ def _receipt_canonical_digest(value: object) -> str | None:
         return hashlib.sha256(canonical_json(value)).hexdigest()
     except (TypeError, ValueError, UnicodeError, OverflowError):
         return None
+
+
+def _receipt_product_contract_output(
+    value: object,
+    *,
+    contract_identity: object,
+    context: ContractContext,
+) -> str | None:
+    """Validate COMPLETE product-output metadata and return its normalized digest."""
+    if (
+        type(value) is not dict
+        or set(value) != {"name", "version", "status", "normalizedSha256", "contractContext"}
+        or type(contract_identity) is not dict
+        or value.get("name") != contract_identity.get("name")
+        or value.get("version") != contract_identity.get("version")
+        or value.get("status") != "complete"
+        or value.get("contractContext")
+        != {
+            "fileNames": list(context.file_names),
+            "reviewDeclarationRequired": context.review_declaration_required,
+        }
+        or not _is_sha256(value.get("normalizedSha256"))
+    ):
+        return None
+    return value["normalizedSha256"]
 
 
 def _fallback_reason_for_attempt(attempt: object) -> str | None:
@@ -1138,6 +1160,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     ):
         reject("review-contract")
     findings_contract = review_contract == "findings-json"
+    product_contract = review_contract in {"product-review-json", "product-judge-json"}
     expected_result_view_fields = RECEIPT_RESULT_VIEW_FIELDS.get(review_contract, frozenset())
     present_result_view_fields = RECEIPT_RESULT_VIEW_FIELD_NAMES.intersection(receipt)
     if present_result_view_fields - expected_result_view_fields:
@@ -1154,6 +1177,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         for attempt in attempts:
             if "contractEvaluation" in attempt or "evaluationError" in attempt:
                 reject("contract-evaluation")
+            if not product_contract and "contractOutput" in attempt:
+                reject("review-contract")
             if attempt.get("promotedFragments") != []:
                 reject("review-contract")
     all_promoted: list[PromotedFragment] = []
@@ -1579,6 +1604,35 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     elif present_result_view_fields:
         reject("accepted-attempt")
 
+    product_outputs = [
+        (index, attempt.get("contractOutput"))
+        for index, attempt in enumerate(attempts, start=1)
+        if "contractOutput" in attempt
+    ]
+    if product_contract and result == "accepted" and accepted is not None:
+        output_context = ContractContext(
+            file_names=source_file_names or (),
+            review_declaration_required=(
+                accepted.get("transport") == "codex" and source_class == "proprietary"
+            ),
+        )
+        output_digest = (
+            _receipt_product_contract_output(
+                product_outputs[0][1],
+                contract_identity=contract_identity,
+                context=output_context,
+            )
+            if len(product_outputs) == 1 and product_outputs[0][0] == accepted_attempt
+            else None
+        )
+        if (
+            output_digest is None
+            or _receipt_canonical_digest(receipt.get("review")) != output_digest
+        ):
+            reject("accepted-attempt")
+    elif product_outputs:
+        reject("contract-evaluation")
+
     if findings_contract:
         relationships = receipt.get("fallbackRelationships")
         relationships_valid = isinstance(relationships, list) and len(relationships) == max(
@@ -1669,10 +1723,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             ):
                 reject("accepted-attempt")
             else:
-                legacy_review = {
-                    "verdict": normalized["verdict"],
-                    "findings": normalized["findings"],
-                }
+                legacy_review = normalized
         consolidation_attempt = accepted or attempts[-1]
         consolidation_context = ContractContext(
             file_names=source_file_names or (),
