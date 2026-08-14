@@ -753,8 +753,10 @@ def build_completion_context(
     review_declaration_required: bool,
 ) -> CompletionContext:
     """Build a deterministic, prompt-safe view of typed fragments and contract gaps."""
-    if request is None:
+    if type(request) is not ContractCompletionRequest:
         raise ValueError("completion context requires a contract completion request")
+    if type(promoted_fragments) is not tuple:
+        raise ValueError("completion context requires canonical promoted fragments")
     if type(review_declaration_required) is not bool:
         raise ValueError("completion context requires a review declaration flag")
     if type(allowed_file_names) not in {tuple, list}:
@@ -975,7 +977,7 @@ def consolidate(
 
 def _receipt_string_list(value: object, *, nonempty: bool = False) -> bool:
     return (
-        isinstance(value, list)
+        type(value) is list
         and (not nonempty or bool(value))
         and all(type(item) is str and (not nonempty or bool(item)) for item in value)
         and len(value) == len(set(value))
@@ -1010,7 +1012,7 @@ def _receipt_normalized_review(value: object) -> dict[str, Any] | None:
     if (
         type(verdict) is not str
         or verdict not in {"approved", "changes-requested"}
-        or not isinstance(findings, list)
+        or type(findings) is not list
         or not all(valid_finding(finding) for finding in findings)
         or (verdict == "approved") != (not findings)
     ):
@@ -1030,7 +1032,7 @@ def _receipt_contract_context(value: object) -> ContractContext | None:
         return None
     file_names = value.get("fileNames")
     required = value.get("reviewDeclarationRequired")
-    if not isinstance(file_names, list):
+    if type(file_names) is not list:
         return None
     context = ContractContext(file_names=tuple(file_names), review_declaration_required=required)
     return context if valid_contract_context(context, require_file_names=True) else None
@@ -1041,7 +1043,7 @@ def _receipt_source_file_names(receipt: dict[str, Any]) -> tuple[str, ...] | Non
     if type(source) is not dict:
         return None
     files = source.get("files")
-    if not isinstance(files, list) or not files:
+    if type(files) is not list or not files:
         return None
     names: list[str] = []
     for file in files:
@@ -1254,7 +1256,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
 
     attempts_value = receipt.get("attempts")
     if (
-        not isinstance(attempts_value, list)
+        type(attempts_value) is not list
         or not attempts_value
         or not all(type(attempt) is dict for attempt in attempts_value)
     ):
@@ -1267,7 +1269,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         reject("attempt-numbering")
 
     routes_value = receipt.get("routes")
-    routes = routes_value if isinstance(routes_value, list) else []
+    routes = routes_value if type(routes_value) is list else []
     route_identities = [_receipt_route(route) for route in routes]
     routes_valid = bool(routes) and all(route is not None for route in route_identities)
     if not routes_valid:
@@ -1437,11 +1439,11 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and _is_sha256(payload_digest)
                     and raw_digest is not None
                     and raw_digest == payload_digest
-                    and isinstance(violations_value, list)
+                    and type(violations_value) is list
                     and all(type(item) is str for item in violations_value)
                     and type(evaluation_status) is str
                     and evaluation_status in {"complete", "incomplete", "invalid"}
-                    and isinstance(fragment_values, list)
+                    and type(fragment_values) is list
                 )
                 contract_context = _receipt_contract_context(evaluation.get("contractContext"))
                 prepared_digest: str | None = None
@@ -1492,7 +1494,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         valid = (
                             fragment.get("kind") == FragmentKind.FINDING.value
                             and _receipt_valid_finding(value, contract_context)
-                            and isinstance(scope, list)
+                            and type(scope) is list
                             and scope == [value["path"]]
                             and fragment.get("payloadDigest") == payload_digest
                         )
@@ -1638,7 +1640,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     reject("contract-evaluation")
 
         promoted_value = attempt.get("promotedFragments", [])
-        if not isinstance(promoted_value, list):
+        if type(promoted_value) is not list:
             reject("promoted-fragments")
             promoted_value = []
         expected_promoted: tuple[PromotedFragment, ...] = ()
@@ -1786,7 +1788,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
 
     if findings_contract:
         relationships = receipt.get("fallbackRelationships")
-        relationships_valid = isinstance(relationships, list) and len(relationships) == max(
+        relationships_valid = type(relationships) is list and len(relationships) == max(
             0, len(attempts) - 1
         )
         if relationships_valid:
@@ -1816,7 +1818,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and type(relationship.get("reason")) is str
                     and relationship.get("reason")
                     == _fallback_reason_for_attempt(attempts[source - 1])
-                    and isinstance(ids, list)
+                    and type(ids) is list
                     and all(type(fragment_id) is str for fragment_id in ids)
                     and ids == sorted(set(ids))
                 ):

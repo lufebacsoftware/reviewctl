@@ -64,6 +64,11 @@ class HostileContractFragment(ContractFragment):
         raise RuntimeError("hostile fragment attribute access")
 
 
+class HostileList(list[object]):
+    def __iter__(self):
+        raise RuntimeError("hostile list iteration")
+
+
 class HostileKey(str):
     __hash__ = str.__hash__
 
@@ -1110,6 +1115,18 @@ def test_build_completion_context_deduplicates_content_but_preserves_provenance(
     assert context.violations == ("response-fields",)
     assert context.to_dict()["fileNames"] == ["source.py"]
     assert context.to_dict()["reviewDeclarationRequired"] is False
+
+
+def test_build_completion_context_requires_a_tuple_of_promoted_fragments() -> None:
+    fragments = promoted(finding())
+    evaluation = incomplete_evaluation(finding())
+
+    with pytest.raises(ValueError, match="canonical promoted fragments"):
+        build_completion_context(
+            evaluation.completion_request,
+            list(fragments),
+            allowed_file_names=("source.py",),
+        )
 
 
 @pytest.mark.parametrize("required", [None, 0, 1, "false"])
@@ -2377,6 +2394,14 @@ def test_promote_fragments_rejects_non_finding_kind() -> None:
 
 def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> None:
     assert validate_v2_receipt(v2_findings_receipt()) == ()
+
+
+def test_validate_v2_receipt_rejects_hostile_attempt_list_without_iteration() -> None:
+    receipt = {"attempts": HostileList([{}])}
+
+    violations = validate_v2_receipt(receipt)
+
+    assert "attempts" in violations
 
 
 def test_validate_v2_receipt_requires_findings_to_remain_missing_when_promotable() -> None:
