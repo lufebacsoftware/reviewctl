@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from reviewctl import cli
 from reviewctl.backends import (
     BackendCapabilities,
     BackendDescriptor,
@@ -234,6 +235,9 @@ def test_topology_is_stably_sorted_and_serializes_with_asdict() -> None:
         unused_execute,
     )
     registry.register(descriptor("codex"), unused_execute)
+    kiro = cli.build_backend_registry().require("kiro").descriptor
+    assert kiro.executable_env == "KIRO_BIN"
+    registry.register(kiro, unused_execute)
 
     topology = discover_topology(
         registry,
@@ -258,6 +262,16 @@ def test_topology_is_stably_sorted_and_serializes_with_asdict() -> None:
                 True,
             ),
             BackendInstallation(
+                "kiro",
+                "kiro-cli",
+                "/bin/kiro-cli",
+                "/bin/kiro-cli 1.0",
+                "available",
+                "unqualified",
+                (),
+                True,
+            ),
+            BackendInstallation(
                 "openrouter", None, None, None, "not-applicable", "unqualified", (), False
             ),
             BackendInstallation(
@@ -275,6 +289,16 @@ def test_topology_is_stably_sorted_and_serializes_with_asdict() -> None:
                 "requested_executable": "codex",
                 "resolved_executable": "/bin/codex",
                 "version": "/bin/codex 1.0",
+                "availability": "available",
+                "qualification": "unqualified",
+                "diagnostics": (),
+                "probe_performed": True,
+            },
+            {
+                "name": "kiro",
+                "requested_executable": "kiro-cli",
+                "resolved_executable": "/bin/kiro-cli",
+                "version": "/bin/kiro-cli 1.0",
                 "availability": "available",
                 "qualification": "unqualified",
                 "diagnostics": (),
