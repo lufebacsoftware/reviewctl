@@ -158,7 +158,9 @@ An accepted Kiro receipt means the response passed `findings-json`; it is not a
 qualified merge approval. The receipt records
 `extension.backendQualification = "unqualified"` and
 `extension.mergeGateEligible = false`. Merge automation must reject that flag,
-while humans or a later qualified reviewer may still use the advisory findings.
+and `reviewctl verify` rejects a Kiro receipt if either value is missing or
+changed. Humans or a later qualified reviewer may still use the advisory
+findings.
 
 Handle Kiro agent errors as follows:
 

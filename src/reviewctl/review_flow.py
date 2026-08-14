@@ -1749,6 +1749,15 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     else:
         reject("result")
 
+    accepted_uses_kiro = accepted is not None and accepted.get("transport") == "kiro"
+    qualification = receipt.get("extension.backendQualification")
+    merge_gate_eligible = receipt.get("extension.mergeGateEligible")
+    if accepted_uses_kiro:
+        if qualification != "unqualified" or merge_gate_eligible is not False:
+            reject("backend-qualification")
+    elif qualification is not None or merge_gate_eligible is not None:
+        reject("backend-qualification")
+
     if result_is_accepted:
         if present_result_view_fields != expected_result_view_fields:
             reject("accepted-attempt")

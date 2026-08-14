@@ -100,8 +100,9 @@ For Kiro, receipt `result: accepted` means only that the response passed the
 declared contract. The same receipt records
 `extension.backendQualification: unqualified` and
 `extension.mergeGateEligible: false`. Any merge gate must reject that explicit
-indicator; the advisory response remains available for consolidation or later
-review instead of being discarded.
+indicator. Receipt verification rejects an accepted Kiro receipt if either
+value is absent or changed; the advisory response remains available for
+consolidation or later review instead of being discarded.
 
 Setup diagnostics observe only executable presence and version for registered
 executable backends. Setup diagnostics never authenticate, call a model or

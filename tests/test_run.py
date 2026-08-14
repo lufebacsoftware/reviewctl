@@ -682,6 +682,23 @@ def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_
     assert receipt["extension.mergeGateEligible"] is False
     verified = run_cli("verify", str(receipt_path))
     assert verified.returncode == 0, verified.stderr
+    for label, mutation in (
+        ("missing", lambda value: value.pop("extension.mergeGateEligible")),
+        ("eligible", lambda value: value.__setitem__("extension.mergeGateEligible", True)),
+        (
+            "qualified",
+            lambda value: value.__setitem__("extension.backendQualification", "qualified"),
+        ),
+    ):
+        mutated = deepcopy(receipt)
+        mutation(mutated)
+        mutated.pop("sha256")
+        mutated["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(mutated))
+        mutated_path = tmp_path / f"kiro-{label}.json"
+        mutated_path.write_bytes(cli.canonical_json(mutated) + b"\n")
+        rejected = run_cli("verify", str(mutated_path))
+        assert rejected.returncode == 1
+        assert "backend-qualification" in json.loads(rejected.stdout)["violations"]
     assert attempt["evidence"]["request"].endswith("request.json")
     assert attempt["evidence"]["response"].endswith("response.log")
     assert attempt["evidence"]["session"].endswith("session.json")
