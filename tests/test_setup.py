@@ -76,9 +76,7 @@ def test_remote_api_discovery_does_not_inspect_credentials_or_call_local_probes(
     def unexpected_which(executable: str, path: str | None) -> str | None:
         raise AssertionError(f"which called for {executable} in {path}")
 
-    def unexpected_probe(
-        executable: str, environ: dict[str, str]
-    ) -> tuple[str | None, str | None]:
+    def unexpected_probe(executable: str, environ: dict[str, str]) -> tuple[str | None, str | None]:
         raise AssertionError(f"probe called for {executable} with {environ}")
 
     installation = discover_backend(
@@ -118,9 +116,7 @@ def test_executable_discovery_resolves_override_or_default(
         which_calls.append((executable, path))
         return f"/tools/{executable}"
 
-    def fake_probe(
-        executable: str, probe_environ: dict[str, str]
-    ) -> tuple[str | None, str | None]:
+    def fake_probe(executable: str, probe_environ: dict[str, str]) -> tuple[str | None, str | None]:
         probe_calls.append((executable, probe_environ))
         return "codex 1.2.3", None
 
@@ -148,9 +144,7 @@ def test_executable_discovery_resolves_override_or_default(
 def test_missing_executable_is_distinct_from_qualification_and_is_not_probed() -> None:
     probe_called = False
 
-    def fake_probe(
-        executable: str, environ: dict[str, str]
-    ) -> tuple[str | None, str | None]:
+    def fake_probe(executable: str, environ: dict[str, str]) -> tuple[str | None, str | None]:
         nonlocal probe_called
         probe_called = True
         return executable, repr(environ)
@@ -171,9 +165,7 @@ def test_missing_executable_is_distinct_from_qualification_and_is_not_probed() -
 def test_discovery_probe_receives_only_path_and_systemroot() -> None:
     probe_calls: list[tuple[str, dict[str, str]]] = []
 
-    def fake_probe(
-        executable: str, environ: dict[str, str]
-    ) -> tuple[str | None, str | None]:
+    def fake_probe(executable: str, environ: dict[str, str]) -> tuple[str | None, str | None]:
         probe_calls.append((executable, environ))
         return None, "version unavailable"
 
@@ -340,8 +332,7 @@ def test_topology_is_stably_sorted_and_serializes_with_asdict() -> None:
             "Authorization: Bearer also-secret\n" + "x" * 600,
             None,
             "version probe exited with status 2: "
-            "token: [REDACTED]\nAuthorization: [REDACTED]\n"
-            + "x" * 420,
+            "token: [REDACTED]\nAuthorization: [REDACTED]\n" + "x" * 420,
         ),
     ],
 )
@@ -406,8 +397,7 @@ def _write_python_executable(directory: Path, name: str, source: str) -> Path:
         return launcher
     launcher = directory / name
     launcher.write_text(
-        "#!/bin/sh\n"
-        f"exec {shlex.quote(python_executable)} {shlex.quote(str(payload))} \"$@\"\n",
+        f'#!/bin/sh\nexec {shlex.quote(python_executable)} {shlex.quote(str(payload))} "$@"\n',
         encoding="utf-8",
     )
     launcher.chmod(0o755)
@@ -451,9 +441,7 @@ def test_discovery_without_supplied_path_does_not_search_ambient_path(
     monkeypatch.setenv("PATH", str(ambient_dir))
     probe_called = False
 
-    def fake_probe(
-        executable: str, environ: dict[str, str]
-    ) -> tuple[str | None, str | None]:
+    def fake_probe(executable: str, environ: dict[str, str]) -> tuple[str | None, str | None]:
         nonlocal probe_called
         probe_called = True
         return executable, repr(environ)
@@ -720,9 +708,7 @@ def test_discovery_sanitizes_secret_shaped_requested_executable_and_diagnostic(
 
     assert lookup_calls == [(requested, "/safe/bin")]
     assert installation.requested_executable == f"/safe/tool?{label}=[REDACTED]"
-    assert installation.diagnostics == (
-        f"executable not found: /safe/tool?{label}=[REDACTED]",
-    )
+    assert installation.diagnostics == (f"executable not found: /safe/tool?{label}=[REDACTED]",)
     assert secret not in repr(asdict(installation))
 
 
@@ -816,9 +802,7 @@ def test_discovery_redacts_generic_secret_env_shaped_requested_executable() -> N
 
     assert secret not in repr(asdict(installation))
     assert installation.requested_executable == "/safe/tool?BUILD_SECRET=[REDACTED]"
-    assert installation.diagnostics == (
-        "executable not found: /safe/tool?BUILD_SECRET=[REDACTED]",
-    )
+    assert installation.diagnostics == ("executable not found: /safe/tool?BUILD_SECRET=[REDACTED]",)
 
 
 @pytest.mark.parametrize(
@@ -881,9 +865,7 @@ def test_discovery_redacts_uri_userinfo_while_preserving_scheme_and_host(
 
 
 def test_discovery_does_not_redact_unstructured_secret_prose_or_safe_neighbors() -> None:
-    safe_version = (
-        "tool 5.0 this is no secret; tokenization and api_key naming are ordinary prose"
-    )
+    safe_version = "tool 5.0 this is no secret; tokenization and api_key naming are ordinary prose"
 
     installation = discover_backend(
         descriptor("tool"),
