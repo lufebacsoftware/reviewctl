@@ -155,6 +155,7 @@ def test_build_backend_registry_has_exact_inventory_and_unqualified_descriptors(
     assert tuple(item.name for item in descriptors) == (
         "agy",
         "codex",
+        "gemini",
         "kiro",
         "llm",
         "openrouter",
@@ -208,6 +209,25 @@ def test_route_transports_match_registered_backend_names() -> None:
                 True,
                 True,
                 SourceIsolation.EXTERNAL_SANDBOX,
+            ),
+        ),
+        (
+            "gemini",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "GEMINI_BIN",
+            "gemini",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                False,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
             ),
         ),
         (
@@ -375,6 +395,7 @@ def test_execute_llm_backend_preserves_failure_without_persisted_response(
         ("LLM_BIN", "execute_llm_backend", "invoke_llm", "llm_bin"),
         ("CODEX_BIN", "execute_codex_backend", "invoke_codex", "codex_bin"),
         ("AGY_BIN", "execute_agy_backend", "invoke_agy", "agy_bin"),
+        ("GEMINI_BIN", "execute_gemini_backend", "invoke_gemini", "gemini_bin"),
         ("KIRO_BIN", "execute_kiro_backend", "invoke_kiro", "kiro_bin"),
         ("PI_BIN", "execute_pi_backend", "invoke_pi", "pi_bin"),
     ],
@@ -503,6 +524,59 @@ def test_execute_codex_backend_persists_rejected_response_and_maps_evidence(
     assert response_path.read_text() == "rejected"
     assert execution == BackendExecution(
         23, "rejected output", expected_response, BackendEvidence(response=response_path)
+    )
+    assert_execution_has_transport_semantics_only(execution)
+
+
+def test_execute_gemini_backend_invokes_headless_transport_and_maps_all_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    expected_response = PersistedResponse(
+        "session", None, 10, 20, request.model, 30, "google-gemini-cli", "ok"
+    )
+    calls: dict[str, object] = {}
+
+    def fake_invoke_gemini(**kwargs: object) -> tuple[int, str, PersistedResponse]:
+        calls.update(kwargs)
+        return 0, "", expected_response
+
+    request.attempt_dir.mkdir()
+    monkeypatch.delenv("GEMINI_BIN", raising=False)
+    monkeypatch.setattr(cli, "invoke_gemini", fake_invoke_gemini)
+
+    execution = cli.execute_gemini_backend(request)
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    session_path = request.attempt_dir / "session.json"
+    final_response_path = request.attempt_dir / "response.md"
+    stderr_path = request.attempt_dir / "stderr.log"
+
+    assert calls == {
+        "gemini_bin": "gemini",
+        "prompt": request.prompt,
+        "model": request.model,
+        "files": list(request.files),
+        "max_output_tokens": request.max_output_tokens,
+        "response_contract": request.response_contract,
+        "timeout_seconds": request.timeout_seconds,
+        "request_path": request_path,
+        "response_path": response_path,
+        "session_path": session_path,
+        "diagnostic_path": stderr_path,
+    }
+    assert final_response_path.read_text() == "ok"
+    assert execution == BackendExecution(
+        0,
+        "",
+        expected_response,
+        BackendEvidence(
+            request=request_path,
+            response=response_path,
+            session=session_path,
+            final_response=final_response_path,
+            stderr=stderr_path,
+        ),
     )
     assert_execution_has_transport_semantics_only(execution)
 

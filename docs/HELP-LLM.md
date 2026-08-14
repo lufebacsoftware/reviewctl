@@ -33,6 +33,33 @@ For formal routes, `MODEL` must be qualified by the organization's private
 policy and evidence store. This public guide intentionally contains no model
 roster, prices, provider-specific invocation commands, or credentials.
 
+For local experimental work, a private policy may authorize a transport's
+runtime-owned model inventory without duplicating a model list:
+
+```toml
+[transports.kiro]
+source_allowed = true
+allow_unresolved_identity = true
+
+[transports.gemini]
+source_allowed = true
+
+[transports.pi]
+source_allowed = true
+
+[transports.codex]
+source_allowed = true
+```
+
+An exact `[models."MODEL_ID"]` entry overrides its transport default. This
+scope is still advisory and does not authorize OpenRouter or make a backend a
+merge gate. The policy file and digest remain part of the receipt.
+
+Gemini, Pi, and Kiro proprietary routes require an explicit policy. Codex
+retains its existing policy-optional proprietary route for backwards
+compatibility; when a policy is supplied, its exact model and transport entries
+are enforced for Codex too.
+
 A formal result requires `receipt.result` to be `accepted`, `acceptedAttempt`
 to name the accepted attempt, successful receipt verification, and independent
 checking of material findings. A missing, empty, unavailable, rejected, or
@@ -177,6 +204,40 @@ Handle Kiro agent errors as follows:
   do not treat the result as approval.
 - Missing executable: run `reviewctl setup check --backend kiro` and correct
   `KIRO_BIN` or the local installation.
+
+## Gemini CLI backend
+
+Gemini CLI is a separate registered transport from Antigravity (`agy`):
+
+```bash
+reviewctl setup check --backend gemini
+reviewctl run --review-id ID --transport gemini --model MODEL_ID \
+  --prompt-file FILE --file SOURCE --source-class synthetic
+```
+
+The adapter uses the installed `gemini` CLI with headless JSON output,
+`--approval-mode plan`, `--sandbox`, and a disposable working directory. The
+frozen packet is supplied over standard input; no source path is passed to the
+model command. The response JSON, session identifier, statistics, request, and
+stderr are retained as attempt evidence.
+
+Gemini may resolve a requested alias to a different model. The receipt records
+the requested model and keeps the CLI's observed model statistics in raw
+evidence; it does not claim resolved model identity or qualification. The CLI
+does not provide a portable output-token cap, so
+`outputTokenLimitEnforced = false` is recorded. A valid or accepted Gemini
+receipt is advisory and is not merge-gate approval.
+
+For local experimental proprietary work, the private policy must explicitly
+authorize the transport before source bytes are sent:
+
+```toml
+[transports.gemini]
+source_allowed = true
+```
+
+The direct Gemini CLI transport is not the same as `agy`, which remains the
+Antigravity transport used by existing product-review routes.
 
 ## Diagnose failures
 

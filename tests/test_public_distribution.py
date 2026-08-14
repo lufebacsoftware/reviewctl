@@ -128,9 +128,9 @@ def test_architecture_defines_backend_seam_and_controller_ownership() -> None:
 def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> None:
     architecture = " ".join((ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split())
 
-    for adapter in ("llm", "openrouter", "agy", "pi", "codex"):
+    for adapter in ("llm", "openrouter", "agy", "gemini", "pi", "codex"):
         assert f"`{adapter}`" in architecture
-    assert "five legacy compatibility adapters are explicitly unqualified" in architecture
+    assert "the registered cli adapters are explicitly unqualified" in architecture
     assert (
         "setup diagnostics observe only executable presence and version for registered "
         "executable backends."
@@ -219,6 +219,9 @@ def test_help_documents_kiro_selection_policy_and_failure_recovery() -> None:
         "proprietary kiro source requires both policy decisions",
         "source_allowed = true",
         "allow_unresolved_identity = true",
+        "private policy may authorize a transport's runtime-owned model inventory",
+        'an exact `[models."model_id"]` entry overrides its transport default',
+        "does not authorize openrouter or make a backend a merge gate",
         "records that waiver in the receipt",
         "does not qualify the backend or prove which model executed",
         "synthetic runs require neither the policy nor the waiver",
