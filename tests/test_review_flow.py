@@ -833,7 +833,14 @@ def test_build_completion_context_requires_a_typed_gap_manifest() -> None:
         ("packet_digest", None),
         ("packet_digest", "A" * 64),
         ("packet_digest", "b" * 63),
+        ("missing_fields", ()),
+        ("missing_fields", ("verdict",)),
+        ("missing_fields", ("findings", "verdict")),
+        ("missing_fields", ("verdict", "findings", "unknown")),
         ("missing_fields", ("verdict", 7)),
+        ("missing_fields", ([],)),
+        ("violations", ()),
+        ("violations", ("unknown-violation",)),
         ("violations", ("response-fields", False)),
         ("invalid_fragment_indexes", (1, 0)),
         ("invalid_fragment_indexes", (0, 0)),
@@ -1034,6 +1041,35 @@ def test_render_completion_prompt_revalidates_direct_completion_context(
     assert "raw prior response" not in str(error.value)
     assert COMPLETION_CONTEXT_START not in str(error.value)
     assert COMPLETION_CONTEXT_END not in str(error.value)
+
+
+def test_build_completion_context_validates_gap_fields_against_declaration_context() -> None:
+    evaluation = incomplete_evaluation(finding())
+    request = replace(
+        evaluation.completion_request,
+        missing_fields=("findings", "reviewedFiles"),
+    )
+
+    with pytest.raises(ValueError, match="invalid completion manifest"):
+        build_completion_context(
+            request,
+            promoted(finding()),
+            allowed_file_names=("source.py",),
+            review_declaration_required=False,
+        )
+
+
+def test_render_completion_prompt_rejects_gap_manifest_for_another_context() -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = build_completion_context(
+        evaluation.completion_request,
+        promoted(finding()),
+        allowed_file_names=("source.py",),
+    )
+    malicious = replace(context, missing_fields=("findings", "reviewedFiles"))
+
+    with pytest.raises(ValueError, match="^invalid completion context$"):
+        render_completion_prompt("Review the packet.", malicious)
 
 
 @pytest.mark.parametrize(
@@ -2269,6 +2305,40 @@ def test_validate_v2_receipt_requires_reviewed_files_to_match_context_exactly() 
 
 def test_validate_v2_receipt_accepts_invalid_evaluation_state() -> None:
     assert validate_v2_receipt(v2_invalid_findings_receipt()) == ()
+
+
+def test_validate_v2_receipt_rejects_impossible_all_covered_invalid_evaluation() -> None:
+    receipt = v2_invalid_findings_receipt()
+    receipt["attempts"][0]["contractEvaluation"]["coverage"] = {
+        "requiredFields": ["verdict", "findings"],
+        "coveredFields": ["verdict", "findings"],
+        "missingFields": [],
+    }
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("missingFields", []),
+        ("missingFields", ["verdict"]),
+        ("missingFields", ["findings", "verdict"]),
+        ("missingFields", ["verdict", "findings", "unknown"]),
+        ("missingFields", [[]]),
+        ("violations", []),
+        ("violations", ["unknown-violation"]),
+    ],
+)
+def test_validate_v2_receipt_rejects_noncanonical_completion_gap(
+    field: str, value: list[object]
+) -> None:
+    receipt = v2_findings_receipt()
+    receipt["attempts"][0]["contractEvaluation"]["completionRequest"][field] = value
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
 
 
 @pytest.mark.parametrize(

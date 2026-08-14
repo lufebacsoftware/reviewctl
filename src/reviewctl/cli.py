@@ -3256,7 +3256,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 and prepared_contract is not None
                 and contract_context is not None
             ):
-                target_missing_fields = ("verdict",)
+                target_missing_fields = ("verdict", "findings")
                 if contract_context.review_declaration_required:
                     target_missing_fields += ("reviewedFiles",)
                 target_completion_request = ContractCompletionRequest(

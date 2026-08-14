@@ -972,8 +972,8 @@ def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
 @pytest.mark.parametrize(
     ("source_transport", "target_transport", "expected_missing"),
     [
-        ("codex", "llm", ["verdict"]),
-        ("llm", "codex", ["verdict", "reviewedFiles"]),
+        ("codex", "llm", ["verdict", "findings"]),
+        ("llm", "codex", ["verdict", "findings", "reviewedFiles"]),
     ],
 )
 def test_completion_prompt_uses_target_route_contract_context(

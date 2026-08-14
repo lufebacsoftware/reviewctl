@@ -13,6 +13,22 @@ from typing import Any, NoReturn, Protocol
 FINDING_FIELDS = {"severity", "path", "line", "title", "evidence", "reproduction"}
 FINDING_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 REVIEW_VERDICTS = {"approved", "changes-requested"}
+FINDINGS_REQUIRED_FIELDS = ("verdict", "findings")
+FINDINGS_CONTRACT_VIOLATION_CODES = frozenset(
+    {
+        "finding-fields",
+        "finding-path",
+        "finding-value",
+        "findings-shape",
+        "invalid-json",
+        "prepared-contract",
+        "response-fields",
+        "review-declaration",
+        "top-level-not-object",
+        "verdict",
+        "verdict-invariant",
+    }
+)
 
 FINDINGS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -115,6 +131,36 @@ class ContractCoverage:
     required_fields: tuple[str, ...]
     covered_fields: tuple[str, ...]
     missing_fields: tuple[str, ...]
+
+
+def findings_required_fields(review_declaration_required: bool) -> tuple[str, ...]:
+    """Return canonical ordered fields for one findings review context."""
+    if type(review_declaration_required) is not bool:
+        raise ValueError("review declaration requirement must be boolean")
+    if review_declaration_required:
+        return (*FINDINGS_REQUIRED_FIELDS, "reviewedFiles")
+    return FINDINGS_REQUIRED_FIELDS
+
+
+def findings_coverage(
+    *,
+    review_declaration_required: bool,
+    verdict_covered: bool,
+    findings_covered: bool,
+    review_declaration_covered: bool,
+) -> ContractCoverage:
+    """Build producer-authoritative coverage in required-field order."""
+    required_fields = findings_required_fields(review_declaration_required)
+    coverage = {
+        "verdict": verdict_covered,
+        "findings": findings_covered,
+        "reviewedFiles": review_declaration_covered,
+    }
+    return ContractCoverage(
+        required_fields=required_fields,
+        covered_fields=tuple(field for field in required_fields if coverage[field]),
+        missing_fields=tuple(field for field in required_fields if not coverage[field]),
+    )
 
 
 @dataclass(frozen=True)
@@ -322,9 +368,7 @@ class FindingsJsonContract:
         if not isinstance(value, dict):
             return rejected("top-level-not-object")
 
-        required_fields = ("verdict", "findings")
-        if context.review_declaration_required:
-            required_fields += ("reviewedFiles",)
+        required_fields = findings_required_fields(context.review_declaration_required)
         expected_fields = set(required_fields)
         violation = "response-fields" if set(value) != expected_fields else None
 
@@ -394,25 +438,11 @@ class FindingsJsonContract:
                 violation = "review-declaration"
 
         findings_valid = findings_are_list and not invalid_fragment_indexes and violation is None
-        covered_fields: list[str] = []
-        missing_fields: list[str] = []
-        if verdict_invariant:
-            covered_fields.append("verdict")
-        else:
-            missing_fields.append("verdict")
-        if findings_valid:
-            covered_fields.append("findings")
-        if not findings_valid:
-            missing_fields.append("findings")
-        if context.review_declaration_required:
-            if normalized_files is not None:
-                covered_fields.append("reviewedFiles")
-            else:
-                missing_fields.append("reviewedFiles")
-        coverage = ContractCoverage(
-            required_fields=required_fields,
-            covered_fields=tuple(covered_fields),
-            missing_fields=tuple(missing_fields),
+        coverage = findings_coverage(
+            review_declaration_required=context.review_declaration_required,
+            verdict_covered=verdict_invariant,
+            findings_covered=findings_valid,
+            review_declaration_covered=normalized_files is not None,
         )
 
         fragments: list[ContractFragment] = []

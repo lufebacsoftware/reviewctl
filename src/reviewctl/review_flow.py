@@ -9,6 +9,7 @@ from typing import Any, NoReturn
 from reviewctl.contracts import (
     FINDING_FIELDS,
     FINDING_SEVERITIES,
+    FINDINGS_CONTRACT_VIOLATION_CODES,
     ContractCompletionRequest,
     ContractContext,
     ContractCoverage,
@@ -16,6 +17,7 @@ from reviewctl.contracts import (
     EvaluationStatus,
     FragmentKind,
     canonical_json,
+    findings_required_fields,
     get_contract,
 )
 
@@ -157,6 +159,8 @@ def _valid_completion_manifest(
     violations: object,
     sequence_type: type[list] | type[tuple],
     require_packet_digest: bool,
+    review_declaration_required: bool,
+    require_findings_gap: bool,
 ) -> bool:
     """Validate the canonical, typed gap manifest at each trust boundary."""
     if not _is_sha256(prepared_digest):
@@ -166,12 +170,27 @@ def _valid_completion_manifest(
             return False
     elif packet_digest is not None and not _is_sha256(packet_digest):
         return False
-    if type(missing_fields) is not sequence_type or not all(
-        type(field) is str for field in missing_fields
+    if type(review_declaration_required) is not bool:
+        return False
+    required_fields = findings_required_fields(review_declaration_required)
+    if type(missing_fields) is not sequence_type or not missing_fields:
+        return False
+    if not all(type(field) is str for field in missing_fields):
+        return False
+    missing = set(missing_fields)
+    if (
+        not missing.issubset(required_fields)
+        or list(missing_fields) != [field for field in required_fields if field in missing]
+        or (require_findings_gap and "findings" not in missing)
     ):
         return False
-    if type(violations) is not sequence_type or not all(
-        type(violation) is str for violation in violations
+    if (
+        type(violations) is not sequence_type
+        or not violations
+        or not all(
+            type(violation) is str and violation in FINDINGS_CONTRACT_VIOLATION_CODES
+            for violation in violations
+        )
     ):
         return False
     if type(invalid_fragment_indexes) is not sequence_type or not all(
@@ -354,6 +373,8 @@ def _validate_completion_context(context: object) -> bool:
         violations=context.violations,
         sequence_type=tuple,
         require_packet_digest=True,
+        review_declaration_required=context.review_declaration_required,
+        require_findings_gap=True,
     ):
         return False
     if (
@@ -462,9 +483,7 @@ def _valid_incomplete_evaluation(
 ) -> bool:
     """Reproduce the complete state that authorizes fragment promotion."""
     try:
-        required_fields = ("verdict", "findings")
-        if context.review_declaration_required:
-            required_fields += ("reviewedFiles",)
+        required_fields = findings_required_fields(context.review_declaration_required)
         prepared = get_contract("findings-json").prepare(context)
         coverage = evaluation.coverage
         request = evaluation.completion_request
@@ -519,6 +538,8 @@ def _valid_incomplete_evaluation(
                 violations=request.violations,
                 sequence_type=tuple,
                 require_packet_digest=True,
+                review_declaration_required=context.review_declaration_required,
+                require_findings_gap=True,
             )
             and request.prepared_digest == evaluation.prepared_digest
             and request.missing_fields == coverage.missing_fields
@@ -601,6 +622,8 @@ def build_completion_context(
     """Build a deterministic, prompt-safe view of typed fragments and contract gaps."""
     if request is None:
         raise ValueError("completion context requires a contract completion request")
+    if type(review_declaration_required) is not bool:
+        raise ValueError("completion context requires a review declaration flag")
     if not _valid_completion_manifest(
         prepared_digest=request.prepared_digest,
         packet_digest=request.packet_digest,
@@ -609,10 +632,10 @@ def build_completion_context(
         violations=request.violations,
         sequence_type=tuple,
         require_packet_digest=True,
+        review_declaration_required=review_declaration_required,
+        require_findings_gap=True,
     ):
         raise ValueError("invalid completion manifest")
-    if type(review_declaration_required) is not bool:
-        raise ValueError("completion context requires a review declaration flag")
     if (
         type(allowed_file_names) not in {tuple, list}
         or not allowed_file_names
@@ -936,6 +959,7 @@ def _receipt_completion_request(
     packet_digest: str | None,
     coverage_missing: list[str],
     violations: list[str],
+    review_declaration_required: bool,
 ) -> bool:
     if type(value) is not dict or set(value) != {
         "preparedDigest",
@@ -959,6 +983,8 @@ def _receipt_completion_request(
             violations=value.get("violations"),
             sequence_type=list,
             require_packet_digest=False,
+            review_declaration_required=review_declaration_required,
+            require_findings_gap=True,
         )
         and bool(coverage_missing or indexes or violations)
     )
@@ -1288,6 +1314,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         packet_digest=packet_digest,
                         coverage_missing=coverage[2],
                         violations=violations_value,
+                        review_declaration_required=declaration_required,
                     )
                     incomplete_coverage_valid = coverage_valid and _valid_incomplete_coverage(
                         coverage[0], coverage[1], coverage[2]
@@ -1304,6 +1331,10 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     )
                     promotion_eligible = state_valid
                 else:
+                    invalid_coverage_valid = evaluation.get("coverage") is None or (
+                        coverage_valid
+                        and _valid_incomplete_coverage(coverage[0], coverage[1], coverage[2])
+                    )
                     state_valid = (
                         state_valid
                         and normalized_digest is None
@@ -1311,7 +1342,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         and bool(violations_value)
                         and fragment_values == []
                         and completion_request is None
-                        and (evaluation.get("coverage") is None or coverage_valid)
+                        and invalid_coverage_valid
                         and attempt.get("result") == "incomplete"
                     )
                 if not state_valid:
