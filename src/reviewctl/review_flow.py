@@ -211,21 +211,45 @@ def _valid_completion_manifest(
     return list(invalid_fragment_indexes) == sorted(set(invalid_fragment_indexes))
 
 
+def _valid_ordered_coverage_partition(
+    required_fields: list[str] | tuple[str, ...],
+    covered_fields: list[str] | tuple[str, ...],
+    missing_fields: list[str] | tuple[str, ...],
+) -> bool:
+    """Validate an exact ordered partition projected from required fields."""
+    if any(
+        type(fields) not in {list, tuple}
+        for fields in (required_fields, covered_fields, missing_fields)
+    ):
+        return False
+    if not all(
+        type(field) is str
+        for fields in (required_fields, covered_fields, missing_fields)
+        for field in fields
+    ):
+        return False
+    required = set(required_fields)
+    covered = set(covered_fields)
+    missing = set(missing_fields)
+    return (
+        len(required_fields) == len(required)
+        and not covered.intersection(missing)
+        and covered.union(missing) == required
+        and list(covered_fields) == [field for field in required_fields if field in covered]
+        and list(missing_fields) == [field for field in required_fields if field in missing]
+    )
+
+
 def _valid_incomplete_coverage(
     required_fields: list[str] | tuple[str, ...],
     covered_fields: list[str] | tuple[str, ...],
     missing_fields: list[str] | tuple[str, ...],
 ) -> bool:
     """Reproduce the coverage state that permits findings promotion."""
-    covered = set(covered_fields)
-    missing = set(missing_fields)
     return (
-        not covered.intersection(missing)
-        and covered.union(missing) == set(required_fields)
-        and list(covered_fields) == [field for field in required_fields if field in covered]
-        and list(missing_fields) == [field for field in required_fields if field in missing]
-        and "findings" not in covered
-        and "findings" in missing
+        _valid_ordered_coverage_partition(required_fields, covered_fields, missing_fields)
+        and "findings" not in covered_fields
+        and "findings" in missing_fields
     )
 
 
@@ -974,7 +998,7 @@ def _receipt_coverage(value: object) -> tuple[list[str], list[str], list[str]] |
     missing = value.get("missingFields")
     if not all(_receipt_string_list(items) for items in (required, covered, missing)):
         return None
-    if set(covered).intersection(missing) or set(covered).union(missing) != set(required):
+    if not _valid_ordered_coverage_partition(required, covered, missing):
         return None
     return required, covered, missing
 
@@ -1172,9 +1196,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     if not _is_sha256(recorded_digest) or recorded_digest != reproduced_digest:
         reject("receipt-digest")
 
-    if receipt.get("receiptSchemaVersion") != 2 or isinstance(
-        receipt.get("receiptSchemaVersion"), bool
-    ):
+    receipt_schema_version = receipt.get("receiptSchemaVersion")
+    if type(receipt_schema_version) is not int or receipt_schema_version != 2:
         reject("receipt-schema-version")
 
     source_class = receipt.get("sourceClass")

@@ -19,6 +19,7 @@ from reviewctl.review_flow import (
     ConsolidatedReview,
     FallbackRelationship,
     PromotedFragment,
+    _receipt_coverage,
     consolidate,
     promote_fragments,
     receipt_contract_identity,
@@ -28,6 +29,10 @@ from reviewctl.review_flow import (
 from reviewctl.review_flow import (
     build_completion_context as _build_completion_context,
 )
+
+
+class ReceiptVersionInt(int):
+    pass
 
 
 def build_completion_context(
@@ -2920,6 +2925,18 @@ def test_validate_v2_receipt_detects_rehashed_structural_mutations(
     assert violation in validate_v2_receipt(receipt)
 
 
+@pytest.mark.parametrize(
+    "version",
+    [2.0, True, False, ReceiptVersionInt(2), "2", None],
+)
+def test_validate_v2_receipt_requires_exact_integer_schema_version(version: object) -> None:
+    receipt = v2_findings_receipt()
+    receipt["receiptSchemaVersion"] = version
+    _sign_receipt(receipt)
+
+    assert "receipt-schema-version" in validate_v2_receipt(receipt)
+
+
 @pytest.mark.parametrize("reason", ["incomplete", "contract-invalid", "unknown"])
 def test_validate_v2_receipt_rejects_fallback_reason_not_derived_from_source(
     reason: str,
@@ -3433,6 +3450,96 @@ def receipt_for_semantic_evaluation(
     ).to_dict()
     _sign_receipt(receipt)
     return receipt, evaluation
+
+
+def receipt_with_two_missing_coverage_fields() -> dict[str, object]:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    payload = json.dumps({"verdict": "unavailable", "findings": []})
+    evaluation = contract.evaluate(payload, contract.prepare(context), context)
+    receipt = v2_invalid_findings_receipt()
+    attempt = receipt["attempts"][0]
+    attempt["rawResponse"]["sha256"] = evaluation.payload_digest
+    attempt["rawResponse"]["characters"] = len(payload)
+    attempt["contractEvaluation"] = _evaluation_dict(
+        evaluation,
+        file_names=context.file_names,
+    )
+    return _sign_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        (field, mutation)
+        for field in ("coveredFields", "missingFields")
+        for mutation in ("order", "duplicate", "field-type", "item-type")
+    ],
+)
+def test_receipt_coverage_requires_ordered_typed_projection(
+    field: str,
+    mutation: str,
+) -> None:
+    coverage: dict[str, object] = (
+        {
+            "requiredFields": ["verdict", "findings", "reviewedFiles"],
+            "coveredFields": ["verdict", "findings"],
+            "missingFields": ["reviewedFiles"],
+        }
+        if field == "coveredFields"
+        else {
+            "requiredFields": ["verdict", "findings", "reviewedFiles"],
+            "coveredFields": ["verdict"],
+            "missingFields": ["findings", "reviewedFiles"],
+        }
+    )
+    assert _receipt_coverage(coverage) is not None
+    values = coverage[field]
+    assert isinstance(values, list)
+    if mutation == "order":
+        values.reverse()
+    elif mutation == "duplicate":
+        coverage[field] = [values[0], values[0], *values[1:]]
+    elif mutation == "field-type":
+        coverage[field] = tuple(values)
+    else:
+        coverage[field] = [values[0], 7, *values[1:]]
+
+    assert _receipt_coverage(coverage) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        (field, mutation)
+        for field in ("coveredFields", "missingFields")
+        for mutation in ("order", "duplicate", "field-type", "item-type")
+    ],
+)
+def test_validate_v2_receipt_requires_ordered_typed_coverage_projection(
+    field: str,
+    mutation: str,
+) -> None:
+    receipt = (
+        v2_findings_receipt()
+        if field == "coveredFields"
+        else receipt_with_two_missing_coverage_fields()
+    )
+    attempt_index = 1 if field == "coveredFields" else 0
+    coverage = receipt["attempts"][attempt_index]["contractEvaluation"]["coverage"]
+    values = coverage[field]
+    assert len(values) == 2
+    if mutation == "order":
+        values.reverse()
+    elif mutation == "duplicate":
+        coverage[field] = [values[0], values[0], values[1]]
+    elif mutation == "field-type":
+        coverage[field] = tuple(values)
+    else:
+        coverage[field] = [values[0], 7]
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
 
 
 @pytest.mark.parametrize(
