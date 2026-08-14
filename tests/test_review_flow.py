@@ -460,14 +460,7 @@ def test_promote_fragments_rejects_prepared_identity_mismatch(tamper: str) -> No
 def test_promote_fragments_rejects_malformed_authoritative_context(
     context: ContractContext,
 ) -> None:
-    contract = get_contract("findings-json")
-    payload = json.dumps({"verdict": "changes-requested", "findings": [finding()], "extra": True})
-    evaluation = contract.evaluate(
-        payload,
-        contract.prepare(context),
-        context,
-        evidence=EvaluationContext(packet_digest="b" * 64),
-    )
+    evaluation = incomplete_evaluation(finding())
 
     assert (
         promote_fragments(
@@ -1507,7 +1500,6 @@ def test_consolidate_rejects_malformed_authoritative_context(
     malformed = replace(
         fragment,
         contract_context=context,
-        prepared_digest=get_contract("findings-json").prepare(context).digest,
     )
 
     result = consolidate(None, (malformed,), None, contract_context=context)
@@ -1805,6 +1797,27 @@ def test_validate_v2_receipt_preserves_compatible_extension_fields(location: str
     _sign_receipt(receipt)
 
     assert validate_v2_receipt(receipt) == ()
+
+
+@pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
+def test_validate_v2_receipt_rejects_non_finite_extension_values(constant: float) -> None:
+    receipt = v2_findings_receipt()
+    receipt["extension.example"] = constant
+    receipt.pop("sha256")
+    permissive = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    receipt["sha256"] = hashlib.sha256(permissive).hexdigest()
+
+    assert "receipt-digest" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_rejects_non_string_extension_object_keys() -> None:
+    receipt = v2_findings_receipt()
+    receipt["extension.example"] = {1: "hostile"}
+    receipt.pop("sha256")
+    permissive = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    receipt["sha256"] = hashlib.sha256(permissive).hexdigest()
+
+    assert "receipt-digest" in validate_v2_receipt(receipt)
 
 
 @pytest.mark.parametrize(

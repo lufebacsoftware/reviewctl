@@ -62,9 +62,29 @@ REVIEWED_FILES_SCHEMA: dict[str, Any] = {
 }
 
 
+def require_string_json_object_keys(value: object) -> None:
+    """Reject Python mappings that JSON would silently coerce into another identity."""
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            if any(type(key) is not str for key in current):
+                raise ValueError("JSON object keys must be strings")
+            pending.extend(current.values())
+        elif isinstance(current, list | tuple):
+            pending.extend(current)
+
+
 def canonical_json(value: object) -> bytes:
     """Serialize contract identity and normalized values deterministically."""
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    require_string_json_object_keys(value)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
 
 
 @dataclass(frozen=True)
@@ -73,6 +93,29 @@ class ContractContext:
 
     file_names: tuple[str, ...] = ()
     review_declaration_required: bool = False
+
+
+def valid_contract_context(value: object, *, require_file_names: bool = False) -> bool:
+    """Validate canonical contract facts before they affect identity or semantics."""
+    if not isinstance(value, ContractContext):
+        return False
+    file_names = value.file_names
+    return (
+        type(require_file_names) is bool
+        and type(value.review_declaration_required) is bool
+        and type(file_names) is tuple
+        and (not require_file_names or bool(file_names))
+        and all(
+            type(file_name) is str
+            and bool(file_name.strip())
+            and file_name not in {".", ".."}
+            and "/" not in file_name
+            and "\\" not in file_name
+            and not _contains_surrogate(file_name)
+            for file_name in file_names
+        )
+        and list(file_names) == sorted(set(file_names))
+    )
 
 
 @dataclass(frozen=True)
@@ -291,6 +334,8 @@ class FindingsJsonContract:
     version = "1"
 
     def prepare(self, context: ContractContext) -> PreparedContract:
+        if not valid_contract_context(context):
+            raise ValueError("invalid contract context")
         schema = deepcopy(FINDINGS_SCHEMA)
         if context.review_declaration_required:
             schema["required"].append("reviewedFiles")
@@ -336,18 +381,21 @@ class FindingsJsonContract:
         evidence: EvaluationContext | None = None,
     ) -> ContractEvaluation:
         payload_digest = hashlib.sha256(payload.encode(errors="surrogatepass")).hexdigest()
+        prepared_digest = prepared.digest if isinstance(prepared, PreparedContract) else ""
 
         def rejected(code: str) -> ContractEvaluation:
             return ContractEvaluation(
                 name=self.name,
                 version=self.version,
-                prepared_digest=prepared.digest,
+                prepared_digest=prepared_digest,
                 payload_digest=payload_digest,
                 normalized_digest=None,
                 value=None,
                 violations=(code,),
             )
 
+        if not isinstance(prepared, PreparedContract) or not valid_contract_context(context):
+            return rejected("prepared-contract")
         if (
             prepared != self.prepare(context)
             or prepared.digest

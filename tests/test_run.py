@@ -5659,6 +5659,40 @@ def test_verify_reports_huge_json_integer_without_traceback(tmp_path: Path) -> N
     assert json.loads(verified.stdout)["violations"] == ["json-receipt"]
 
 
+@pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
+def test_cli_canonical_json_rejects_non_finite_numbers(constant: float) -> None:
+    with pytest.raises(ValueError, match="JSON compliant"):
+        cli.canonical_json({"extension.example": constant})
+
+
+def test_cli_canonical_json_rejects_non_string_object_keys() -> None:
+    with pytest.raises(ValueError, match="object keys must be strings"):
+        cli.canonical_json({"extension.example": {1: "hostile"}})
+
+
+@pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
+def test_numeric_value_rejects_non_finite_transport_metadata(constant: float) -> None:
+    assert cli.numeric_value(constant) is None
+
+
+def test_numeric_value_rejects_oversized_transport_metadata_without_exception() -> None:
+    assert cli.numeric_value(10**4000) is None
+
+
+@pytest.mark.parametrize(("value", "expected"), [(1, 1.0), (1.25, 1.25)])
+def test_numeric_value_preserves_finite_transport_metadata(
+    value: int | float, expected: float
+) -> None:
+    assert cli.numeric_value(value) == expected
+
+
+@pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
+def test_valid_receipt_fails_closed_for_non_finite_extension(constant: float) -> None:
+    receipt = {"extension.example": constant, "sha256": "0" * 64}
+
+    assert cli.valid_receipt(receipt) is False
+
+
 def test_policy_check_and_tournament_complete_when_under_budget(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     policy = tmp_path / "policy.toml"

@@ -20,6 +20,7 @@ from reviewctl.contracts import (
     canonical_json,
     findings_required_fields,
     get_contract,
+    valid_contract_context,
 )
 
 COMPLETION_CONTEXT_START = "<reviewctl-completion-context>"
@@ -266,27 +267,6 @@ def _coverage_matches_violation(
     return fragment_count == 0 or "findings" in missing
 
 
-def _valid_contract_context(value: object) -> bool:
-    """Validate the canonical authoritative scope used across trust boundaries."""
-    if not isinstance(value, ContractContext):
-        return False
-    file_names = value.file_names
-    return (
-        type(value.review_declaration_required) is bool
-        and type(file_names) is tuple
-        and bool(file_names)
-        and all(
-            type(file_name) is str
-            and bool(file_name.strip())
-            and file_name not in {".", ".."}
-            and "/" not in file_name
-            and "\\" not in file_name
-            for file_name in file_names
-        )
-        and list(file_names) == sorted(set(file_names))
-    )
-
-
 def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | None:
     """Reproduce v1 finding identity at every promoted-fragment trust boundary."""
     if (
@@ -298,7 +278,7 @@ def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | 
         or not _is_sha256(fragment.raw_response_digest)
         or not _is_sha256(fragment.packet_digest)
         or not _is_sha256(fragment.prepared_digest)
-        or not _valid_contract_context(fragment.contract_context)
+        or not valid_contract_context(fragment.contract_context, require_file_names=True)
         or not _is_positive_int(fragment.source_attempt)
         or not _is_nonnegative_int(fragment.route_index)
     ):
@@ -458,7 +438,7 @@ def _validate_completion_context(context: object) -> bool:
         review_declaration_required=context.review_declaration_required,
     )
     if (
-        not _valid_contract_context(authoritative_context)
+        not valid_contract_context(authoritative_context, require_file_names=True)
         or type(context.findings) is not tuple
         or get_contract("findings-json").prepare(authoritative_context).digest
         != context.prepared_digest
@@ -556,7 +536,7 @@ def _valid_incomplete_evaluation(
     context: ContractContext,
 ) -> bool:
     """Reproduce the complete state that authorizes fragment promotion."""
-    if not _valid_contract_context(context):
+    if not valid_contract_context(context, require_file_names=True):
         return False
     try:
         required_fields = findings_required_fields(context.review_declaration_required)
@@ -713,7 +693,7 @@ def build_completion_context(
         file_names=tuple(allowed_file_names),
         review_declaration_required=review_declaration_required,
     )
-    if not _valid_contract_context(target_context):
+    if not valid_contract_context(target_context, require_file_names=True):
         raise ValueError("completion context requires canonical allowed file names")
     if not _valid_completion_manifest(
         prepared_digest=request.prepared_digest,
@@ -796,7 +776,7 @@ def consolidate(
     contract_context: ContractContext,
 ) -> ConsolidatedReview:
     """Combine accepted and partial findings without manufacturing acceptance or dispute."""
-    if not _valid_contract_context(contract_context):
+    if not valid_contract_context(contract_context, require_file_names=True):
         return ConsolidatedReview(
             status="unavailable",
             verdict=None,
@@ -971,7 +951,7 @@ def _receipt_contract_context(value: object) -> ContractContext | None:
     if not isinstance(file_names, list):
         return None
     context = ContractContext(file_names=tuple(file_names), review_declaration_required=required)
-    return context if _valid_contract_context(context) else None
+    return context if valid_contract_context(context, require_file_names=True) else None
 
 
 def _receipt_source_file_names(receipt: dict[str, Any]) -> tuple[str, ...] | None:

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -52,6 +53,7 @@ from reviewctl.contracts import (
     EvaluationStatus,
     exact_json_object,
     get_contract,
+    require_string_json_object_keys,
 )
 from reviewctl.review_flow import (
     FallbackRelationship,
@@ -332,7 +334,14 @@ def write_private_exclusive(path: Path, contents: bytes) -> None:
 
 
 def canonical_json(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    require_string_json_object_keys(value)
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
 
 
 def utc_now() -> str:
@@ -1630,7 +1639,13 @@ def openrouter_packet(
 
 
 def numeric_value(value: object) -> float | None:
-    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 def token_value(value: object) -> int | None:
@@ -3719,7 +3734,11 @@ def valid_receipt(receipt: dict[str, Any]) -> bool:
     """Verify the hash embedded in an in-memory receipt without mutating it."""
     recorded = receipt.get("sha256")
     unsigned = {key: value for key, value in receipt.items() if key != "sha256"}
-    return isinstance(recorded, str) and recorded == sha256_bytes(canonical_json(unsigned))
+    try:
+        reproduced = sha256_bytes(canonical_json(unsigned))
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        return False
+    return isinstance(recorded, str) and recorded == reproduced
 
 
 def verify_receipt(args: argparse.Namespace) -> int:

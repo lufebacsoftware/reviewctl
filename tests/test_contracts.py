@@ -1,6 +1,7 @@
 import hashlib
 import json
 from copy import copy, deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -45,6 +46,94 @@ def test_findings_contract_can_require_a_review_declaration_without_mutating_por
     }
     assert "reviewedFiles" not in portable.schema["properties"]
     assert declared.digest != portable.digest
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        ContractContext(file_names=("nested/source.py",)),
+        ContractContext(file_names=("source.py",), review_declaration_required=1),
+        ContractContext(file_names=(chr(0xD800),)),
+    ],
+)
+def test_findings_contract_prepare_rejects_malformed_context(
+    context: ContractContext,
+) -> None:
+    with pytest.raises(ValueError, match="invalid contract context"):
+        get_contract("findings-json").prepare(context)
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        ContractContext(file_names=("nested/source.py",)),
+        ContractContext(file_names=("source.py",), review_declaration_required=1),
+        ContractContext(file_names=(chr(0xD800),)),
+    ],
+)
+def test_findings_contract_evaluate_rejects_malformed_context_without_exception(
+    context: ContractContext,
+) -> None:
+    contract = get_contract("findings-json")
+    base = contract.prepare(
+        ContractContext(
+            file_names=("source.py",),
+            review_declaration_required=bool(context.review_declaration_required),
+        )
+    )
+    if context.file_names == (chr(0xD800),):
+        prepared = base
+    else:
+        prepared = replace(
+            base,
+            file_names=context.file_names,
+            review_declaration_required=context.review_declaration_required,
+        )
+        prepared = replace(
+            prepared,
+            digest=hashlib.sha256(canonical_json(prepared.identity_material)).hexdigest(),
+        )
+    payload = {"verdict": "approved", "findings": []}
+    if context.review_declaration_required:
+        payload["reviewedFiles"] = ["source.py"]
+
+    evaluation = contract.evaluate(json.dumps(payload), prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("prepared-contract",)
+    assert evaluation.value is None
+
+
+@pytest.mark.parametrize("prepared", [None, object()])
+def test_findings_contract_evaluate_rejects_malformed_prepared_without_exception(
+    prepared: object,
+) -> None:
+    evaluation = get_contract("findings-json").evaluate(
+        json.dumps({"verdict": "approved", "findings": []}),
+        prepared,  # type: ignore[arg-type]
+        ContractContext(),
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.prepared_digest == ""
+    assert evaluation.violations == ("prepared-contract",)
+
+
+@pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_json_rejects_non_finite_numbers(constant: float) -> None:
+    with pytest.raises(ValueError, match="JSON compliant"):
+        canonical_json({"extension.example": constant})
+
+
+def test_canonical_json_preserves_legitimate_json() -> None:
+    assert canonical_json({"finite": 1.25, "items": [True, None]}) == (
+        b'{"finite":1.25,"items":[true,null]}'
+    )
+
+
+def test_canonical_json_rejects_non_string_object_keys() -> None:
+    with pytest.raises(ValueError, match="object keys must be strings"):
+        canonical_json({"extension.example": {1: "hostile"}})
 
 
 def test_findings_contract_normalizes_reviewed_files_to_authoritative_context_order() -> None:
