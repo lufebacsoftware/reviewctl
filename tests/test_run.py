@@ -659,6 +659,33 @@ def test_proprietary_kiro_policy_checks_each_kiro_route(tmp_path: Path) -> None:
     assert not (tmp_path / "artifacts").exists()
 
 
+def test_proprietary_kiro_accepts_transport_scoped_policy(tmp_path: Path) -> None:
+    fake_kiro = write_fake_kiro(tmp_path)
+    policy = tmp_path / "transport-default.toml"
+    policy.write_text(
+        "[transports.kiro]\nsource_allowed = true\nallow_unresolved_identity = true\n"
+    )
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "claude-sonnet-5",
+        "--source-class",
+        "proprietary",
+        "--response-contract",
+        "findings-json",
+        "--policy",
+        str(policy),
+        env={"KIRO_BIN": str(fake_kiro)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["extension.kiroUnresolvedIdentityWaiver"] is True
+
+
 def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_identity(
     tmp_path: Path,
 ) -> None:
@@ -4016,6 +4043,30 @@ def test_document_prompts_are_explicit_for_each_transport(tmp_path: Path) -> Non
 
 def test_source_policy_defaults_to_denied() -> None:
     assert cli.source_allowed({}, "unlisted-model") is False
+
+
+def test_policy_can_authorize_dynamic_models_by_transport_with_model_override() -> None:
+    policy = {
+        "models": {
+            "explicit-deny": {
+                "source_allowed": False,
+                "allow_unresolved_identity": False,
+            }
+        },
+        "transports": {
+            "kiro": {
+                "source_allowed": True,
+                "allow_unresolved_identity": True,
+            },
+            "pi": {"source_allowed": True},
+        },
+    }
+
+    assert cli.source_allowed(policy, "dynamic-kiro-model", transport="kiro") is True
+    assert cli.unresolved_identity_waived(policy, "dynamic-kiro-model", transport="kiro") is True
+    assert cli.source_allowed(policy, "explicit-deny", transport="kiro") is False
+    assert cli.unresolved_identity_waived(policy, "explicit-deny", transport="kiro") is False
+    assert cli.source_allowed(policy, "dynamic-openrouter-model", transport="openrouter") is False
 
 
 @pytest.mark.parametrize(

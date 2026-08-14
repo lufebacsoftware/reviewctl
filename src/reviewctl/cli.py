@@ -1554,13 +1554,29 @@ def codex_isolation(
         yield CodexIsolation(environment=environment, home=home, profile=profile)
 
 
-def source_allowed(policy: dict[str, Any], model: str) -> bool:
-    return bool(policy.get("models", {}).get(model, {}).get("source_allowed", False))
+def policy_entry(
+    policy: dict[str, Any], model: str, *, transport: str | None = None
+) -> dict[str, Any]:
+    models = policy.get("models")
+    if type(models) is dict and model in models:
+        entry = models[model]
+        return entry if type(entry) is dict else {}
+    if transport is not None:
+        transports = policy.get("transports")
+        if type(transports) is dict and transport in transports:
+            entry = transports[transport]
+            return entry if type(entry) is dict else {}
+    return {}
 
 
-def unresolved_identity_waived(policy: dict[str, Any], model: str) -> bool:
-    entry = policy.get("models", {}).get(model, {})
-    return type(entry) is dict and entry.get("allow_unresolved_identity") is True
+def source_allowed(policy: dict[str, Any], model: str, *, transport: str | None = None) -> bool:
+    return bool(policy_entry(policy, model, transport=transport).get("source_allowed", False))
+
+
+def unresolved_identity_waived(
+    policy: dict[str, Any], model: str, *, transport: str | None = None
+) -> bool:
+    return policy_entry(policy, model, transport=transport).get("allow_unresolved_identity") is True
 
 
 def reap_process(process: subprocess.Popen[bytes]) -> None:
@@ -3583,9 +3599,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if loaded_policy is None:
             parser.error("proprietary Kiro reviews require --policy")
         for route in kiro_routes:
-            if not source_allowed(loaded_policy, route.model):
+            if not source_allowed(loaded_policy, route.model, transport=route.transport):
                 parser.error(f"policy does not allow Kiro model {route.model}")
-            if not unresolved_identity_waived(loaded_policy, route.model):
+            if not unresolved_identity_waived(
+                loaded_policy, route.model, transport=route.transport
+            ):
                 parser.error(
                     f"policy must explicitly allow unresolved Kiro model identity for {route.model}"
                 )

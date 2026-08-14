@@ -49,6 +49,12 @@ Backend adapters only invoke a backend and persist its observed evidence;
 adapters do not decide acceptance. The controller alone owns policy, contract
 evaluation, acceptance, fallback, and receipt construction.
 
+Private experimental policies may authorize local transport defaults under
+`[transports.<name>]` for `kiro`, `gemini`, `pi`, and `codex`. An exact model
+entry under `[models.<id>]` overrides that default. This permits a
+runtime-owned local inventory without publishing a roster; it does not open
+OpenRouter, resolve an otherwise unresolved identity, or qualify a backend.
+
 The five legacy compatibility adapters are explicitly unqualified: `llm`,
 `openrouter`, `agy`, `pi`, and `codex`. They preserve existing route behavior
 without claiming conformance. Availability is not qualification.

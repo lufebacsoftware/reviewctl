@@ -33,6 +33,28 @@ For formal routes, `MODEL` must be qualified by the organization's private
 policy and evidence store. This public guide intentionally contains no model
 roster, prices, provider-specific invocation commands, or credentials.
 
+For local experimental work, a private policy may authorize a transport's
+runtime-owned model inventory without duplicating a model list:
+
+```toml
+[transports.kiro]
+source_allowed = true
+allow_unresolved_identity = true
+
+[transports.gemini]
+source_allowed = true
+
+[transports.pi]
+source_allowed = true
+
+[transports.codex]
+source_allowed = true
+```
+
+An exact `[models."MODEL_ID"]` entry overrides its transport default. This
+scope is still advisory and does not authorize OpenRouter or make a backend a
+merge gate. The policy file and digest remain part of the receipt.
+
 A formal result requires `receipt.result` to be `accepted`, `acceptedAttempt`
 to name the accepted attempt, successful receipt verification, and independent
 checking of material findings. A missing, empty, unavailable, rejected, or
