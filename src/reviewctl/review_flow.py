@@ -35,6 +35,12 @@ RECEIPT_CONTRACT_VERSIONS = {
     "product-review-json": "legacy-1",
     "product-judge-json": "legacy-1",
 }
+RECEIPT_RESULT_VIEW_FIELDS = {
+    "findings-json": frozenset({"findings", "verdict"}),
+    "product-review-json": frozenset({"review"}),
+    "product-judge-json": frozenset({"review"}),
+}
+RECEIPT_RESULT_VIEW_FIELD_NAMES = frozenset().union(*RECEIPT_RESULT_VIEW_FIELDS.values())
 SUPPORTED_RESPONSE_CONTRACTS = frozenset(RECEIPT_CONTRACT_VERSIONS)
 SUPPORTED_ATTEMPT_RESULTS = frozenset(
     {
@@ -1132,14 +1138,16 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     ):
         reject("review-contract")
     findings_contract = review_contract == "findings-json"
+    expected_result_view_fields = RECEIPT_RESULT_VIEW_FIELDS.get(review_contract, frozenset())
+    present_result_view_fields = RECEIPT_RESULT_VIEW_FIELD_NAMES.intersection(receipt)
+    if present_result_view_fields - expected_result_view_fields:
+        reject("review-contract")
     if not findings_contract:
         if any(
             field in receipt
             for field in (
                 "fallbackRelationships",
                 "consolidatedReview",
-                "findings",
-                "verdict",
             )
         ):
             reject("review-contract")
@@ -1562,6 +1570,14 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             reject("result")
     else:
         reject("result")
+
+    if result == "accepted":
+        if present_result_view_fields != expected_result_view_fields:
+            reject("accepted-attempt")
+        if "review" in expected_result_view_fields and type(receipt.get("review")) is not dict:
+            reject("accepted-attempt")
+    elif present_result_view_fields:
+        reject("accepted-attempt")
 
     if findings_contract:
         relationships = receipt.get("fallbackRelationships")

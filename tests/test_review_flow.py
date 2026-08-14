@@ -332,6 +332,45 @@ def v2_invalid_findings_receipt() -> dict[str, object]:
     return _sign_receipt(receipt)
 
 
+def v2_legacy_receipt(review_contract: str = "document") -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "receiptSchemaVersion": 2,
+        "reviewContract": review_contract,
+        "contract": {"name": review_contract, "version": "legacy-1"},
+        "sourceClass": "synthetic",
+        "source": {
+            "files": [
+                {
+                    "name": "source.py",
+                    "path": "/bounded/source.py",
+                    "sha256": "b" * 64,
+                }
+            ]
+        },
+        "transport": "llm",
+        "result": "accepted",
+        "acceptedAttempt": 1,
+        "routes": [{"model": "writer", "transport": "llm"}],
+        "attempts": [
+            {
+                "number": 1,
+                "routeIndex": 0,
+                "route": {"model": "writer", "transport": "llm"},
+                "transport": "llm",
+                "model": {"requested": "writer", "resolved": "writer"},
+                "result": "accepted",
+                "rawResponse": {
+                    "path": "attempts/01/raw-response.txt",
+                    "sha256": "a" * 64,
+                    "characters": 30,
+                },
+                "promotedFragments": [],
+            }
+        ],
+    }
+    return _sign_receipt(receipt)
+
+
 @pytest.mark.parametrize(
     "gate_result",
     [
@@ -3270,37 +3309,7 @@ def test_validate_v2_receipt_rejects_promotion_from_non_incomplete_status(
 
 
 def test_validate_v2_receipt_requires_exact_non_findings_contract_identity() -> None:
-    receipt = _sign_receipt(
-        {
-            "receiptSchemaVersion": 2,
-            "reviewContract": "document",
-            "contract": {"name": "document", "version": "legacy-1"},
-            "sourceClass": "synthetic",
-            "source": {
-                "files": [{"name": "source.py", "path": "/bounded/source.py", "sha256": "b" * 64}]
-            },
-            "transport": "llm",
-            "result": "accepted",
-            "acceptedAttempt": 1,
-            "routes": [{"model": "writer", "transport": "llm"}],
-            "attempts": [
-                {
-                    "number": 1,
-                    "routeIndex": 0,
-                    "route": {"model": "writer", "transport": "llm"},
-                    "transport": "llm",
-                    "model": {"requested": "writer", "resolved": "writer"},
-                    "result": "accepted",
-                    "rawResponse": {
-                        "path": "attempts/01/raw-response.txt",
-                        "sha256": "a" * 64,
-                        "characters": 30,
-                    },
-                    "promotedFragments": [],
-                }
-            ],
-        }
-    )
+    receipt = v2_legacy_receipt()
 
     assert validate_v2_receipt(receipt) == ()
 
@@ -3310,6 +3319,86 @@ def test_validate_v2_receipt_requires_exact_non_findings_contract_identity() -> 
 
     receipt["contract"] = {"name": "verdict", "version": "legacy-1"}
     _sign_receipt(receipt)
+    assert "review-contract" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "view"),
+    [
+        ("verdict-only", {"verdict": "approved"}),
+        ("findings-only", {"findings": []}),
+        ("approved", {"verdict": "approved", "findings": []}),
+        (
+            "changes-requested",
+            {"verdict": "changes-requested", "findings": [finding()]},
+        ),
+    ],
+)
+def test_validate_v2_receipt_rejects_findings_view_without_accepted_result(
+    mutation: str, view: dict[str, object]
+) -> None:
+    receipt = v2_invalid_findings_receipt()
+    receipt.update(view)
+    _sign_receipt(receipt)
+
+    assert "accepted-attempt" in validate_v2_receipt(receipt), mutation
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-verdict",
+        "missing-findings",
+        "altered-verdict",
+        "altered-findings",
+    ],
+)
+def test_validate_v2_receipt_requires_exact_findings_view_for_accepted_result(
+    mutation: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    if mutation == "missing-verdict":
+        receipt.pop("verdict")
+    elif mutation == "missing-findings":
+        receipt.pop("findings")
+    elif mutation == "altered-verdict":
+        receipt["verdict"] = "changes-requested"
+    else:
+        receipt["findings"] = [finding()]
+    _sign_receipt(receipt)
+
+    assert "accepted-attempt" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize("review_contract", ["product-review-json", "product-judge-json"])
+def test_validate_v2_receipt_binds_product_review_view_to_accepted_result(
+    review_contract: str,
+) -> None:
+    receipt = v2_legacy_receipt(review_contract)
+    receipt["review"] = {"producer": "normalized"}
+    _sign_receipt(receipt)
+    assert validate_v2_receipt(receipt) == ()
+
+    receipt.pop("review")
+    _sign_receipt(receipt)
+    assert "accepted-attempt" in validate_v2_receipt(receipt)
+
+    receipt["result"] = "unavailable"
+    receipt["acceptedAttempt"] = None
+    receipt["attempts"][0]["result"] = "timeout"
+    receipt["review"] = {"producer": "normalized"}
+    _sign_receipt(receipt)
+    assert "accepted-attempt" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize("review_contract", ["document", "verdict"])
+def test_validate_v2_receipt_rejects_review_view_for_non_review_contract(
+    review_contract: str,
+) -> None:
+    receipt = v2_legacy_receipt(review_contract)
+    receipt["review"] = {"producer": "normalized"}
+    _sign_receipt(receipt)
+
     assert "review-contract" in validate_v2_receipt(receipt)
 
 
