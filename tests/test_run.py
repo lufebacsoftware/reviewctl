@@ -562,6 +562,27 @@ def test_run_rejects_kiro_auto_before_creating_artifacts(tmp_path: Path) -> None
     assert not (tmp_path / "artifacts").exists()
 
 
+@pytest.mark.parametrize("contract", ["verdict", "document", "product-review-json"])
+def test_run_rejects_non_findings_kiro_contracts_before_creating_artifacts(
+    tmp_path: Path, contract: str
+) -> None:
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "claude-sonnet-5",
+        "--response-contract",
+        contract,
+    )
+
+    assert result.returncode == 2
+    assert "kiro transport currently supports only" in result.stderr.lower()
+    assert "findings-json" in result.stderr
+    assert "cannot be verified without rewriting" in result.stderr.lower()
+    assert not (tmp_path / "artifacts").exists()
+
+
 def test_proprietary_kiro_requires_an_authorizing_policy_for_every_kiro_route(
     tmp_path: Path,
 ) -> None:
@@ -574,6 +595,8 @@ def test_proprietary_kiro_requires_an_authorizing_policy_for_every_kiro_route(
         "claude-sonnet-5",
         "--source-class",
         "proprietary",
+        "--response-contract",
+        "findings-json",
     ]
 
     missing = run_cli(*arguments, env={"KIRO_BIN": str(fake_kiro)})
@@ -609,6 +632,8 @@ def test_proprietary_kiro_policy_checks_each_kiro_route(tmp_path: Path) -> None:
         "proprietary",
         "--policy",
         str(policy),
+        "--response-contract",
+        "findings-json",
     )
 
     assert result.returncode == 2
@@ -659,6 +684,8 @@ def test_empty_kiro_response_records_zero_byte_stderr_evidence(tmp_path: Path) -
         "kiro",
         "--model",
         "empty",
+        "--response-contract",
+        "findings-json",
         env={"KIRO_BIN": str(fake_kiro)},
     )
 
@@ -678,6 +705,8 @@ def test_failed_kiro_inventory_links_only_the_evidence_that_exists(tmp_path: Pat
         "kiro",
         "--model",
         "claude-sonnet-5",
+        "--response-contract",
+        "findings-json",
         env={"KIRO_BIN": str(tmp_path / "missing-kiro")},
     )
 
@@ -7894,24 +7923,13 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
     assert cli.normalize_kiro_output(fenced_json, "findings-json") == (
         '{\n  "verdict": "approved",\n  "findings": []\n}'
     )
-    assert cli.normalize_kiro_output(fenced_json, "document") == (
-        'json\n{\n  "verdict": "approved",\n  "findings": []\n}'
+    escaped_ansi = b'> {"value":"\\u001b[31mred\\u001b[0m"}\n'
+    assert cli.normalize_kiro_output(escaped_ansi, "findings-json") == (
+        '{"value":"\\u001b[31mred\\u001b[0m"}'
     )
-    assert (
-        cli.normalize_kiro_output(
-            "> approved\n▸ Credits: reproduce with input X\n".encode(), "document"
-        )
-        == "approved\n▸ Credits: reproduce with input X"
-    )
-    assert cli.normalize_kiro_output("> ▸ Credits: 1\n".encode(), "document") == "▸ Credits: 1"
-    assert (
-        cli.normalize_kiro_output(
-            "> document\n\x1b[38;5;8m\n ▸ Credits: 1 • Time: 2s\n".encode(),
-            "document",
-        )
-        == "document"
-    )
-    assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n", "document") == ""
+    with pytest.raises(ValueError, match="only findings-json"):
+        cli.normalize_kiro_output(fenced_json, "document")
+    assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n", "findings-json") == ""
 
 
 def test_kiro_process_environment_is_an_exact_allowlist() -> None:
@@ -8022,7 +8040,7 @@ def test_invoke_kiro_uses_one_deadline_across_all_processes(
         model="claude-sonnet-5",
         files=[source],
         max_output_tokens=1,
-        response_contract="verdict",
+        response_contract="findings-json",
         timeout_seconds=1,
         **kiro_paths(tmp_path),
     )
@@ -8243,7 +8261,7 @@ def test_invoke_kiro_reports_a_missing_binary(tmp_path: Path) -> None:
         model="claude-sonnet-5",
         files=[source],
         max_output_tokens=1,
-        response_contract="verdict",
+        response_contract="findings-json",
         timeout_seconds=1,
         **kiro_paths(tmp_path),
     )
@@ -8269,7 +8287,7 @@ def test_invoke_kiro_maps_operating_system_execution_errors_to_127(
         model="claude-sonnet-5",
         files=[source],
         max_output_tokens=1,
-        response_contract="verdict",
+        response_contract="findings-json",
         timeout_seconds=1,
         **kiro_paths(tmp_path),
     )

@@ -79,6 +79,10 @@ standard input so bounded source is not constrained by the process argument-size
 Inventory, invocation, and session recovery share one total timeout; retained
 evidence is written with mode `0600`. The request manifest links the raw model
 inventory and its digest even when inventory discovery or validation fails.
+The initial adapter accepts only `findings-json`. Kiro's terminal-rendered
+`document`, `verdict`, and product output cannot be separated from UI framing
+without rewriting possible response content, so those contracts fail before
+artifacts or source transmission.
 
 This boundary provides advisory read-only behavior and tool control with
 `sourceIsolation: unavailable`. The disposable directory and reduced process

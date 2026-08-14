@@ -1732,9 +1732,11 @@ def kiro_process_environment(source: Mapping[str, str]) -> dict[str, str]:
 
 
 def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
-    """Remove Kiro terminal framing without rewriting response content."""
-    text = ANSI_ESCAPE.sub("", stdout.decode(errors="replace")).replace("\r", "")
-    lines = text.splitlines()
+    """Decode known Kiro UI framing for the JSON-only review contract."""
+    if response_contract != "findings-json":
+        raise ValueError("Kiro output normalization supports only findings-json")
+    text = ANSI_ESCAPE.sub("", stdout.decode(errors="replace")).replace("\r\n", "\n")
+    lines = text.split("\n")
     start = next((index for index, line in enumerate(lines) if line.startswith("> ")), None)
     if start is None:
         return ""
@@ -1742,17 +1744,7 @@ def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
     lines = lines[start:]
     while lines and not lines[-1].strip():
         lines.pop()
-    raw_has_framed_footer = bool(
-        re.search(
-            rb"\x1b\[38;5;8m\s*\n\s*\xe2\x96\xb8 Credits: [^\r\n]+",
-            stdout,
-        )
-    )
-    if (
-        lines
-        and KIRO_CREDITS_FOOTER.fullmatch(lines[-1].strip())
-        and (response_contract.endswith("-json") or raw_has_framed_footer)
-    ):
+    if lines and KIRO_CREDITS_FOOTER.fullmatch(lines[-1].strip()):
         lines.pop()
         while lines and not lines[-1].strip():
             lines.pop()
@@ -1834,6 +1826,8 @@ def invoke_kiro(
 ) -> tuple[int, str, PersistedResponse]:
     """Run Kiro from an empty directory and retain its runtime-owned evidence."""
     blank = PersistedResponse("", None, None, None, model, None, None, "")
+    if response_contract != "findings-json":
+        return 502, "Kiro transport currently supports only findings-json", blank
     environment = kiro_process_environment(os.environ)
     stderr_chunks: list[bytes] = []
     started = time.monotonic()
@@ -3544,6 +3538,14 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         parser.error("pi review models must use provider/model identity")
     if any(route.transport == "kiro" and route.model == "auto" for route in routes):
         parser.error("Kiro review model auto is rejected because resolved identity is unobservable")
+    if (
+        any(route.transport == "kiro" for route in routes)
+        and args.response_contract != "findings-json"
+    ):
+        parser.error(
+            "Kiro transport currently supports only --response-contract findings-json; "
+            "terminal-rendered document and verdict output cannot be verified without rewriting"
+        )
     route_transports = {route.transport for route in routes}
     transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
     transport_defaults, execution_config = load_transport_defaults(

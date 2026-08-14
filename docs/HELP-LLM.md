@@ -122,6 +122,11 @@ The supported selection forms are `--transport kiro --model MODEL_ID` and
 unobservable. Do not copy the returned model roster, prices, credits, or
 provider commands into repository or project instruction documents.
 
+Kiro currently supports only `--response-contract findings-json`. Other
+contracts fail before artifacts or source transmission because terminal-rendered
+document, verdict, and product output cannot be separated from Kiro UI framing
+without rewriting possible model content.
+
 The adapter reuses the user's local Kiro subscription and login. It does not use
 OpenRouter and does not inherit ambient provider, AWS, or API-token variables.
 It uses a disposable controlled working directory, reduced environment, and a

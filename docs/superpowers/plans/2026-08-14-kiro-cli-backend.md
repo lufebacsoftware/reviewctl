@@ -151,6 +151,8 @@ and then call `kiro-cli chat --list-sessions --format json` in the same director
 
 `execute_kiro_backend()` writes final `response.md` only when nonempty and maps request/raw output/final response/stderr into `BackendEvidence`.
 
+The stabilized initial boundary supports only `findings-json`; all other response contracts fail before artifacts or source transmission because Kiro exposes them only through terminal-rendered output.
+
 - [ ] **Step 4: Make unresolved identity explicit in orchestration**
 
 Use the selected backend descriptor in `run_review()`. Enforce model mismatch and serialize `model.resolved` only when `capabilities.resolved_model_identity` is true; enforce provider identity only when that capability is true. Kiro therefore persists its requested route while leaving resolved model/provider null rather than inventing them.
