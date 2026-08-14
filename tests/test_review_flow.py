@@ -447,6 +447,41 @@ def test_promote_fragments_rejects_prepared_identity_mismatch(tamper: str) -> No
     )
 
 
+@pytest.mark.parametrize(
+    "context",
+    [
+        ContractContext(file_names=["source.py"]),
+        ContractContext(file_names=("", "source.py")),
+        ContractContext(file_names=("nested/path.py", "source.py")),
+        ContractContext(file_names=("source.py", "source.py")),
+        ContractContext(file_names=("z.py", "source.py")),
+    ],
+)
+def test_promote_fragments_rejects_malformed_authoritative_context(
+    context: ContractContext,
+) -> None:
+    contract = get_contract("findings-json")
+    payload = json.dumps({"verdict": "changes-requested", "findings": [finding()], "extra": True})
+    evaluation = contract.evaluate(
+        payload,
+        contract.prepare(context),
+        context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
+
+    assert (
+        promote_fragments(
+            evaluation,
+            contract_context=context,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
 def test_promote_fragments_deduplicates_identical_incomplete_siblings_by_id() -> None:
     evaluation = incomplete_evaluation(finding(), finding())
 
@@ -1454,6 +1489,32 @@ def test_consolidate_discards_fragment_from_different_contract_context() -> None
     assert result.findings == ()
 
 
+@pytest.mark.parametrize(
+    "context",
+    [
+        ContractContext(file_names=("source.py",), review_declaration_required=1),
+        ContractContext(file_names=["source.py"]),
+        ContractContext(file_names=("", "source.py")),
+        ContractContext(file_names=("nested/path.py", "source.py")),
+        ContractContext(file_names=("source.py", "source.py")),
+        ContractContext(file_names=("z.py", "source.py")),
+    ],
+)
+def test_consolidate_rejects_malformed_authoritative_context(
+    context: ContractContext,
+) -> None:
+    fragment = promoted(finding())[0]
+    malformed = replace(
+        fragment,
+        contract_context=context,
+        prepared_digest=get_contract("findings-json").prepare(context).digest,
+    )
+
+    result = consolidate(None, (malformed,), None, contract_context=context)
+
+    assert result.findings == ()
+
+
 def test_consolidate_requires_explicit_authoritative_context() -> None:
     with pytest.raises(TypeError, match="contract_context"):
         consolidate(None, (), None)  # type: ignore[call-arg]
@@ -2249,7 +2310,9 @@ def test_validate_v2_receipt_allows_pre_gate_attempt_without_evaluation(
         ("complete-completion-request", "contract-evaluation"),
         ("complete-coverage", "contract-evaluation"),
         ("review-declaration-bool", "contract-evaluation"),
+        ("context-files-empty", "contract-evaluation"),
         ("context-file-empty", "contract-evaluation"),
+        ("context-file-path", "contract-evaluation"),
         ("context-file-duplicate", "contract-evaluation"),
         ("context-file-unsorted", "contract-evaluation"),
         ("prepared-context-mismatch", "contract-evaluation"),
@@ -2332,8 +2395,12 @@ def test_validate_v2_receipt_detects_rehashed_structural_mutations(
         second["contractEvaluation"]["coverage"]["missingFields"] = ["verdict"]
     elif mutation == "review-declaration-bool":
         second["contractEvaluation"]["contractContext"]["reviewDeclarationRequired"] = 1
+    elif mutation == "context-files-empty":
+        second["contractEvaluation"]["contractContext"]["fileNames"] = []
     elif mutation == "context-file-empty":
         second["contractEvaluation"]["contractContext"]["fileNames"] = [""]
+    elif mutation == "context-file-path":
+        second["contractEvaluation"]["contractContext"]["fileNames"] = ["nested/source.py"]
     elif mutation == "context-file-duplicate":
         second["contractEvaluation"]["contractContext"]["fileNames"] = ["a.py", "a.py"]
     elif mutation == "context-file-unsorted":
