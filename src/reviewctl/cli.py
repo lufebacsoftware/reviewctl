@@ -123,6 +123,11 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 KIRO_SESSION_ID = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 )
+KIRO_CREDITS_FOOTER = re.compile(
+    r"^▸ Credits: [0-9]+(?:\.[0-9]+)?"
+    r"(?: • Time: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h)"
+    r"(?: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h))*)?$"
+)
 
 _STRING_SCHEMA = {"type": "string", "minLength": 1}
 _STRING_LIST_SCHEMA = {"type": "array", "items": _STRING_SCHEMA}
@@ -1678,8 +1683,12 @@ def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
         return ""
     lines[start] = lines[start][2:]
     lines = lines[start:]
-    while lines and (not lines[-1].strip() or lines[-1].strip().startswith("▸ Credits:")):
+    while lines and not lines[-1].strip():
         lines.pop()
+    if lines and KIRO_CREDITS_FOOTER.fullmatch(lines[-1].strip()):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
     if (
         response_contract.endswith("-json")
         and len(lines) > 1

@@ -7832,6 +7832,12 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
     assert cli.normalize_kiro_output(fenced_json, "document") == (
         'json\n{\n  "verdict": "approved",\n  "findings": []\n}'
     )
+    assert (
+        cli.normalize_kiro_output(
+            "> approved\n▸ Credits: reproduce with input X\n".encode(), "document"
+        )
+        == "approved\n▸ Credits: reproduce with input X"
+    )
     assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n", "document") == ""
 
 
