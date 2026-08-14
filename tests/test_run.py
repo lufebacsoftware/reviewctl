@@ -5647,6 +5647,17 @@ def test_terminate_process_group_handles_missing_and_stubborn_processes(
     cli.terminate_process_group(StubbornProcess())
     assert signals == [cli.signal.SIGTERM, cli.signal.SIGKILL]
 
+    class UnreapableProcess:
+        pid = 3
+
+        def wait(self, timeout: int | None = None) -> None:
+            assert timeout is not None
+            raise subprocess.TimeoutExpired("llm", timeout)
+
+    signals.clear()
+    cli.terminate_process_group(UnreapableProcess())
+    assert signals == [cli.signal.SIGTERM, cli.signal.SIGKILL]
+
 
 def test_seal_failure_and_cli_runtime_error_are_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -8021,6 +8032,51 @@ def test_kiro_inventory_receives_the_full_remaining_deadline(
     assert exit_code == 0, error
     assert response.response
     assert observed_timeouts[0] > 80
+
+
+def test_kiro_timeout_returns_partial_evidence_without_a_second_communicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    communicate_calls = 0
+
+    class TimedOutProcess:
+        pid = 123
+        returncode = 0
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def communicate(
+            self, input: bytes | None = None, timeout: float | None = None
+        ) -> tuple[bytes, bytes]:
+            nonlocal communicate_calls
+            communicate_calls += 1
+            raise subprocess.TimeoutExpired(
+                "kiro-cli", timeout, output=b"partial inventory", stderr=b"partial diagnostic"
+            )
+
+    monkeypatch.setattr(cli.subprocess, "Popen", TimedOutProcess)
+    monkeypatch.setattr(cli, "terminate_process_group", lambda _process: None)
+
+    exit_code, error, response = cli.invoke_kiro(
+        kiro_bin="kiro-cli",
+        prompt="Review synthetic source.",
+        model="claude-sonnet-5",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        **kiro_paths(tmp_path),
+    )
+
+    assert exit_code == 124
+    assert error == "review attempt timed out"
+    assert response.response == ""
+    assert communicate_calls == 1
+    assert (tmp_path / "models.json").read_bytes() == b"partial inventory"
+    assert (tmp_path / "stderr.log").read_bytes() == b"partial diagnostic"
 
 
 @pytest.mark.parametrize(

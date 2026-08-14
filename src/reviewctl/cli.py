@@ -1543,8 +1543,11 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     except ProcessLookupError:
         return
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=1)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            return
 
 
 def packet_prompt(prompt: str, files: list[Path], response_contract: str = "verdict") -> str:
@@ -1798,9 +1801,10 @@ def invoke_kiro(
             try:
                 stdout, stderr = process.communicate(input=input_bytes, timeout=remaining)
                 return process.returncode, stdout, stderr, ""
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as error:
                 terminate_process_group(process)
-                stdout, stderr = process.communicate()
+                stdout = error.output if isinstance(error.output, bytes) else b""
+                stderr = error.stderr if isinstance(error.stderr, bytes) else b""
                 return 124, stdout, stderr, "review attempt timed out"
         except FileNotFoundError:
             return 127, b"", b"", f"Kiro transport executable not found: {kiro_bin}"
