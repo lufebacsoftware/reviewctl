@@ -3188,6 +3188,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     previous_attempt: int | None = None
     previous_route_index: int | None = None
     previous_gate_result: str | None = None
+    consolidation_context: ContractContext | None = None
 
     profile_settings = route_profile.get("settings", {}) if route_profile else {}
     configured_timeout = (
@@ -3249,9 +3250,19 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 if native_contract and contract_context
                 else None
             )
+            if contract_context is not None:
+                consolidation_context = contract_context
             attempt_prompt = review_prompt
+            completion_fragments: tuple[PromotedFragment, ...] = ()
+            if prepared_contract is not None and contract_context is not None:
+                completion_fragments = tuple(
+                    fragment
+                    for fragment in promoted_fragments
+                    if fragment.contract_context == contract_context
+                    and fragment.prepared_digest == prepared_contract.digest
+                )
             if (
-                promoted_fragments
+                completion_fragments
                 and completion_request is not None
                 and prepared_contract is not None
                 and contract_context is not None
@@ -3268,7 +3279,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 )
                 completion_context = build_completion_context(
                     target_completion_request,
-                    promoted_fragments,
+                    completion_fragments,
                     allowed_file_names=contract_context.file_names,
                     review_declaration_required=(contract_context.review_declaration_required),
                 )
@@ -3287,7 +3298,9 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     kind=relationship_kind,
                     reason=previous_gate_result,
                     promoted_fragment_ids=tuple(
-                        fragment.fragment_id for fragment in promoted_fragments
+                        fragment.fragment_id
+                        for fragment in promoted_fragments
+                        if fragment in completion_fragments
                     ),
                 )
                 fallback_relationships.append(relationship)
@@ -3640,6 +3653,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         },
     }
     if native_contract:
+        assert consolidation_context is not None
         receipt["fallbackRelationships"] = [
             relationship.to_dict() for relationship in fallback_relationships
         ]
@@ -3647,9 +3661,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             accepted_review,
             promoted_fragments,
             accepted_attempt,
-            contract_context=ContractContext(
-                file_names=tuple(item["name"] for item in source_files)
-            ),
+            contract_context=consolidation_context,
         ).to_dict()
     if accepted:
         receipt["response"] = {

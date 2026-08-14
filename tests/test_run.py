@@ -970,16 +970,15 @@ def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
 
 
 @pytest.mark.parametrize(
-    ("source_transport", "target_transport", "expected_missing"),
+    ("source_transport", "target_transport"),
     [
-        ("codex", "llm", ["verdict", "findings"]),
-        ("llm", "codex", ["verdict", "findings", "reviewedFiles"]),
+        ("codex", "llm"),
+        ("llm", "codex"),
     ],
 )
 def test_completion_prompt_uses_target_route_contract_context(
     source_transport: str,
     target_transport: str,
-    expected_missing: list[str],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1038,25 +1037,14 @@ def test_completion_prompt_uses_target_route_contract_context(
     receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
     assert len(captured) == 2
     first_prompt, target_prompt = (request.prompt for request in captured)
-    encoded_context = target_prompt.split("<reviewctl-completion-context>\n", 1)[1].split(
-        "\n</reviewctl-completion-context>", 1
-    )[0]
-    completion_context = json.loads(encoded_context)
-    target_contract_context = cli.ContractContext(
-        file_names=("source.py",),
-        review_declaration_required=target_transport == "codex",
-    )
-    target_prepared = cli.get_contract("findings-json").prepare(target_contract_context)
     source_contract_context = cli.ContractContext(
         file_names=("source.py",),
         review_declaration_required=source_transport == "codex",
     )
     source_prepared = cli.get_contract("findings-json").prepare(source_contract_context)
 
-    assert completion_context["preparedDigest"] == target_prepared.digest
-    assert completion_context["reviewDeclarationRequired"] is (target_transport == "codex")
-    assert completion_context["gapManifest"]["missingFields"] == expected_missing
-    assert completion_context["packetDigest"] == receipt["prompt"]["packetSha256"]
+    assert target_prompt == first_prompt
+    assert "<reviewctl-completion-context>" not in target_prompt
     assert receipt["prompt"]["packetSha256"] == cli.sha256_bytes(first_prompt.encode())
     assert receipt["attempts"][1]["attemptRequestSha256"] == cli.sha256_bytes(
         target_prompt.encode()
@@ -1069,6 +1057,12 @@ def test_completion_prompt_uses_target_route_contract_context(
         first_attempt["promotedFragments"][0]["payloadDigest"]
         == first_attempt["rawResponse"]["sha256"]
     )
+    assert first_attempt["promotedFragments"][0]["preparedDigest"] == source_prepared.digest
+    assert first_attempt["promotedFragments"][0]["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": source_transport == "codex",
+    }
+    assert receipt["fallbackRelationships"][0]["promotedFragmentIds"] == []
 
 
 def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(

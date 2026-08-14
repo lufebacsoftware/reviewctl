@@ -14,6 +14,7 @@ from reviewctl.contracts import (
     ContractContext,
     ContractCoverage,
     ContractEvaluation,
+    ContractFragment,
     EvaluationStatus,
     FragmentKind,
     canonical_json,
@@ -268,17 +269,26 @@ def _coverage_matches_violation(
 def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | None:
     """Reproduce v1 finding identity at every promoted-fragment trust boundary."""
     if (
-        not _valid_finding(fragment.finding)
+        not isinstance(fragment, PromotedFragment)
+        or not _valid_finding(fragment.finding)
         or not _is_sha256(fragment.fingerprint)
         or not _is_sha256(fragment.fragment_id)
         or not _is_sha256(fragment.payload_digest)
         or not _is_sha256(fragment.raw_response_digest)
         or not _is_sha256(fragment.packet_digest)
+        or not _is_sha256(fragment.prepared_digest)
+        or not isinstance(fragment.contract_context, ContractContext)
         or not _is_positive_int(fragment.source_attempt)
         or not _is_nonnegative_int(fragment.route_index)
     ):
         return None
     finding = _copy_finding(fragment.finding)
+    try:
+        expected_prepared_digest = (
+            get_contract("findings-json").prepare(fragment.contract_context).digest
+        )
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
     fingerprint = _fragment_fingerprint(
         finding,
         contract="findings-json",
@@ -287,6 +297,8 @@ def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | 
     )
     if (
         fragment.raw_response_digest != fragment.payload_digest
+        or fragment.prepared_digest != expected_prepared_digest
+        or finding["path"] not in fragment.contract_context.file_names
         or fragment.fingerprint != fingerprint
         or fragment.fragment_id != _fragment_id(fingerprint, fragment.payload_digest)
     ):
@@ -304,6 +316,8 @@ class PromotedFragment:
     payload_digest: str
     raw_response_digest: str
     packet_digest: str
+    prepared_digest: str
+    contract_context: ContractContext
 
     def provenance_dict(self) -> dict[str, object]:
         return _FrozenDict(
@@ -313,6 +327,11 @@ class PromotedFragment:
                 "payloadDigest": self.payload_digest,
                 "rawResponseDigest": self.raw_response_digest,
                 "packetDigest": self.packet_digest,
+                "preparedDigest": self.prepared_digest,
+                "contractContext": {
+                    "fileNames": list(self.contract_context.file_names),
+                    "reviewDeclarationRequired": self.contract_context.review_declaration_required,
+                },
                 "routeIndex": self.route_index,
             }
         )
@@ -327,6 +346,11 @@ class PromotedFragment:
             "payloadDigest": self.payload_digest,
             "rawResponseDigest": self.raw_response_digest,
             "packetDigest": self.packet_digest,
+            "preparedDigest": self.prepared_digest,
+            "contractContext": {
+                "fileNames": list(self.contract_context.file_names),
+                "reviewDeclarationRequired": self.contract_context.review_declaration_required,
+            },
         }
 
 
@@ -476,6 +500,8 @@ def _validate_completion_context(context: object) -> bool:
                 or source_finding != finding
                 or source_finding["path"] not in context.file_names
                 or source.packet_digest != context.packet_digest
+                or source.prepared_digest != context.prepared_digest
+                or source.contract_context != authoritative_context
                 or provenance in seen_provenance
             ):
                 return False
@@ -548,6 +574,9 @@ def _valid_incomplete_evaluation(
             or not all(type(violation) is str for violation in evaluation.violations)
             or type(evaluation.valid_fragments) is not tuple
             or not evaluation.valid_fragments
+            or not all(
+                isinstance(fragment, ContractFragment) for fragment in evaluation.valid_fragments
+            )
             or not isinstance(coverage, ContractCoverage)
             or not isinstance(request, ContractCompletionRequest)
         ):
@@ -656,6 +685,8 @@ def promote_fragments(
                 payload_digest=fragment.payload_digest,
                 raw_response_digest=raw_response_digest,
                 packet_digest=evaluation.completion_request.packet_digest,
+                prepared_digest=evaluation.prepared_digest,
+                contract_context=contract_context,
             )
         )
     return tuple(promoted)
@@ -707,6 +738,15 @@ def build_completion_context(
             raise ValueError("invalid promoted fragment identity")
         if finding["path"] not in target_file_names:
             raise ValueError("promoted finding is outside target review scope")
+        target_context = ContractContext(
+            file_names=target_file_names,
+            review_declaration_required=review_declaration_required,
+        )
+        if (
+            fragment.contract_context != target_context
+            or fragment.prepared_digest != request.prepared_digest
+        ):
+            raise ValueError("promoted fragment belongs to a different contract context")
         if fragment.packet_digest != request.packet_digest:
             raise ValueError("promoted fragment belongs to a different packet")
         validated.append((fragment, finding))
@@ -766,7 +806,12 @@ def consolidate(
     validated_fragments: list[tuple[PromotedFragment, dict[str, Any]]] = []
     for fragment in promoted_fragments:
         finding = _validated_promoted_finding(fragment)
-        if finding is not None and finding["path"] in contract_context.file_names:
+        if (
+            finding is not None
+            and fragment.contract_context == contract_context
+            and fragment.prepared_digest
+            == get_contract("findings-json").prepare(contract_context).digest
+        ):
             validated_fragments.append((fragment, finding))
 
     groups: dict[str, dict[str, Any]] = {}
@@ -1145,7 +1190,6 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 reject("review-contract")
     all_promoted: list[PromotedFragment] = []
     promoted_provenance: set[tuple[str, int]] = set()
-    promoted_attempts_by_id: dict[str, set[int]] = {}
     normalized_by_attempt: dict[int, dict[str, Any]] = {}
     prompt_value = receipt.get("prompt")
     packet_digest = (
@@ -1442,6 +1486,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 "payloadDigest",
                 "rawResponseDigest",
                 "packetDigest",
+                "preparedDigest",
+                "contractContext",
             }:
                 reject("promoted-fragments")
                 continue
@@ -1455,6 +1501,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     payload_digest=item.get("payloadDigest"),
                     raw_response_digest=item.get("rawResponseDigest"),
                     packet_digest=item.get("packetDigest"),
+                    prepared_digest=item.get("preparedDigest"),
+                    contract_context=_receipt_contract_context(item.get("contractContext")),
                 )
             except Exception:
                 reject("promoted-fragments")
@@ -1467,6 +1515,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     fragment.payload_digest,
                     fragment.raw_response_digest,
                     fragment.packet_digest,
+                    fragment.prepared_digest,
                 )
             ):
                 reject("promoted-fragments")
@@ -1484,6 +1533,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 or fragment.route_index != route_index
                 or fragment.raw_response_digest != raw_digest
                 or fragment.packet_digest != packet_digest
+                or fragment.prepared_digest != prepared_digest
+                or fragment.contract_context != contract_context
                 or not source_fragments
                 or any(
                     source.get("fingerprint") != fragment.fingerprint
@@ -1498,7 +1549,6 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 reject("promoted-fragments")
                 continue
             promoted_provenance.add(provenance_key)
-            promoted_attempts_by_id.setdefault(fragment.fragment_id, set()).add(index)
             all_promoted.append(fragment)
         if findings_contract and evaluation_error is not None:
             if not (
@@ -1590,10 +1640,25 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 ):
                     relationships_valid = False
                     break
+                destination_attempt = attempts[destination - 1]
+                destination_context = ContractContext(
+                    file_names=source_file_names or (),
+                    review_declaration_required=(
+                        destination_attempt.get("transport") == "codex"
+                        and source_class == "proprietary"
+                    ),
+                )
+                destination_prepared = (
+                    get_contract("findings-json").prepare(destination_context).digest
+                )
                 expected_ids = sorted(
-                    fragment_id
-                    for fragment_id, source_attempts in promoted_attempts_by_id.items()
-                    if any(source_attempt <= source for source_attempt in source_attempts)
+                    {
+                        fragment.fragment_id
+                        for fragment in all_promoted
+                        if fragment.source_attempt <= source
+                        and fragment.contract_context == destination_context
+                        and fragment.prepared_digest == destination_prepared
+                    }
                 )
                 if ids != expected_ids:
                     relationships_valid = False
@@ -1632,11 +1697,18 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     "verdict": normalized["verdict"],
                     "findings": normalized["findings"],
                 }
+        consolidation_attempt = accepted or attempts[-1]
+        consolidation_context = ContractContext(
+            file_names=source_file_names or (),
+            review_declaration_required=(
+                consolidation_attempt.get("transport") == "codex" and source_class == "proprietary"
+            ),
+        )
         expected_consolidation = consolidate(
             legacy_review,
             tuple(all_promoted),
             accepted_attempt if _is_positive_int(accepted_attempt) else None,
-            contract_context=ContractContext(file_names=source_file_names or ()),
+            contract_context=consolidation_context,
         ).to_dict()
         if receipt.get("consolidatedReview") != expected_consolidation:
             reject("consolidated-review")
