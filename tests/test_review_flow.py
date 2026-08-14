@@ -841,6 +841,7 @@ def test_build_completion_context_requires_a_typed_gap_manifest() -> None:
         ("missing_fields", ([],)),
         ("violations", ()),
         ("violations", ("unknown-violation",)),
+        ("violations", ("response-fields", "finding-value")),
         ("violations", ("response-fields", False)),
         ("invalid_fragment_indexes", (1, 0)),
         ("invalid_fragment_indexes", (0, 0)),
@@ -1021,6 +1022,7 @@ def test_render_completion_prompt_rejects_original_prompt_marker_collision(marke
         ("packet_digest", "b" * 63),
         ("missing_fields", ("verdict", 1)),
         ("violations", ("response-fields", 1)),
+        ("violations", ("response-fields", "finding-value")),
         ("invalid_fragment_indexes", (2, 1)),
     ],
 )
@@ -2414,6 +2416,114 @@ def test_validate_v2_receipt_rejects_invalid_state_mutations(mutation: str) -> N
         }
     else:
         attempt["result"] = "accepted"
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_violation", "coverage_present"),
+    [
+        ("not json", "invalid-json", False),
+        ("[]", "top-level-not-object", False),
+        ('{"extra":true}', "response-fields", True),
+        ('{"verdict":"approved","findings":"no"}', "findings-shape", True),
+    ],
+)
+def test_validate_v2_receipt_accepts_generated_invalid_evaluation_shapes(
+    payload: str,
+    expected_violation: str,
+    coverage_present: bool,
+) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    evaluation = contract.evaluate(payload, contract.prepare(context), context)
+    receipt = v2_invalid_findings_receipt()
+    attempt = receipt["attempts"][0]
+    attempt["rawResponse"]["sha256"] = evaluation.payload_digest
+    attempt["rawResponse"]["characters"] = len(payload)
+    attempt["contractEvaluation"] = _evaluation_dict(
+        evaluation,
+        file_names=context.file_names,
+    )
+    _sign_receipt(receipt)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == (expected_violation,)
+    assert (evaluation.coverage is not None) is coverage_present
+    assert validate_v2_receipt(receipt) == ()
+
+
+def test_validate_v2_receipt_accepts_generated_prepared_contract_failure() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    prepared.schema["additionalProperties"] = True
+    payload = '{"verdict":"approved","findings":[]}'
+    evaluation = contract.evaluate(payload, prepared, context)
+    receipt = v2_invalid_findings_receipt()
+    attempt = receipt["attempts"][0]
+    attempt["rawResponse"]["sha256"] = evaluation.payload_digest
+    attempt["rawResponse"]["characters"] = len(payload)
+    attempt["contractEvaluation"] = _evaluation_dict(
+        evaluation,
+        file_names=context.file_names,
+    )
+    _sign_receipt(receipt)
+
+    assert evaluation.violations == ("prepared-contract",)
+    assert evaluation.coverage is None
+    assert validate_v2_receipt(receipt) == ()
+
+
+def test_validate_v2_receipt_rejects_coverage_on_early_invalid_evaluation() -> None:
+    receipt = v2_invalid_findings_receipt()
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    evaluation["coverage"] = {
+        "requiredFields": ["verdict", "findings"],
+        "coveredFields": ["verdict"],
+        "missingFields": ["findings"],
+    }
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_requires_coverage_on_semantic_invalid_evaluation() -> None:
+    receipt = v2_invalid_findings_receipt()
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    evaluation["violations"] = ["response-fields"]
+    evaluation["coverage"] = None
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    "violations",
+    [["invented"], ["invalid-json", "top-level-not-object"]],
+)
+def test_validate_v2_receipt_requires_one_recognized_invalid_violation(
+    violations: list[str],
+) -> None:
+    receipt = v2_invalid_findings_receipt()
+    receipt["attempts"][0]["contractEvaluation"]["violations"] = violations
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    "violations",
+    [["invented"], ["response-fields", "finding-value"]],
+)
+def test_validate_v2_receipt_requires_one_recognized_incomplete_violation(
+    violations: list[str],
+) -> None:
+    receipt = v2_findings_receipt()
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    evaluation["violations"] = violations
+    evaluation["completionRequest"]["violations"] = violations
     _sign_receipt(receipt)
 
     assert "contract-evaluation" in validate_v2_receipt(receipt)

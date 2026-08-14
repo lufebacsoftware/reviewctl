@@ -48,6 +48,8 @@ SUPPORTED_ATTEMPT_RESULTS = frozenset(
     }
 )
 PRECONTRACT_ATTEMPT_RESULTS = SUPPORTED_ATTEMPT_RESULTS - {"accepted", "incomplete"}
+EARLY_INVALID_VIOLATIONS = frozenset({"prepared-contract", "invalid-json", "top-level-not-object"})
+SEMANTIC_INVALID_VIOLATIONS = FINDINGS_CONTRACT_VIOLATION_CODES - EARLY_INVALID_VIOLATIONS
 
 
 class _FrozenDict(dict[str, Any]):
@@ -186,11 +188,9 @@ def _valid_completion_manifest(
         return False
     if (
         type(violations) is not sequence_type
-        or not violations
-        or not all(
-            type(violation) is str and violation in FINDINGS_CONTRACT_VIOLATION_CODES
-            for violation in violations
-        )
+        or len(violations) != 1
+        or type(violations[0]) is not str
+        or violations[0] not in FINDINGS_CONTRACT_VIOLATION_CODES
     ):
         return False
     if type(invalid_fragment_indexes) is not sequence_type or not all(
@@ -1331,15 +1331,26 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     )
                     promotion_eligible = state_valid
                 else:
-                    invalid_coverage_valid = evaluation.get("coverage") is None or (
-                        coverage_valid
-                        and _valid_incomplete_coverage(coverage[0], coverage[1], coverage[2])
+                    exact_invalid_violation = (
+                        type(violations_value) is list
+                        and len(violations_value) == 1
+                        and type(violations_value[0]) is str
+                        and violations_value[0] in FINDINGS_CONTRACT_VIOLATION_CODES
                     )
+                    invalid_code = violations_value[0] if exact_invalid_violation else None
+                    if invalid_code in EARLY_INVALID_VIOLATIONS:
+                        invalid_coverage_valid = evaluation.get("coverage") is None
+                    elif invalid_code in SEMANTIC_INVALID_VIOLATIONS:
+                        invalid_coverage_valid = coverage_valid and _valid_incomplete_coverage(
+                            coverage[0], coverage[1], coverage[2]
+                        )
+                    else:
+                        invalid_coverage_valid = False
                     state_valid = (
                         state_valid
                         and normalized_digest is None
                         and evaluation.get("normalizedValue") is None
-                        and bool(violations_value)
+                        and exact_invalid_violation
                         and fragment_values == []
                         and completion_request is None
                         and invalid_coverage_valid
