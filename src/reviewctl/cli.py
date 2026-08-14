@@ -123,8 +123,7 @@ CODEX_FINDINGS_SCHEMA = {
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_ESCAPE_BYTES = rb"\x1b\[[0-?]*[ -/]*[@-~]"
 KIRO_RESPONSE_PREFIX = re.compile(
-    rb"^(?:" + ANSI_ESCAPE_BYTES + rb")*> (?:" + ANSI_ESCAPE_BYTES + rb")*",
-    re.MULTILINE,
+    rb"^(?:" + ANSI_ESCAPE_BYTES + rb")*> (?:" + ANSI_ESCAPE_BYTES + rb")*"
 )
 KIRO_LEADING_UI = re.compile(rb"^(?:" + ANSI_ESCAPE_BYTES + rb")*")
 KIRO_TRAILING_UI = re.compile(rb"(?:" + ANSI_ESCAPE_BYTES + rb")+[\r\n]*$")
@@ -1747,7 +1746,7 @@ def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
     """Decode known Kiro UI framing for the JSON-only review contract."""
     if response_contract != "findings-json":
         raise ValueError("Kiro output normalization supports only findings-json")
-    prefix = KIRO_RESPONSE_PREFIX.search(stdout)
+    prefix = KIRO_RESPONSE_PREFIX.match(stdout)
     if prefix is None:
         return ""
     payload = stdout[prefix.end() :]

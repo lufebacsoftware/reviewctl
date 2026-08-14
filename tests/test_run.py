@@ -480,7 +480,11 @@ if model == "styled":
     sys.stdout.buffer.write(b'> {{"verdict":"approved",' + b'\\x1b[0m' + b'"findings":[]}}\\n')
     raise SystemExit(0)
 response = json.dumps({{"verdict": "approved", "findings": []}})
-sys.stdout.write("\\x1b[36mKiro CLI\\x1b[0m\\n> " + response + "\\n\\n▸ Credits: 0.25\\n")
+sys.stdout.write(
+    "\\x1b[m> \\x1b[0m\\x1b[1mjson\\n\\x1b[0m\\x1b[m"
+    + response
+    + "\\n\\x1b[0m"
+)
 if model != "quiet":
     print("token=super-secret-token-value", file=sys.stderr)
 """,
@@ -8001,7 +8005,7 @@ def invoke_fake_kiro(
 
 
 def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
-    stdout = "\x1b[36mKiro CLI\x1b[0m\r\n> first line\r\nbody\r\n\r\n▸ Credits: 0.25\r\n".encode()
+    stdout = "\x1b[36m\x1b[0m> first line\r\nbody\r\n\r\n▸ Credits: 0.25\r\n".encode()
     fenced_json = (
         b"\x1b[38;5;141m> \x1b[0m\x1b[1mjson\n"
         b'\x1b[0m\x1b[38;5;10m{\n  "verdict": "approved",\n  "findings": []\n}\n'
@@ -8028,6 +8032,13 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
     with pytest.raises(UnicodeDecodeError):
         cli.normalize_kiro_output(b'> {"value":"\xff"}\n', "findings-json")
     assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n", "findings-json") == ""
+    assert (
+        cli.normalize_kiro_output(
+            b'Kiro CLI status\n> {"verdict":"approved","findings":[]}\n',
+            "findings-json",
+        )
+        == ""
+    )
     assert (
         cli.normalize_kiro_output(
             b'not Kiro framing > {"verdict":"approved","findings":[]}\n',
@@ -8106,8 +8117,8 @@ def test_invoke_kiro_uses_isolated_exact_commands_and_persists_evidence(
     for key in ("OPENROUTER_API_KEY", "AWS_ACCESS_KEY_ID", "SOME_TOKEN"):
         assert key not in observations[1]["environment"]
     expected_stdout = (
-        '\x1b[36mKiro CLI\x1b[0m\n> {"verdict": "approved", "findings": []}\n\n▸ Credits: 0.25\n'
-    ).encode()
+        b'\x1b[m> \x1b[0m\x1b[1mjson\n\x1b[0m\x1b[m{"verdict": "approved", "findings": []}\n\x1b[0m'
+    )
     assert (tmp_path / "response.log").read_bytes() == expected_stdout
     assert (tmp_path / "stderr.log").read_text() == "[REDACTED_CREDENTIAL]\n"
     session = json.loads((tmp_path / "session.json").read_text())

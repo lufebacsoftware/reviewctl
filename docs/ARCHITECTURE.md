@@ -84,8 +84,9 @@ The initial adapter accepts only `findings-json`. Kiro's terminal-rendered
 without rewriting possible response content, so those contracts fail before
 artifacts or source transmission.
 The child terminal is forced to `TERM=dumb` with standard no-color settings.
-Only boundary framing is removed; invalid UTF-8 or ANSI remaining inside the
-JSON payload fails the attempt while raw stdout remains evidence.
+Only a boundary at byte zero is removed; a banner or prompt-like line later in
+the stream is not a response boundary. Invalid UTF-8 or ANSI remaining inside
+the JSON payload fails the attempt while raw stdout remains evidence.
 
 This boundary provides advisory read-only behavior and tool control with
 `sourceIsolation: unavailable`. The disposable directory and reduced process
