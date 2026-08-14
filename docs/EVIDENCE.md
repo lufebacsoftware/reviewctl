@@ -15,12 +15,30 @@ provenance invalidates the prior receipt and requires a fresh review. The policy
 policy bytes used for that historical decision: changing the policy later does not alter an existing
 receipt, but a new review records the new policy digest.
 
+Every attempt distinguishes an absent backend response from a present response. A non-null response is
+retained even when it is empty or rejected, under the attempt directory. `rawResponse` records its
+durable absolute path, SHA-256, and character count. This durable raw evidence supports diagnosis; it is never
+copied into a completion prompt and never qualifies a rejected response for fragment promotion.
+
+Receipt schema versions have deliberately different verification guarantees. V1 verification is
+digest-only: it preserves the historical integrity check without retroactively imposing new structure.
+V2 verification is structural and offline: after checking the digest, it validates attempt numbering,
+contract identity, gates and evaluation state, fallback relationships, promoted-fragment identity, the
+accepted attempt, and consolidation without calling a provider or model.
+
+The receipt SHA-256 is tamper detection, not a digital signature and not a trust root. Structural
+verification detects internally incompatible facts, including mixing native findings state into a legacy
+contract receipt. It does not prove who authored the receipt or defend against an actor authorized to
+rewrite every fact and recompute the digest; signatures and organizational trust policy remain separate
+concerns.
+
 ## Sealed audit payload
 
 The runner never copies source files into its artifact directory. It writes private temporary snapshots
 only for the lifetime of the model process; `snapshotIntegrity` receipt provenance hashes those exact
 bytes locally. Passing
-`--seal-to` stores the exact assembled request and raw model response only as Age-encrypted payloads.
+`--seal-to` stores the exact assembled request and a sealed copy of the raw model response as
+Age-encrypted payloads.
 SQLite transport databases are deleted after extraction, including when Age sealing fails, because they
 contain raw prompt and response data. The Codex transport similarly deletes its `--output-last-message`
 file and any temporary JSON schema after extraction; the receipt keeps the Codex session identifier,
@@ -42,6 +60,17 @@ The structured findings contract accepts exactly two outcomes: `approved` with n
 `changes-requested` with one or more findings. A model that reports unavailable context, refuses to
 read the files, or returns an ambiguous natural-language verdict produces an unavailable receipt rather
 than an approval.
+
+For typed findings, contract evaluation is `complete`, `incomplete`, or `invalid`. Promotion is allowed
+only from an eligible incomplete attempt and only for findings that independently pass the full finding
+validator. Invalid responses and responses rejected by a pre-gate promote nothing. Completion receives
+validated fragments and a target-bound gap manifest, not the raw response. It cannot inherit a prior
+verdict or approval, and absence of a finding in a later response is not a dispute.
+
+acceptedAttempt must identify a real complete accepted attempt. The legacy verdict and findings are
+bound to that attempt. Unconfirmed findings remain visible in the consolidated view with provenance;
+they are not silently discarded merely because a later response is complete. Consequently the
+consolidated approval invariant is stricter than the legacy accepted-attempt view.
 
 For transport contexts that require a `reviewDeclaration`, the structured response lists every frozen
 basename it declares it reviewed. `reviewctl` compares that set exactly with the frozen packet. The

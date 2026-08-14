@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -45,9 +46,25 @@ from reviewctl.backends import (
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
     REVIEWED_FILES_SCHEMA,
+    ContractCompletionRequest,
     ContractContext,
     ContractEvaluation,
+    EvaluationContext,
+    EvaluationStatus,
+    exact_json_object,
     get_contract,
+    require_string_json_object_keys,
+    valid_review_basename,
+)
+from reviewctl.review_flow import (
+    FallbackRelationship,
+    PromotedFragment,
+    build_completion_context,
+    consolidate,
+    promote_fragments,
+    receipt_contract_identity,
+    render_completion_prompt,
+    validate_v2_receipt,
 )
 from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discover_topology
 
@@ -247,9 +264,11 @@ def codex_schema(schema: dict[str, object]) -> dict[str, object]:
 def response_schema(contract: str, *, codex: bool = False) -> dict[str, object] | None:
     """Return the strict JSON schema for one supported response contract."""
     if contract == "findings-json":
-        return get_contract(contract).prepare(
-            ContractContext(review_declaration_required=codex)
-        ).schema
+        return (
+            get_contract(contract)
+            .prepare(ContractContext(review_declaration_required=codex))
+            .schema
+        )
     schema = {
         "product-review-json": PRODUCT_REVIEW_SCHEMA,
         "product-judge-json": PRODUCT_JUDGE_SCHEMA,
@@ -295,8 +314,35 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def write_private_exclusive(path: Path, contents: bytes) -> None:
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError(
+            f"raw response evidence collision at {path}: "
+            "the adapter already created the reserved raw-response.txt path; "
+            "configure the adapter to use a different evidence path"
+        ) from error
+    try:
+        remaining = memoryview(contents)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written == 0:
+                raise OSError(f"could not finish writing raw response evidence at {path}")
+            remaining = remaining[written:]
+    finally:
+        os.close(descriptor)
+
+
 def canonical_json(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    require_string_json_object_keys(value)
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
 
 
 def utc_now() -> str:
@@ -435,9 +481,7 @@ def load_transport_defaults(
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             parser.error(f"defaults.{transport}.{key} must be a positive integer")
         if maximum is not None and value > maximum:
-            parser.error(
-                f"defaults.{transport}.{key} must be from {minimum} to {maximum}"
-            )
+            parser.error(f"defaults.{transport}.{key} must be from {minimum} to {maximum}")
         settings[key] = value
     return settings, {
         "path": str(config_path),
@@ -570,9 +614,10 @@ def llm_help_payload() -> dict[str, object]:
                 "incomplete": {
                     "meaning": "response failed the selected response contract",
                     "inspect": [
-                        "attempt.json:validationError",
-                        "attempt.json:contractEvaluation.violations",
-                        "attempt evidence response",
+                        "attempt.json:contractEvaluation.completionRequest",
+                        "attempt.json:promotedFragments",
+                        "receipt.json:fallbackRelationships",
+                        "attempt.json:rawResponse",
                     ],
                 },
             },
@@ -592,6 +637,31 @@ def llm_help_payload() -> dict[str, object]:
                 "verdict-invariant": "verdict and finding count disagree",
             },
             "redaction": "diagnostics are bounded and credential-shaped values are redacted",
+        },
+        "nextActions": {
+            "incomplete": {
+                "inspect": [
+                    "attempt.json:contractEvaluation.completionRequest",
+                    "attempt.json:promotedFragments",
+                    "receipt.json:fallbackRelationships",
+                    "attempt.json:rawResponse",
+                ]
+            },
+            "invalid": {
+                "inspect": [
+                    "attempt.json:contractEvaluation.violations",
+                    "attempt.json:evaluationError",
+                    "attempt.json:rawResponse",
+                ]
+            },
+            "accepted": {
+                "inspect": [
+                    "receipt.json:verdict",
+                    "receipt.json:findings",
+                    "receipt.json:consolidatedReview",
+                ],
+                "run": "reviewctl verify RECEIPT.json",
+            },
         },
         "rules": [
             "Exploration responses are working material, not approvals.",
@@ -614,8 +684,8 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "exploration. Use `reviewctl run` for a bounded formal review.\n\n"
         "## Exploration\n\n"
         "```bash\n"
-        "reviewctl explore start --id ID --model MODEL --cwd PATH --prompt \"QUESTION\"\n"
-        "reviewctl explore resume --id ID --prompt \"NEXT QUESTION\"\n"
+        'reviewctl explore start --id ID --model MODEL --cwd PATH --prompt "QUESTION"\n'
+        'reviewctl explore resume --id ID --prompt "NEXT QUESTION"\n'
         "reviewctl explore show --id ID\n"
         "reviewctl explore promote --id ID --output PATH\n"
         "```\n\n"
@@ -723,8 +793,10 @@ def run_setup(args: argparse.Namespace) -> int:
     print_setup_topology(selected_topology, args.format)
     if args.setup_command != "check":
         return 0
-    checked = selected if selected_names else tuple(
-        backend for backend in selected if backend.availability != "not-applicable"
+    checked = (
+        selected
+        if selected_names
+        else tuple(backend for backend in selected if backend.availability != "not-applicable")
     )
     return 0 if all(backend.availability == "available" for backend in checked) else 1
 
@@ -759,6 +831,8 @@ def validate_request(
             fail(parser, f"review file does not exist: {file}")
         if file.stat().st_size > MAX_FRAGMENT_BYTES:
             fail(parser, f"review file exceeds {MAX_FRAGMENT_BYTES} bytes: {file}")
+    if not all(valid_review_basename(file.name) for file in files):
+        fail(parser, "review files must have safe printable basenames")
     if len({file.name for file in files}) != len(files):
         fail(parser, "review files must have unique basenames")
     return prompt, files
@@ -1319,11 +1393,17 @@ def frozen_review_files(files: list[Path]) -> Iterator[tuple[list[dict[str, str]
         root = Path(directory)
         source: list[dict[str, str]] = []
         snapshots: list[Path] = []
-        for file in files:
+        for file in sorted(files, key=lambda item: item.name):
             contents = file.read_bytes()
             snapshot = root / file.name
             snapshot.write_bytes(contents)
-            source.append({"path": str(file), "sha256": sha256_bytes(contents)})
+            source.append(
+                {
+                    "name": file.name,
+                    "path": str(file),
+                    "sha256": sha256_bytes(contents),
+                }
+            )
             snapshots.append(snapshot)
         yield source, snapshots
 
@@ -1539,9 +1619,11 @@ def openrouter_packet(
         f"--- BEGIN {file.name} ---\n{file.read_text()}\n--- END {file.name} ---" for file in files
     )
     if response_contract == "findings-json":
-        contract = get_contract(response_contract).prepare(
-            ContractContext(file_names=tuple(file.name for file in files))
-        ).output_instructions
+        contract = (
+            get_contract(response_contract)
+            .prepare(ContractContext(file_names=tuple(file.name for file in files)))
+            .output_instructions
+        )
     elif response_contract == "product-review-json":
         contract = (
             "Return only JSON matching the supplied product-design schema. Address every stated "
@@ -1560,7 +1642,13 @@ def openrouter_packet(
 
 
 def numeric_value(value: object) -> float | None:
-    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 def token_value(value: object) -> int | None:
@@ -2034,9 +2122,7 @@ def invoke_pi(
         diagnostic_path.write_text(
             redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
         )
-    persisted = pi_persisted_response(
-        stdout, model, round((time.monotonic() - started) * 1000)
-    )
+    persisted = pi_persisted_response(stdout, model, round((time.monotonic() - started) * 1000))
     if not persisted.response:
         return (
             process.returncode,
@@ -2151,9 +2237,7 @@ def invoke_pi_exploration(
         process.returncode,
         stderr.decode(errors="replace"),
         stderr.decode(errors="replace"),
-        pi_persisted_response(
-            stdout, model, round((time.monotonic() - started) * 1000)
-        ),
+        pi_persisted_response(stdout, model, round((time.monotonic() - started) * 1000)),
     )
 
 
@@ -2220,9 +2304,7 @@ def run_exploration_turn(
                 fail(parser, "exploration manifest has no model; pass --model")
             cwd_value = args.cwd or manifest.get("cwd")
             cwd = (
-                Path(cwd_value).expanduser().resolve()
-                if isinstance(cwd_value, str)
-                else Path.cwd()
+                Path(cwd_value).expanduser().resolve() if isinstance(cwd_value, str) else Path.cwd()
             )
             if not cwd.is_dir():
                 fail(parser, f"exploration cwd does not exist: {cwd}")
@@ -2409,9 +2491,7 @@ def invoke_codex(
     output_path = temporary_root / "codex-response.md"
     schema_path: Path | None = None
     sandbox_arguments = (
-        ["--dangerously-bypass-approvals-and-sandbox"]
-        if isolation
-        else ["--sandbox", "read-only"]
+        ["--dangerously-bypass-approvals-and-sandbox"] if isolation else ["--sandbox", "read-only"]
     )
     command = [
         codex_bin,
@@ -2447,9 +2527,13 @@ def invoke_codex(
 
     started = time.monotonic()
     timed_out = False
-    process_environment = isolation.environment if isolation else codex_process_environment(
-        os.environ,
-        {"HOME": os.environ.get("HOME") or str(account_home())},
+    process_environment = (
+        isolation.environment
+        if isolation
+        else codex_process_environment(
+            os.environ,
+            {"HOME": os.environ.get("HOME") or str(account_home())},
+        )
     )
     try:
         process = subprocess.Popen(
@@ -3018,9 +3102,7 @@ def review_validation_error(
     return f"{contract}: response does not satisfy the required schema"
 
 
-def findings_validation_error(
-    response: str, evaluation: ContractEvaluation
-) -> str | None:
+def findings_validation_error(response: str, evaluation: ContractEvaluation) -> str | None:
     """Render one native findings evaluation using the stable CLI diagnostics."""
     if not evaluation.violations:
         return None
@@ -3038,10 +3120,7 @@ def findings_validation_error(
         verdict = value.get("verdict")
         if not isinstance(verdict, str):
             return "findings-json: verdict must be a string"
-        return (
-            f"findings-json: invalid verdict {verdict!r}; "
-            "expected approved or changes-requested"
-        )
+        return f"findings-json: invalid verdict {verdict!r}; expected approved or changes-requested"
     return "findings-json: findings do not satisfy the required schema or verdict invariant"
 
 
@@ -3070,6 +3149,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         parser, getattr(args, "config", None), transport_default_key
     )
     review_prompt = packet_prompt(prompt, files, args.response_contract)
+    packet_digest = sha256_bytes(review_prompt.encode())
     try:
         provider_preferences = provider_preferences_from_args(args)
     except ValueError as error:
@@ -3100,6 +3180,14 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     )
     snapshots_context = frozen_review_files(files)
     source_files, snapshots = snapshots_context.__enter__()
+    if not source_files:
+        prompt_source: dict[str, str] = {
+            "name": Path(args.prompt_file).name if args.prompt_file else "prompt.txt",
+            "sha256": sha256_bytes(prompt.encode()),
+        }
+        if args.prompt_file:
+            prompt_source["path"] = str(Path(args.prompt_file))
+        source_files.append(prompt_source)
     snapshot_hashes = {file.name: sha256_bytes(file.read_bytes()) for file in snapshots}
     native_contract = (
         get_contract(args.response_contract) if args.response_contract == "findings-json" else None
@@ -3112,6 +3200,13 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     accepted: PersistedResponse | None = None
     accepted_review: dict[str, Any] | None = None
     accepted_attempt: int | None = None
+    promoted_fragments: tuple[PromotedFragment, ...] = ()
+    fallback_relationships: list[FallbackRelationship] = []
+    completion_request = None
+    previous_attempt: int | None = None
+    previous_route_index: int | None = None
+    previous_gate_result: str | None = None
+    consolidation_context: ContractContext | None = None
 
     profile_settings = route_profile.get("settings", {}) if route_profile else {}
     configured_timeout = (
@@ -3158,14 +3253,9 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             transport_model = (
                 model.removeprefix("openrouter/") if transport == "openrouter" else model
             )
-            attempt_dir = attempts_dir / f"{number:02d}"
-            attempt_dir.mkdir()
-            database: Path | None = None
-            request_path: Path | None = None
-            response_path: Path | None = None
             contract_context = (
                 ContractContext(
-                    file_names=tuple(snapshot_hashes),
+                    file_names=tuple(item["name"] for item in source_files),
                     review_declaration_required=(
                         transport == "codex" and args.source_class == "proprietary"
                     ),
@@ -3178,6 +3268,77 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 if native_contract and contract_context
                 else None
             )
+            if contract_context is not None:
+                consolidation_context = contract_context
+            attempt_prompt = review_prompt
+            completion_fragments: tuple[PromotedFragment, ...] = ()
+            if prepared_contract is not None and contract_context is not None:
+                completion_fragments = tuple(
+                    fragment
+                    for fragment in promoted_fragments
+                    if fragment.contract_context == contract_context
+                    and fragment.prepared_digest == prepared_contract.digest
+                )
+            if (
+                completion_fragments
+                and completion_request is not None
+                and prepared_contract is not None
+                and contract_context is not None
+            ):
+                target_missing_fields = ("verdict", "findings")
+                if contract_context.review_declaration_required:
+                    target_missing_fields += ("reviewedFiles",)
+                target_completion_request = ContractCompletionRequest(
+                    prepared_digest=prepared_contract.digest,
+                    packet_digest=packet_digest,
+                    missing_fields=target_missing_fields,
+                    invalid_fragment_indexes=completion_request.invalid_fragment_indexes,
+                    violations=completion_request.violations,
+                )
+                completion_context = build_completion_context(
+                    target_completion_request,
+                    completion_fragments,
+                    allowed_file_names=contract_context.file_names,
+                    review_declaration_required=(contract_context.review_declaration_required),
+                )
+                attempt_prompt = render_completion_prompt(review_prompt, completion_context)
+            if (
+                previous_attempt is not None
+                and previous_route_index is not None
+                and previous_gate_result is not None
+            ):
+                relationship_kind = (
+                    "retry" if previous_route_index == route_index else "route-fallback"
+                )
+                relationship = FallbackRelationship(
+                    from_attempt=previous_attempt,
+                    to_attempt=number,
+                    kind=relationship_kind,
+                    reason=previous_gate_result,
+                    promoted_fragment_ids=tuple(
+                        fragment.fragment_id
+                        for fragment in promoted_fragments
+                        if fragment in completion_fragments
+                    ),
+                )
+                fallback_relationships.append(relationship)
+                log_event(
+                    logger,
+                    "attempt_retry" if relationship_kind == "retry" else "route_fallback",
+                    from_attempt=previous_attempt,
+                    to_attempt=number,
+                    from_model=routes[previous_route_index].model,
+                    from_transport=routes[previous_route_index].transport,
+                    to_model=model,
+                    to_transport=transport,
+                    reason=previous_gate_result,
+                    review_id=args.review_id,
+                )
+            attempt_dir = attempts_dir / f"{number:02d}"
+            attempt_dir.mkdir()
+            database: Path | None = None
+            request_path: Path | None = None
+            response_path: Path | None = None
             session_path: Path | None = None
             final_response_path: Path | None = None
             diagnostic_path: Path | None = None
@@ -3192,7 +3353,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             )
             execution = backend_registry.require(transport).execute(
                 BackendRequest(
-                    prompt=review_prompt,
+                    prompt=attempt_prompt,
                     model=transport_model,
                     response_contract=args.response_contract,
                     files=tuple(snapshots),
@@ -3213,70 +3374,111 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             session_path = execution.evidence.session
             final_response_path = execution.evidence.final_response
             diagnostic_path = execution.evidence.stderr
-            contract_evaluation = (
-                native_contract.evaluate(
-                    persisted.response, prepared_contract, contract_context
-                )
-                if persisted is not None
-                and native_contract
-                and prepared_contract
-                and contract_context
-                else None
-            )
-            if contract_evaluation:
-                review = contract_evaluation.value
-                validation_error = (
-                    findings_validation_error(persisted.response, contract_evaluation)
-                    if review is None
-                    else None
-                )
-            else:
-                review = (
-                    validate_review_response(
-                        persisted.response,
-                        args.response_contract,
-                        expected_file_hashes=(
-                            snapshot_hashes
-                            if transport == "codex" and args.source_class == "proprietary"
-                            else None
-                        ),
-                    )
-                    if persisted is not None
-                    else None
-                )
-                validation_error = (
-                    review_validation_error(
-                        persisted.response,
-                        args.response_contract,
-                        expected_file_hashes=(
-                            snapshot_hashes
-                            if transport == "codex" and args.source_class == "proprietary"
-                            else None
-                        ),
-                    )
-                    if persisted is not None and review is None
-                    else None
-                )
+            raw_response: dict[str, object] | None = None
+            if persisted is not None:
+                raw_response_path = attempt_dir / "raw-response.txt"
+                raw_response_bytes = persisted.response.encode(errors="surrogatepass")
+                write_private_exclusive(raw_response_path, raw_response_bytes)
+                raw_response = {
+                    "path": str(raw_response_path),
+                    "sha256": sha256_bytes(raw_response_bytes),
+                    "characters": len(persisted.response),
+                }
+            contract_evaluation = None
+            evaluation_error: dict[str, str] | None = None
+            review = None
+            validation_error = None
             if exit_code == 124:
-                result = "timeout"
+                gate_result = "timeout"
             elif exit_code != 0:
-                result = "transport-failed"
+                gate_result = "transport-failed"
             elif persisted is None:
-                result = "missing-response"
+                gate_result = "missing-response"
             elif persisted.model != transport_model:
-                result = "model-mismatch"
+                gate_result = "model-mismatch"
             elif not resolved_provider_matches(provider_preferences, persisted.provider):
-                result = "provider-mismatch"
+                gate_result = "provider-mismatch"
             elif not persisted.response.strip():
-                result = "empty"
+                gate_result = "empty"
             elif not persisted.conversation_id:
-                result = "missing-conversation"
-            elif review is None:
-                result = "incomplete"
+                gate_result = "missing-conversation"
             else:
-                result = "accepted"
+                if native_contract and prepared_contract and contract_context:
+                    try:
+                        contract_evaluation = native_contract.evaluate(
+                            persisted.response,
+                            prepared_contract,
+                            contract_context,
+                            evidence=EvaluationContext(packet_digest=packet_digest),
+                        )
+                    except (ValueError, UnicodeError, OverflowError) as error:
+                        exception_name = type(error).__name__
+                        evaluation_error = {
+                            "type": exception_name,
+                            "message": "response data could not be evaluated safely",
+                        }
+                        validation_error = (
+                            "findings-json: response data could not be evaluated safely "
+                            f"({exception_name})"
+                        )
+                        gate_result = "contract-invalid"
+                    else:
+                        review = contract_evaluation.value
+                        validation_error = (
+                            findings_validation_error(persisted.response, contract_evaluation)
+                            if review is None
+                            else None
+                        )
+                        if contract_evaluation.status is EvaluationStatus.COMPLETE:
+                            gate_result = "accepted"
+                        elif contract_evaluation.status is EvaluationStatus.INCOMPLETE:
+                            gate_result = "contract-incomplete"
+                        else:
+                            gate_result = "contract-invalid"
+                else:
+                    expected_file_hashes = (
+                        snapshot_hashes
+                        if transport == "codex" and args.source_class == "proprietary"
+                        else None
+                    )
+                    review = validate_review_response(
+                        persisted.response,
+                        args.response_contract,
+                        expected_file_hashes=expected_file_hashes,
+                    )
+                    validation_error = (
+                        review_validation_error(
+                            persisted.response,
+                            args.response_contract,
+                            expected_file_hashes=expected_file_hashes,
+                        )
+                        if review is None
+                        else None
+                    )
+                    gate_result = "incomplete" if review is None else "accepted"
+
+            result = (
+                "incomplete"
+                if gate_result in {"contract-incomplete", "contract-invalid"}
+                else gate_result
+            )
+            newly_promoted: tuple[PromotedFragment, ...] = ()
+            if native_contract and contract_evaluation is not None and raw_response is not None:
+                newly_promoted = promote_fragments(
+                    contract_evaluation,
+                    contract_context=contract_context,
+                    gate_result=gate_result,
+                    attempt=number,
+                    route_index=route_index,
+                    raw_response_digest=str(raw_response["sha256"]),
+                )
+                if newly_promoted and contract_evaluation.completion_request is not None:
+                    promoted_fragments = (*promoted_fragments, *newly_promoted)
+                    completion_request = contract_evaluation.completion_request
 
             attempt = {
+                "number": number,
+                "routeIndex": route_index,
                 "database": str(database) if database else None,
                 "evidence": {
                     "request": (
@@ -3318,6 +3520,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "resolved": persisted.provider if persisted else None,
                 },
                 "providerPreferences": provider_preferences,
+                "rawResponse": raw_response,
+                "attemptRequestSha256": sha256_bytes(attempt_prompt.encode()),
                 "result": result,
                 "route": {"model": model, "transport": transport},
                 "validationError": validation_error,
@@ -3332,6 +3536,26 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 "conversationId": persisted.conversation_id if persisted else None,
                 "findings": review.get("findings", []) if review else [],
             }
+            if (
+                args.response_contract in {"product-review-json", "product-judge-json"}
+                and result == "accepted"
+                and review is not None
+            ):
+                contract_identity = receipt_contract_identity(args.response_contract)
+                attempt["contractOutput"] = {
+                    "name": contract_identity["name"],
+                    "version": contract_identity["version"],
+                    "status": "complete",
+                    "normalizedSha256": sha256_bytes(canonical_json(review)),
+                    "contractContext": {
+                        "fileNames": [item["name"] for item in source_files],
+                        "reviewDeclarationRequired": (
+                            transport == "codex" and args.source_class == "proprietary"
+                        ),
+                    },
+                }
+            if native_contract:
+                attempt["promotedFragments"] = [fragment.to_dict() for fragment in newly_promoted]
             if contract_evaluation:
                 attempt["contractEvaluation"] = {
                     "name": contract_evaluation.name,
@@ -3339,8 +3563,53 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "preparedSha256": contract_evaluation.prepared_digest,
                     "payloadSha256": contract_evaluation.payload_digest,
                     "normalizedSha256": contract_evaluation.normalized_digest,
+                    "normalizedValue": contract_evaluation.value,
+                    "contractContext": {
+                        "fileNames": list(contract_context.file_names),
+                        "reviewDeclarationRequired": (contract_context.review_declaration_required),
+                    },
                     "violations": list(contract_evaluation.violations),
+                    "status": contract_evaluation.status.value,
+                    "fragments": [
+                        {
+                            "fragmentId": fragment.fragment_id,
+                            "fingerprint": fragment.fingerprint,
+                            "kind": fragment.kind.value,
+                            "value": fragment.value,
+                            "payloadDigest": fragment.payload_digest,
+                            "scope": list(fragment.scope),
+                        }
+                        for fragment in contract_evaluation.valid_fragments
+                    ],
+                    "coverage": (
+                        {
+                            "requiredFields": list(contract_evaluation.coverage.required_fields),
+                            "coveredFields": list(contract_evaluation.coverage.covered_fields),
+                            "missingFields": list(contract_evaluation.coverage.missing_fields),
+                        }
+                        if contract_evaluation.coverage is not None
+                        else None
+                    ),
+                    "completionRequest": (
+                        {
+                            "preparedDigest": (
+                                contract_evaluation.completion_request.prepared_digest
+                            ),
+                            "packetDigest": contract_evaluation.completion_request.packet_digest,
+                            "missingFields": list(
+                                contract_evaluation.completion_request.missing_fields
+                            ),
+                            "invalidFragmentIndexes": list(
+                                contract_evaluation.completion_request.invalid_fragment_indexes
+                            ),
+                            "violations": list(contract_evaluation.completion_request.violations),
+                        }
+                        if contract_evaluation.completion_request is not None
+                        else None
+                    ),
                 }
+            if evaluation_error is not None:
+                attempt["evaluationError"] = evaluation_error
             attempts.append(attempt)
             (attempt_dir / "attempt.json").write_bytes(canonical_json(attempt) + b"\n")
             log_event(
@@ -3361,17 +3630,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 accepted_review = review
                 accepted_attempt = number
                 break
+            previous_attempt = number
+            previous_route_index = route_index
+            previous_gate_result = gate_result
             if result not in RETRIABLE_REVIEW_RESULTS:
                 break
-            log_event(
-                logger,
-                "route_fallback",
-                attempt=number,
-                from_model=model,
-                from_transport=transport,
-                reason=result,
-                review_id=args.review_id,
-            )
         if accepted is not None:
             break
 
@@ -3388,6 +3651,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         }
 
     receipt: dict[str, Any] = {
+        "receiptSchemaVersion": 2,
         "acceptedAttempt": accepted_attempt,
         "attempts": attempts,
         "createdAt": utc_now(),
@@ -3399,11 +3663,13 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         "prompt": {
             "sha256": sha256_bytes(prompt.encode()),
             "characters": len(prompt),
-            "packetSha256": sha256_bytes(review_prompt.encode()),
+            "packetSha256": packet_digest,
         },
         "result": "accepted" if accepted else "unavailable",
         "reviewContract": args.response_contract,
+        "contract": receipt_contract_identity(args.response_contract),
         "reviewId": args.review_id,
+        "sourceClass": args.source_class,
         "source": source,
         "tool": {"name": "reviewctl", "version": __version__},
         "executionSettings": {
@@ -3424,10 +3690,16 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         },
     }
     if native_contract:
-        receipt["contract"] = {
-            "name": native_contract.name,
-            "version": native_contract.version,
-        }
+        assert consolidation_context is not None
+        receipt["fallbackRelationships"] = [
+            relationship.to_dict() for relationship in fallback_relationships
+        ]
+        receipt["consolidatedReview"] = consolidate(
+            accepted_review,
+            promoted_fragments,
+            accepted_attempt,
+            contract_context=consolidation_context,
+        ).to_dict()
     if accepted:
         receipt["response"] = {
             "sha256": sha256_bytes(accepted.response.encode()),
@@ -3484,14 +3756,49 @@ def valid_receipt(receipt: dict[str, Any]) -> bool:
     """Verify the hash embedded in an in-memory receipt without mutating it."""
     recorded = receipt.get("sha256")
     unsigned = {key: value for key, value in receipt.items() if key != "sha256"}
-    return isinstance(recorded, str) and recorded == sha256_bytes(canonical_json(unsigned))
+    try:
+        reproduced = sha256_bytes(canonical_json(unsigned))
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        return False
+    return isinstance(recorded, str) and recorded == reproduced
 
 
 def verify_receipt(args: argparse.Namespace) -> int:
     receipt_path = Path(args.receipt)
-    receipt = json.loads(receipt_path.read_text())
-    valid = isinstance(receipt, dict) and valid_receipt(receipt)
-    print(json.dumps({"receipt": str(receipt_path), "valid": valid}, sort_keys=True))
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        receipt = json.loads(
+            receipt_path.read_text(),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except (OSError, UnicodeError, ValueError):
+        violations = ("json-receipt",)
+    else:
+        if not isinstance(receipt, dict):
+            violations = ("receipt-object",)
+        elif "receiptSchemaVersion" not in receipt:
+            violations = () if valid_receipt(receipt) else ("receipt-digest",)
+        elif receipt.get("receiptSchemaVersion") == 2 and not isinstance(
+            receipt.get("receiptSchemaVersion"), bool
+        ):
+            violations = validate_v2_receipt(receipt)
+        else:
+            violations = ("receipt-schema-version",)
+    valid = not violations
+    print(
+        json.dumps(
+            {
+                "receipt": str(receipt_path),
+                "valid": valid,
+                "violations": list(violations),
+            },
+            sort_keys=True,
+        )
+    )
     return 0 if valid else 1
 
 

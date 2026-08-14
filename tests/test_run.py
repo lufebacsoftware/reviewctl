@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
 from contextlib import closing
+from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from reviewctl import cli
+from reviewctl import cli, review_flow
 from reviewctl.setup import BackendInstallation, LocalExecutionTopology
 
 REPOSITORY = Path(__file__).parents[1]
+V1_RECEIPT_FIXTURES = REPOSITORY / "tests" / "fixtures" / "receipts"
 
 
 def run_cli(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -378,12 +382,20 @@ def review_arguments(tmp_path: Path, *models: str) -> list[str]:
 
 
 def test_transport_return_annotations_match_runtime_tuple_shapes() -> None:
-    assert cli.invoke_openrouter.__annotations__["return"] == (
-        "tuple[int, str, PersistedResponse]"
-    )
+    assert cli.invoke_openrouter.__annotations__["return"] == ("tuple[int, str, PersistedResponse]")
     assert cli.invoke_pi_exploration.__annotations__["return"] == (
         "tuple[int, str, str, PersistedResponse]"
     )
+
+
+def test_receipt_transport_allowlist_matches_registered_backend_descriptors() -> None:
+    registered = {descriptor.name for descriptor in cli.build_backend_registry().descriptors()}
+
+    assert review_flow.SUPPORTED_REVIEW_TRANSPORTS == frozenset(registered)
+
+
+def test_receipt_contract_allowlist_matches_cli_contract_choices() -> None:
+    assert review_flow.SUPPORTED_RESPONSE_CONTRACTS == frozenset(cli.RESPONSE_CONTRACTS)
 
 
 def test_run_dispatches_frozen_packet_through_registered_backend(
@@ -401,9 +413,7 @@ def test_run_dispatches_frozen_packet_through_registered_backend(
         return cli.BackendExecution(
             0,
             "",
-            cli.PersistedResponse(
-                "fake-turn", None, 1, 10, "accepted", 2, None, response_json
-            ),
+            cli.PersistedResponse("fake-turn", None, 1, 10, "accepted", 2, None, response_json),
             cli.BackendEvidence(response=evidence_path),
         )
 
@@ -418,7 +428,11 @@ def test_run_dispatches_frozen_packet_through_registered_backend(
     ]
     namespace = cli.build_parser().parse_args(arguments)
 
-    assert namespace.handler(namespace) == 0
+    previous_umask = os.umask(0o022)
+    try:
+        assert namespace.handler(namespace) == 0
+    finally:
+        os.umask(previous_umask)
     assert len(captured) == 1
     request = captured[0]
     original_source = tmp_path / "source.py"
@@ -435,6 +449,663 @@ def test_run_dispatches_frozen_packet_through_registered_backend(
     assert attempt["result"] == "accepted"
     assert attempt["evidence"]["response"] == str(evidence_path)
     assert evidence_path.read_text() == response_json
+    raw_response = attempt["rawResponse"]
+    raw_response_path = Path(raw_response["path"])
+    assert raw_response_path == request.attempt_dir / "raw-response.txt"
+    assert raw_response_path != evidence_path
+    assert raw_response_path.read_text() == response_json
+    assert stat.S_IMODE(raw_response_path.stat().st_mode) == 0o600
+    assert raw_response["sha256"] == cli.sha256_bytes(response_json.encode())
+    assert raw_response["characters"] == len(response_json)
+
+
+def test_run_rejects_raw_response_evidence_collision_without_overwriting_adapter_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    response_json = '{"verdict":"approved","findings":[]}'
+    native_bytes = b"adapter-native-evidence"
+    collision_path: Path | None = None
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        nonlocal collision_path
+        collision_path = request.attempt_dir / "raw-response.txt"
+        collision_path.write_bytes(native_bytes)
+        return cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse("conversation", None, 1, 10, "accepted", 2, None, response_json),
+            cli.BackendEvidence(response=collision_path),
+        )
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path, "accepted"),
+            "--transport",
+            "llm",
+            "--response-contract",
+            "findings-json",
+        ]
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"raw response evidence collision at .*raw-response\.txt.*different evidence path",
+    ):
+        namespace.handler(namespace)
+
+    assert collision_path is not None
+    assert collision_path.read_bytes() == native_bytes
+
+
+@pytest.mark.parametrize(
+    ("response_text", "resolved_model", "exit_code", "expected_result"),
+    [
+        ("not-json", "accepted", 0, "incomplete"),
+        ('{"verdict":"approved"}', "accepted", 0, "incomplete"),
+        ('{"verdict":"approved","findings":[]}', "other-model", 0, "model-mismatch"),
+        ('{"verdict":"approved","findings":[]}', "accepted", 17, "transport-failed"),
+        ("", "accepted", 0, "empty"),
+        ("\ud800", "accepted", 0, "incomplete"),
+        (None, None, 0, "missing-response"),
+    ],
+    ids=[
+        "invalid-json",
+        "contract-incomplete",
+        "model-mismatch",
+        "transport-failure-with-payload",
+        "empty-response",
+        "non-scalar-unicode",
+        "no-response",
+    ],
+)
+def test_run_preserves_every_present_raw_backend_response(
+    response_text: str | None,
+    resolved_model: str | None,
+    exit_code: int,
+    expected_result: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        persisted = (
+            cli.PersistedResponse(
+                "conversation", None, 1, 10, resolved_model or "", 2, None, response_text
+            )
+            if response_text is not None
+            else None
+        )
+        return cli.BackendExecution(
+            exit_code, "failed" if exit_code else "", persisted, cli.BackendEvidence()
+        )
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path, "accepted"),
+            "--transport",
+            "llm",
+            "--response-contract",
+            "findings-json",
+        ]
+    )
+
+    assert namespace.handler(namespace) == 1
+    turn = Path(capsys.readouterr().out.strip())
+    receipt = json.loads((turn / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == expected_result
+    assert json.loads((turn / "attempts" / "01" / "attempt.json").read_text()) == attempt
+    raw_response = attempt["rawResponse"]
+    durable_path = turn / "attempts" / "01" / "raw-response.txt"
+    if response_text is None:
+        assert raw_response is None
+        assert not durable_path.exists()
+    else:
+        response_bytes = response_text.encode(errors="surrogatepass")
+        assert raw_response == {
+            "path": str(durable_path),
+            "sha256": cli.sha256_bytes(response_bytes),
+            "characters": len(response_text),
+        }
+        assert durable_path.read_bytes() == response_bytes
+
+
+def _run_registered_findings_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    responses: list[dict[str, object]],
+    *,
+    models: tuple[str, ...] = ("accepted",),
+    max_attempts: int = 2,
+    response_contract: str = "findings-json",
+) -> tuple[int, dict[str, object], list[cli.BackendRequest]]:
+    captured: list[cli.BackendRequest] = []
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        captured.append(request)
+        item = responses[len(captured) - 1]
+        response = item.get("response")
+        persisted = (
+            cli.PersistedResponse(
+                str(item.get("conversation", "conversation")),
+                None,
+                1,
+                10,
+                str(item.get("model", request.model)),
+                2,
+                item.get("provider") if isinstance(item.get("provider"), str) else None,
+                response,
+            )
+            if isinstance(response, str)
+            else None
+        )
+        return cli.BackendExecution(
+            int(item.get("exit_code", 0)),
+            str(item.get("diagnostic", "")),
+            persisted,
+            cli.BackendEvidence(),
+        )
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path, *models),
+            "--transport",
+            "llm",
+            "--response-contract",
+            response_contract,
+            "--max-attempts",
+            str(max_attempts),
+        ]
+    )
+
+    return_code = namespace.handler(namespace)
+    turn = Path(capsys.readouterr().out.strip())
+    return return_code, json.loads((turn / "receipt.json").read_text()), captured
+
+
+def test_partial_findings_complete_with_typed_same_route_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Partial finding",
+        "evidence": "The first response identified this evidence.",
+        "reproduction": "Inspect source.py line 1.",
+    }
+    raw_partial_marker = "RAW-PRIOR-RESPONSE-MUST-NOT-BE-INJECTED"
+    partial = json.dumps({"findings": [finding], "untrusted": raw_partial_marker})
+    complete = json.dumps({"verdict": "approved", "findings": []})
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": partial}, {"response": complete}],
+    )
+
+    assert return_code == 0
+    assert len(requests) == 2
+    first_prompt, second_prompt = (request.prompt for request in requests)
+    assert raw_partial_marker not in second_prompt
+    assert partial not in second_prompt
+    assert "<reviewctl-completion-context>" in second_prompt
+    assert finding["title"] in second_prompt
+    assert receipt["prompt"]["packetSha256"] == cli.sha256_bytes(first_prompt.encode())
+    assert receipt["attempts"][0]["attemptRequestSha256"] == cli.sha256_bytes(first_prompt.encode())
+    assert receipt["attempts"][1]["attemptRequestSha256"] == cli.sha256_bytes(
+        second_prompt.encode()
+    )
+    assert receipt["acceptedAttempt"] == 2
+    assert [attempt["result"] for attempt in receipt["attempts"]] == [
+        "incomplete",
+        "accepted",
+    ]
+    first_evaluation = receipt["attempts"][0]["contractEvaluation"]
+    assert first_evaluation["status"] == "incomplete"
+    assert (
+        first_evaluation["completionRequest"]["packetDigest"] == receipt["prompt"]["packetSha256"]
+    )
+    promoted = receipt["attempts"][0]["promotedFragments"]
+    assert len(promoted) == 1
+    assert receipt["fallbackRelationships"] == [
+        {
+            "fromAttempt": 1,
+            "toAttempt": 2,
+            "kind": "retry",
+            "reason": "contract-incomplete",
+            "promotedFragmentIds": [promoted[0]["fragmentId"]],
+        }
+    ]
+    assert receipt["verdict"] == "approved"
+    assert receipt["findings"] == []
+    assert receipt["consolidatedReview"]["status"] == "accepted"
+    assert receipt["consolidatedReview"]["verdict"] == "approved"
+    assert receipt["consolidatedReview"]["approved"] is False
+    assert receipt["consolidatedReview"]["acceptedAttempt"] == 2
+    assert len(receipt["consolidatedReview"]["findings"]) == 1
+    assert cli.validate_v2_receipt(receipt) == ()
+    log = Path(receipt["logging"]["path"]).read_text()
+    assert '"event":"attempt_retry"' in log
+    assert '"from_attempt":1' in log
+    assert '"to_attempt":2' in log
+    assert '"event":"route_fallback"' not in log
+
+
+def test_partial_then_invalid_preserves_only_consolidated_partial_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "medium",
+        "path": "source.py",
+        "line": 1,
+        "title": "Useful partial finding",
+        "evidence": "The partial response contains bounded evidence.",
+        "reproduction": "Inspect the source.",
+    }
+    partial = json.dumps({"findings": [finding]})
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": partial}, {"response": "not json"}],
+    )
+
+    assert return_code == 1
+    assert len(requests) == 2
+    assert receipt["result"] == "unavailable"
+    assert receipt["acceptedAttempt"] is None
+    assert [attempt["contractEvaluation"]["status"] for attempt in receipt["attempts"]] == [
+        "incomplete",
+        "invalid",
+    ]
+    assert receipt["attempts"][1]["promotedFragments"] == []
+    assert receipt["consolidatedReview"]["status"] == "unavailable"
+    assert receipt["consolidatedReview"]["approved"] is False
+    assert len(receipt["consolidatedReview"]["findings"]) == 1
+    assert cli.validate_v2_receipt(receipt) == ()
+
+
+def test_partial_findings_follow_the_actual_route_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "low",
+        "path": "source.py",
+        "line": 1,
+        "title": "Cross-route finding",
+        "evidence": "The first route returned useful evidence.",
+        "reproduction": "Inspect source.py.",
+    }
+    partial = json.dumps({"findings": [finding]})
+    complete = json.dumps({"verdict": "changes-requested", "findings": [finding]})
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": partial}, {"response": complete}],
+        models=("route-one", "route-two"),
+        max_attempts=1,
+    )
+
+    assert return_code == 0
+    assert [request.model for request in requests] == ["route-one", "route-two"]
+    encoded_context = (
+        requests[1]
+        .prompt.split("<reviewctl-completion-context>\n", 1)[1]
+        .split("\n</reviewctl-completion-context>", 1)[0]
+    )
+    assert json.loads(encoded_context)["fileNames"] == ["source.py"]
+    assert receipt["fallbackRelationships"][0]["kind"] == "route-fallback"
+    assert receipt["fallbackRelationships"][0]["reason"] == "contract-incomplete"
+    log = Path(receipt["logging"]["path"]).read_text()
+    assert '"event":"route_fallback"' in log
+    assert '"event":"attempt_retry"' not in log
+
+
+@pytest.mark.parametrize("response_contract", ["findings-json", "verdict"])
+@pytest.mark.parametrize(
+    ("response_overrides", "expected_gate", "reject_provider"),
+    [
+        ({"response": "partial", "exit_code": 124}, "timeout", False),
+        ({"response": "partial", "exit_code": 17}, "transport-failed", False),
+        ({"response": None}, "missing-response", False),
+        ({"response": "partial", "model": "wrong-model"}, "model-mismatch", False),
+        ({"response": "partial", "provider": "wrong"}, "provider-mismatch", True),
+        ({"response": ""}, "empty", False),
+        ({"response": "partial", "conversation": ""}, "missing-conversation", False),
+    ],
+    ids=["timeout", "exit", "missing", "model", "provider", "empty", "conversation"],
+)
+def test_precontract_gates_never_invoke_native_or_legacy_evaluation(
+    response_contract: str,
+    response_overrides: dict[str, object],
+    expected_gate: str,
+    reject_provider: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if reject_provider:
+        monkeypatch.setattr(cli, "resolved_provider_matches", lambda *_: False)
+
+    if response_contract == "findings-json":
+        real_contract = cli.get_contract("findings-json")
+
+        class ExplodingContract:
+            name = real_contract.name
+            version = real_contract.version
+
+            def prepare(self, context: object) -> object:
+                return real_contract.prepare(context)
+
+            def evaluate(self, *_: object, **__: object) -> object:
+                raise AssertionError("native contract evaluation crossed a pre-gate")
+
+        monkeypatch.setattr(cli, "get_contract", lambda _: ExplodingContract())
+    else:
+
+        def explode(*_: object, **__: object) -> object:
+            raise AssertionError("legacy validation crossed a pre-gate")
+
+        monkeypatch.setattr(cli, "validate_review_response", explode)
+        monkeypatch.setattr(cli, "review_validation_error", explode)
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [response_overrides],
+        max_attempts=1,
+        response_contract=response_contract,
+    )
+
+    assert return_code == 1
+    assert len(requests) == 1
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == expected_gate
+    if response_contract == "findings-json":
+        assert attempt["promotedFragments"] == []
+    else:
+        assert "promotedFragments" not in attempt
+    assert attempt["validationError"] is None
+    assert "contractEvaluation" not in attempt
+    if response_overrides["response"] is None:
+        assert attempt["rawResponse"] is None
+    else:
+        raw_response = attempt["rawResponse"]
+        assert Path(raw_response["path"]).is_file()
+        assert raw_response["characters"] == len(str(response_overrides["response"]))
+    if response_contract == "findings-json":
+        assert receipt["fallbackRelationships"] == []
+        assert receipt["consolidatedReview"]["findings"] == []
+
+
+def test_provider_mismatch_never_promotes_partial_findings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Wrong provider partial",
+        "evidence": "This payload came from a rejected provider.",
+        "reproduction": "Inspect provider resolution.",
+    }
+    monkeypatch.setattr(cli, "resolved_provider_matches", lambda *_: False)
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": json.dumps({"findings": [finding]}), "provider": "wrong"}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "provider-mismatch"
+    assert attempt["promotedFragments"] == []
+    assert receipt["consolidatedReview"]["findings"] == []
+
+
+def test_native_data_decode_failure_emits_stable_invalid_attempt_and_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hostile = '{"oversized":' + ("9" * 5000) + "}"
+
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": hostile}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    attempt = receipt["attempts"][0]
+    assert attempt["result"] == "incomplete"
+    assert attempt["validationError"] == "findings-json: invalid JSON"
+    assert "evaluationError" not in attempt
+    assert attempt["contractEvaluation"]["status"] == "invalid"
+    assert attempt["contractEvaluation"]["violations"] == ["invalid-json"]
+    assert attempt["promotedFragments"] == []
+    raw_response = attempt["rawResponse"]
+    assert Path(raw_response["path"]).read_text() == hostile
+    assert raw_response["sha256"] == cli.sha256_bytes(hostile.encode())
+    assert receipt["acceptedAttempt"] is None
+    assert receipt["result"] == "unavailable"
+    assert cli.validate_v2_receipt(receipt) == ()
+
+
+def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    real_contract = cli.get_contract("findings-json")
+
+    class RaisingContract:
+        name = real_contract.name
+        version = real_contract.version
+
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        def prepare(self, context: object) -> object:
+            return real_contract.prepare(context)
+
+        def evaluate(self, *_: object, **__: object) -> object:
+            raise self.error
+
+    monkeypatch.setattr(cli, "get_contract", lambda _: RaisingContract(ValueError("hostile")))
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": "eligible response"}],
+        max_attempts=1,
+    )
+    assert return_code == 1
+    assert receipt["attempts"][0]["evaluationError"]["type"] == "ValueError"
+    assert receipt["attempts"][0]["promotedFragments"] == []
+    assert "contractEvaluation" not in receipt["attempts"][0]
+    assert cli.validate_v2_receipt(receipt) == ()
+
+    monkeypatch.setattr(cli, "get_contract", lambda _: RaisingContract(RuntimeError("bug")))
+    other = tmp_path / "runtime-error"
+    other.mkdir()
+    with pytest.raises(RuntimeError, match="bug"):
+        _run_registered_findings_sequence(
+            monkeypatch,
+            other,
+            capsys,
+            [{"response": "eligible response"}],
+            max_attempts=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_transport", "target_transport"),
+    [
+        ("codex", "llm"),
+        ("llm", "codex"),
+    ],
+)
+def test_completion_prompt_uses_target_route_contract_context(
+    source_transport: str,
+    target_transport: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Target-bound context",
+        "evidence": "The first route found bounded evidence.",
+        "reproduction": "Inspect source.py line 1.",
+    }
+    raw_marker = "RAW-SOURCE-PAYLOAD-MUST-NOT-CROSS"
+    partial = json.dumps({"findings": [finding], "untrusted": raw_marker})
+    target_review: dict[str, object] = {
+        "verdict": "changes-requested",
+        "findings": [finding],
+    }
+    if target_transport == "codex":
+        target_review["reviewedFiles"] = ["source.py"]
+    responses = [partial, json.dumps(target_review)]
+    captured: list[cli.BackendRequest] = []
+    real_registry = cli.build_backend_registry()
+    registry = cli.BackendRegistry()
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        captured.append(request)
+        response = responses[len(captured) - 1]
+        return cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse("conversation", None, 1, 10, request.model, 2, None, response),
+            cli.BackendEvidence(),
+        )
+
+    for transport in {source_transport, target_transport}:
+        registry.register(real_registry.require(transport).descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path),
+            "--route",
+            f"{source_transport}:source-model",
+            "--route",
+            f"{target_transport}:target-model",
+            "--response-contract",
+            "findings-json",
+            "--source-class",
+            "proprietary",
+            "--max-attempts",
+            "1",
+        ]
+    )
+
+    assert namespace.handler(namespace) == 0
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    assert len(captured) == 2
+    first_prompt, target_prompt = (request.prompt for request in captured)
+    source_contract_context = cli.ContractContext(
+        file_names=("source.py",),
+        review_declaration_required=source_transport == "codex",
+    )
+    source_prepared = cli.get_contract("findings-json").prepare(source_contract_context)
+
+    assert target_prompt == first_prompt
+    assert "<reviewctl-completion-context>" not in target_prompt
+    assert receipt["prompt"]["packetSha256"] == cli.sha256_bytes(first_prompt.encode())
+    assert receipt["attempts"][1]["attemptRequestSha256"] == cli.sha256_bytes(
+        target_prompt.encode()
+    )
+    assert raw_marker not in target_prompt
+    assert partial not in target_prompt
+    first_attempt = receipt["attempts"][0]
+    assert first_attempt["contractEvaluation"]["preparedSha256"] == source_prepared.digest
+    assert (
+        first_attempt["promotedFragments"][0]["payloadDigest"]
+        == first_attempt["rawResponse"]["sha256"]
+    )
+    assert first_attempt["promotedFragments"][0]["preparedDigest"] == source_prepared.digest
+    assert first_attempt["promotedFragments"][0]["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": source_transport == "codex",
+    }
+    assert receipt["fallbackRelationships"][0]["promotedFragmentIds"] == []
+
+
+def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    executions: list[str] = []
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("llm").descriptor
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        executions.append(request.model)
+        return cli.BackendExecution(0, "", None, cli.BackendEvidence())
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    arguments = [
+        *review_arguments(tmp_path, "route1", "route2"),
+        "--max-attempts",
+        "2",
+    ]
+    namespace = cli.build_parser().parse_args(arguments)
+
+    assert namespace.handler(namespace) == 1
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    expected_routes = [
+        {"model": "route1", "transport": "llm"},
+        {"model": "route2", "transport": "llm"},
+    ]
+    expected_execution_order = ["route1", "route1", "route2", "route2"]
+    assert receipt["executionSettings"]["maxAttempts"] == 2
+    assert receipt["routes"] == expected_routes
+    assert executions == expected_execution_order
+    assert len(executions) <= len(expected_routes) * 2
+    assert [attempt["route"] for attempt in receipt["attempts"]] == [
+        expected_routes[0],
+        expected_routes[0],
+        expected_routes[1],
+        expected_routes[1],
+    ]
+    assert [attempt["result"] for attempt in receipt["attempts"]] == ["missing-response"] * 4
 
 
 def test_uses_a_separate_database_for_each_attempt_and_accepts_matching_model(
@@ -452,6 +1123,18 @@ def test_uses_a_separate_database_for_each_attempt_and_accepts_matching_model(
     assert receipt["acceptedAttempt"] == 2
     assert receipt["model"]["resolved"] == "accepted"
     assert receipt["attempts"][0]["database"] != receipt["attempts"][1]["database"]
+    for attempt, expected_response in zip(
+        receipt["attempts"],
+        ["", "VERDICT: approved\n1. No blocking findings."],
+        strict=True,
+    ):
+        assert not Path(attempt["database"]).exists()
+        raw_response = attempt["rawResponse"]
+        raw_response_path = Path(raw_response["path"])
+        assert raw_response_path.is_file()
+        assert raw_response_path.read_text() == expected_response
+        assert raw_response["sha256"] == cli.sha256_bytes(expected_response.encode())
+        assert raw_response["characters"] == len(expected_response)
 
 
 def test_ordered_routes_fallback_after_antigravity_quota_failure(tmp_path: Path) -> None:
@@ -563,9 +1246,9 @@ def test_pi_timeout_drains_diagnostics_emitted_during_termination(tmp_path: Path
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
     attempt = receipt["attempts"][0]
     assert attempt["result"] == "timeout"
-    assert "diagnostic emitted during termination" in Path(
-        attempt["evidence"]["stderr"]
-    ).read_text()
+    assert (
+        "diagnostic emitted during termination" in Path(attempt["evidence"]["stderr"]).read_text()
+    )
 
 
 def test_missing_pi_binary_does_not_claim_nonexistent_evidence(tmp_path: Path) -> None:
@@ -632,18 +1315,28 @@ def test_pi_metadata_normalization_preserves_provider_qualified_routes() -> None
     assert cli.pi_resolved_model("google/gemini-2.5-flash", "google", "gemini-2.5-flash") == (
         "google/gemini-2.5-flash"
     )
-    assert cli.pi_resolved_model(
-        "openrouter/google/gemini-2.5-flash", "openrouter", "google/gemini-2.5-flash"
-    ) == "openrouter/google/gemini-2.5-flash"
-    assert cli.pi_resolved_model(
-        "openrouter/google/gemini-2.5-flash", "google", "gemini-2.5-flash"
-    ) == "google/gemini-2.5-flash"
-    assert cli.pi_resolved_model(
-        "openrouter/google/gemini-2.5-flash", None, "openrouter/google/gemini-2.5-flash"
-    ) == ""
-    assert cli.pi_resolved_model(
-        "openrouter/google/gemini-2.5-flash", "openrouter/google", "gemini-2.5-flash"
-    ) == ""
+    assert (
+        cli.pi_resolved_model(
+            "openrouter/google/gemini-2.5-flash", "openrouter", "google/gemini-2.5-flash"
+        )
+        == "openrouter/google/gemini-2.5-flash"
+    )
+    assert (
+        cli.pi_resolved_model("openrouter/google/gemini-2.5-flash", "google", "gemini-2.5-flash")
+        == "google/gemini-2.5-flash"
+    )
+    assert (
+        cli.pi_resolved_model(
+            "openrouter/google/gemini-2.5-flash", None, "openrouter/google/gemini-2.5-flash"
+        )
+        == ""
+    )
+    assert (
+        cli.pi_resolved_model(
+            "openrouter/google/gemini-2.5-flash", "openrouter/google", "gemini-2.5-flash"
+        )
+        == ""
+    )
 
 
 def test_pi_transport_rejects_a_non_atomic_observed_provider(tmp_path: Path) -> None:
@@ -742,9 +1435,10 @@ def test_pi_response_normalization_only_removes_one_json_fence() -> None:
         '{"verdict":"approved","findings":[]}'
     )
     assert cli.normalize_pi_response("```json\n[]\n```", "findings-json") == "```json\n[]\n```"
-    assert cli.normalize_pi_response(
-        '```json\n{"verdict":NaN}\n```', "findings-json"
-    ) == '```json\n{"verdict":NaN}\n```'
+    assert (
+        cli.normalize_pi_response('```json\n{"verdict":NaN}\n```', "findings-json")
+        == '```json\n{"verdict":NaN}\n```'
+    )
     assert cli.normalize_pi_response(fenced, "document") == fenced
 
 
@@ -821,9 +1515,7 @@ def test_explore_resume_uses_the_same_pi_session_and_appends_a_turn(tmp_path: Pa
     session_root = exploration_root / "ledger-thread"
     manifest = json.loads((session_root / "manifest.json").read_text())
     assert manifest["turns"] == 2
-    assert (session_root / "turns" / "002" / "request.md").read_text() == (
-        "Continue the thread."
-    )
+    assert (session_root / "turns" / "002" / "request.md").read_text() == ("Continue the thread.")
     assert manifest["session"] == str(session_root / "session.jsonl")
 
 
@@ -946,8 +1638,10 @@ def test_exploration_does_not_manufacture_transport_artifacts(
     assert metadata["status"] == "unavailable"
     assert expected_diagnostic in metadata["diagnostic"]
     manifest = json.loads((exploration_root / "unavailable-thread" / "manifest.json").read_text())
-    expected_session = None if environment.get("PI_BIN") == "missing" else str(
-        exploration_root / "unavailable-thread" / "session.jsonl"
+    expected_session = (
+        None
+        if environment.get("PI_BIN") == "missing"
+        else str(exploration_root / "unavailable-thread" / "session.jsonl")
     )
     assert manifest["session"] == expected_session
     assert not (turn / "events.jsonl").exists()
@@ -1074,9 +1768,10 @@ def test_help_llm_json_is_machine_readable() -> None:
         "follow the selected command's next step; only run creates a receipt"
     )
     assert payload["errors"]["attemptResults"]["incomplete"]["inspect"] == [
-        "attempt.json:validationError",
-        "attempt.json:contractEvaluation.violations",
-        "attempt evidence response",
+        "attempt.json:contractEvaluation.completionRequest",
+        "attempt.json:promotedFragments",
+        "receipt.json:fallbackRelationships",
+        "attempt.json:rawResponse",
     ]
     assert payload["errors"]["attemptResults"]["transport-failed"]["inspect"] == [
         "attempt.json:exitCode",
@@ -1098,6 +1793,31 @@ def test_help_llm_json_is_machine_readable() -> None:
         "availabilityIsNotQualification": True,
         "setupIsLocalOnly": True,
         "setupCallsModels": False,
+    }
+    assert payload["nextActions"] == {
+        "incomplete": {
+            "inspect": [
+                "attempt.json:contractEvaluation.completionRequest",
+                "attempt.json:promotedFragments",
+                "receipt.json:fallbackRelationships",
+                "attempt.json:rawResponse",
+            ]
+        },
+        "invalid": {
+            "inspect": [
+                "attempt.json:contractEvaluation.violations",
+                "attempt.json:evaluationError",
+                "attempt.json:rawResponse",
+            ]
+        },
+        "accepted": {
+            "inspect": [
+                "receipt.json:verdict",
+                "receipt.json:findings",
+                "receipt.json:consolidatedReview",
+            ],
+            "run": "reviewctl verify RECEIPT.json",
+        },
     }
 
 
@@ -1234,8 +1954,7 @@ def test_setup_human_output_escapes_terminal_controls_without_changing_json(
         "  diagnostic: warning\\x1b]52;c;Y2xpcA==\\x07\\r\\nforged\\tline\\x00\\x80",
     ]
     assert not any(
-        (ord(character) < 32 and character != "\n")
-        or 0x7F <= ord(character) <= 0x9F
+        (ord(character) < 32 and character != "\n") or 0x7F <= ord(character) <= 0x9F
         for character in human_output
     )
 
@@ -1281,10 +2000,7 @@ def test_setup_human_subprocess_does_not_recreate_raw_environment_control_byte()
 
     assert result.returncode == 0, result.stderr
     assert b"missing-\\udc9b-tool" in result.stdout
-    assert not any(
-        (byte < 0x20 and byte != 0x0A) or 0x7F <= byte <= 0x9F
-        for byte in result.stdout
-    )
+    assert not any((byte < 0x20 and byte != 0x0A) or 0x7F <= byte <= 0x9F for byte in result.stdout)
 
 
 @pytest.mark.parametrize(
@@ -1308,9 +2024,10 @@ def test_setup_check_explicit_backend_exit_status(
         setup_installation(name, availability, probe_performed=probe_performed)
     )
 
-    assert invoke_setup(
-        monkeypatch, topology, "check", "--backend", name, "--format", "json"
-    ) == expected_exit
+    assert (
+        invoke_setup(monkeypatch, topology, "check", "--backend", name, "--format", "json")
+        == expected_exit
+    )
 
     payload = json.loads(capsys.readouterr().out)
     assert [backend["name"] for backend in payload["backends"]] == [name]
@@ -1345,17 +2062,20 @@ def test_setup_check_repeatable_selection_filters_output_and_checks_every_select
         setup_installation("pi", "available"),
     )
 
-    assert invoke_setup(
-        monkeypatch,
-        topology,
-        "check",
-        "--backend",
-        "agy",
-        "--backend",
-        "codex",
-        "--format",
-        "json",
-    ) == 1
+    assert (
+        invoke_setup(
+            monkeypatch,
+            topology,
+            "check",
+            "--backend",
+            "agy",
+            "--backend",
+            "codex",
+            "--format",
+            "json",
+        )
+        == 1
+    )
 
     payload = json.loads(capsys.readouterr().out)
     assert [backend["name"] for backend in payload["backends"]] == ["agy", "codex"]
@@ -1448,10 +2168,10 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
     config.write_text(
-        '[profiles.gemini]\n'
+        "[profiles.gemini]\n"
         'routes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n'
-        'timeout_seconds = 600\n'
-        'max_attempts = 2\n'
+        "timeout_seconds = 600\n"
+        "max_attempts = 2\n"
     )
 
     result = run_cli(
@@ -1490,10 +2210,7 @@ def test_route_profile_applies_execution_settings_when_cli_omits_them(tmp_path: 
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
     config.write_text(
-        '[profiles.code]\n'
-        'routes = ["llm:accepted"]\n'
-        'timeout_seconds = 600\n'
-        'max_attempts = 2\n'
+        '[profiles.code]\nroutes = ["llm:accepted"]\ntimeout_seconds = 600\nmax_attempts = 2\n'
     )
     arguments = review_arguments(tmp_path)
     arguments.remove("--timeout-seconds")
@@ -1519,11 +2236,7 @@ def test_route_profile_applies_execution_settings_when_cli_omits_them(tmp_path: 
 def test_direct_transport_applies_configured_transport_defaults(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
-    config.write_text(
-        '[defaults.llm]\n'
-        'timeout_seconds = 600\n'
-        'max_attempts = 2\n'
-    )
+    config.write_text("[defaults.llm]\ntimeout_seconds = 600\nmax_attempts = 2\n")
     arguments = review_arguments(tmp_path, "accepted")
     arguments.remove("--timeout-seconds")
     arguments.remove("5")
@@ -1549,12 +2262,12 @@ def test_mixed_routes_do_not_apply_the_first_transports_defaults(tmp_path: Path)
     fake_pi = write_fake_pi(tmp_path)
     config = tmp_path / "reviewctl.toml"
     config.write_text(
-        '[profiles.mixed]\n'
+        "[profiles.mixed]\n"
         'routes = ["agy:gemini-3.6-flash-high", "pi:openrouter/accepted"]\n'
-        '[defaults.agy]\n'
-        'timeout_seconds = 111\n'
-        '[defaults.pi]\n'
-        'timeout_seconds = 222\n'
+        "[defaults.agy]\n"
+        "timeout_seconds = 111\n"
+        "[defaults.pi]\n"
+        "timeout_seconds = 222\n"
     )
     arguments = review_arguments(tmp_path)
     arguments.remove("--timeout-seconds")
@@ -1627,15 +2340,11 @@ def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) ->
         ("[profiles.empty]\n", "empty"),
         ('[profiles.invalid]\nroutes = ["bad-route"]\n', "invalid"),
         (
-            '[profiles.invalid-timeout]\n'
-            'routes = ["llm:accepted"]\n'
-            'timeout_seconds = 0\n',
+            '[profiles.invalid-timeout]\nroutes = ["llm:accepted"]\ntimeout_seconds = 0\n',
             "invalid-timeout",
         ),
         (
-            '[profiles.invalid-attempts]\n'
-            'routes = ["llm:accepted"]\n'
-            'max_attempts = 4\n',
+            '[profiles.invalid-attempts]\nroutes = ["llm:accepted"]\nmax_attempts = 4\n',
             "invalid-attempts",
         ),
     ],
@@ -1799,6 +2508,9 @@ def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -
     response_path = Path(receipt["attempts"][0]["evidence"]["response"])
     assert response_path.is_file()
     assert response_path.read_text()
+    verified = run_cli("verify", str(turn / "receipt.json"))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["violations"] == []
 
 
 def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Path) -> None:
@@ -1815,22 +2527,80 @@ def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Pat
                     "reproduction": "Submit it twice.",
                 }
             ],
+            "reviewedFiles": ["source.py"],
         }
     )
-    fake_codex = write_fake_codex(tmp_path, response=response)
+    fake_codex_root = tmp_path.parent / "structured-codex-bin"
+    fake_codex_root.mkdir()
+    fake_codex = write_fake_codex(fake_codex_root, response=response)
 
     result = run_cli(
         *review_arguments(tmp_path, "gpt-5.6-terra"),
         "--transport",
         "codex",
+        "--source-class",
+        "proprietary",
         "--response-contract",
         "findings-json",
         env={"CODEX_BIN": str(fake_codex)},
     )
 
     assert result.returncode == 0, result.stderr
-    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["sourceClass"] == "proprietary"
     assert receipt["findings"][0]["path"] == "source.py"
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    assert evaluation["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": True,
+    }
+    assert evaluation["coverage"]["requiredFields"] == [
+        "verdict",
+        "findings",
+        "reviewedFiles",
+    ]
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+
+
+def test_generated_v2_receipt_canonicalizes_reversed_review_declaration(
+    tmp_path: Path,
+) -> None:
+    extra_source = tmp_path / "alpha.py"
+    extra_source.write_text("def alpha() -> None: pass\n")
+    response = json.dumps(
+        {
+            "verdict": "approved",
+            "findings": [],
+            "reviewedFiles": ["source.py", "alpha.py"],
+        }
+    )
+    fake_codex_root = tmp_path.parent / "ordered-declaration-codex-bin"
+    fake_codex_root.mkdir()
+    fake_codex = write_fake_codex(fake_codex_root, response=response)
+    arguments = review_arguments(tmp_path, "gpt-5.6-terra")
+    arguments.extend(("--file", str(extra_source)))
+
+    result = run_cli(
+        *arguments,
+        "--transport",
+        "codex",
+        "--source-class",
+        "proprietary",
+        "--response-contract",
+        "findings-json",
+        env={"CODEX_BIN": str(fake_codex)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    normalized = receipt["attempts"][0]["contractEvaluation"]["normalizedValue"]
+    assert normalized["reviewedFiles"] == ["alpha.py", "source.py"]
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["violations"] == []
 
 
 def test_codex_transport_reads_the_session_identifier_from_stderr(tmp_path: Path) -> None:
@@ -1978,6 +2748,14 @@ def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) ->
     assert "--dangerously-bypass-approvals-and-sandbox" not in arguments
     assert receipt["result"] == "accepted"
     assert receipt["findings"] == []
+    assert receipt["sourceClass"] == "synthetic"
+    assert receipt["attempts"][0]["contractEvaluation"]["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": False,
+    }
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
 
 
 def test_findings_contract_rejects_a_severity_outside_the_shared_taxonomy() -> None:
@@ -2235,8 +3013,60 @@ def test_usage_synthetic_prompt_only_product_review(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["receiptSchemaVersion"] == 2
+    assert receipt["contract"] == {
+        "name": "product-review-json",
+        "version": "legacy-1",
+    }
+    assert receipt["attempts"][0]["number"] == 1
     assert receipt["review"] == payload
+    output = receipt["attempts"][0]["contractOutput"]
+    assert output == {
+        "name": "product-review-json",
+        "version": "legacy-1",
+        "status": "complete",
+        "normalizedSha256": cli.sha256_bytes(cli.canonical_json(receipt["review"])),
+        "contractContext": {
+            "fileNames": ["prompt.md"],
+            "reviewDeclarationRequired": False,
+        },
+    }
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout) == {
+        "receipt": str(receipt_path),
+        "valid": True,
+        "violations": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "contract", ["verdict", "document", "product-review-json", "product-judge-json"]
+)
+def test_generated_unavailable_non_findings_v2_receipt_verifies(
+    tmp_path: Path, contract: str
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path, "missing"),
+        "--response-contract",
+        contract,
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert result.returncode == 1
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["receiptSchemaVersion"] == 2
+    assert receipt["result"] == "unavailable"
+    assert receipt["acceptedAttempt"] is None
+    assert receipt["contract"] == {"name": contract, "version": "legacy-1"}
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["violations"] == []
     assert "findings" not in receipt
 
 
@@ -3367,9 +4197,7 @@ def test_findings_contract_accepts_unique_snapshot_basename_from_sandbox_path() 
 
 
 def test_legacy_product_read_proof_rejects_arbitrary_relative_paths() -> None:
-    assert not cli.validate_read_proof(
-        {"reviewedFiles": ["../source.py"]}, {"source.py": "a" * 64}
-    )
+    assert not cli.validate_read_proof({"reviewedFiles": ["../source.py"]}, {"source.py": "a" * 64})
 
 
 @pytest.mark.parametrize(
@@ -3939,6 +4767,29 @@ def test_rejects_duplicate_file_basenames_before_creating_artifacts(tmp_path: Pa
     assert not (tmp_path / "artifacts").exists()
 
 
+def test_rejects_non_printable_file_basename_before_creating_artifacts(tmp_path: Path) -> None:
+    source = tmp_path / "source.py\n"
+    source.write_text("pass\n")
+
+    result = run_cli(
+        "run",
+        "--review-id",
+        "unsafe-basename",
+        "--prompt",
+        "Review this synthetic packet.",
+        "--model",
+        "accepted",
+        "--file",
+        str(source),
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+    )
+
+    assert result.returncode == 2
+    assert "safe printable basenames" in result.stderr
+    assert not (tmp_path / "artifacts").exists()
+
+
 def test_freezes_source_bytes_before_the_model_receives_them(tmp_path: Path) -> None:
     source = tmp_path / "source.py"
     source.write_text("before\n")
@@ -3947,7 +4798,13 @@ def test_freezes_source_bytes_before_the_model_receives_them(tmp_path: Path) -> 
         source.write_text("after\n")
 
         assert snapshots[0].read_text() == "before\n"
-        assert provenance == [{"path": str(source), "sha256": cli.sha256_bytes(b"before\n")}]
+        assert provenance == [
+            {
+                "name": "source.py",
+                "path": str(source),
+                "sha256": cli.sha256_bytes(b"before\n"),
+            }
+        ]
 
 
 def test_tournament_budgets_the_assembled_packet_not_only_the_user_prompt(tmp_path: Path) -> None:
@@ -4489,32 +5346,291 @@ def test_verification_detects_tampered_receipt(tmp_path: Path) -> None:
     assert tampered.returncode == 1
 
 
+@pytest.mark.parametrize(
+    ("filename", "expected_digest"),
+    [
+        (
+            "accepted-findings-v1.json",
+            "bba561e2704d9a54bc4b911cc71c7071676ba298789fe047bb1971ed9e0a33c8",
+        ),
+        (
+            "unavailable-findings-v1.json",
+            "03c939fdee8aaf58ec2be137c6df5d13e72163b2ff254ab32cf85f7ed0555c06",
+        ),
+        (
+            "legacy-digest-only.json",
+            "d96f6cf66e34cb13404e69c6a5515eadb2354fff65729d03ebedf0a800e1b057",
+        ),
+    ],
+)
+def test_immutable_v1_receipt_fixtures_verify_by_embedded_digest(
+    filename: str, expected_digest: str
+) -> None:
+    fixture_path = V1_RECEIPT_FIXTURES / filename
+    receipt = json.loads(fixture_path.read_text())
+
+    assert "receiptSchemaVersion" not in receipt
+    assert fixture_path.read_bytes() == cli.canonical_json(receipt) + b"\n"
+    assert receipt["sha256"] == expected_digest
+    serialized = fixture_path.read_text().lower()
+    for forbidden in ("/users/", "/home/", "api_key", "bearer ", "password", "sk-"):
+        assert forbidden not in serialized
+    assert cli.valid_receipt(receipt) is True
+    verified = run_cli("verify", str(fixture_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["valid"] is True
+
+
+def test_legacy_digest_only_fixture_is_a_compatibility_routing_sentinel() -> None:
+    receipt = json.loads((V1_RECEIPT_FIXTURES / "legacy-digest-only.json").read_text())
+
+    assert receipt["fixturePurpose"] == "compatibility-routing-sentinel-not-a-valid-review"
+    assert receipt["result"] == "accepted"
+    assert receipt["acceptedAttempt"] == 99
+    assert len(receipt["attempts"]) == 1
+    assert cli.valid_receipt(receipt) is True
+
+
 def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
+    complete_response = {
+        "verdict": "changes-requested",
+        "findings": [
+            {
+                "severity": "high",
+                "path": "source.py",
+                "line": 1,
+                "title": "Example finding",
+                "evidence": "The bounded source contains the example.",
+                "reproduction": "Inspect source.py line 1.",
+            }
+        ],
+    }
 
     result = run_cli(
         *review_arguments(tmp_path, "accepted"),
         "--response-contract",
         "findings-json",
-        env={"LLM_BIN": str(fake_llm)},
+        env={
+            "LLM_BIN": str(fake_llm),
+            "LLM_SCHEMA_RESPONSE": json.dumps(complete_response),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    attempt = receipt["attempts"][0]
+    evaluation = attempt["contractEvaluation"]
+    assert receipt["receiptSchemaVersion"] == 2
+    assert receipt["sourceClass"] == "synthetic"
+    assert receipt["source"]["files"][0]["name"] == "source.py"
+    assert attempt["number"] == 1
+    assert attempt["routeIndex"] == 0
+    assert receipt["fallbackRelationships"] == []
+    assert receipt["consolidatedReview"]["status"] == "accepted"
+    assert receipt["acceptedAttempt"] == 1
+    assert receipt["result"] == "accepted"
+    assert attempt["result"] == "accepted"
+    assert receipt["verdict"] == complete_response["verdict"]
+    assert receipt["findings"] == complete_response["findings"]
+    assert receipt["reviewContract"] == "findings-json"
+    assert receipt["contract"] == {"name": "findings-json", "version": "1"}
+    assert set(evaluation) == {
+        "name",
+        "version",
+        "preparedSha256",
+        "payloadSha256",
+        "normalizedSha256",
+        "normalizedValue",
+        "contractContext",
+        "violations",
+        "status",
+        "fragments",
+        "coverage",
+        "completionRequest",
+    }
+    assert (evaluation["name"], evaluation["version"]) == ("findings-json", "1")
+    assert evaluation["status"] == "complete"
+    assert evaluation["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": False,
+    }
+    assert evaluation["normalizedValue"] == complete_response
+    assert evaluation["normalizedSha256"] == cli.sha256_bytes(cli.canonical_json(complete_response))
+    assert evaluation["completionRequest"] is None
+    assert evaluation["violations"] == []
+    for field in ("preparedSha256", "payloadSha256", "normalizedSha256"):
+        assert len(evaluation[field]) == 64
+        int(evaluation[field], 16)
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["valid"] is True
+
+
+def test_generated_complete_duplicate_findings_receipt_self_verifies(tmp_path: Path) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    duplicate = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Duplicate finding",
+        "evidence": "The same finding is intentionally repeated.",
+        "reproduction": "Inspect source.py line 1.",
+    }
+    response = {
+        "verdict": "changes-requested",
+        "findings": [duplicate, duplicate],
+    }
+
+    result = run_cli(
+        *review_arguments(tmp_path, "accepted"),
+        "--response-contract",
+        "findings-json",
+        env={"LLM_BIN": str(fake_llm), "LLM_SCHEMA_RESPONSE": json.dumps(response)},
     )
 
     assert result.returncode == 0, result.stderr
     receipt_path = Path(result.stdout.strip()) / "receipt.json"
     receipt = json.loads(receipt_path.read_text())
     evaluation = receipt["attempts"][0]["contractEvaluation"]
-    assert receipt["reviewContract"] == "findings-json"
-    assert receipt["contract"] == {"name": "findings-json", "version": "1"}
-    assert evaluation["name"] == "findings-json"
-    assert evaluation["version"] == "1"
-    assert evaluation["violations"] == []
-    for field in ("preparedSha256", "payloadSha256", "normalizedSha256"):
-        assert len(evaluation[field]) == 64
-        int(evaluation[field], 16)
-    assert run_cli("verify", str(receipt_path)).returncode == 0
+    assert len(evaluation["fragments"]) == 1
+    assert evaluation["normalizedValue"]["findings"] == [duplicate]
+    assert receipt["findings"] == [duplicate]
+    assert receipt["attempts"][0]["promotedFragments"] == []
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["violations"] == []
 
 
-def test_incomplete_findings_receipt_retains_rejected_contract_evaluation(
+def test_generated_incomplete_duplicate_findings_promote_once_and_self_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    duplicate = {
+        "severity": "medium",
+        "path": "source.py",
+        "line": 1,
+        "title": "Useful duplicate",
+        "evidence": "The partial response repeats one bounded finding.",
+        "reproduction": "Inspect source.py.",
+    }
+    response = json.dumps({"findings": [duplicate, duplicate]})
+
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": response}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    attempt = receipt["attempts"][0]
+    assert len(attempt["contractEvaluation"]["fragments"]) == 1
+    assert len(attempt["promotedFragments"]) == 1
+    assert cli.validate_v2_receipt(receipt) == ()
+
+
+def test_generated_mixed_valid_and_invalid_findings_self_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    valid = {
+        "severity": "medium",
+        "path": "source.py",
+        "line": 1,
+        "title": "Useful sibling",
+        "evidence": "One sibling remains valid evidence.",
+        "reproduction": "Inspect source.py.",
+    }
+    invalid = {**valid, "severity": "urgent"}
+    response = json.dumps({"verdict": "changes-requested", "findings": [invalid, valid]})
+
+    return_code, receipt, _ = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": response}],
+        max_attempts=1,
+    )
+
+    assert return_code == 1
+    attempt = receipt["attempts"][0]
+    evaluation = attempt["contractEvaluation"]
+    assert evaluation["status"] == "incomplete"
+    assert len(evaluation["fragments"]) == 1
+    assert evaluation["coverage"]["coveredFields"] == ["verdict"]
+    assert evaluation["coverage"]["missingFields"] == ["findings"]
+    assert len(attempt["promotedFragments"]) == 1
+    assert cli.validate_v2_receipt(receipt) == ()
+
+
+def test_repeated_partial_payload_promotes_identity_only_once_across_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "low",
+        "path": "source.py",
+        "line": 1,
+        "title": "Repeated partial",
+        "evidence": "Both attempts return the same typed evidence.",
+        "reproduction": "Inspect source.py.",
+    }
+    response = json.dumps({"findings": [finding]})
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": response}, {"response": response}, {"response": "not json"}],
+        max_attempts=3,
+    )
+
+    assert return_code == 1
+    assert [len(attempt["promotedFragments"]) for attempt in receipt["attempts"]] == [1, 1, 0]
+    first, second = (attempt["promotedFragments"][0] for attempt in receipt["attempts"][:2])
+    assert first["fragmentId"] == second["fragmentId"]
+    assert [first["sourceAttempt"], second["sourceAttempt"]] == [1, 2]
+    encoded_context = (
+        requests[2]
+        .prompt.split("<reviewctl-completion-context>\n", 1)[1]
+        .split("\n</reviewctl-completion-context>", 1)[0]
+    )
+    context = json.loads(encoded_context)
+    assert len(context["findings"]) == 1
+    assert [source["attempt"] for source in context["findings"][0]["sources"]] == [1, 2]
+    assert receipt["fallbackRelationships"][1]["promotedFragmentIds"] == [first["fragmentId"]]
+    assert [
+        source["attempt"] for source in receipt["consolidatedReview"]["findings"][0]["sources"]
+    ] == [1, 2]
+    assert cli.validate_v2_receipt(receipt) == ()
+
+    wrong_source = deepcopy(receipt)
+    wrong_source["fallbackRelationships"][1]["fromAttempt"] = 1
+    wrong_source.pop("sha256")
+    wrong_source["sha256"] = hashlib.sha256(cli.canonical_json(wrong_source)).hexdigest()
+    assert "fallback-relationships" in cli.validate_v2_receipt(wrong_source)
+
+    omitted_context = deepcopy(receipt)
+    omitted_context["fallbackRelationships"][1]["promotedFragmentIds"] = []
+    omitted_context.pop("sha256")
+    omitted_context["sha256"] = hashlib.sha256(cli.canonical_json(omitted_context)).hexdigest()
+    assert "fallback-relationships" in cli.validate_v2_receipt(omitted_context)
+
+    injected_context = deepcopy(receipt)
+    injected_context["fallbackRelationships"][1]["promotedFragmentIds"].append("0" * 64)
+    injected_context["fallbackRelationships"][1]["promotedFragmentIds"].sort()
+    injected_context.pop("sha256")
+    injected_context["sha256"] = hashlib.sha256(cli.canonical_json(injected_context)).hexdigest()
+    assert "fallback-relationships" in cli.validate_v2_receipt(injected_context)
+
+
+def test_invalid_json_findings_receipt_retains_rejected_contract_evaluation(
     tmp_path: Path,
 ) -> None:
     fake_llm = write_fake_llm(tmp_path)
@@ -4529,11 +5645,92 @@ def test_incomplete_findings_receipt_retains_rejected_contract_evaluation(
     assert result.returncode == 1
     receipt_path = Path(result.stdout.strip()) / "receipt.json"
     receipt = json.loads(receipt_path.read_text())
-    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    attempt = receipt["attempts"][0]
+    evaluation = attempt["contractEvaluation"]
+    assert receipt["receiptSchemaVersion"] == 2
+    assert attempt["number"] == 1
     assert receipt["result"] == "unavailable"
+    assert receipt["acceptedAttempt"] is None
+    assert attempt["result"] == "incomplete"
     assert evaluation["normalizedSha256"] is None
+    assert evaluation["normalizedValue"] is None
     assert evaluation["violations"] == ["invalid-json"]
-    assert run_cli("verify", str(receipt_path)).returncode == 0
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["valid"] is True
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected_violation"),
+    [
+        ("{", "json-receipt"),
+        ('{"value":NaN}', "json-receipt"),
+        ('{"value":Infinity}', "json-receipt"),
+        ('{"value":-Infinity}', "json-receipt"),
+        ('{"receiptSchemaVersion":2,"attempts":[],"attempts":[]}', "json-receipt"),
+        ("[]", "receipt-object"),
+        ('{"receiptSchemaVersion":3}', "receipt-schema-version"),
+        ('{"receiptSchemaVersion":2,"attempts":[null,true]}', "attempts"),
+    ],
+)
+def test_verify_reports_malformed_and_hostile_receipts_without_traceback(
+    tmp_path: Path, contents: str, expected_violation: str
+) -> None:
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(contents)
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert "Traceback" not in verified.stderr
+    result = json.loads(verified.stdout)
+    assert result["valid"] is False
+    assert expected_violation in result["violations"]
+
+
+def test_verify_reports_huge_json_integer_without_traceback(tmp_path: Path) -> None:
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text('{"receiptSchemaVersion":' + "9" * 5000 + "}")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert "Traceback" not in verified.stderr
+    assert json.loads(verified.stdout)["violations"] == ["json-receipt"]
+
+
+@pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
+def test_cli_canonical_json_rejects_non_finite_numbers(constant: float) -> None:
+    with pytest.raises(ValueError, match="JSON compliant"):
+        cli.canonical_json({"extension.example": constant})
+
+
+def test_cli_canonical_json_rejects_non_string_object_keys() -> None:
+    with pytest.raises(ValueError, match="object keys must be strings"):
+        cli.canonical_json({"extension.example": {1: "hostile"}})
+
+
+@pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
+def test_numeric_value_rejects_non_finite_transport_metadata(constant: float) -> None:
+    assert cli.numeric_value(constant) is None
+
+
+def test_numeric_value_rejects_oversized_transport_metadata_without_exception() -> None:
+    assert cli.numeric_value(10**4000) is None
+
+
+@pytest.mark.parametrize(("value", "expected"), [(1, 1.0), (1.25, 1.25)])
+def test_numeric_value_preserves_finite_transport_metadata(
+    value: int | float, expected: float
+) -> None:
+    assert cli.numeric_value(value) == expected
+
+
+@pytest.mark.parametrize("constant", [float("nan"), float("inf"), float("-inf")])
+def test_valid_receipt_fails_closed_for_non_finite_extension(constant: float) -> None:
+    receipt = {"extension.example": constant, "sha256": "0" * 64}
+
+    assert cli.valid_receipt(receipt) is False
 
 
 def test_policy_check_and_tournament_complete_when_under_budget(tmp_path: Path) -> None:
@@ -5442,7 +6639,7 @@ def test_structured_contract_extracts_a_portable_finding() -> None:
                 "findings": [
                     {
                         "severity": "critical",
-                        "path": "src/example.py",
+                        "path": "example.py",
                         "line": 12,
                         "title": "Idempotency key is not unique",
                         "evidence": "A second request is accepted.",
@@ -5459,7 +6656,7 @@ def test_structured_contract_extracts_a_portable_finding() -> None:
         "findings": [
             {
                 "severity": "critical",
-                "path": "src/example.py",
+                "path": "example.py",
                 "line": 12,
                 "title": "Idempotency key is not unique",
                 "evidence": "A second request is accepted.",
@@ -5883,9 +7080,7 @@ def test_invoke_openrouter_limits_gemini_36_flash_reasoning_for_fallback(
 
     assert exit_code == 0
     assert response.response == "hola desde OpenRouter"
-    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == {
-        "effort": "minimal"
-    }
+    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == {"effort": "minimal"}
 
 
 def test_invoke_openrouter_requires_an_api_key(tmp_path: Path) -> None:

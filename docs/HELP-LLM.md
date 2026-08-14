@@ -29,9 +29,9 @@ reviewctl run --review-id ID --transport TRANSPORT --model MODEL \
 reviewctl verify RECEIPT.json
 ```
 
-For formal Pi routes, `MODEL` must be provider-qualified, for example
-`openrouter/google/gemini-2.5-flash`. Unqualified Pi model names are rejected
-because they cannot bind the expected provider identity.
+For formal routes, `MODEL` must be qualified by the organization's private
+policy and evidence store. This public guide intentionally contains no model
+roster, prices, provider-specific invocation commands, or credentials.
 
 A formal result requires `receipt.result` to be `accepted`, `acceptedAttempt`
 to name the accepted attempt, successful receipt verification, and independent
@@ -44,6 +44,27 @@ For machine-readable guidance:
 ```bash
 reviewctl help-llm --format json
 ```
+
+## Partial review results
+
+Contract evaluation happens only after the transport, timeout, model,
+provider, empty-response, and conversation pre-gates succeed. Its status is:
+
+- `complete`: the whole typed contract is valid; only a complete eligible
+  attempt can become `acceptedAttempt`.
+- `incomplete`: the whole contract is not valid, but one or more complete
+  findings can be preserved for bounded fallback.
+- `invalid`: no finding can be safely preserved, or contract evaluation could
+  not complete. It never promotes fragments.
+
+Fallback receives revalidated fragments and a completion manifest bound to the
+target contract. It never receives the raw response, inherits approval, or
+treats absence as a dispute. The legacy view remains bound to the real accepted
+attempt. The consolidated view keeps partial or unconfirmed findings visible,
+so it can be stricter than the legacy approval.
+
+`maxAttempts` is a per-route limit. A route fallback starts the destination
+route's own bounded allowance; it does not extend either route indefinitely.
 
 ## Local backend setup
 
@@ -73,6 +94,22 @@ executables also exit `1`.
 
 ## Diagnose failures
 
+Errors are actionable for LLMs. Use the receipt fields instead of guessing or
+retrying blindly:
+
+- Incomplete: inspect `completionRequest`, `fallbackRelationships`, and
+  `rawResponse`.
+- If completion fails with `original prompt collides with completion framing`,
+  remove the reserved `<reviewctl-completion-context>` marker (opening or
+  closing form) from the original prompt and start a fresh bounded review.
+- Invalid: inspect `violations`, `evaluationError`, and `rawResponse`.
+- Accepted: inspect both the legacy and consolidated views, then run
+  `reviewctl verify`.
+
+`rawResponse` identifies the retained bytes by durable absolute path, SHA-256, and
+character count. A missing response and a present empty response are different
+facts.
+
 Do not retry blindly. A failed formal run normally still prints its artifact
 directory and persists `receipt.json` plus `attempts/NN/attempt.json`.
 
@@ -99,3 +136,15 @@ reviewctl verify RECEIPT.json
 ```
 
 Never edit an old receipt to make it pass verification.
+
+Receipt v1 verification remains digest-only. Receipt v2 verification also
+checks its structure offline, including attempt identity, fallback provenance,
+promotion, accepted-attempt binding, and consolidation. Verification does not
+call a model or provider.
+
+reviewctl is local-first. Registered adapters can still be unqualified;
+availability is not qualification. Cursor and Claude Code are not claimed as
+supported backends. BAML is an architectural inspiration only, with no runtime
+dependency. Editable formal execution, project evidence-store integration,
+and federation are deferred. Federation is optional future work, and Potzal is
+not a dependency.

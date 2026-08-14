@@ -32,8 +32,9 @@ backends. Local reviewctl execution does not enable remote controller or adapter
 dispatch. Federation remains deferred and separate from backend execution and
 setup synchronization.
 
-The BAML-inspired typed boundary is native and has no BAML dependency; this
-phase does not expand the existing contract work.
+The BAML-inspired typed boundary is native and has no BAML dependency. The
+concepts are adopted natively, with no BAML runtime dependency; BAML is not a
+library, service, generator, or runtime requirement.
 
 The boundary has three provider-neutral types:
 
@@ -56,6 +57,56 @@ Setup diagnostics observe only executable presence and version for registered
 executable backends. Setup diagnostics never authenticate, call a model or
 provider, or write configuration. The next gate is backend conformance before
 Cursor, Claude Code, or another native backend can be added.
+
+Registration and discovery are not support or qualification claims. Adapters
+may be registered while remaining unqualified, and availability is not
+qualification. Public documentation therefore contains no operating model
+roster, prices, provider-specific invocation commands, or credentials. It does
+not claim Cursor or Claude Code support.
+
+## Partial review and bounded completion
+
+An eligible typed response evaluates as **complete, incomplete, or invalid**.
+Transport, timeout, model, provider, empty-response, and conversation pre-gates
+run before contract evaluation. Rejected responses never promote fragments.
+Only a response that passes those gates and is incomplete with independently
+valid findings may contribute promoted fragments.
+
+The controller can use those findings as bounded input to a later attempt. The
+completion context is bound to the target contract, never contains the raw
+response, and never inherits approval. It carries only revalidated typed
+fragments, their provenance, and the target contract's missing-field manifest.
+Absence is not a dispute: a reviewer that does not repeat an earlier finding
+has not contradicted or resolved it.
+
+maxAttempts applies independently to each route. Retrying one route does not
+consume another route's allowance. A same-route retry and a route fallback are
+recorded as different relationships.
+
+acceptedAttempt names a real complete accepted attempt. A partial response,
+promoted fragment, fallback, or consolidated projection can never occupy that
+field or manufacture approval. The legacy verdict and findings remain the view
+of that accepted attempt. The consolidated view preserves partial or
+unconfirmed findings with provenance; approval is stricter because any such
+finding prevents the consolidated view from claiming approval.
+
+New receipts use schema v2, which adds offline structural verification of
+attempts, contract identities, fallback relationships, promoted fragments, and
+consolidation. Schema v1 remains digest-only for compatibility; schema v2 adds
+offline structural verification rather than changing historical v1 meaning.
+
+## Current deployment boundary
+
+reviewctl is local-first: its controller, policy decision, evidence assembly,
+and verification run on the user's machine. Project-owned evidence stores are
+a compatible future destination for receipts. Federation is optional future
+work, and Potzal is not a dependency. Potzal or another store may later carry
+signed bundles without owning reviewctl semantics.
+
+Editable execution is deferred for formal review. Cursor, Claude Code, and
+other interactive editors are also deferred until a backend passes explicit
+conformance and organization qualification. No current receipt claims those
+capabilities.
 
 ## Canonical terms
 
