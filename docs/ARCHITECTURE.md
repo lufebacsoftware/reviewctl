@@ -71,8 +71,10 @@ The adapter reuses the user's local Kiro subscription and login, so it can avoid
 OpenRouter for models available through that account. The adapter does not use
 OpenRouter and does not inherit ambient provider, AWS, or API-token variables.
 For a formal invocation it performs a dynamic model check, creates a disposable
-empty working directory, passes a reduced environment, selects the built-in
-`kiro_default` agent without granting tool trust, and supplies the inline frozen packet over
+controlled working directory, passes a reduced environment, and installs a
+workspace-local `reviewctl_readonly` agent with no tools, allowed tools, MCP
+servers, inherited MCP configuration, or resources. Its exact configuration and
+digest are retained in the request manifest. The adapter supplies the inline frozen packet over
 standard input so bounded source is not constrained by the process argument-size limit.
 Inventory, invocation, and session recovery share one total timeout; retained
 evidence is written with mode `0600`. The request manifest links the raw model

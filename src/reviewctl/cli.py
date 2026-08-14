@@ -129,6 +129,19 @@ KIRO_CREDITS_FOOTER = re.compile(
     r"(?: • Time: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h)"
     r"(?: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h))*)?$"
 )
+KIRO_REVIEW_AGENT = {
+    "name": "reviewctl_readonly",
+    "description": "Ephemeral no-tools review agent managed by reviewctl.",
+    "prompt": None,
+    "mcpServers": {},
+    "tools": [],
+    "toolAliases": {},
+    "allowedTools": [],
+    "resources": [],
+    "toolsSettings": {},
+    "includeMcpJson": False,
+    "model": None,
+}
 
 _STRING_SCHEMA = {"type": "string", "minLength": 1}
 _STRING_LIST_SCHEMA = {"type": "array", "items": _STRING_SCHEMA}
@@ -1729,7 +1742,17 @@ def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
     lines = lines[start:]
     while lines and not lines[-1].strip():
         lines.pop()
-    if lines and KIRO_CREDITS_FOOTER.fullmatch(lines[-1].strip()):
+    raw_has_framed_footer = bool(
+        re.search(
+            rb"\x1b\[38;5;8m\s*\n\s*\xe2\x96\xb8 Credits: [^\r\n]+",
+            stdout,
+        )
+    )
+    if (
+        lines
+        and KIRO_CREDITS_FOOTER.fullmatch(lines[-1].strip())
+        and (response_contract.endswith("-json") or raw_has_framed_footer)
+    ):
         lines.pop()
         while lines and not lines[-1].strip():
             lines.pop()
@@ -1854,13 +1877,18 @@ def invoke_kiro(
 
     with tempfile.TemporaryDirectory(prefix="reviewctl-kiro-") as directory:
         cwd = Path(directory).resolve()
+        agent_dir = cwd / ".kiro" / "agents"
+        agent_dir.mkdir(parents=True, mode=0o700)
+        agent_path = agent_dir / "reviewctl_readonly.json"
+        agent_bytes = canonical_json(KIRO_REVIEW_AGENT) + b"\n"
+        write_private_exclusive(agent_path, agent_bytes)
         inline_packet = openrouter_packet(prompt, files, response_contract)
         command = [
             kiro_bin,
             "chat",
             "--no-interactive",
             "--agent",
-            "kiro_default",
+            "reviewctl_readonly",
             "--model",
             model,
             "--wrap",
@@ -1876,6 +1904,10 @@ def invoke_kiro(
             canonical_json(
                 {
                     "command": command,
+                    "agentConfig": {
+                        "sha256": sha256_bytes(agent_bytes),
+                        "value": KIRO_REVIEW_AGENT,
+                    },
                     "inventoryCommand": inventory_command,
                     "inventoryExitCode": code,
                     "model": model,

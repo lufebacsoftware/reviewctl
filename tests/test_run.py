@@ -378,6 +378,7 @@ import time
 from pathlib import Path
 
 arguments = sys.argv[1:]
+agent_path = Path.cwd() / ".kiro" / "agents" / "reviewctl_readonly.json"
 stdin_payload = None
 if (
     arguments != ["chat", "--list-models", "--format", "json"]
@@ -390,6 +391,7 @@ observation = {{
     "cwd": str(Path.cwd().resolve()),
     "entries": sorted(item.name for item in Path.cwd().iterdir()),
     "environment": dict(os.environ),
+    "agent_config": json.loads(agent_path.read_text()) if agent_path.is_file() else None,
     "stdin": stdin_payload,
 }}
 with Path({str(observations)!r}).open("a") as stream:
@@ -7901,6 +7903,14 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
         )
         == "approved\n▸ Credits: reproduce with input X"
     )
+    assert cli.normalize_kiro_output("> ▸ Credits: 1\n".encode(), "document") == "▸ Credits: 1"
+    assert (
+        cli.normalize_kiro_output(
+            "> document\n\x1b[38;5;8m\n ▸ Credits: 1 • Time: 2s\n".encode(),
+            "document",
+        )
+        == "document"
+    )
     assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n", "document") == ""
 
 
@@ -7952,14 +7962,15 @@ def test_invoke_kiro_uses_isolated_exact_commands_and_persists_evidence(
         "chat",
         "--no-interactive",
         "--agent",
-        "kiro_default",
+        "reviewctl_readonly",
         "--model",
         "claude-sonnet-5",
         "--wrap",
         "never",
     ]
     assert observations[1]["stdin"] == packet
-    assert observations[1]["entries"] == []
+    assert observations[1]["entries"] == [".kiro"]
+    assert observations[1]["agent_config"] == cli.KIRO_REVIEW_AGENT
     assert observations[2]["argv"] == ["chat", "--list-sessions", "--format", "json"]
     assert observations[1]["cwd"] == observations[2]["cwd"]
     assert observations[1]["cwd"] != str(tmp_path)
@@ -7978,6 +7989,10 @@ def test_invoke_kiro_uses_isolated_exact_commands_and_persists_evidence(
     models_bytes = (tmp_path / "models.json").read_bytes()
     manifest = json.loads((tmp_path / "request.json").read_text())
     assert manifest["model"] == "claude-sonnet-5"
+    assert manifest["agentConfig"] == {
+        "sha256": cli.sha256_bytes(cli.canonical_json(cli.KIRO_REVIEW_AGENT) + b"\n"),
+        "value": cli.KIRO_REVIEW_AGENT,
+    }
     assert manifest["inventoryCommand"] == [
         str(tmp_path / "kiro-cli"),
         "chat",

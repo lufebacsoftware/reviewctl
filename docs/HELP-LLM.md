@@ -124,11 +124,13 @@ provider commands into repository or project instruction documents.
 
 The adapter reuses the user's local Kiro subscription and login. It does not use
 OpenRouter and does not inherit ambient provider, AWS, or API-token variables.
-It uses a disposable empty working directory, reduced environment, built-in
-`kiro_default` agent, no pre-trusted tools, an inline frozen packet, one total
-timeout, private evidence, a dynamic model check, and session recovery. Those
-controls are advisory read-only and tool controls with source isolation
-unavailable; they are not OS sandbox enforcement.
+It uses a disposable controlled working directory, reduced environment, and a
+workspace-local `reviewctl_readonly` agent with no tools, allowed tools, MCP
+servers, inherited MCP configuration, or resources. The request manifest
+retains that exact agent configuration and digest. The frozen packet travels
+over standard input; inventory, invocation, and session recovery share one
+total timeout. Those controls are advisory read-only and tool controls with
+source isolation unavailable; they are not OS sandbox enforcement.
 
 Proprietary Kiro source requires both policy decisions below for the requested
 model before bytes are sent:
