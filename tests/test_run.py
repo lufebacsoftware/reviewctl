@@ -701,6 +701,15 @@ def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_
         rejected = run_cli("verify", str(mutated_path))
         assert rejected.returncode == 1
         assert "backend-qualification" in json.loads(rejected.stdout)["violations"]
+    unexpected_waiver = deepcopy(receipt)
+    unexpected_waiver["extension.kiroUnresolvedIdentityWaiver"] = True
+    unexpected_waiver.pop("sha256")
+    unexpected_waiver["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(unexpected_waiver))
+    unexpected_waiver_path = tmp_path / "kiro-unexpected-waiver.json"
+    unexpected_waiver_path.write_bytes(cli.canonical_json(unexpected_waiver) + b"\n")
+    rejected = run_cli("verify", str(unexpected_waiver_path))
+    assert rejected.returncode == 1
+    assert "kiro-identity-waiver" in json.loads(rejected.stdout)["violations"]
     assert attempt["evidence"]["request"].endswith("request.json")
     assert attempt["evidence"]["response"].endswith("response.log")
     assert attempt["evidence"]["session"].endswith("session.json")
@@ -819,6 +828,25 @@ def test_proprietary_kiro_runs_with_an_authorizing_policy(tmp_path: Path) -> Non
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
     assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
     assert receipt["extension.kiroUnresolvedIdentityWaiver"] is True
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    for label, mutation in (
+        ("missing", lambda value: value.pop("extension.kiroUnresolvedIdentityWaiver")),
+        (
+            "false",
+            lambda value: value.__setitem__("extension.kiroUnresolvedIdentityWaiver", False),
+        ),
+    ):
+        mutated = deepcopy(receipt)
+        mutation(mutated)
+        mutated.pop("sha256")
+        mutated["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(mutated))
+        mutated_path = tmp_path / f"kiro-waiver-{label}.json"
+        mutated_path.write_bytes(cli.canonical_json(mutated) + b"\n")
+        rejected = run_cli("verify", str(mutated_path))
+        assert rejected.returncode == 1
+        assert "kiro-identity-waiver" in json.loads(rejected.stdout)["violations"]
 
 
 def test_receipt_contract_allowlist_matches_cli_contract_choices() -> None:

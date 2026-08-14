@@ -105,6 +105,9 @@ value is absent or changed; the advisory response remains available for
 consolidation or later review instead of being discarded.
 Legacy schema-v1 receipts cannot claim Kiro because that schema predates the
 backend-qualification boundary.
+For a proprietary schema-v2 route set containing Kiro, verification also
+requires `extension.kiroUnresolvedIdentityWaiver: true` and rejects that field
+on receipts where no such waiver applies.
 
 Setup diagnostics observe only executable presence and version for registered
 executable backends. Setup diagnostics never authenticate, call a model or

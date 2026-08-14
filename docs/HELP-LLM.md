@@ -163,6 +163,8 @@ changed. Humans or a later qualified reviewer may still use the advisory
 findings.
 Legacy schema-v1 receipts that claim the Kiro transport fail verification;
 Kiro receipts require schema v2 and its backend-qualification fields.
+For proprietary routing that includes Kiro, `reviewctl verify` also requires
+`extension.kiroUnresolvedIdentityWaiver = true`.
 
 Handle Kiro agent errors as follows:
 

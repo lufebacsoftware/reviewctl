@@ -1758,6 +1758,18 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     elif qualification is not None or merge_gate_eligible is not None:
         reject("backend-qualification")
 
+    expected_kiro_waiver = (
+        source_is_proprietary
+        and routes_valid
+        and any(route is not None and route[1] == "kiro" for route in route_identities)
+    )
+    kiro_waiver = receipt.get("extension.kiroUnresolvedIdentityWaiver")
+    if expected_kiro_waiver:
+        if kiro_waiver is not True:
+            reject("kiro-identity-waiver")
+    elif kiro_waiver is not None:
+        reject("kiro-identity-waiver")
+
     if result_is_accepted:
         if present_result_view_fields != expected_result_view_fields:
             reject("accepted-attempt")
