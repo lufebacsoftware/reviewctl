@@ -156,6 +156,88 @@ def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> N
         assert unsupported_claim not in architecture
 
 
+def test_architecture_documents_the_unqualified_kiro_backend_boundary() -> None:
+    architecture = " ".join((ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split())
+
+    for statement in (
+        "kiro is a registered native agent-cli adapter",
+        "remains unqualified",
+        "`kiro-cli`",
+        "`kiro_bin`",
+        "`reviewctl setup check --backend kiro`",
+        "version-only local discovery",
+        "`kiro-cli chat --list-models --format json`",
+        "availability and a valid receipt do not qualify a model",
+        "disposable empty working directory",
+        "reduced environment",
+        "`kiro_default`",
+        "`--trust-tools=`",
+        "inline frozen packet",
+        "one total timeout",
+        "mode `0600`",
+        "dynamic model check",
+        "session recovery",
+        "advisory read-only",
+        "`sourceisolation: unavailable`",
+        "not os sandbox enforcement",
+    ):
+        assert statement in architecture
+
+
+def test_help_documents_kiro_selection_policy_and_failure_recovery() -> None:
+    help_text = " ".join((ROOT / "docs" / "HELP-LLM.md").read_text().lower().split())
+
+    for guidance in (
+        "`--transport kiro --model model_id`",
+        "`--route kiro:model_id`",
+        "`auto` is rejected",
+        "does not use openrouter",
+        "does not inherit ambient provider, aws, or api-token variables",
+        "proprietary kiro source requires an explicit policy",
+        "synthetic runs do not require that policy",
+        "rerun `kiro-cli chat --list-models --format json`",
+        "inspect the attempt evidence and do not treat the result as approval",
+        "run `reviewctl setup check --backend kiro`",
+        "supported by `run`, routes, and tournaments",
+    ):
+        assert guidance in help_text
+
+
+def test_project_guidance_keeps_kiro_rosters_out_of_instruction_files() -> None:
+    guide = " ".join((ROOT / "docs" / "PROJECT-INTEGRATION.md").read_text().lower().split())
+
+    assert "projects may state when review is required and which commands to run" in guide
+    assert "must not embed kiro model tables" in guide
+
+
+def test_global_design_lists_kiro_and_justifies_the_native_adapter() -> None:
+    design = " ".join(
+        (ROOT / "docs" / "superpowers" / "specs" / "2026-08-12-global-best-match-review-design.md")
+        .read_text()
+        .lower()
+        .split()
+    )
+
+    assert "`llm`, `openrouter`, `agy`, `pi`, `codex`, and `kiro`" in design
+    assert "subscription access unavailable through pi or openrouter" in design
+
+
+def test_public_kiro_guidance_does_not_publish_a_static_model_table() -> None:
+    paths = (
+        ROOT / "docs" / "ARCHITECTURE.md",
+        ROOT / "docs" / "HELP-LLM.md",
+        ROOT / "docs" / "PROJECT-INTEGRATION.md",
+        ROOT / "docs" / "superpowers" / "specs" / "2026-08-12-global-best-match-review-design.md",
+    )
+    lines = [line.lower() for path in paths for line in path.read_text().splitlines()]
+
+    compact_lines = [line.replace(" ", "") for line in lines]
+    assert not any(
+        line.startswith("|model|") or line.startswith("|kiromodel|") for line in compact_lines
+    )
+    assert not any("claude-sonnet-" in line for line in lines)
+
+
 def test_architecture_defines_partial_review_and_consolidation_semantics() -> None:
     architecture = " ".join((ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split())
 

@@ -53,6 +53,35 @@ The five legacy compatibility adapters are explicitly unqualified: `llm`,
 `openrouter`, `agy`, `pi`, and `codex`. They preserve existing route behavior
 without claiming conformance. Availability is not qualification.
 
+Kiro is a registered native agent-CLI adapter and remains unqualified. Its
+default executable is `kiro-cli`; `KIRO_BIN` overrides that executable.
+`reviewctl setup check --backend kiro` performs version-only local discovery:
+it does not authenticate or call a model or provider. Availability and a valid
+receipt do not qualify a model. Qualification and the current operating roster
+remain the organization's private evidence responsibility.
+
+Kiro owns its runtime model inventory. Read it from the installed CLI with
+`kiro-cli chat --list-models --format json`, then select one exact returned ID
+with `--transport kiro --model MODEL_ID` or `--route kiro:MODEL_ID`. `auto` is
+rejected because resolved model identity is unobservable. Never copy that
+inventory, model prices, credit values, or provider commands into this
+repository or a project's instruction files.
+
+The adapter reuses the user's local Kiro subscription and login, so it can avoid
+OpenRouter for models available through that account. The adapter does not use
+OpenRouter and does not inherit ambient provider, AWS, or API-token variables.
+For a formal invocation it performs a dynamic model check, creates a disposable
+empty working directory, passes a reduced environment, selects the built-in
+`kiro_default` agent with `--trust-tools=`, and supplies the inline frozen packet.
+Inventory, invocation, and session recovery share one total timeout; retained
+evidence is written with mode `0600`.
+
+This boundary provides advisory read-only behavior and tool control with
+`sourceIsolation: unavailable`. The disposable directory and reduced process
+environment are not OS sandbox enforcement. Proprietary Kiro source therefore
+requires an explicit policy allowing the exact Kiro model before any source
+bytes are sent. Synthetic runs do not require that policy.
+
 Setup diagnostics observe only executable presence and version for registered
 executable backends. Setup diagnostics never authenticate, call a model or
 provider, or write configuration. The next gate is backend conformance before

@@ -92,6 +92,58 @@ fail an unfiltered check of local executables. Explicitly selecting one reports
 its non-qualifying state and exits `1`. Missing or unverified selected
 executables also exit `1`.
 
+## Kiro backend
+
+Kiro is supported by `run`, routes, and tournaments as a registered native
+agent-CLI adapter, but it remains unqualified. Availability and a valid receipt
+do not qualify a model. The organization owns qualification and its private
+operating evidence.
+
+The executable defaults to `kiro-cli`; set `KIRO_BIN` to override it. This
+version-only check is local discovery and does not call a model or provider:
+
+```bash
+reviewctl setup check --backend kiro
+```
+
+Kiro owns the current runtime model inventory. Query the installed CLI, choose
+an exact returned model ID, and pass it explicitly:
+
+```bash
+kiro-cli chat --list-models --format json
+reviewctl run --review-id ID --transport kiro --model MODEL_ID \
+  --prompt-file FILE --file SOURCE
+reviewctl run --review-id ID --route kiro:MODEL_ID \
+  --prompt-file FILE --file SOURCE
+```
+
+The supported selection forms are `--transport kiro --model MODEL_ID` and
+`--route kiro:MODEL_ID`. `auto` is rejected because the resolved identity is
+unobservable. Do not copy the returned model roster, prices, credits, or
+provider commands into repository or project instruction documents.
+
+The adapter reuses the user's local Kiro subscription and login. It does not use
+OpenRouter and does not inherit ambient provider, AWS, or API-token variables.
+It uses a disposable empty working directory, reduced environment, built-in
+`kiro_default` agent, no pre-trusted tools, an inline frozen packet, one total
+timeout, private evidence, a dynamic model check, and session recovery. Those
+controls are advisory read-only and tool controls with source isolation
+unavailable; they are not OS sandbox enforcement.
+
+Proprietary Kiro source requires an explicit policy allowing the exact Kiro
+model before bytes are sent. Synthetic runs do not require that policy. Potzal
+and federation remain unrelated and optional.
+
+Handle Kiro agent errors as follows:
+
+- Unknown or unlisted model: rerun
+  `kiro-cli chat --list-models --format json` and select the exact returned ID.
+- `auto`: select an explicit model ID.
+- Missing or malformed session or inventory: inspect the attempt evidence and
+  do not treat the result as approval.
+- Missing executable: run `reviewctl setup check --backend kiro` and correct
+  `KIRO_BIN` or the local installation.
+
 ## Diagnose failures
 
 Errors are actionable for LLMs. Use the receipt fields instead of guessing or

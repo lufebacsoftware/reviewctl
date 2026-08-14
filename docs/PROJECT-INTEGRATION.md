@@ -23,6 +23,11 @@ The current operating roster is private evidence, not a permanent instruction.
 Consult the organization's evidence repository when selecting a specialized
 review lane.
 
+Projects may state when review is required and which commands to run, but they
+must not embed Kiro model tables. Runtime model inventory, prices, credits,
+provider commands, qualification, and tournament evidence stay outside project
+instruction files.
+
 ## Minimal Project Contract
 
 Keep this block small and adapt only the bracketed local details:
@@ -51,8 +56,8 @@ text-only tournament does not qualify a vision model.
 1. Keep the project-specific rules: standards, privacy limits, test commands,
    deployment constraints, and who verifies external claims.
 2. Remove generic model tables, costs, rankings, provider-specific CLI snippets,
-   historical audition reports, and mandatory multi-model vote rules from
-   `AGENTS.md` and `CLAUDE.md`.
+   Kiro model tables, historical audition reports, and mandatory multi-model
+   vote rules from `AGENTS.md` and `CLAUDE.md`.
 3. Replace them with the minimal project contract above.
 4. Put new model evidence in the organization's private evidence repository,
    not in `reviewctl` or the consuming project.
