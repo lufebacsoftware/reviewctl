@@ -117,6 +117,14 @@ reviewctl run --review-id ID --route kiro:MODEL_ID \
   --prompt-file FILE --file SOURCE
 ```
 
+Illustrative example (current at writing; check
+`kiro-cli chat --list-models --format json` before use):
+
+```bash
+reviewctl run --review-id ID --route kiro:claude-sonnet-5 \
+  --prompt-file FILE --file SOURCE
+```
+
 The supported selection forms are `--transport kiro --model MODEL_ID` and
 `--route kiro:MODEL_ID`. `auto` is rejected because the resolved identity is
 unobservable. Do not copy the returned model roster, prices, credits, or

@@ -230,12 +230,28 @@ def test_public_kiro_guidance_does_not_publish_a_static_model_table() -> None:
         ROOT / "docs" / "superpowers" / "specs" / "2026-08-12-global-best-match-review-design.md",
     )
     lines = [line.lower() for path in paths for line in path.read_text().splitlines()]
+    combined = "\n".join(lines)
+    help_text = " ".join((ROOT / "docs" / "HELP-LLM.md").read_text().lower().split())
 
     compact_lines = [line.replace(" ", "") for line in lines]
     assert not any(
-        line.startswith("|model|") or line.startswith("|kiromodel|") for line in compact_lines
+        line.startswith(("|model|", "|kiromodel|", "|price|", "|credits|"))
+        for line in compact_lines
     )
-    assert not any("claude-sonnet-" in line for line in lines)
+    for forbidden_static_detail in (
+        "kiro models:",
+        "kiro model roster:",
+        "price:",
+        "credits per",
+        "$",
+    ):
+        assert forbidden_static_detail not in combined
+    assert combined.count("kiro:claude-sonnet-5") == 1
+    assert sum("claude-sonnet-" in line for line in lines) == 1
+    assert (
+        "illustrative example (current at writing; check "
+        "`kiro-cli chat --list-models --format json` before use):"
+    ) in help_text
 
 
 def test_architecture_defines_partial_review_and_consolidation_semantics() -> None:
