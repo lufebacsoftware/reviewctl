@@ -41,6 +41,33 @@ class RecursiveProductReview(dict):
         raise RecursionError("hostile recursive product review")
 
 
+class HostileText(str):
+    def strip(self, *args: object, **kwargs: object) -> str:
+        raise AssertionError("hostile strip executed")
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("hostile equality executed")
+
+    def __ne__(self, other: object) -> bool:
+        raise AssertionError("hostile inequality executed")
+
+    def __hash__(self) -> int:
+        raise AssertionError("hostile hash executed")
+
+    def __str__(self) -> str:
+        raise AssertionError("hostile string conversion executed")
+
+
+class HostileKey(str):
+    __hash__ = str.__hash__
+
+    def __ne__(self, other: object) -> bool:
+        raise AssertionError("hostile inequality executed")
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("hostile equality executed")
+
+
 def build_completion_context(
     request,
     promoted_fragments,
@@ -71,6 +98,11 @@ def finding(
         "evidence": "The same key reaches the write twice.",
         "reproduction": "Submit the same key twice.",
     }
+
+
+def hostile_text_finding(field: str) -> dict[str, object]:
+    value = finding()
+    return {**value, field: HostileText(str(value[field]))}
 
 
 def product_output(review_contract: str) -> dict[str, object]:
@@ -542,6 +574,62 @@ def test_promote_fragments_records_attempt_provenance_only_for_contract_incomple
     }
     assert copy(result[0].finding) is result[0].finding
     assert deepcopy(result[0].finding) is result[0].finding
+
+
+@pytest.mark.parametrize("field", ["name", "version"])
+def test_promote_fragments_rejects_hostile_evaluation_identity(field: str) -> None:
+    evaluation = incomplete_evaluation(finding())
+    evaluation = replace(evaluation, **{field: HostileText(getattr(evaluation, field))})
+
+    assert (
+        promote_fragments(
+            evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+def test_promote_fragments_rejects_hostile_gate_result() -> None:
+    evaluation = incomplete_evaluation(finding())
+
+    assert (
+        promote_fragments(
+            evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
+            gate_result=HostileText("contract-incomplete"),
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("field", ["fingerprint", "payload_digest", "scope"])
+def test_promote_fragments_rejects_hostile_fragment_metadata(field: str) -> None:
+    evaluation = incomplete_evaluation(finding())
+    fragment = evaluation.valid_fragments[0]
+    value: object = HostileText(getattr(fragment, field))
+    if field == "scope":
+        value = (HostileText(fragment.scope[0]),)
+    evaluation = replace(evaluation, valid_fragments=(replace(fragment, **{field: value}),))
+
+    assert (
+        promote_fragments(
+            evaluation,
+            contract_context=ContractContext(file_names=("source.py",)),
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
 
 
 def test_promote_fragments_rejects_reidentified_finding_outside_origin_scope() -> None:
@@ -2018,6 +2106,157 @@ def test_consolidate_rejects_unencodable_accepted_finding_without_exception() ->
     assert result.status == "unavailable"
 
 
+@pytest.mark.parametrize("field", ["severity", "path", "title", "evidence", "reproduction"])
+@pytest.mark.parametrize("boundary", ["manual-promotion", "completion", "consolidate", "receipt"])
+def test_finding_trust_boundaries_reject_hostile_text_subclasses_without_exception(
+    field: str,
+    boundary: str,
+) -> None:
+    hostile = hostile_text_finding(field)
+    context = ContractContext(file_names=("source.py",))
+    if boundary == "manual-promotion":
+        evaluation = incomplete_evaluation(finding())
+        fragment = replace(evaluation.valid_fragments[0], value=hostile)
+
+        assert (
+            promote_fragments(
+                replace(evaluation, valid_fragments=(fragment,)),
+                contract_context=context,
+                gate_result="contract-incomplete",
+                attempt=1,
+                route_index=0,
+                raw_response_digest=evaluation.payload_digest,
+            )
+            == ()
+        )
+    elif boundary == "completion":
+        evaluation = incomplete_evaluation(finding())
+        fragment = replace(promoted(finding())[0], finding=hostile)
+
+        with pytest.raises(ValueError, match="invalid promoted fragment identity"):
+            build_completion_context(
+                evaluation.completion_request,
+                (fragment,),
+                allowed_file_names=("source.py",),
+            )
+    elif boundary == "consolidate":
+        result = consolidate(
+            {"verdict": "changes-requested", "findings": [hostile]},
+            (),
+            accepted_attempt=1,
+            contract_context=context,
+        )
+
+        assert result.status == "unavailable"
+    else:
+        receipt = v2_findings_receipt()
+        receipt["attempts"][0]["promotedFragments"][0]["finding"] = hostile
+        _sign_receipt(receipt)
+
+        assert "promoted-fragments" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("location", "violation"),
+    [
+        ("review-contract", "review-contract"),
+        ("product-digest", "accepted-attempt"),
+        ("top-verdict", "accepted-attempt"),
+    ],
+)
+def test_receipt_rejects_hostile_contract_scalar_strings_without_exception(
+    location: str,
+    violation: str,
+) -> None:
+    if location == "product-digest":
+        receipt = v2_legacy_receipt("product-review-json")
+        output = receipt["attempts"][0]["contractOutput"]
+        output["normalizedSha256"] = HostileText(output["normalizedSha256"])
+    else:
+        receipt = v2_findings_receipt()
+        if location == "review-contract":
+            receipt["reviewContract"] = HostileText(receipt["reviewContract"])
+        else:
+            receipt["verdict"] = HostileText(receipt["verdict"])
+    _sign_receipt(receipt)
+
+    assert violation in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("location", "violation"),
+    [
+        ("source-class", "receipt-source"),
+        ("attempt-result", "attempt-result"),
+        ("evaluation-violation", "contract-evaluation"),
+        ("evaluation-status", "contract-evaluation"),
+        ("evaluation-name", "contract-evaluation"),
+        ("fallback-kind", "fallback-relationships"),
+        ("fallback-id", "fallback-relationships"),
+        ("fragment-kind", "contract-fragments"),
+        ("fragment-id", "contract-fragments"),
+        ("fragment-fingerprint", "contract-fragments"),
+        ("fragment-payload", "contract-fragments"),
+        ("fragment-scope", "contract-fragments"),
+    ],
+)
+def test_receipt_rejects_other_hostile_typed_strings_without_exception(
+    location: str,
+    violation: str,
+) -> None:
+    receipt = v2_findings_receipt()
+    first = receipt["attempts"][0]
+    evaluation = first["contractEvaluation"]
+    relationship = receipt["fallbackRelationships"][0]
+    if location == "source-class":
+        receipt["sourceClass"] = HostileText(receipt["sourceClass"])
+    elif location == "attempt-result":
+        first["result"] = HostileText(first["result"])
+    elif location == "evaluation-violation":
+        hostile = HostileText(evaluation["violations"][0])
+        evaluation["violations"] = [hostile]
+        evaluation["completionRequest"]["violations"] = [hostile]
+    elif location == "evaluation-status":
+        evaluation["status"] = HostileText(evaluation["status"])
+    elif location == "evaluation-name":
+        evaluation["name"] = HostileText(evaluation["name"])
+    elif location == "fallback-kind":
+        relationship["kind"] = HostileText(relationship["kind"])
+    elif location == "fallback-id":
+        relationship["promotedFragmentIds"] = [HostileText(relationship["promotedFragmentIds"][0])]
+    else:
+        fragment = evaluation["fragments"][0]
+        key = {
+            "fragment-kind": "kind",
+            "fragment-id": "fragmentId",
+            "fragment-fingerprint": "fingerprint",
+            "fragment-payload": "payloadDigest",
+        }.get(location)
+        if key is None:
+            fragment["scope"] = [HostileText(fragment["scope"][0])]
+        else:
+            fragment[key] = HostileText(fragment[key])
+    _sign_receipt(receipt)
+
+    assert violation in validate_v2_receipt(receipt)
+
+
+def test_receipt_rejects_hostile_root_keys_before_comparison() -> None:
+    receipt = v2_findings_receipt()
+    hostile_receipt = {HostileKey(key): value for key, value in receipt.items()}
+
+    assert "receipt-digest" in validate_v2_receipt(hostile_receipt)
+
+
+def test_receipt_rejects_hostile_contract_fragment_keys_without_exception() -> None:
+    receipt = v2_findings_receipt()
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    fragment = evaluation["fragments"][0]
+    evaluation["fragments"][0] = {HostileKey(key): value for key, value in fragment.items()}
+
+    assert "contract-fragments" in validate_v2_receipt(receipt)
+
+
 @pytest.mark.parametrize(
     ("location", "expected_violation"),
     [
@@ -2165,6 +2404,16 @@ def test_validate_v2_receipt_preserves_compatible_extension_fields(
     _sign_receipt(receipt)
 
     assert validate_v2_receipt(receipt) == ()
+
+
+@pytest.mark.parametrize("location", ["receipt", "attempt"])
+def test_validate_v2_receipt_rejects_hostile_extension_strings(location: str) -> None:
+    receipt = v2_findings_receipt()
+    target = receipt if location == "receipt" else receipt["attempts"][0]
+    target["extension.example"] = {"label": HostileText("hostile")}
+    _sign_receipt(receipt)
+
+    assert "receipt-digest" in validate_v2_receipt(receipt)
 
 
 @pytest.mark.parametrize("review_contract", ["document", "product-review-json", "findings-json"])
@@ -2997,6 +3246,14 @@ def test_validate_v2_product_receipt_rejects_actual_cycle_without_hanging() -> N
 
     assert "receipt-digest" in violations
     assert "accepted-attempt" in violations
+
+
+def test_validate_v2_product_receipt_rejects_hostile_review_strings() -> None:
+    receipt = v2_legacy_receipt("product-review-json")
+    receipt["review"]["summary"] = HostileText(receipt["review"]["summary"])
+    _sign_receipt(receipt)
+
+    assert "accepted-attempt" in validate_v2_receipt(receipt)
 
 
 def test_receipt_canonical_digest_contains_recursion_error() -> None:

@@ -11,6 +11,7 @@ from reviewctl.contracts import (
     EvaluationContext,
     EvaluationStatus,
     FragmentKind,
+    PreparedContract,
     canonical_json,
     get_contract,
     valid_contract_context,
@@ -20,6 +21,24 @@ from reviewctl.contracts import (
 
 
 class TextSubclass(str):
+    pass
+
+
+class HostileText(str):
+    def strip(self, *args: object, **kwargs: object) -> str:
+        raise AssertionError("hostile strip executed")
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("hostile equality executed")
+
+    def __ne__(self, other: object) -> bool:
+        raise AssertionError("hostile inequality executed")
+
+    def __hash__(self) -> int:
+        raise AssertionError("hostile hash executed")
+
+
+class PreparedContractSubclass(PreparedContract):
     pass
 
 
@@ -277,6 +296,56 @@ def test_valid_finding_requires_strict_canonical_serializability() -> None:
     assert valid_finding(legitimate) is True
     assert valid_finding({**legitimate, "line": 10**5000}) is False
     assert valid_finding({**legitimate, "title": chr(0xD800)}) is False
+
+
+@pytest.mark.parametrize("field", ["severity", "path", "title", "evidence", "reproduction"])
+def test_valid_finding_rejects_hostile_text_subclasses_without_invoking_them(
+    field: str,
+) -> None:
+    value = finding_payload()["findings"][0]
+
+    assert valid_finding({**value, field: HostileText(str(value[field]))}) is False
+
+
+def test_findings_contract_rejects_hostile_payload_subclass_without_invoking_it() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+
+    evaluation = contract.evaluate(
+        HostileText(json.dumps(finding_payload())),
+        contract.prepare(context),
+        context,
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+
+
+@pytest.mark.parametrize("field", ["name", "version", "output_instructions", "digest"])
+def test_findings_contract_rejects_hostile_prepared_strings_without_invoking_them(
+    field: str,
+) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    hostile = replace(prepared, **{field: HostileText(str(getattr(prepared, field)))})
+
+    evaluation = contract.evaluate("{}", hostile, context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("prepared-contract",)
+
+
+def test_findings_contract_rejects_prepared_contract_subclasses() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    prepared = contract.prepare(context)
+    subclass = PreparedContractSubclass(**prepared.__dict__)
+
+    evaluation = contract.evaluate("{}", subclass, context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("prepared-contract",)
 
 
 @pytest.mark.parametrize("path", ["source.py\0", "source.py\n", "source.py\t", "source\u202e.py"])

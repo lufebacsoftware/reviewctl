@@ -19,6 +19,7 @@ from reviewctl.contracts import (
     canonical_json,
     findings_required_fields,
     get_contract,
+    has_exact_json_scalar_types,
     valid_contract_context,
     valid_finding,
     valid_review_basename,
@@ -134,7 +135,7 @@ def _fragment_id(fingerprint: str, payload_digest: str) -> str:
 
 def _is_sha256(value: object) -> bool:
     return (
-        isinstance(value, str)
+        type(value) is str
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
@@ -381,9 +382,9 @@ class FallbackRelationship:
     promoted_fragment_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, str) or self.kind not in {"retry", "route-fallback"}:
+        if type(self.kind) is not str or self.kind not in {"retry", "route-fallback"}:
             raise ValueError(f"unsupported fallback relationship kind: {self.kind}")
-        if not all(isinstance(fragment_id, str) for fragment_id in self.promoted_fragment_ids):
+        if not all(type(fragment_id) is str for fragment_id in self.promoted_fragment_ids):
             raise ValueError("promoted fragment IDs must be strings")
 
     def to_dict(self) -> dict[str, object]:
@@ -573,7 +574,9 @@ def _valid_incomplete_evaluation(
         request = evaluation.completion_request
         if (
             evaluation.status is not EvaluationStatus.INCOMPLETE
+            or type(evaluation.name) is not str
             or evaluation.name != "findings-json"
+            or type(evaluation.version) is not str
             or evaluation.version != "1"
             or evaluation.value is not None
             or evaluation.normalized_digest is not None
@@ -645,13 +648,13 @@ def promote_fragments(
     raw_response_digest: str,
 ) -> tuple[PromotedFragment, ...]:
     """Promote only identity-valid findings from an otherwise eligible partial result."""
-    if gate_result != "contract-incomplete":
+    if type(gate_result) is not str or gate_result != "contract-incomplete":
         return ()
     if not _valid_incomplete_evaluation(evaluation, contract_context):
         return ()
     if (
-        raw_response_digest != evaluation.payload_digest
-        or not _is_sha256(raw_response_digest)
+        not _is_sha256(raw_response_digest)
+        or raw_response_digest != evaluation.payload_digest
         or not _is_positive_int(attempt)
         or not _is_nonnegative_int(route_index)
     ):
@@ -691,7 +694,9 @@ def _promote_contract_fragments(
     """Reproduce the exact promoted list from validated contract fragments."""
     if (
         not _contract_fragments_are_canonical(fragments)
+        or type(contract_name) is not str
         or contract_name != "findings-json"
+        or type(contract_version) is not str
         or contract_version != "1"
         or not valid_contract_context(contract_context, require_file_names=True)
         or not _is_sha256(prepared_digest)
@@ -717,6 +722,10 @@ def _promote_contract_fragments(
             not isinstance(fragment, ContractFragment)
             or fragment.kind is not FragmentKind.FINDING
             or not valid_finding(fragment.value)
+            or type(fragment.scope) is not tuple
+            or not all(type(item) is str for item in fragment.scope)
+            or not _is_sha256(fragment.fingerprint)
+            or not _is_sha256(fragment.payload_digest)
         ):
             return None
         finding = _copy_finding(fragment.value)
@@ -935,6 +944,8 @@ def consolidate(
 
     contract = get_contract("findings-json")
     try:
+        if not has_exact_json_scalar_types(accepted_review):
+            raise ValueError("accepted review contains non-exact JSON scalars")
         accepted_evaluation = contract.evaluate(
             canonical_json(accepted_review).decode(),
             contract.prepare(contract_context),
@@ -984,7 +995,7 @@ def _receipt_string_list(value: object, *, nonempty: bool = False) -> bool:
     return (
         isinstance(value, list)
         and (not nonempty or bool(value))
-        and all(isinstance(item, str) and (not nonempty or bool(item)) for item in value)
+        and all(type(item) is str and (not nonempty or bool(item)) for item in value)
         and len(value) == len(set(value))
     )
 
@@ -1015,7 +1026,7 @@ def _receipt_normalized_review(value: object) -> dict[str, Any] | None:
     verdict = value.get("verdict")
     findings = value.get("findings")
     if (
-        not isinstance(verdict, str)
+        type(verdict) is not str
         or verdict not in {"approved", "changes-requested"}
         or not isinstance(findings, list)
         or not all(valid_finding(finding) for finding in findings)
@@ -1058,7 +1069,7 @@ def _receipt_source_file_names(receipt: dict[str, Any]) -> tuple[str, ...] | Non
         path = file.get("path")
         if (
             not valid_review_basename(name)
-            or not isinstance(path, str)
+            or type(path) is not str
             or not path.strip()
             or not _is_sha256(file.get("sha256"))
         ):
@@ -1087,33 +1098,18 @@ def _receipt_route(value: object) -> tuple[str, str] | None:
 
 def _receipt_canonical_digest(value: object) -> str | None:
     try:
+        if not has_exact_json_scalar_types(value):
+            return None
         return hashlib.sha256(canonical_json(value)).hexdigest()
     except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
         return None
-
-
-def _receipt_has_exact_integer_types(value: object) -> bool:
-    pending = [value]
-    seen_containers: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if isinstance(current, int) and type(current) not in {bool, int}:
-            return False
-        if not isinstance(current, dict | list | tuple):
-            continue
-        identity = id(current)
-        if identity in seen_containers:
-            continue
-        seen_containers.add(identity)
-        pending.extend(current.values() if isinstance(current, dict) else current)
-    return True
 
 
 def _receipt_canonical_equal(left: object, right: object) -> bool:
     left_digest = _receipt_canonical_digest(left)
     return (
         left_digest is not None
-        and _receipt_has_exact_integer_types(left)
+        and has_exact_json_scalar_types(left)
         and left_digest == _receipt_canonical_digest(right)
     )
 
@@ -1129,6 +1125,9 @@ def _receipt_product_contract_output(
         type(value) is not dict
         or set(value) != {"name", "version", "status", "normalizedSha256", "contractContext"}
         or type(contract_identity) is not dict
+        or type(value.get("name")) is not str
+        or type(value.get("version")) is not str
+        or type(value.get("status")) is not str
         or value.get("name") != contract_identity.get("name")
         or value.get("version") != contract_identity.get("version")
         or value.get("status") != "complete"
@@ -1159,6 +1158,8 @@ def _fallback_reason_for_attempt(attempt: object) -> str | None:
     evaluation = attempt.get("contractEvaluation")
     if type(evaluation) is dict:
         status = evaluation.get("status")
+        if type(status) is not str:
+            return None
         if status == "incomplete":
             return "contract-incomplete"
         if status == "invalid":
@@ -1205,6 +1206,29 @@ def _receipt_completion_request(
     )
 
 
+def _receipt_extensions_have_exact_scalar_types(value: object) -> bool:
+    """Validate scalar identities inside otherwise-compatible receipt extensions."""
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if type(current) not in {dict, list}:
+            continue
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if type(current) is list:
+            pending.extend(current)
+            continue
+        for key, item in current.items():
+            if type(key) is str and key.startswith("extension."):
+                if not has_exact_json_scalar_types(item):
+                    return False
+            pending.append(item)
+    return True
+
+
 def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     """Validate one schema-v2 receipt without consulting external state."""
     violations: list[str] = []
@@ -1215,6 +1239,10 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
 
     if type(receipt) is not dict:
         return ("receipt-object",)
+    if any(type(key) is not str for key in receipt):
+        return ("receipt-digest",)
+    if not _receipt_extensions_have_exact_scalar_types(receipt):
+        return ("receipt-digest",)
 
     recorded_digest = receipt.get("sha256")
     try:
@@ -1232,9 +1260,10 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         reject("receipt-field-location")
 
     source_class = receipt.get("sourceClass")
+    source_is_proprietary = type(source_class) is str and source_class == "proprietary"
     source_file_names = _receipt_source_file_names(receipt)
     if (
-        not isinstance(source_class, str)
+        type(source_class) is not str
         or source_class not in ("proprietary", "synthetic")
         or source_file_names is None
     ):
@@ -1271,23 +1300,33 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         if top_transport != expected_transport:
             reject("receipt-transport")
     review_contract = receipt.get("reviewContract")
-    if not isinstance(review_contract, str) or review_contract not in SUPPORTED_RESPONSE_CONTRACTS:
+    review_contract_valid = (
+        type(review_contract) is str and review_contract in SUPPORTED_RESPONSE_CONTRACTS
+    )
+    if not review_contract_valid:
         reject("review-contract")
     contract_identity = receipt.get("contract")
     expected_contract_identity = (
-        receipt_contract_identity(review_contract)
-        if isinstance(review_contract, str) and review_contract in SUPPORTED_RESPONSE_CONTRACTS
-        else None
+        receipt_contract_identity(review_contract) if review_contract_valid else None
     )
     if (
         type(contract_identity) is not dict
         or set(contract_identity) != {"name", "version"}
+        or type(contract_identity.get("name")) is not str
+        or type(contract_identity.get("version")) is not str
         or contract_identity != expected_contract_identity
     ):
         reject("review-contract")
-    findings_contract = review_contract == "findings-json"
-    product_contract = review_contract in {"product-review-json", "product-judge-json"}
-    expected_result_view_fields = RECEIPT_RESULT_VIEW_FIELDS.get(review_contract, frozenset())
+    findings_contract = review_contract_valid and review_contract == "findings-json"
+    product_contract = review_contract_valid and review_contract in {
+        "product-review-json",
+        "product-judge-json",
+    }
+    expected_result_view_fields = (
+        RECEIPT_RESULT_VIEW_FIELDS.get(review_contract, frozenset())
+        if review_contract_valid
+        else frozenset()
+    )
     present_result_view_fields = RECEIPT_RESULT_VIEW_FIELD_NAMES.intersection(receipt)
     if present_result_view_fields - expected_result_view_fields:
         reject("review-contract")
@@ -1318,7 +1357,12 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
 
     for index, attempt in enumerate(attempts, start=1):
         attempt_result = attempt.get("result")
-        if not isinstance(attempt_result, str) or attempt_result not in SUPPORTED_ATTEMPT_RESULTS:
+        attempt_result_valid = (
+            type(attempt_result) is str and attempt_result in SUPPORTED_ATTEMPT_RESULTS
+        )
+        attempt_is_accepted = attempt_result_valid and attempt_result == "accepted"
+        attempt_is_incomplete = attempt_result_valid and attempt_result == "incomplete"
+        if not attempt_result_valid:
             reject("attempt-result")
 
         raw = attempt.get("rawResponse")
@@ -1327,7 +1371,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             if not (
                 type(raw) is dict
                 and set(raw) == {"path", "sha256", "characters"}
-                and isinstance(raw.get("path"), str)
+                and type(raw.get("path")) is str
                 and bool(raw["path"])
                 and _is_sha256(raw.get("sha256"))
                 and _is_nonnegative_int(raw.get("characters"))
@@ -1375,6 +1419,12 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 reject("contract-evaluation")
             else:
                 evaluation_status = evaluation.get("status")
+                evaluation_is_complete = (
+                    type(evaluation_status) is str and evaluation_status == "complete"
+                )
+                evaluation_is_incomplete = (
+                    type(evaluation_status) is str and evaluation_status == "incomplete"
+                )
                 payload_digest = evaluation.get("payloadSha256")
                 fragment_values = evaluation.get("fragments")
                 contract_identity = receipt.get("contract")
@@ -1396,6 +1446,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         "completionRequest",
                     }
                     and type(contract_identity) is dict
+                    and type(evaluation.get("name")) is str
+                    and type(evaluation.get("version")) is str
                     and evaluation.get("name") == contract_identity.get("name")
                     and evaluation.get("version") == contract_identity.get("version")
                     and _is_sha256(evaluation.get("preparedSha256"))
@@ -1403,8 +1455,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and raw_digest is not None
                     and raw_digest == payload_digest
                     and isinstance(violations_value, list)
-                    and all(isinstance(item, str) for item in violations_value)
-                    and isinstance(evaluation_status, str)
+                    and all(type(item) is str for item in violations_value)
+                    and type(evaluation_status) is str
                     and evaluation_status in {"complete", "incomplete", "invalid"}
                     and isinstance(fragment_values, list)
                 )
@@ -1419,10 +1471,10 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     == (
                         type(route.get("transport")) is str
                         and route["transport"] == "codex"
-                        and source_class == "proprietary"
+                        and source_is_proprietary
                     )
                 )
-                if context_is_authoritative and isinstance(evaluation.get("name"), str):
+                if context_is_authoritative and type(evaluation.get("name")) is str:
                     try:
                         prepared = get_contract(evaluation["name"]).prepare(contract_context)
                     except (KeyError, TypeError, ValueError, UnicodeError):
@@ -1438,14 +1490,19 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     reject("contract-evaluation")
                     fragment_values = []
                 for fragment in fragment_values:
-                    valid = type(fragment) is dict and set(fragment) == {
-                        "fragmentId",
-                        "fingerprint",
-                        "kind",
-                        "value",
-                        "payloadDigest",
-                        "scope",
-                    }
+                    valid = (
+                        type(fragment) is dict
+                        and has_exact_json_scalar_types(fragment)
+                        and set(fragment)
+                        == {
+                            "fragmentId",
+                            "fingerprint",
+                            "kind",
+                            "value",
+                            "payloadDigest",
+                            "scope",
+                        }
+                    )
                     if valid:
                         value = fragment.get("value")
                         scope = fragment.get("scope")
@@ -1497,7 +1554,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     expected_required.append("reviewedFiles")
                 coverage_valid = coverage is not None and coverage[0] == expected_required
                 state_valid = identity_valid and contract_fragments_canonical
-                if evaluation_status == "complete":
+                if evaluation_is_complete:
                     state_valid = (
                         state_valid
                         and normalized_value is not None
@@ -1514,18 +1571,18 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                             or normalized_value.get("reviewedFiles")
                             == list(contract_context.file_names)
                         )
-                        and attempt.get("result") == "accepted"
+                        and attempt_is_accepted
                     )
-                    if normalized_value is not None:
+                    if state_valid and normalized_value is not None:
                         expected_fragment_ids = sorted(
                             _fragment_id(
                                 _fragment_fingerprint(
                                     finding,
-                                    contract=str(evaluation.get("name")),
-                                    version=str(evaluation.get("version")),
+                                    contract=evaluation["name"],
+                                    version=evaluation["version"],
                                     scope=(finding["path"],),
                                 ),
-                                str(payload_digest),
+                                payload_digest,
                             )
                             for finding in normalized_value["findings"]
                         )
@@ -1533,7 +1590,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                             fragment["fragmentId"] for fragment in contract_fragments
                         ) == (expected_fragment_ids)
                         normalized_by_attempt[index] = normalized_value
-                elif evaluation_status == "incomplete":
+                elif evaluation_is_incomplete:
                     completion_valid = coverage_valid and _receipt_completion_request(
                         completion_request,
                         prepared_digest=evaluation.get("preparedSha256"),
@@ -1561,7 +1618,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         and bool(contract_fragments)
                         and completion_valid
                         and incomplete_coverage_valid
-                        and attempt.get("result") == "incomplete"
+                        and attempt_is_incomplete
                     )
                     promotion_eligible = state_valid
                 else:
@@ -1592,7 +1649,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         and fragment_values == []
                         and completion_request is None
                         and invalid_coverage_valid
-                        and attempt.get("result") == "incomplete"
+                        and attempt_is_incomplete
                     )
                 if not state_valid:
                     reject("contract-evaluation")
@@ -1643,33 +1700,42 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             if not (
                 type(evaluation_error) is dict
                 and set(evaluation_error) == {"type", "message"}
-                and isinstance(evaluation_error.get("type"), str)
+                and type(evaluation_error.get("type")) is str
                 and bool(evaluation_error["type"].strip())
-                and isinstance(evaluation_error.get("message"), str)
+                and type(evaluation_error.get("message")) is str
                 and bool(evaluation_error["message"].strip())
                 and raw_digest is not None
                 and evaluation is None
-                and attempt.get("result") == "incomplete"
+                and attempt_is_incomplete
                 and promoted_value == []
             ):
                 reject("contract-evaluation")
         if (
             findings_contract
-            and attempt.get("result") == "incomplete"
+            and attempt_is_incomplete
             and evaluation is None
             and evaluation_error is None
         ):
             reject("contract-evaluation")
 
     result = receipt.get("result")
+    result_is_accepted = type(result) is str and result == "accepted"
+    result_is_unavailable = type(result) is str and result == "unavailable"
     accepted_attempt = receipt.get("acceptedAttempt")
     accepted: dict[str, Any] | None = None
-    if result == "accepted":
+    if type(result) is not str:
+        reject("result")
+    elif result_is_accepted:
         if not _is_positive_int(accepted_attempt) or accepted_attempt > len(attempts):
             reject("accepted-attempt")
         else:
             accepted = attempts[accepted_attempt - 1]
-            if accepted.get("number") != accepted_attempt or accepted.get("result") != "accepted":
+            accepted_result = accepted.get("result")
+            if (
+                accepted.get("number") != accepted_attempt
+                or type(accepted_result) is not str
+                or accepted_result != "accepted"
+            ):
                 reject("accepted-attempt")
             evaluation = accepted.get("contractEvaluation")
             if findings_contract and (
@@ -1678,21 +1744,27 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 reject("accepted-attempt")
             if findings_contract and accepted_attempt not in normalized_by_attempt:
                 reject("accepted-attempt")
-            if any(attempt.get("result") == "accepted" for attempt in attempts[accepted_attempt:]):
+            if any(
+                type(attempt.get("result")) is str and attempt.get("result") == "accepted"
+                for attempt in attempts[accepted_attempt:]
+            ):
                 reject("accepted-attempt")
             if accepted_attempt != len(attempts) or [
-                attempt.get("number") for attempt in attempts if attempt.get("result") == "accepted"
+                attempt.get("number")
+                for attempt in attempts
+                if type(attempt.get("result")) is str and attempt.get("result") == "accepted"
             ] != [accepted_attempt]:
                 reject("accepted-attempt")
-    elif result == "unavailable":
+    elif result_is_unavailable:
         if accepted_attempt is not None or any(
-            attempt.get("result") == "accepted" for attempt in attempts
+            type(attempt.get("result")) is str and attempt.get("result") == "accepted"
+            for attempt in attempts
         ):
             reject("result")
     else:
         reject("result")
 
-    if result == "accepted":
+    if result_is_accepted:
         if present_result_view_fields != expected_result_view_fields:
             reject("accepted-attempt")
         if "review" in expected_result_view_fields and type(receipt.get("review")) is not dict:
@@ -1705,11 +1777,11 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         for index, attempt in enumerate(attempts, start=1)
         if "contractOutput" in attempt
     ]
-    if product_contract and result == "accepted" and accepted is not None:
+    if product_contract and result_is_accepted and accepted is not None:
         output_context = ContractContext(
             file_names=source_file_names or (),
             review_declaration_required=(
-                accepted.get("transport") == "codex" and source_class == "proprietary"
+                accepted.get("transport") == "codex" and source_is_proprietary
             ),
         )
         output_digest = (
@@ -1756,12 +1828,13 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and destination == target
                     and source <= len(attempts)
                     and destination <= len(attempts)
-                    and isinstance(kind, str)
+                    and type(kind) is str
                     and kind in {"retry", "route-fallback"}
+                    and type(relationship.get("reason")) is str
                     and relationship.get("reason")
                     == _fallback_reason_for_attempt(attempts[source - 1])
                     and isinstance(ids, list)
-                    and all(isinstance(fragment_id, str) for fragment_id in ids)
+                    and all(type(fragment_id) is str for fragment_id in ids)
                     and ids == sorted(set(ids))
                 ):
                     relationships_valid = False
@@ -1770,8 +1843,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 destination_context = ContractContext(
                     file_names=source_file_names or (),
                     review_declaration_required=(
-                        destination_attempt.get("transport") == "codex"
-                        and source_class == "proprietary"
+                        destination_attempt.get("transport") == "codex" and source_is_proprietary
                     ),
                 )
                 destination_prepared = (
@@ -1802,7 +1874,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             reject("fallback-relationships")
 
         legacy_review: dict[str, Any] | None = None
-        if result == "accepted":
+        if result_is_accepted:
             verdict = receipt.get("verdict")
             findings = receipt.get("findings")
             normalized = (
@@ -1813,6 +1885,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             if (
                 normalized is None
                 or accepted is None
+                or type(verdict) is not str
                 or verdict != normalized["verdict"]
                 or not _receipt_canonical_equal(findings, normalized["findings"])
                 or not _receipt_canonical_equal(accepted.get("findings"), findings)
@@ -1824,7 +1897,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         consolidation_context = ContractContext(
             file_names=source_file_names or (),
             review_declaration_required=(
-                consolidation_attempt.get("transport") == "codex" and source_class == "proprietary"
+                consolidation_attempt.get("transport") == "codex" and source_is_proprietary
             ),
         )
         expected_consolidation = consolidate(

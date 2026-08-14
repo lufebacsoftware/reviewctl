@@ -98,6 +98,31 @@ def canonical_json(value: object) -> bytes:
     ).encode()
 
 
+def has_exact_json_scalar_types(value: object) -> bool:
+    """Reject host-language scalar subclasses before contract comparisons."""
+    pending = [value]
+    seen_containers: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str) and type(current) is not str:
+            return False
+        if isinstance(current, int) and type(current) not in {bool, int}:
+            return False
+        if not isinstance(current, dict | list | tuple):
+            continue
+        identity = id(current)
+        if identity in seen_containers:
+            continue
+        seen_containers.add(identity)
+        if isinstance(current, dict):
+            if any(type(key) is not str for key in current):
+                return False
+            pending.extend(current.values())
+        else:
+            pending.extend(current)
+    return True
+
+
 @dataclass(frozen=True)
 class ContractContext:
     """Bounded facts that affect preparation and semantic validation."""
@@ -313,7 +338,7 @@ def _contains_surrogate(value: object) -> bool:
     pending = [value]
     while pending:
         current = pending.pop()
-        if isinstance(current, str):
+        if type(current) is str:
             if any(0xD800 <= ord(character) <= 0xDFFF for character in current):
                 return True
         elif isinstance(current, list):
@@ -328,15 +353,16 @@ def valid_finding(value: object) -> bool:
     """Validate one finding before any canonical identity operation."""
     if not isinstance(value, dict) or set(value) != FINDING_FIELDS:
         return False
-    if not isinstance(value["severity"], str) or value["severity"] not in FINDING_SEVERITIES:
+    severity = value["severity"]
+    if type(severity) is not str or severity not in FINDING_SEVERITIES:
         return False
     if type(value["line"]) is not int or value["line"] < 1:
         return False
     if not valid_review_basename(value["path"]):
         return False
     if not all(
-        isinstance(value[field], str) and bool(value[field].strip())
-        for field in FINDING_FIELDS - {"line"}
+        type(value[field]) is str and bool(value[field].strip())
+        for field in ("title", "evidence", "reproduction")
     ):
         return False
     try:
@@ -412,7 +438,11 @@ class FindingsJsonContract:
         payload_is_text = type(payload) is str
         payload_bytes = payload.encode(errors="surrogatepass") if payload_is_text else b""
         payload_digest = hashlib.sha256(payload_bytes).hexdigest()
-        prepared_digest = prepared.digest if isinstance(prepared, PreparedContract) else ""
+        prepared_digest = (
+            prepared.digest
+            if type(prepared) is PreparedContract and type(prepared.digest) is str
+            else ""
+        )
 
         def rejected(code: str) -> ContractEvaluation:
             return ContractEvaluation(
@@ -427,12 +457,21 @@ class FindingsJsonContract:
 
         if not payload_is_text:
             return rejected("invalid-json")
-        if not isinstance(prepared, PreparedContract) or not valid_contract_context(context):
+        if (
+            type(prepared) is not PreparedContract
+            or not has_exact_json_scalar_types(prepared.identity_material)
+            or type(prepared.digest) is not str
+            or not valid_contract_context(context)
+        ):
+            return rejected("prepared-contract")
+        try:
+            prepared_identity = canonical_json(prepared.identity_material)
+            expected_identity = canonical_json(self.prepare(context).identity_material)
+        except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
             return rejected("prepared-contract")
         if (
-            prepared != self.prepare(context)
-            or prepared.digest
-            != hashlib.sha256(canonical_json(prepared.identity_material)).hexdigest()
+            prepared_identity != expected_identity
+            or prepared.digest != hashlib.sha256(prepared_identity).hexdigest()
         ):
             return rejected("prepared-contract")
 
@@ -458,7 +497,7 @@ class FindingsJsonContract:
         violation = "response-fields" if set(value) != expected_fields else None
 
         verdict = value.get("verdict")
-        verdict_valid = isinstance(verdict, str) and verdict in REVIEW_VERDICTS
+        verdict_valid = type(verdict) is str and verdict in REVIEW_VERDICTS
         if violation is None and not verdict_valid:
             violation = "verdict"
 
@@ -500,7 +539,7 @@ class FindingsJsonContract:
             review_declaration_valid = isinstance(reviewed_files, list)
             if review_declaration_valid:
                 for reviewed in reviewed_files:
-                    if not isinstance(reviewed, str) or not reviewed.strip():
+                    if type(reviewed) is not str or not reviewed.strip():
                         review_declaration_valid = False
                         break
                     declared = reviewed.strip()
