@@ -431,6 +431,7 @@ if arguments == ["chat", "--list-models", "--format", "json"]:
                 {{"model_id": "nonzero-session"}},
                 {{"model_id": "timeout-session"}},
                 {{"model_id": "invalid-utf8"}},
+                {{"model_id": "styled"}},
             ],
             "default_model": "claude-sonnet-5",
         }}))
@@ -472,6 +473,9 @@ if model == "invalid-utf8":
         + bytes([255])
         + b'"}}\\n'
     )
+    raise SystemExit(0)
+if model == "styled":
+    sys.stdout.buffer.write(b'> {{"verdict":"approved",' + b'\\x1b[0m' + b'"findings":[]}}\\n')
     raise SystemExit(0)
 response = json.dumps({{"verdict": "approved", "findings": []}})
 sys.stdout.write("\\x1b[36mKiro CLI\\x1b[0m\\n> " + response + "\\n\\n▸ Credits: 0.25\\n")
@@ -7928,7 +7932,8 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
     )
 
     assert cli.normalize_kiro_output(stdout, "findings-json") == "first line\nbody"
-    assert cli.normalize_kiro_output(fenced_json, "findings-json") == (
+    plain_fenced_json = b'> json\n{\n  "verdict": "approved",\n  "findings": []\n}\n'
+    assert cli.normalize_kiro_output(plain_fenced_json, "findings-json") == (
         '{\n  "verdict": "approved",\n  "findings": []\n}'
     )
     escaped_ansi = b'> {"value":"\\u001b[31mred\\u001b[0m"}\n'
@@ -7936,7 +7941,11 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
         '{"value":"\\u001b[31mred\\u001b[0m"}'
     )
     literal_ansi = b'> {"value":"a\x1b[31mb"}\n'
-    assert cli.normalize_kiro_output(literal_ansi, "findings-json") == ('{"value":"a\x1b[31mb"}')
+    with pytest.raises(ValueError, match="styled response payload"):
+        cli.normalize_kiro_output(literal_ansi, "findings-json")
+    assert cli.normalize_kiro_output(fenced_json, "findings-json") == (
+        '{\n  "verdict": "approved",\n  "findings": []\n}'
+    )
     with pytest.raises(ValueError, match="only findings-json"):
         cli.normalize_kiro_output(fenced_json, "document")
     with pytest.raises(UnicodeDecodeError):
@@ -7960,7 +7969,10 @@ def test_kiro_process_environment_is_an_exact_allowlist() -> None:
         "HOME": "/real/home",
         "LANG": "en_US.UTF-8",
         "SSL_CERT_FILE": "/cert.pem",
+        "CLICOLOR": "0",
         "KIRO_LOG_NO_COLOR": "1",
+        "NO_COLOR": "1",
+        "TERM": "dumb",
     }
 
 
@@ -8331,6 +8343,17 @@ def test_invoke_kiro_rejects_non_utf8_output_without_rewriting_raw_evidence(
     assert error == "Kiro returned non-UTF-8 terminal output"
     assert response.response == ""
     assert b"\xff" in (tmp_path / "response.log").read_bytes()
+
+
+def test_invoke_kiro_rejects_styled_payload_without_rewriting_raw_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(tmp_path, monkeypatch, model="styled")
+
+    assert exit_code == 502
+    assert error == "Kiro returned a styled response payload"
+    assert response.response == ""
+    assert b"\x1b[0m" in (tmp_path / "response.log").read_bytes()
 
 
 def test_usage_private_gemini_product_review(tmp_path: Path) -> None:

@@ -1736,6 +1736,9 @@ def kiro_process_environment(source: Mapping[str, str]) -> dict[str, str]:
     )
     environment = {key: source[key] for key in allowed if key in source}
     environment["KIRO_LOG_NO_COLOR"] = "1"
+    environment["NO_COLOR"] = "1"
+    environment["CLICOLOR"] = "0"
+    environment["TERM"] = "dumb"
     return environment
 
 
@@ -1756,6 +1759,8 @@ def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
         candidate = KIRO_LEADING_UI.sub(b"", payload[len(b"json\n") :])
         if candidate.lstrip().startswith((b"{", b"[")):
             payload = candidate
+    if re.search(ANSI_ESCAPE_BYTES, payload):
+        raise ValueError("Kiro returned a styled response payload")
     return payload.decode().replace("\r\n", "\n").strip("\r\n")
 
 
@@ -1961,6 +1966,8 @@ def invoke_kiro(
             normalized_response = normalize_kiro_output(stdout, response_contract)
         except UnicodeDecodeError:
             return 502, "Kiro returned non-UTF-8 terminal output", blank
+        except ValueError as error:
+            return 502, str(error), blank
         return (
             0,
             stderr,
