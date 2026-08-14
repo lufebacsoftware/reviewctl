@@ -25,6 +25,7 @@ evidence features call external tools only when selected:
 | Codex transport | Codex CLI; macOS `sandbox-exec` for proprietary-source isolation |
 | OpenRouter direct transport | `curl` and `OPENROUTER_API_KEY` |
 | Gemini/Antigravity transport | `agy` |
+| Gemini CLI transport | local `gemini` CLI; unqualified and advisory |
 | Sealed evidence | `age` |
 
 Missing optional tools produce a typed unavailable attempt; they never count

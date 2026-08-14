@@ -128,9 +128,9 @@ def test_architecture_defines_backend_seam_and_controller_ownership() -> None:
 def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> None:
     architecture = " ".join((ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split())
 
-    for adapter in ("llm", "openrouter", "agy", "pi", "codex"):
+    for adapter in ("llm", "openrouter", "agy", "gemini", "pi", "codex"):
         assert f"`{adapter}`" in architecture
-    assert "five legacy compatibility adapters are explicitly unqualified" in architecture
+    assert "the local cli adapters are explicitly unqualified" in architecture
     assert (
         "setup diagnostics observe only executable presence and version for registered "
         "executable backends."

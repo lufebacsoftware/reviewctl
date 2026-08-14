@@ -30,7 +30,9 @@ COMPLETION_CONTEXT_START = "<reviewctl-completion-context>"
 COMPLETION_CONTEXT_END = "</reviewctl-completion-context>"
 # Pure receipt validation cannot construct the CLI registry, so this allowlist is
 # kept synchronized with build_backend_registry() by a focused registry test.
-SUPPORTED_REVIEW_TRANSPORTS = frozenset({"agy", "codex", "kiro", "llm", "openrouter", "pi"})
+SUPPORTED_REVIEW_TRANSPORTS = frozenset(
+    {"agy", "codex", "gemini", "kiro", "llm", "openrouter", "pi"}
+)
 RECEIPT_CONTRACT_VERSIONS = {
     "document": "legacy-1",
     "verdict": "legacy-1",

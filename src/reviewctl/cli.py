@@ -95,7 +95,8 @@ DEFAULT_REVIEW_TIMEOUT_SECONDS = 90
 DEFAULT_REVIEW_MAX_ATTEMPTS = 1
 TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
-ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
+ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"}
+LOCAL_POLICY_TRANSPORTS = frozenset({"codex", "gemini", "kiro", "pi"})
 RETRIABLE_REVIEW_RESULTS = {
     "timeout",
     "transport-failed",
@@ -433,7 +434,7 @@ def parse_route(value: str) -> ReviewRoute:
     if not separator or transport not in ROUTE_TRANSPORTS or not model.strip():
         raise ValueError(
             "routes must use transport:model with transport in "
-            "llm, codex, openrouter, agy, kiro, pi"
+            "llm, codex, openrouter, agy, gemini, kiro, pi"
         )
     return ReviewRoute(transport=transport, model=model.strip())
 
@@ -1561,7 +1562,7 @@ def policy_entry(
     if type(models) is dict and model in models:
         entry = models[model]
         return entry if type(entry) is dict else {}
-    if transport is not None:
+    if transport in LOCAL_POLICY_TRANSPORTS:
         transports = policy.get("transports")
         if type(transports) is dict and transport in transports:
             entry = transports[transport]
@@ -1570,13 +1571,22 @@ def policy_entry(
 
 
 def source_allowed(policy: dict[str, Any], model: str, *, transport: str | None = None) -> bool:
-    return bool(policy_entry(policy, model, transport=transport).get("source_allowed", False))
+    return policy_entry(policy, model, transport=transport).get("source_allowed") is True
 
 
 def unresolved_identity_waived(
     policy: dict[str, Any], model: str, *, transport: str | None = None
 ) -> bool:
     return policy_entry(policy, model, transport=transport).get("allow_unresolved_identity") is True
+
+
+def transport_policy_configured(policy: dict[str, Any], transport: str) -> bool:
+    transports = policy.get("transports")
+    return (
+        transport in LOCAL_POLICY_TRANSPORTS
+        and type(transports) is dict
+        and transport in transports
+    )
 
 
 def reap_process(process: subprocess.Popen[bytes]) -> None:
@@ -2012,6 +2022,195 @@ def numeric_value(value: object) -> float | None:
 
 def token_value(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def gemini_process_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Retain Gemini CLI login/configuration while excluding unrelated credentials."""
+    allowed = (
+        "PATH",
+        "SYSTEMROOT",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "GEMINI_CLI_HOME",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    )
+    environment = {key: source[key] for key in allowed if key in source}
+    environment["NO_COLOR"] = "1"
+    environment["CLICOLOR"] = "0"
+    environment["TERM"] = "dumb"
+    return environment
+
+
+def gemini_usage(payload: Mapping[str, object]) -> tuple[int | None, int | None]:
+    """Sum the CLI's per-model token counters without trusting absent values."""
+    stats = payload.get("stats")
+    models = stats.get("models") if isinstance(stats, dict) else None
+    if not isinstance(models, dict):
+        return None, None
+    input_tokens = 0
+    output_tokens = 0
+    saw_input = False
+    saw_output = False
+    for details in models.values():
+        tokens = details.get("tokens") if isinstance(details, dict) else None
+        if not isinstance(tokens, dict):
+            continue
+        input_value = token_value(tokens.get("input", tokens.get("prompt")))
+        output_value = token_value(tokens.get("candidates", tokens.get("output")))
+        if input_value is not None:
+            input_tokens += input_value
+            saw_input = True
+        if output_value is not None:
+            output_tokens += output_value
+            saw_output = True
+    return (
+        input_tokens if saw_input else None,
+        output_tokens if saw_output else None,
+    )
+
+
+def invoke_gemini(
+    *,
+    gemini_bin: str,
+    prompt: str,
+    model: str,
+    files: list[Path],
+    max_output_tokens: int,
+    response_contract: str,
+    timeout_seconds: int,
+    request_path: Path,
+    response_path: Path,
+    session_path: Path,
+    diagnostic_path: Path,
+) -> tuple[int, str, PersistedResponse]:
+    """Run Gemini CLI headlessly with a read-only plan and durable JSON evidence."""
+    blank = PersistedResponse("", None, None, None, "", None, None, "")
+    packet = openrouter_packet(prompt, files, response_contract)
+    command = [
+        gemini_bin,
+        "--model",
+        model,
+        "--prompt",
+        "Read the complete review packet from standard input. Do not use tools or edit files.",
+        "--output-format",
+        "json",
+        "--approval-mode",
+        "plan",
+        "--sandbox",
+        "--skip-trust",
+    ]
+    request_path.write_bytes(
+        canonical_json(
+            {
+                "command": command,
+                "model": model,
+                "maxOutputTokens": max_output_tokens,
+                "outputTokenLimitEnforced": False,
+                "responseContract": response_contract,
+                "files": [str(file) for file in files],
+                "prompt": packet,
+                "approvalMode": "plan",
+                "sandbox": True,
+                "session": str(session_path),
+            }
+        )
+        + b"\n"
+    )
+    started = time.monotonic()
+    environment = gemini_process_environment(os.environ)
+    stdout = b""
+    stderr = b""
+    with tempfile.TemporaryDirectory(prefix="reviewctl-gemini-") as directory:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=directory,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(input=packet.encode(), timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as error:
+                terminate_process_group(process)
+                stdout = error.output if isinstance(error.output, bytes) else b""
+                stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+                stdout_after, stderr_after = process.communicate()
+                stdout += stdout_after
+                stderr += stderr_after
+                if stdout:
+                    write_private_exclusive(response_path, stdout)
+                if stderr:
+                    write_private_exclusive(
+                        diagnostic_path,
+                        redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
+                    )
+                return 124, "review attempt timed out", blank
+        except FileNotFoundError:
+            return 127, f"Gemini transport executable not found: {gemini_bin}", blank
+        except OSError as error:
+            return 127, f"Gemini transport could not execute: {error}", blank
+
+    if stdout:
+        write_private_exclusive(response_path, stdout)
+    diagnostic = redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
+    if diagnostic:
+        write_private_exclusive(diagnostic_path, diagnostic.encode())
+    if process.returncode != 0:
+        return process.returncode, diagnostic, blank
+    try:
+        payload = json.loads(stdout, parse_constant=reject_nonstandard_json_constant)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return 502, "Gemini returned invalid JSON", blank
+    if not isinstance(payload, dict):
+        return 502, "Gemini returned a non-object response", blank
+    conversation_id = payload.get("session_id")
+    response_text = payload.get("response")
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        return 502, "Gemini returned no session identifier", blank
+    if not isinstance(response_text, str):
+        return 502, "Gemini returned no response", blank
+    response_text = normalize_pi_response(response_text, response_contract)
+    session_path.write_bytes(
+        canonical_json(
+            {
+                "session_id": conversation_id,
+                "observedModels": payload.get("stats", {}).get("models", {})
+                if isinstance(payload.get("stats"), dict)
+                else {},
+            }
+        )
+        + b"\n"
+    )
+    input_tokens, output_tokens = gemini_usage(payload)
+    return (
+        0,
+        diagnostic,
+        PersistedResponse(
+            conversation_id=conversation_id,
+            cost_usd=None,
+            duration_ms=round((time.monotonic() - started) * 1000),
+            input_tokens=input_tokens,
+            model=model,
+            output_tokens=output_tokens,
+            provider="google-gemini-cli",
+            response=response_text,
+        ),
+    )
 
 
 def positive_timeout_seconds(value: str) -> int:
@@ -3106,6 +3305,41 @@ def execute_agy_backend(request: BackendRequest) -> BackendExecution:
     )
 
 
+def execute_gemini_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    session_path = request.attempt_dir / "session.json"
+    final_response_path = request.attempt_dir / "response.md"
+    diagnostic_path = request.attempt_dir / "stderr.log"
+    exit_code, diagnostic, response = invoke_gemini(
+        gemini_bin=os.environ.get("GEMINI_BIN", "gemini"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=response_path,
+        session_path=session_path,
+        diagnostic_path=diagnostic_path,
+    )
+    if response.response:
+        write_private_exclusive(final_response_path, response.response.encode())
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(
+            request=request_path,
+            response=response_path,
+            session=session_path,
+            final_response=final_response_path if response.response else None,
+            stderr=diagnostic_path,
+        ),
+    )
+
+
 def execute_pi_backend(request: BackendRequest) -> BackendExecution:
     request_path = request.attempt_dir / "request.json"
     events_path = request.attempt_dir / "events.jsonl"
@@ -3188,6 +3422,29 @@ def build_backend_registry() -> BackendRegistry:
             "unqualified",
         ),
         execute_codex_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "gemini",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "GEMINI_BIN",
+            "gemini",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                False,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_gemini_backend,
     )
     registry.register(
         BackendDescriptor(
@@ -3595,13 +3852,24 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         loaded_policy = load_policy(args.policy)
         policy_digest = policy_sha256(args.policy)
     kiro_routes = [route for route in routes if route.transport == "kiro"]
-    if args.source_class == "proprietary" and kiro_routes:
-        if loaded_policy is None:
+    if args.source_class == "proprietary":
+        scoped_routes = [
+            route
+            for route in routes
+            if route.transport == "kiro"
+            or (
+                loaded_policy is not None
+                and transport_policy_configured(loaded_policy, route.transport)
+            )
+        ]
+        if kiro_routes and loaded_policy is None:
             parser.error("proprietary Kiro reviews require --policy")
-        for route in kiro_routes:
-            if not source_allowed(loaded_policy, route.model, transport=route.transport):
-                parser.error(f"policy does not allow Kiro model {route.model}")
-            if not unresolved_identity_waived(
+        for route in scoped_routes:
+            if loaded_policy is None or not source_allowed(
+                loaded_policy, route.model, transport=route.transport
+            ):
+                parser.error(f"policy does not allow {route.transport} model {route.model}")
+            if route.transport == "kiro" and not unresolved_identity_waived(
                 loaded_policy, route.model, transport=route.transport
             ):
                 parser.error(
@@ -4821,7 +5089,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--response-contract", choices=sorted(RESPONSE_CONTRACTS), default="verdict")
     run.add_argument(
         "--transport",
-        choices=("llm", "codex", "openrouter", "agy", "kiro", "pi"),
+        choices=("llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"),
         default="llm",
     )
     run.set_defaults(handler=lambda namespace: run_review(parser, namespace))

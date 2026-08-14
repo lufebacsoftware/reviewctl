@@ -200,6 +200,40 @@ Handle Kiro agent errors as follows:
 - Missing executable: run `reviewctl setup check --backend kiro` and correct
   `KIRO_BIN` or the local installation.
 
+## Gemini CLI backend
+
+Gemini CLI is a separate registered transport from Antigravity (`agy`):
+
+```bash
+reviewctl setup check --backend gemini
+reviewctl run --review-id ID --transport gemini --model MODEL_ID \
+  --prompt-file FILE --file SOURCE --source-class synthetic
+```
+
+The adapter uses the installed `gemini` CLI with headless JSON output,
+`--approval-mode plan`, `--sandbox`, and a disposable working directory. The
+frozen packet is supplied over standard input; no source path is passed to the
+model command. The response JSON, session identifier, statistics, request, and
+stderr are retained as attempt evidence.
+
+Gemini may resolve a requested alias to a different model. The receipt records
+the requested model and keeps the CLI's observed model statistics in raw
+evidence; it does not claim resolved model identity or qualification. The CLI
+does not provide a portable output-token cap, so
+`outputTokenLimitEnforced = false` is recorded. A valid or accepted Gemini
+receipt is advisory and is not merge-gate approval.
+
+For local experimental proprietary work, the private policy must explicitly
+authorize the transport before source bytes are sent:
+
+```toml
+[transports.gemini]
+source_allowed = true
+```
+
+The direct Gemini CLI transport is not the same as `agy`, which remains the
+Antigravity transport used by existing product-review routes.
+
 ## Diagnose failures
 
 Errors are actionable for LLMs. Use the receipt fields instead of guessing or

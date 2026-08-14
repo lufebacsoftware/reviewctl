@@ -296,6 +296,40 @@ else:
     )
 
 
+def write_fake_gemini(path: Path) -> Path:
+    return write_fake_python_executable(
+        path,
+        "gemini",
+        """import json
+import os
+import sys
+import time
+
+arguments = sys.argv[1:]
+test_mode = os.environ.get('GEMINI_API_KEY', '')
+if log := os.environ.get('GEMINI_ARGUMENTS_LOG'):
+    from pathlib import Path
+    Path(log).write_text(json.dumps(arguments))
+if test_mode == 'invalid':
+    print('{')
+elif test_mode == 'list':
+    print('[]')
+else:
+    print(json.dumps({
+        'session_id': 'gemini-session',
+        'response': '```json\\n' + json.dumps({'verdict': 'approved', 'findings': []}) + '\\n```',
+        'stats': {'models': {'gemini-3.5-flash': {'tokens': {
+            'input': 12, 'candidates': 34, 'total': 46,
+        }}}},
+    }))
+if test_mode.startswith('sleep:'):
+    time.sleep(float(test_mode.removeprefix('sleep:')))
+if test_mode.startswith('exit:'):
+    sys.exit(int(test_mode.removeprefix('exit:')))
+""",
+    )
+
+
 def write_fake_pi(path: Path) -> Path:
     return write_fake_python_executable(
         path,
@@ -534,7 +568,7 @@ def test_route_parser_accepts_kiro_and_lists_it_in_validation_errors() -> None:
         ValueError,
         match=(
             "^routes must use transport:model with transport in "
-            "llm, codex, openrouter, agy, kiro, pi$"
+            "llm, codex, openrouter, agy, gemini, kiro, pi$"
         ),
     ):
         cli.parse_route("unknown:model")
@@ -4067,6 +4101,23 @@ def test_policy_can_authorize_dynamic_models_by_transport_with_model_override() 
     assert cli.source_allowed(policy, "explicit-deny", transport="kiro") is False
     assert cli.unresolved_identity_waived(policy, "explicit-deny", transport="kiro") is False
     assert cli.source_allowed(policy, "dynamic-openrouter-model", transport="openrouter") is False
+    assert (
+        cli.source_allowed(
+            {"transports": {"openrouter": {"source_allowed": True}}},
+            "dynamic-model",
+            transport="openrouter",
+        )
+        is False
+    )
+    for malformed in ("false", 1, [], {}):
+        assert (
+            cli.source_allowed(
+                {"transports": {"kiro": {"source_allowed": malformed}}},
+                "dynamic-model",
+                transport="kiro",
+            )
+            is False
+        )
 
 
 @pytest.mark.parametrize(
@@ -8016,6 +8067,130 @@ def test_invoke_agy_reports_a_missing_binary(tmp_path: Path) -> None:
 
     assert exit_code == 127
     assert "No such file or directory" in error
+    assert response.response == ""
+
+
+def test_invoke_gemini_persists_headless_json_and_observed_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_gemini = write_fake_gemini(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("def send() -> None: pass\n")
+    request_path = tmp_path / "request.json"
+    response_path = tmp_path / "response.json"
+    session_path = tmp_path / "session.json"
+    diagnostic_path = tmp_path / "stderr.log"
+
+    exit_code, error, response = cli.invoke_gemini(
+        gemini_bin=str(fake_gemini),
+        prompt="Review the bounded synthetic source.",
+        model="gemini-3.6-flash",
+        files=[source],
+        max_output_tokens=123,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=request_path,
+        response_path=response_path,
+        session_path=session_path,
+        diagnostic_path=diagnostic_path,
+    )
+
+    assert exit_code == 0
+    assert error == ""
+    assert response == cli.PersistedResponse(
+        conversation_id="gemini-session",
+        cost_usd=None,
+        duration_ms=response.duration_ms,
+        input_tokens=12,
+        model="gemini-3.6-flash",
+        output_tokens=34,
+        provider="google-gemini-cli",
+        response='{"verdict": "approved", "findings": []}',
+    )
+    request_payload = json.loads(request_path.read_text())
+    assert request_payload["command"][0] == str(fake_gemini)
+    assert request_payload["command"][1:] == [
+        "--model",
+        "gemini-3.6-flash",
+        "--prompt",
+        "Read the complete review packet from standard input. Do not use tools or edit files.",
+        "--output-format",
+        "json",
+        "--approval-mode",
+        "plan",
+        "--sandbox",
+        "--skip-trust",
+    ]
+    assert request_payload["model"] == "gemini-3.6-flash"
+    assert request_payload["maxOutputTokens"] == 123
+    assert request_payload["approvalMode"] == "plan"
+    assert request_payload["sandbox"] is True
+    assert "source.py" in request_payload["prompt"]
+    assert json.loads(response_path.read_text())["session_id"] == "gemini-session"
+    assert json.loads(session_path.read_text())["session_id"] == "gemini-session"
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected_exit", "expected_error"),
+    [
+        ({"GEMINI_API_KEY": "exit:17"}, 17, ""),
+        ({"GEMINI_API_KEY": "invalid"}, 502, "Gemini returned invalid JSON"),
+        ({"GEMINI_API_KEY": "list"}, 502, "Gemini returned a non-object response"),
+        ({"GEMINI_API_KEY": "sleep:3"}, 124, "review attempt timed out"),
+    ],
+)
+def test_invoke_gemini_handles_process_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    expected_exit: int,
+    expected_error: str,
+) -> None:
+    fake_gemini = write_fake_gemini(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+
+    exit_code, error, response = cli.invoke_gemini(
+        gemini_bin=str(fake_gemini),
+        prompt="Review synthetic source.",
+        model="gemini-3.6-flash",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+        session_path=tmp_path / "session.json",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert exit_code == expected_exit
+    assert error == expected_error
+    assert response.response == ""
+
+
+def test_invoke_gemini_reports_a_missing_binary(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    exit_code, error, response = cli.invoke_gemini(
+        gemini_bin=str(tmp_path / "missing-gemini"),
+        prompt="Review synthetic source.",
+        model="gemini-3.6-flash",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+        session_path=tmp_path / "session.json",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert exit_code == 127
+    assert "executable not found" in error
     assert response.response == ""
 
 

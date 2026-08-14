@@ -55,9 +55,19 @@ entry under `[models.<id>]` overrides that default. This permits a
 runtime-owned local inventory without publishing a roster; it does not open
 OpenRouter, resolve an otherwise unresolved identity, or qualify a backend.
 
-The five legacy compatibility adapters are explicitly unqualified: `llm`,
-`openrouter`, `agy`, `pi`, and `codex`. They preserve existing route behavior
-without claiming conformance. Availability is not qualification.
+The local CLI adapters are explicitly unqualified: `llm`, `openrouter`, `agy`,
+`gemini`, `pi`, and `codex`. They preserve route behavior without claiming
+conformance. Availability is not qualification.
+
+Gemini CLI is a separate native adapter from Antigravity (`agy`). It runs the
+installed `gemini` executable in headless JSON mode with `--approval-mode plan`
+and `--sandbox`, and sends the frozen packet over standard input from a
+disposable working directory. The CLI's `response` and session identifier are
+retained; its per-model statistics remain raw evidence. The requested model is
+kept as requested identity because the CLI may resolve an alias to another
+model, so the adapter deliberately does not claim resolved model identity or
+qualification. Gemini's CLI does not expose a portable output-token cap, so
+the receipt records the requested value as unenforced.
 
 Kiro is a registered native agent-CLI adapter and remains unqualified. Its
 default executable is `kiro-cli`; `KIRO_BIN` overrides that executable.
