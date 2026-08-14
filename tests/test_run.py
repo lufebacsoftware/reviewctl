@@ -5748,6 +5748,14 @@ def test_legacy_digest_only_fixture_is_a_compatibility_routing_sentinel() -> Non
     assert cli.valid_receipt(receipt) is True
 
 
+def test_v1_unicode_receipt_keeps_legacy_ascii_escaped_digest_compatibility() -> None:
+    receipt = {"reviewId": "revisión-histórica", "result": "accepted"}
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+
+    assert b"\\u00f3" in cli.canonical_json(receipt)
+    assert cli.valid_receipt(receipt) is True
+
+
 def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     complete_response = {

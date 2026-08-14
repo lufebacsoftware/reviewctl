@@ -56,6 +56,9 @@ from reviewctl.contracts import (
     require_string_json_object_keys,
     valid_review_basename,
 )
+from reviewctl.contracts import (
+    canonical_json as contract_canonical_json,
+)
 from reviewctl.review_flow import (
     FallbackRelationship,
     PromotedFragment,
@@ -342,7 +345,7 @@ def canonical_json(value: object) -> bytes:
     require_string_json_object_keys(value)
     return json.dumps(
         value,
-        ensure_ascii=False,
+        ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -3872,7 +3875,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "name": contract_identity["name"],
                     "version": contract_identity["version"],
                     "status": "complete",
-                    "normalizedSha256": sha256_bytes(canonical_json(review)),
+                    "normalizedSha256": sha256_bytes(contract_canonical_json(review)),
                     "contractContext": {
                         "fileNames": [item["name"] for item in source_files],
                         "reviewDeclarationRequired": (
@@ -4072,7 +4075,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 ),
             }
 
-        receipt["sha256"] = sha256_bytes(canonical_json(receipt))
+        receipt["sha256"] = sha256_bytes(contract_canonical_json(receipt))
         (turn_dir / "receipt.json").write_bytes(canonical_json(receipt) + b"\n")
         log_event(
             logger,
