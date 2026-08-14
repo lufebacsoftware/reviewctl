@@ -842,6 +842,8 @@ def build_completion_context(
 
 def render_completion_prompt(original_prompt: str, context: CompletionContext) -> str:
     """Append only typed prior evidence, never the raw prior model response."""
+    if type(original_prompt) is not str:
+        raise ValueError("original prompt must be an exact string")
     if COMPLETION_CONTEXT_START in original_prompt or COMPLETION_CONTEXT_END in original_prompt:
         raise ValueError("original prompt collides with completion framing")
     if not _validate_completion_context(context):

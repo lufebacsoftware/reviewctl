@@ -1470,6 +1470,22 @@ def test_render_completion_prompt_rejects_original_prompt_marker_collision(marke
     assert "hidden" not in str(error.value)
 
 
+@pytest.mark.parametrize("original_prompt", [None, [], 1, HostileText("safe prompt")])
+def test_render_completion_prompt_requires_exact_string_prompt(
+    original_prompt: object,
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = build_completion_context(
+        evaluation.completion_request,
+        promoted(finding()),
+        allowed_file_names=("source.py",),
+        review_declaration_required=False,
+    )
+
+    with pytest.raises(ValueError, match="^original prompt must be an exact string$"):
+        render_completion_prompt(original_prompt, context)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
