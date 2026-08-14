@@ -121,13 +121,21 @@ CODEX_FINDINGS_SCHEMA = {
     },
 }
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ANSI_ESCAPE_BYTES = rb"\x1b\[[0-?]*[ -/]*[@-~]"
+KIRO_RESPONSE_PREFIX = re.compile(
+    rb"(?:" + ANSI_ESCAPE_BYTES + rb")*> (?:" + ANSI_ESCAPE_BYTES + rb")*"
+)
+KIRO_LEADING_UI = re.compile(rb"^(?:" + ANSI_ESCAPE_BYTES + rb")*")
+KIRO_TRAILING_UI = re.compile(rb"(?:" + ANSI_ESCAPE_BYTES + rb")+[\r\n]*$")
+KIRO_RAW_CREDITS_FOOTER = re.compile(
+    rb"\n(?:" + ANSI_ESCAPE_BYTES + rb"|[ \t\r\n])*"
+    rb"\xe2\x96\xb8 Credits: [0-9]+(?:\.[0-9]+)?"
+    rb"(?: \xe2\x80\xa2 Time: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h)"
+    rb"(?: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h))*)?"
+    rb"(?:" + ANSI_ESCAPE_BYTES + rb"|[ \t\r\n])*$"
+)
 KIRO_SESSION_ID = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
-)
-KIRO_CREDITS_FOOTER = re.compile(
-    r"^▸ Credits: [0-9]+(?:\.[0-9]+)?"
-    r"(?: • Time: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h)"
-    r"(?: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h))*)?$"
 )
 KIRO_REVIEW_AGENT = {
     "name": "reviewctl_readonly",
@@ -1735,27 +1743,20 @@ def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
     """Decode known Kiro UI framing for the JSON-only review contract."""
     if response_contract != "findings-json":
         raise ValueError("Kiro output normalization supports only findings-json")
-    text = ANSI_ESCAPE.sub("", stdout.decode()).replace("\r\n", "\n")
-    lines = text.split("\n")
-    start = next((index for index, line in enumerate(lines) if line.startswith("> ")), None)
-    if start is None:
+    prefix = KIRO_RESPONSE_PREFIX.search(stdout)
+    if prefix is None:
         return ""
-    lines[start] = lines[start][2:]
-    lines = lines[start:]
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if lines and KIRO_CREDITS_FOOTER.fullmatch(lines[-1].strip()):
-        lines.pop()
-        while lines and not lines[-1].strip():
-            lines.pop()
-    if (
-        response_contract.endswith("-json")
-        and len(lines) > 1
-        and lines[0].strip() == "json"
-        and lines[1].lstrip().startswith(("{", "["))
-    ):
-        lines.pop(0)
-    return "\n".join(lines)
+    payload = stdout[prefix.end() :]
+    footer = KIRO_RAW_CREDITS_FOOTER.search(payload)
+    if footer is not None:
+        payload = payload[: footer.start()]
+    payload = KIRO_TRAILING_UI.sub(b"", payload)
+    payload = KIRO_LEADING_UI.sub(b"", payload)
+    if payload.startswith(b"json\n"):
+        candidate = KIRO_LEADING_UI.sub(b"", payload[len(b"json\n") :])
+        if candidate.lstrip().startswith((b"{", b"[")):
+            payload = candidate
+    return payload.decode().replace("\r\n", "\n").strip("\r\n")
 
 
 def kiro_model_inventory(payload: bytes) -> tuple[tuple[str, ...], str]:

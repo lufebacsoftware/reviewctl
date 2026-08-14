@@ -7935,6 +7935,8 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
     assert cli.normalize_kiro_output(escaped_ansi, "findings-json") == (
         '{"value":"\\u001b[31mred\\u001b[0m"}'
     )
+    literal_ansi = b'> {"value":"a\x1b[31mb"}\n'
+    assert cli.normalize_kiro_output(literal_ansi, "findings-json") == ('{"value":"a\x1b[31mb"}')
     with pytest.raises(ValueError, match="only findings-json"):
         cli.normalize_kiro_output(fenced_json, "document")
     with pytest.raises(UnicodeDecodeError):
