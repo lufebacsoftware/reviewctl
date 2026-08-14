@@ -648,6 +648,26 @@ def test_promote_fragments_rejects_manually_duplicated_fragment_ids() -> None:
     assert result == ()
 
 
+def test_promote_fragments_rejects_manually_reordered_fragments() -> None:
+    evaluation = incomplete_evaluation(
+        finding(line=1, title="First"),
+        finding(line=9, title="Second"),
+    )
+    canonical = tuple(sorted(evaluation.valid_fragments, key=lambda fragment: fragment.fragment_id))
+    reordered = tuple(reversed(canonical))
+
+    result = promote_fragments(
+        replace(evaluation, valid_fragments=reordered),
+        contract_context=ContractContext(file_names=("source.py",)),
+        gate_result="contract-incomplete",
+        attempt=1,
+        route_index=0,
+        raw_response_digest=evaluation.payload_digest,
+    )
+
+    assert result == ()
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -2593,6 +2613,25 @@ def test_validate_v2_receipt_requires_exact_complete_fragment_promotion(mutation
     _sign_receipt(receipt)
 
     assert "promoted-fragments" in validate_v2_receipt(receipt), mutation
+
+
+def test_validate_v2_receipt_rejects_joint_fragment_and_promotion_reordering() -> None:
+    receipt, promoted = v2_two_promotions_receipt()
+    first = receipt["attempts"][0]
+    first["contractEvaluation"]["fragments"].reverse()
+    first["promotedFragments"].reverse()
+    receipt["consolidatedReview"] = consolidate(
+        {"verdict": "approved", "findings": []},
+        tuple(reversed(promoted)),
+        2,
+        contract_context=ContractContext(file_names=("source.py",)),
+    ).to_dict()
+    _sign_receipt(receipt)
+
+    violations = validate_v2_receipt(receipt)
+
+    assert "contract-fragments" in violations
+    assert "contract-evaluation" in violations
 
 
 def test_validate_v2_receipt_rejects_complete_duplicate_findings() -> None:

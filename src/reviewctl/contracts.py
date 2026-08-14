@@ -546,6 +546,7 @@ class FindingsJsonContract:
                     scope=scope,
                 )
             )
+        fragments.sort(key=lambda fragment: fragment.fragment_id)
 
         if violation is not None:
             violations = (violation,)

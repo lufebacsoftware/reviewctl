@@ -521,6 +521,17 @@ class ConsolidatedReview:
         }
 
 
+def _contract_fragments_are_canonical(value: object) -> bool:
+    """Require one unique ascending fragment-id sequence at every trust boundary."""
+    if type(value) is not tuple or not all(
+        isinstance(fragment, ContractFragment) and type(fragment.fragment_id) is str
+        for fragment in value
+    ):
+        return False
+    fragment_ids = [fragment.fragment_id for fragment in value]
+    return fragment_ids == sorted(set(fragment_ids))
+
+
 def _valid_incomplete_evaluation(
     evaluation: ContractEvaluation,
     context: ContractContext,
@@ -545,11 +556,8 @@ def _valid_incomplete_evaluation(
             or type(evaluation.violations) is not tuple
             or not evaluation.violations
             or not all(type(violation) is str for violation in evaluation.violations)
-            or type(evaluation.valid_fragments) is not tuple
             or not evaluation.valid_fragments
-            or not all(
-                isinstance(fragment, ContractFragment) for fragment in evaluation.valid_fragments
-            )
+            or not _contract_fragments_are_canonical(evaluation.valid_fragments)
             or not isinstance(coverage, ContractCoverage)
             or not isinstance(request, ContractCompletionRequest)
         ):
@@ -655,7 +663,7 @@ def _promote_contract_fragments(
 ) -> tuple[PromotedFragment, ...] | None:
     """Reproduce the exact promoted list from validated contract fragments."""
     if (
-        type(fragments) is not tuple
+        not _contract_fragments_are_canonical(fragments)
         or contract_name != "findings-json"
         or contract_version != "1"
         or not valid_contract_context(contract_context, require_file_names=True)
@@ -1410,10 +1418,10 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     contract_fragments.append(fragment)
 
                 contract_fragment_ids = [fragment["fragmentId"] for fragment in contract_fragments]
-                contract_fragments_unique = len(contract_fragment_ids) == len(
+                contract_fragments_canonical = contract_fragment_ids == sorted(
                     set(contract_fragment_ids)
                 )
-                if not contract_fragments_unique:
+                if not contract_fragments_canonical:
                     reject("contract-fragments")
 
                 coverage = _receipt_coverage(evaluation.get("coverage"))
@@ -1434,7 +1442,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 if declaration_required:
                     expected_required.append("reviewedFiles")
                 coverage_valid = coverage is not None and coverage[0] == expected_required
-                state_valid = identity_valid and contract_fragments_unique
+                state_valid = identity_valid and contract_fragments_canonical
                 if evaluation_status == "complete":
                     state_valid = (
                         state_valid

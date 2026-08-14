@@ -673,6 +673,29 @@ def test_repeated_findings_are_canonicalized_in_complete_normalized_value() -> N
     assert len(evaluation.valid_fragments) == 1
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_distinct_fragments_are_emitted_in_canonical_id_order(reverse: bool) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    findings = [
+        finding_payload(line=1, title="Finding 0")["findings"][0],
+        finding_payload(line=3, title="Finding 2")["findings"][0],
+    ]
+    if reverse:
+        findings.reverse()
+
+    evaluation = contract.evaluate(
+        json.dumps({"verdict": "changes-requested", "findings": findings, "extra": True}),
+        contract.prepare(context),
+        context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
+
+    fragment_ids = [fragment.fragment_id for fragment in evaluation.valid_fragments]
+    assert len(fragment_ids) == 2
+    assert fragment_ids == sorted(fragment_ids)
+
+
 @pytest.mark.parametrize(
     "invalid_finding",
     [
