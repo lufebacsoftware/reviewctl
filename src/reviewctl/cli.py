@@ -3522,7 +3522,6 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 "providerPreferences": provider_preferences,
                 "rawResponse": raw_response,
                 "attemptRequestSha256": sha256_bytes(attempt_prompt.encode()),
-                "promotedFragments": [fragment.to_dict() for fragment in newly_promoted],
                 "result": result,
                 "route": {"model": model, "transport": transport},
                 "validationError": validation_error,
@@ -3555,6 +3554,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                         ),
                     },
                 }
+            if native_contract:
+                attempt["promotedFragments"] = [fragment.to_dict() for fragment in newly_promoted]
             if contract_evaluation:
                 attempt["contractEvaluation"] = {
                     "name": contract_evaluation.name,

@@ -490,7 +490,6 @@ def v2_legacy_receipt(review_contract: str = "document") -> dict[str, object]:
                     "sha256": "a" * 64,
                     "characters": 30,
                 },
-                "promotedFragments": [],
             }
         ],
     }
@@ -4424,6 +4423,26 @@ def test_validate_v2_receipt_rejects_contract_swap_with_multiple_native_residues
     violations = validate_v2_receipt(receipt)
     assert "review-contract" in violations
     assert "contract-evaluation" in violations
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("completionRequest", {"hostile": True}), ("promotedFragments", [])],
+)
+@pytest.mark.parametrize(
+    "review_contract",
+    ["document", "verdict", "product-review-json", "product-judge-json"],
+)
+def test_validate_v2_receipt_rejects_attempt_only_findings_fields_for_legacy_contracts(
+    review_contract: str,
+    field: str,
+    value: object,
+) -> None:
+    receipt = v2_legacy_receipt(review_contract)
+    receipt["attempts"][0][field] = value
+    _sign_receipt(receipt)
+
+    assert "review-contract" in validate_v2_receipt(receipt)
 
 
 @pytest.mark.parametrize(

@@ -38,6 +38,11 @@ class HostileText(str):
         raise AssertionError("hostile hash executed")
 
 
+class HostileDict(dict[str, object]):
+    def __iter__(self):
+        raise AssertionError("hostile dictionary iteration executed")
+
+
 class PreparedContractSubclass(PreparedContract):
     pass
 
@@ -305,6 +310,12 @@ def test_valid_finding_rejects_hostile_text_subclasses_without_invoking_them(
     value = finding_payload()["findings"][0]
 
     assert valid_finding({**value, field: HostileText(str(value[field]))}) is False
+
+
+def test_valid_finding_rejects_dictionary_subclasses_before_iteration() -> None:
+    value = HostileDict(finding_payload()["findings"][0])
+
+    assert valid_finding(value) is False
 
 
 def test_findings_contract_rejects_hostile_payload_subclass_without_invoking_it() -> None:

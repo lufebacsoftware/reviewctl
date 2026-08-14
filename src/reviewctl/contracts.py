@@ -30,6 +30,7 @@ FINDINGS_CONTRACT_VIOLATION_CODES = frozenset(
     }
 )
 
+
 FINDINGS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["verdict", "findings"],
@@ -311,7 +312,7 @@ def exact_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
-class _FrozenDict(dict[str, Any]):
+class FrozenDict(dict[str, Any]):
     """JSON-compatible dictionary with immutable v1 finding values."""
 
     def _reject_mutation(self, *args: object, **kwargs: object) -> NoReturn:
@@ -326,10 +327,10 @@ class _FrozenDict(dict[str, Any]):
     update = _reject_mutation
     __ior__ = _reject_mutation
 
-    def __copy__(self) -> _FrozenDict:
+    def __copy__(self) -> FrozenDict:
         return self
 
-    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenDict:
+    def __deepcopy__(self, memo: dict[int, object]) -> FrozenDict:
         memo[id(self)] = self
         return self
 
@@ -351,7 +352,7 @@ def _contains_surrogate(value: object) -> bool:
 
 def valid_finding(value: object) -> bool:
     """Validate one finding before any canonical identity operation."""
-    if not isinstance(value, dict) or set(value) != FINDING_FIELDS:
+    if type(value) not in {dict, FrozenDict} or set(value) != FINDING_FIELDS:
         return False
     severity = value["severity"]
     if type(severity) is not str or severity not in FINDING_SEVERITIES:
@@ -381,7 +382,7 @@ def _validate_finding(
         return None, "finding-value"
     if context.file_names and finding["path"] not in context.file_names:
         return None, "finding-path"
-    return _FrozenDict(finding), None
+    return FrozenDict(finding), None
 
 
 class FindingsJsonContract:

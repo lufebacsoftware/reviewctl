@@ -847,7 +847,10 @@ def test_precontract_gates_never_invoke_native_or_legacy_evaluation(
     assert len(requests) == 1
     attempt = receipt["attempts"][0]
     assert attempt["result"] == expected_gate
-    assert attempt["promotedFragments"] == []
+    if response_contract == "findings-json":
+        assert attempt["promotedFragments"] == []
+    else:
+        assert "promotedFragments" not in attempt
     assert attempt["validationError"] is None
     assert "contractEvaluation" not in attempt
     if response_overrides["response"] is None:

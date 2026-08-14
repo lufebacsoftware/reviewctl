@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any
 
 from reviewctl.contracts import (
     FINDING_FIELDS,
@@ -16,6 +16,7 @@ from reviewctl.contracts import (
     ContractFragment,
     EvaluationStatus,
     FragmentKind,
+    FrozenDict,
     canonical_json,
     findings_required_fields,
     get_contract,
@@ -75,35 +76,12 @@ _VIOLATION_COVERAGE_RULES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 }
 
 
-class _FrozenDict(dict[str, Any]):
-    """JSON-compatible immutable mapping for identity-bound public values."""
-
-    def _reject_mutation(self, *args: object, **kwargs: object) -> NoReturn:
-        raise TypeError("review flow values are immutable")
-
-    __setitem__ = _reject_mutation
-    __delitem__ = _reject_mutation
-    clear = _reject_mutation
-    pop = _reject_mutation
-    popitem = _reject_mutation
-    setdefault = _reject_mutation
-    update = _reject_mutation
-    __ior__ = _reject_mutation
-
-    def __copy__(self) -> _FrozenDict:
-        return self
-
-    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenDict:
-        memo[id(self)] = self
-        return self
-
-
 def _copy_finding(value: dict[str, Any]) -> dict[str, Any]:
-    return _FrozenDict({field: value[field] for field in sorted(FINDING_FIELDS)})
+    return FrozenDict({field: value[field] for field in sorted(FINDING_FIELDS)})
 
 
 def _freeze_source(value: dict[str, object]) -> dict[str, object]:
-    return _FrozenDict(value)
+    return FrozenDict(value)
 
 
 def _receipt_valid_finding(value: object, context: ContractContext | None) -> bool:
@@ -339,7 +317,7 @@ class PromotedFragment:
     contract_context: ContractContext
 
     def provenance_dict(self) -> dict[str, object]:
-        return _FrozenDict(
+        return FrozenDict(
             {
                 "attempt": self.source_attempt,
                 "fragmentId": self.fragment_id,
@@ -1346,7 +1324,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 reject("contract-evaluation")
             if not product_contract and "contractOutput" in attempt:
                 reject("review-contract")
-            if attempt.get("promotedFragments") != []:
+            if "completionRequest" in attempt or "promotedFragments" in attempt:
                 reject("review-contract")
     all_promoted: list[PromotedFragment] = []
     normalized_by_attempt: dict[int, dict[str, Any]] = {}
