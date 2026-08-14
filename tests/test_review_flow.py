@@ -611,8 +611,12 @@ def test_promote_fragments_rejects_malformed_authoritative_context(
     )
 
 
-def test_promote_fragments_deduplicates_identical_incomplete_siblings_by_id() -> None:
-    evaluation = incomplete_evaluation(finding(), finding())
+def test_evaluator_canonicalizes_identical_findings_before_promotion() -> None:
+    evaluation = incomplete_evaluation(
+        finding(),
+        finding(),
+        finding(severity="urgent"),
+    )
 
     result = promote_fragments(
         evaluation,
@@ -623,9 +627,25 @@ def test_promote_fragments_deduplicates_identical_incomplete_siblings_by_id() ->
         raw_response_digest=evaluation.payload_digest,
     )
 
-    assert len(evaluation.valid_fragments) == 2
-    assert evaluation.valid_fragments[0].fragment_id == evaluation.valid_fragments[1].fragment_id
+    assert evaluation.violations == ("response-fields",)
+    assert len(evaluation.valid_fragments) == 1
     assert len(result) == 1
+
+
+def test_promote_fragments_rejects_manually_duplicated_fragment_ids() -> None:
+    evaluation = incomplete_evaluation(finding())
+    fragment = evaluation.valid_fragments[0]
+
+    result = promote_fragments(
+        replace(evaluation, valid_fragments=(fragment, fragment)),
+        contract_context=ContractContext(file_names=("source.py",)),
+        gate_result="contract-incomplete",
+        attempt=1,
+        route_index=0,
+        raw_response_digest=evaluation.payload_digest,
+    )
+
+    assert result == ()
 
 
 @pytest.mark.parametrize(
@@ -1838,7 +1858,7 @@ def test_consolidate_rejects_invalid_accepted_attempt_but_preserves_partial_evid
         "route_index",
     ],
 )
-def test_consolidate_discards_promoted_fragments_with_divergent_identity(tamper: str) -> None:
+def test_consolidate_rejects_promoted_fragments_with_divergent_identity(tamper: str) -> None:
     fragment = promoted(finding())[0]
     if tamper == "finding":
         fragment = replace(fragment, finding={**fragment.finding, "title": "Changed"})
@@ -1870,6 +1890,7 @@ def test_consolidate_discards_promoted_fragments_with_divergent_identity(tamper:
     )
 
     assert result.status == "unavailable"
+    assert result.approved is False
     assert result.findings == ()
 
 
@@ -1888,9 +1909,8 @@ def test_consolidate_validates_mixed_untrusted_fragments_before_sorting() -> Non
 
     assert canonical_json(forward.to_dict()) == canonical_json(reverse.to_dict())
     assert forward.status == "unavailable"
-    assert len(forward.findings) == 1
-    assert forward.findings[0].finding == finding()
-    assert [source["attempt"] for source in forward.findings[0].sources] == [2]
+    assert forward.approved is False
+    assert forward.findings == ()
 
 
 def test_consolidate_rejects_an_impossible_accepted_verdict_finding_pair() -> None:
@@ -1916,21 +1936,29 @@ def test_consolidate_fails_closed_for_invalid_accepted_finding() -> None:
     assert result.status == "unavailable"
 
 
-def test_consolidate_ignores_invalid_untrusted_promoted_object() -> None:
-    fragment = replace(promoted(finding())[0], finding={"title": "partial"})
+@pytest.mark.parametrize("malformed", [object(), "wrong-context"])
+def test_consolidate_rejects_any_malformed_promoted_evidence(malformed: object) -> None:
+    fragment: object = malformed
+    if malformed == "wrong-context":
+        fragment = replace(
+            promoted(finding())[0],
+            contract_context=ContractContext(file_names=("other.py", "source.py")),
+        )
 
     result = consolidate(
         {"verdict": "approved", "findings": []},
-        (fragment,),
+        (fragment,),  # type: ignore[arg-type]
         accepted_attempt=2,
         contract_context=ContractContext(file_names=("source.py",)),
     )
 
-    assert result.status == "accepted"
+    assert result.status == "unavailable"
+    assert result.approved is False
+    assert result.accepted_attempt is None
     assert result.findings == ()
 
 
-def test_consolidate_ignores_unencodable_promoted_finding_without_exception() -> None:
+def test_consolidate_rejects_unencodable_promoted_finding_without_exception() -> None:
     fragment = replace(promoted(finding())[0], finding={**finding(), "line": 10**5000})
 
     result = consolidate(
@@ -1940,7 +1968,8 @@ def test_consolidate_ignores_unencodable_promoted_finding_without_exception() ->
         contract_context=ContractContext(file_names=("source.py",)),
     )
 
-    assert result.status == "accepted"
+    assert result.status == "unavailable"
+    assert result.approved is False
     assert result.findings == ()
 
 
@@ -2522,14 +2551,17 @@ def test_validate_v2_receipt_rejects_transport_that_contradicts_declaration_flag
     assert "contract-evaluation" in validate_v2_receipt(receipt)
 
 
-def test_validate_v2_receipt_preserves_duplicate_contract_fragments() -> None:
+def test_validate_v2_receipt_rejects_duplicate_contract_fragment_ids() -> None:
     receipt = v2_findings_receipt()
     evaluation = receipt["attempts"][0]["contractEvaluation"]
     evaluation["fragments"].append(deepcopy(evaluation["fragments"][0]))
     _sign_receipt(receipt)
 
-    assert len(receipt["attempts"][0]["promotedFragments"]) == 1
-    assert validate_v2_receipt(receipt) == ()
+    violations = validate_v2_receipt(receipt)
+
+    assert "contract-fragments" in violations
+    assert "contract-evaluation" in violations
+    assert "promoted-fragments" in violations
 
 
 @pytest.mark.parametrize("mutation", ["omission", "reorder", "duplicate", "reidentified"])
@@ -2563,7 +2595,7 @@ def test_validate_v2_receipt_requires_exact_complete_fragment_promotion(mutation
     assert "promoted-fragments" in validate_v2_receipt(receipt), mutation
 
 
-def test_validate_v2_receipt_accepts_complete_duplicate_findings() -> None:
+def test_validate_v2_receipt_rejects_complete_duplicate_findings() -> None:
     receipt = v2_findings_receipt()
     accepted = receipt["attempts"][1]
     evaluation = accepted["contractEvaluation"]
@@ -2611,7 +2643,10 @@ def test_validate_v2_receipt_accepts_complete_duplicate_findings() -> None:
     ).to_dict()
     _sign_receipt(receipt)
 
-    assert validate_v2_receipt(receipt) == ()
+    violations = validate_v2_receipt(receipt)
+
+    assert "contract-fragments" in violations
+    assert "contract-evaluation" in violations
 
 
 def test_validate_v2_receipt_rejects_orphan_post_gate_incomplete_attempt() -> None:

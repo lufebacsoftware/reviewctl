@@ -453,6 +453,7 @@ class FindingsJsonContract:
             violation = "findings-shape"
 
         normalized_findings: list[dict[str, Any]] = []
+        normalized_finding_identities: set[bytes] = set()
         invalid_fragment_indexes: list[int] = []
         first_finding_violation: str | None = None
         if findings_are_list:
@@ -464,6 +465,10 @@ class FindingsJsonContract:
                         first_finding_violation = finding_violation
                     continue
                 assert normalized_finding is not None
+                finding_identity = canonical_json(normalized_finding)
+                if finding_identity in normalized_finding_identities:
+                    continue
+                normalized_finding_identities.add(finding_identity)
                 normalized_findings.append(normalized_finding)
         verdict_invariant = (
             verdict_valid and findings_are_list and (verdict == "approved") == (not findings)

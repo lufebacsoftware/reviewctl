@@ -5490,7 +5490,10 @@ def test_generated_complete_duplicate_findings_receipt_self_verifies(tmp_path: P
     assert result.returncode == 0, result.stderr
     receipt_path = Path(result.stdout.strip()) / "receipt.json"
     receipt = json.loads(receipt_path.read_text())
-    assert len(receipt["attempts"][0]["contractEvaluation"]["fragments"]) == 2
+    evaluation = receipt["attempts"][0]["contractEvaluation"]
+    assert len(evaluation["fragments"]) == 1
+    assert evaluation["normalizedValue"]["findings"] == [duplicate]
+    assert receipt["findings"] == [duplicate]
     assert receipt["attempts"][0]["promotedFragments"] == []
     verified = run_cli("verify", str(receipt_path))
     assert verified.returncode == 0, verified.stderr
@@ -5522,7 +5525,7 @@ def test_generated_incomplete_duplicate_findings_promote_once_and_self_verify(
 
     assert return_code == 1
     attempt = receipt["attempts"][0]
-    assert len(attempt["contractEvaluation"]["fragments"]) == 2
+    assert len(attempt["contractEvaluation"]["fragments"]) == 1
     assert len(attempt["promotedFragments"]) == 1
     assert cli.validate_v2_receipt(receipt) == ()
 

@@ -702,7 +702,7 @@ def _promote_contract_fragments(
         ):
             return None
         if fragment.fragment_id in promoted_ids:
-            continue
+            return None
         promoted_ids.add(fragment.fragment_id)
         promoted.append(
             PromotedFragment(
@@ -822,24 +822,35 @@ def consolidate(
     contract_context: ContractContext,
 ) -> ConsolidatedReview:
     """Combine accepted and partial findings without manufacturing acceptance or dispute."""
-    if not valid_contract_context(contract_context, require_file_names=True):
-        return ConsolidatedReview(
-            status="unavailable",
-            verdict=None,
-            approved=False,
-            accepted_attempt=None,
-            findings=(),
-        )
+    unavailable = ConsolidatedReview(
+        status="unavailable",
+        verdict=None,
+        approved=False,
+        accepted_attempt=None,
+        findings=(),
+    )
+    if (
+        not valid_contract_context(contract_context, require_file_names=True)
+        or type(promoted_fragments) is not tuple
+    ):
+        return unavailable
+    try:
+        expected_prepared_digest = get_contract("findings-json").prepare(contract_context).digest
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return unavailable
     validated_fragments: list[tuple[PromotedFragment, dict[str, Any]]] = []
+    promoted_provenance: set[tuple[str, int]] = set()
     for fragment in promoted_fragments:
         finding = _validated_promoted_finding(fragment)
         if (
-            finding is not None
-            and fragment.contract_context == contract_context
-            and fragment.prepared_digest
-            == get_contract("findings-json").prepare(contract_context).digest
+            finding is None
+            or fragment.contract_context != contract_context
+            or fragment.prepared_digest != expected_prepared_digest
+            or (fragment.fragment_id, fragment.source_attempt) in promoted_provenance
         ):
-            validated_fragments.append((fragment, finding))
+            return unavailable
+        promoted_provenance.add((fragment.fragment_id, fragment.source_attempt))
+        validated_fragments.append((fragment, finding))
 
     groups: dict[str, dict[str, Any]] = {}
     for fragment, finding in sorted(
@@ -1398,6 +1409,13 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         continue
                     contract_fragments.append(fragment)
 
+                contract_fragment_ids = [fragment["fragmentId"] for fragment in contract_fragments]
+                contract_fragments_unique = len(contract_fragment_ids) == len(
+                    set(contract_fragment_ids)
+                )
+                if not contract_fragments_unique:
+                    reject("contract-fragments")
+
                 coverage = _receipt_coverage(evaluation.get("coverage"))
                 normalized_value = _receipt_normalized_review(evaluation.get("normalizedValue"))
                 if normalized_value is not None and not all(
@@ -1416,7 +1434,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 if declaration_required:
                     expected_required.append("reviewedFiles")
                 coverage_valid = coverage is not None and coverage[0] == expected_required
-                state_valid = identity_valid
+                state_valid = identity_valid and contract_fragments_unique
                 if evaluation_status == "complete":
                     state_valid = (
                         state_valid

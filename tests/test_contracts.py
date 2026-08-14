@@ -638,6 +638,41 @@ def test_mixed_findings_extract_only_valid_siblings_and_request_completion() -> 
     assert evaluation.completion_request.violations == ("finding-value",)
 
 
+def test_repeated_valid_findings_are_canonicalized_before_incomplete_evaluation() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    valid = finding_payload()["findings"][0]
+    invalid = {**valid, "severity": "urgent"}
+
+    evaluation = contract.evaluate(
+        json.dumps({"verdict": "changes-requested", "findings": [valid, valid, invalid]}),
+        contract.prepare(context),
+        context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
+
+    assert evaluation.status is EvaluationStatus.INCOMPLETE
+    assert evaluation.violations == ("finding-value",)
+    assert len(evaluation.valid_fragments) == 1
+    assert evaluation.valid_fragments[0].value == valid
+
+
+def test_repeated_findings_are_canonicalized_in_complete_normalized_value() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",))
+    valid = finding_payload()["findings"][0]
+
+    evaluation = contract.evaluate(
+        json.dumps({"verdict": "changes-requested", "findings": [valid, valid]}),
+        contract.prepare(context),
+        context,
+    )
+
+    assert evaluation.status is EvaluationStatus.COMPLETE
+    assert evaluation.value == {"verdict": "changes-requested", "findings": [valid]}
+    assert len(evaluation.valid_fragments) == 1
+
+
 @pytest.mark.parametrize(
     "invalid_finding",
     [
