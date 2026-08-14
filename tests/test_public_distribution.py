@@ -186,6 +186,7 @@ def test_architecture_documents_the_unqualified_kiro_backend_boundary() -> None:
         "any merge gate must reject that explicit indicator",
         "receipt verification rejects an accepted kiro receipt if either value is absent "
         "or changed",
+        "legacy schema-v1 receipts cannot claim kiro",
         "advisory read-only",
         "`sourceisolation: unavailable`",
         "not os sandbox enforcement",
@@ -208,6 +209,7 @@ def test_help_documents_kiro_selection_policy_and_failure_recovery() -> None:
         "`extension.mergegateeligible = false`",
         "merge automation must reject that flag",
         "`reviewctl verify` rejects a kiro receipt if either value is missing or changed",
+        "legacy schema-v1 receipts that claim the kiro transport fail verification",
         "does not use openrouter",
         "does not inherit ambient provider, aws, or api-token variables",
         "proprietary kiro source requires both policy decisions",

@@ -161,6 +161,8 @@ qualified merge approval. The receipt records
 and `reviewctl verify` rejects a Kiro receipt if either value is missing or
 changed. Humans or a later qualified reviewer may still use the advisory
 findings.
+Legacy schema-v1 receipts that claim the Kiro transport fail verification;
+Kiro receipts require schema v2 and its backend-qualification fields.
 
 Handle Kiro agent errors as follows:
 

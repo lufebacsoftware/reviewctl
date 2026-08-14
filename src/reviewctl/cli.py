@@ -4225,6 +4225,29 @@ def valid_receipt(receipt: dict[str, Any]) -> bool:
     return isinstance(recorded, str) and recorded == reproduced
 
 
+def legacy_receipt_declares_transport(receipt: dict[str, Any], transport: str) -> bool:
+    """Detect a transport claim in the routing positions of a legacy receipt."""
+    if receipt.get("transport") == transport:
+        return True
+    routes = receipt.get("routes")
+    if type(routes) is list and any(
+        type(route) is dict and route.get("transport") == transport for route in routes
+    ):
+        return True
+    attempts = receipt.get("attempts")
+    if type(attempts) is not list:
+        return False
+    for attempt in attempts:
+        if type(attempt) is not dict:
+            continue
+        route = attempt.get("route")
+        if attempt.get("transport") == transport or (
+            type(route) is dict and route.get("transport") == transport
+        ):
+            return True
+    return False
+
+
 def verify_receipt(args: argparse.Namespace) -> int:
     receipt_path = Path(args.receipt)
 
@@ -4243,7 +4266,12 @@ def verify_receipt(args: argparse.Namespace) -> int:
         if not isinstance(receipt, dict):
             violations = ("receipt-object",)
         elif "receiptSchemaVersion" not in receipt:
-            violations = () if valid_receipt(receipt) else ("receipt-digest",)
+            if not valid_receipt(receipt):
+                violations = ("receipt-digest",)
+            elif legacy_receipt_declares_transport(receipt, "kiro"):
+                violations = ("backend-qualification",)
+            else:
+                violations = ()
         elif receipt.get("receiptSchemaVersion") == 2 and not isinstance(
             receipt.get("receiptSchemaVersion"), bool
         ):

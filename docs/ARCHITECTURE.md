@@ -103,6 +103,8 @@ declared contract. The same receipt records
 indicator. Receipt verification rejects an accepted Kiro receipt if either
 value is absent or changed; the advisory response remains available for
 consolidation or later review instead of being discarded.
+Legacy schema-v1 receipts cannot claim Kiro because that schema predates the
+backend-qualification boundary.
 
 Setup diagnostics observe only executable presence and version for registered
 executable backends. Setup diagnostics never authenticate, call a model or

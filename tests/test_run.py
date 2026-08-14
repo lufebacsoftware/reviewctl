@@ -11,11 +11,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import closing
 from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -5897,6 +5899,31 @@ def test_immutable_v1_receipt_fixtures_verify_by_embedded_digest(
     verified = run_cli("verify", str(fixture_path))
     assert verified.returncode == 0, verified.stderr
     assert json.loads(verified.stdout)["valid"] is True
+
+
+@pytest.mark.parametrize(
+    "mutate_transport",
+    [
+        lambda receipt: receipt.__setitem__("transport", "kiro"),
+        lambda receipt: receipt["routes"][0].__setitem__("transport", "kiro"),
+        lambda receipt: receipt["attempts"][0].__setitem__("transport", "kiro"),
+        lambda receipt: receipt["attempts"][0]["route"].__setitem__("transport", "kiro"),
+    ],
+)
+def test_v1_receipts_cannot_claim_the_kiro_transport(
+    tmp_path: Path, mutate_transport: Callable[[dict[str, Any]], None]
+) -> None:
+    receipt = json.loads((V1_RECEIPT_FIXTURES / "accepted-findings-v1.json").read_text())
+    mutate_transport(receipt)
+    receipt.pop("sha256")
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "forged-v1-kiro.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    assert cli.valid_receipt(receipt) is True
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["backend-qualification"]
 
 
 def test_legacy_digest_only_fixture_is_a_compatibility_routing_sentinel() -> None:
