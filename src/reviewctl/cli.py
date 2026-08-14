@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from collections.abc import Iterator, Mapping
@@ -1536,6 +1537,18 @@ def source_allowed(policy: dict[str, Any], model: str) -> bool:
     return bool(policy.get("models", {}).get(model, {}).get("source_allowed", False))
 
 
+def unresolved_identity_waived(policy: dict[str, Any], model: str) -> bool:
+    entry = policy.get("models", {}).get(model, {})
+    return type(entry) is dict and entry.get("allow_unresolved_identity") is True
+
+
+def reap_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.wait()
+    except (ChildProcessError, OSError):
+        pass
+
+
 def terminate_process_group(process: subprocess.Popen[bytes], *, grace_seconds: float = 5) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -1544,7 +1557,12 @@ def terminate_process_group(process: subprocess.Popen[bytes], *, grace_seconds: 
             try:
                 process.wait(timeout=0)
             except (ProcessLookupError, subprocess.TimeoutExpired):
-                pass
+                threading.Thread(
+                    target=reap_process,
+                    args=(process,),
+                    daemon=True,
+                    name=f"reviewctl-reap-{process.pid}",
+                ).start()
             return
         process.wait(timeout=grace_seconds)
     except ProcessLookupError:
@@ -3505,6 +3523,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         for route in kiro_routes:
             if not source_allowed(loaded_policy, route.model):
                 parser.error(f"policy does not allow Kiro model {route.model}")
+            if not unresolved_identity_waived(loaded_policy, route.model):
+                parser.error(
+                    f"policy must explicitly allow unresolved Kiro model identity for {route.model}"
+                )
+    kiro_identity_waiver = args.source_class == "proprietary" and bool(kiro_routes)
     artifact_root = Path(args.artifact_root)
     log_path = (
         Path(args.log_file).expanduser()
@@ -4055,6 +4078,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "rotation": {"maxBytes": 5 * 1024 * 1024, "backupCount": 5},
         },
     }
+    if kiro_identity_waiver:
+        receipt["extension.kiroUnresolvedIdentityWaiver"] = True
     if native_contract:
         assert consolidation_context is not None
         receipt["fallbackRelationships"] = [

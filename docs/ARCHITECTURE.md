@@ -81,8 +81,11 @@ inventory and its digest even when inventory discovery or validation fails.
 This boundary provides advisory read-only behavior and tool control with
 `sourceIsolation: unavailable`. The disposable directory and reduced process
 environment are not OS sandbox enforcement. Proprietary Kiro source therefore
-requires an explicit policy allowing the exact Kiro model before any source
-bytes are sent. Synthetic runs do not require that policy.
+requires both `source_allowed = true` and `allow_unresolved_identity = true`
+for the requested model before any source bytes are sent. The second decision
+is an explicit, receipt-recorded waiver: it does not turn the requested model
+into an observed identity or qualify the backend. Synthetic runs do not require
+that policy or waiver.
 
 Setup diagnostics observe only executable presence and version for registered
 executable backends. Setup diagnostics never authenticate, call a model or

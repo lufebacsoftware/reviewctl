@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 from contextlib import closing
 from copy import deepcopy
@@ -582,12 +583,19 @@ def test_proprietary_kiro_requires_an_authorizing_policy_for_every_kiro_route(
     denied = run_cli(*arguments, "--policy", str(policy), env={"KIRO_BIN": str(fake_kiro)})
     assert denied.returncode == 2
     assert "does not allow kiro model claude-sonnet-5" in denied.stderr.lower()
+
+    policy.write_text('[models."claude-sonnet-5"]\nsource_allowed = true\n')
+    unwaived = run_cli(*arguments, "--policy", str(policy), env={"KIRO_BIN": str(fake_kiro)})
+    assert unwaived.returncode == 2
+    assert "explicitly allow unresolved kiro model identity" in unwaived.stderr.lower()
     assert not (tmp_path / "kiro-observations.jsonl").exists()
 
 
 def test_proprietary_kiro_policy_checks_each_kiro_route(tmp_path: Path) -> None:
     policy = tmp_path / "partial.toml"
-    policy.write_text('[models."claude-sonnet-5"]\nsource_allowed = true\n')
+    policy.write_text(
+        '[models."claude-sonnet-5"]\nsource_allowed = true\nallow_unresolved_identity = true\n'
+    )
 
     result = run_cli(
         *review_arguments(tmp_path),
@@ -721,7 +729,9 @@ def test_kiro_attempt_artifacts_are_private_including_empty_stderr(tmp_path: Pat
 def test_proprietary_kiro_runs_with_an_authorizing_policy(tmp_path: Path) -> None:
     fake_kiro = write_fake_kiro(tmp_path)
     policy = tmp_path / "allowed.toml"
-    policy.write_text('[models."claude-sonnet-5"]\nsource_allowed = true\n')
+    policy.write_text(
+        '[models."claude-sonnet-5"]\nsource_allowed = true\nallow_unresolved_identity = true\n'
+    )
 
     result = run_cli(
         *review_arguments(tmp_path),
@@ -741,6 +751,7 @@ def test_proprietary_kiro_runs_with_an_authorizing_policy(tmp_path: Path) -> Non
     assert result.returncode == 0, result.stderr
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
     assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
+    assert receipt["extension.kiroUnresolvedIdentityWaiver"] is True
 
 
 def test_receipt_contract_allowlist_matches_cli_contract_choices() -> None:
@@ -5657,6 +5668,22 @@ def test_terminate_process_group_handles_missing_and_stubborn_processes(
     signals.clear()
     cli.terminate_process_group(UnreapableProcess())
     assert signals == [cli.signal.SIGTERM, cli.signal.SIGKILL]
+
+    reaped = threading.Event()
+
+    class DeferredReapProcess:
+        pid = 4
+
+        def wait(self, timeout: int | None = None) -> None:
+            if timeout == 0:
+                raise subprocess.TimeoutExpired("kiro", timeout)
+            assert timeout is None
+            reaped.set()
+
+    signals.clear()
+    cli.terminate_process_group(DeferredReapProcess(), grace_seconds=0)
+    assert signals == [cli.signal.SIGTERM, cli.signal.SIGKILL]
+    assert reaped.wait(timeout=1)
 
 
 def test_seal_failure_and_cli_runtime_error_are_reported(

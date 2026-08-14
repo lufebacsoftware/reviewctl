@@ -183,7 +183,7 @@ git commit -m "feat: invoke kiro reviews"
 
 - [ ] **Step 1: Write failing documentation assertions**
 
-Require public docs to state all of the following without a static model table: Kiro is a registered native adapter; `KIRO_BIN` overrides `kiro-cli`; setup availability remains non-qualifying; the current model inventory is read with `kiro-cli chat --list-models --format json`; formal Kiro runs use no pre-trusted tools and an inline frozen packet; organization policy/evidence owns qualification.
+Require public docs to state all of the following without a static model table: Kiro is a registered native adapter; `KIRO_BIN` overrides `kiro-cli`; setup availability remains non-qualifying; the current model inventory is read with `kiro-cli chat --list-models --format json`; formal Kiro runs use no pre-trusted tools and an inline frozen packet; proprietary source additionally requires a receipt-recorded unresolved-identity waiver; organization policy/evidence owns qualification.
 
 - [ ] **Step 2: Run documentation tests and confirm RED**
 
