@@ -123,7 +123,8 @@ CODEX_FINDINGS_SCHEMA = {
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_ESCAPE_BYTES = rb"\x1b\[[0-?]*[ -/]*[@-~]"
 KIRO_RESPONSE_PREFIX = re.compile(
-    rb"(?:" + ANSI_ESCAPE_BYTES + rb")*> (?:" + ANSI_ESCAPE_BYTES + rb")*"
+    rb"^(?:" + ANSI_ESCAPE_BYTES + rb")*> (?:" + ANSI_ESCAPE_BYTES + rb")*",
+    re.MULTILINE,
 )
 KIRO_LEADING_UI = re.compile(rb"^(?:" + ANSI_ESCAPE_BYTES + rb")*")
 KIRO_TRAILING_UI = re.compile(rb"(?:" + ANSI_ESCAPE_BYTES + rb")+[\r\n]*$")
@@ -4142,6 +4143,9 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     }
     if kiro_identity_waiver:
         receipt["extension.kiroUnresolvedIdentityWaiver"] = True
+    if accepted_attempt is not None and attempts[accepted_attempt - 1]["transport"] == "kiro":
+        receipt["extension.backendQualification"] = "unqualified"
+        receipt["extension.mergeGateEligible"] = False
     if native_contract:
         assert consolidation_context is not None
         receipt["fallbackRelationships"] = [

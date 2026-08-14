@@ -154,6 +154,12 @@ not qualify the backend or prove which model executed. Synthetic runs require
 neither the policy nor the waiver. Potzal and federation remain unrelated and
 optional.
 
+An accepted Kiro receipt means the response passed `findings-json`; it is not a
+qualified merge approval. The receipt records
+`extension.backendQualification = "unqualified"` and
+`extension.mergeGateEligible = false`. Merge automation must reject that flag,
+while humans or a later qualified reviewer may still use the advisory findings.
+
 Handle Kiro agent errors as follows:
 
 - Unknown or unlisted model: rerun

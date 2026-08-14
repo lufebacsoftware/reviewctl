@@ -96,6 +96,13 @@ is an explicit, receipt-recorded waiver: it does not turn the requested model
 into an observed identity or qualify the backend. Synthetic runs do not require
 that policy or waiver.
 
+For Kiro, receipt `result: accepted` means only that the response passed the
+declared contract. The same receipt records
+`extension.backendQualification: unqualified` and
+`extension.mergeGateEligible: false`. Any merge gate must reject that explicit
+indicator; the advisory response remains available for consolidation or later
+review instead of being discarded.
+
 Setup diagnostics observe only executable presence and version for registered
 executable backends. Setup diagnostics never authenticate, call a model or
 provider, or write configuration. The next gate is backend conformance before

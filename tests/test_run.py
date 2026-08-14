@@ -670,13 +670,18 @@ def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_
     )
 
     assert result.returncode == 0, result.stderr
-    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
     attempt = receipt["attempts"][0]
     assert receipt["model"] == {"requested": ["claude-sonnet-5"], "resolved": None}
     assert receipt["response"]["provider"] is None
     assert attempt["model"] == {"requested": "claude-sonnet-5", "resolved": None}
     assert attempt["provider"] == {"requested": [], "resolved": None}
     assert attempt["result"] == "accepted"
+    assert receipt["extension.backendQualification"] == "unqualified"
+    assert receipt["extension.mergeGateEligible"] is False
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
     assert attempt["evidence"]["request"].endswith("request.json")
     assert attempt["evidence"]["response"].endswith("response.log")
     assert attempt["evidence"]["session"].endswith("session.json")
@@ -7951,6 +7956,13 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
     with pytest.raises(UnicodeDecodeError):
         cli.normalize_kiro_output(b'> {"value":"\xff"}\n', "findings-json")
     assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n", "findings-json") == ""
+    assert (
+        cli.normalize_kiro_output(
+            b'not Kiro framing > {"verdict":"approved","findings":[]}\n',
+            "findings-json",
+        )
+        == ""
+    )
 
 
 def test_kiro_process_environment_is_an_exact_allowlist() -> None:
