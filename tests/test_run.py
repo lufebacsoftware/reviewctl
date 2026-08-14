@@ -2919,6 +2919,47 @@ def test_generated_v2_receipt_canonicalizes_reversed_review_declaration(
     assert json.loads(verified.stdout)["violations"] == []
 
 
+def test_generated_v2_receipt_with_unicode_findings_verifies(tmp_path: Path) -> None:
+    response = json.dumps(
+        {
+            "verdict": "changes-requested",
+            "findings": [
+                {
+                    "severity": "high",
+                    "path": "source.py",
+                    "line": 1,
+                    "title": "Condición inválida",
+                    "evidence": "La revisión encontró una condición inválida.",
+                    "reproduction": "Ejecuta el caso límite otra vez.",
+                }
+            ],
+            "reviewedFiles": ["source.py"],
+        }
+    )
+    fake_codex_root = tmp_path.parent / "unicode-codex-bin"
+    fake_codex_root.mkdir()
+    fake_codex = write_fake_codex(fake_codex_root, response=response)
+
+    result = run_cli(
+        *review_arguments(tmp_path, "gpt-5.6-terra"),
+        "--transport",
+        "codex",
+        "--source-class",
+        "proprietary",
+        "--response-contract",
+        "findings-json",
+        env={"CODEX_BIN": str(fake_codex)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt_path = Path(result.stdout.strip()) / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["findings"][0]["evidence"].startswith("La revisión")
+    verified = run_cli("verify", str(receipt_path))
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["violations"] == []
+
+
 def test_codex_transport_reads_the_session_identifier_from_stderr(tmp_path: Path) -> None:
     fake_codex = write_fake_codex(tmp_path, session_on_stderr=True)
 

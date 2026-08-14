@@ -342,7 +342,7 @@ def canonical_json(value: object) -> bytes:
     require_string_json_object_keys(value)
     return json.dumps(
         value,
-        ensure_ascii=True,
+        ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
