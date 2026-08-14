@@ -1751,13 +1751,20 @@ def invoke_kiro(
     environment = kiro_process_environment(os.environ)
     stderr_chunks: list[bytes] = []
     started = time.monotonic()
+    deadline = started + timeout_seconds
 
     def persist_stderr() -> str:
         stderr = b"".join(stderr_chunks).decode(errors="replace")
-        diagnostic_path.write_text(redact_diagnostic(stderr, limit=100_000))
+        write_private_exclusive(diagnostic_path, redact_diagnostic(stderr, limit=100_000).encode())
         return stderr
 
-    def run_process(command: list[str], cwd: Path, timeout: int) -> tuple[int, bytes, bytes, str]:
+    def run_process(
+        command: list[str], cwd: Path, timeout_cap: float | None = None
+    ) -> tuple[int, bytes, bytes, str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 124, b"", b"", "review attempt timed out"
+        timeout = min(remaining, timeout_cap) if timeout_cap is not None else remaining
         try:
             process = subprocess.Popen(
                 command,
@@ -1783,9 +1790,9 @@ def invoke_kiro(
         cwd = Path(directory).resolve()
         inventory_command = [kiro_bin, "chat", "--list-models", "--format", "json"]
         code, inventory_stdout, inventory_stderr, transport_error = run_process(
-            inventory_command, cwd, min(10, timeout_seconds)
+            inventory_command, cwd, 10
         )
-        models_path.write_bytes(inventory_stdout)
+        write_private_exclusive(models_path, inventory_stdout)
         stderr_chunks.append(inventory_stderr)
         if code != 0:
             stderr = persist_stderr()
@@ -1820,7 +1827,8 @@ def invoke_kiro(
             "never",
             inline_packet,
         ]
-        request_path.write_bytes(
+        write_private_exclusive(
+            request_path,
             canonical_json(
                 {
                     "command": command,
@@ -1835,22 +1843,18 @@ def invoke_kiro(
                     "responseContract": response_contract,
                 }
             )
-            + b"\n"
+            + b"\n",
         )
-        code, stdout, invocation_stderr, transport_error = run_process(
-            command, cwd, timeout_seconds
-        )
-        response_path.write_bytes(stdout)
+        code, stdout, invocation_stderr, transport_error = run_process(command, cwd)
+        write_private_exclusive(response_path, stdout)
         stderr_chunks.append(invocation_stderr)
         if code != 0:
             stderr = persist_stderr()
             return code, transport_error or stderr or "Kiro review invocation failed", blank
 
         session_command = [kiro_bin, "chat", "--list-sessions", "--format", "json"]
-        code, session_stdout, session_stderr, transport_error = run_process(
-            session_command, cwd, timeout_seconds
-        )
-        session_path.write_bytes(session_stdout)
+        code, session_stdout, session_stderr, transport_error = run_process(session_command, cwd)
+        write_private_exclusive(session_path, session_stdout)
         stderr_chunks.append(session_stderr)
         stderr = persist_stderr()
         if code != 0:
@@ -2919,7 +2923,7 @@ def execute_kiro_backend(request: BackendRequest) -> BackendExecution:
     )
     final_evidence = None
     if response.response:
-        final_response_path.write_text(response.response)
+        write_private_exclusive(final_response_path, response.response.encode())
         final_evidence = final_response_path
     return BackendExecution(
         exit_code,

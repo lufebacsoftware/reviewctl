@@ -360,7 +360,12 @@ if model == 'failure' or model.endswith('/failure'):
     )
 
 
-def write_fake_kiro(path: Path, *, inventory_mode: str = "valid") -> Path:
+def write_fake_kiro(
+    path: Path,
+    *,
+    inventory_mode: str = "valid",
+    stage_delays: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> Path:
     observations = path / "kiro-observations.jsonl"
     return write_fake_python_executable(
         path,
@@ -382,6 +387,7 @@ with Path({str(observations)!r}).open("a") as stream:
     stream.write(json.dumps(observation) + "\\n")
 
 if arguments == ["chat", "--list-models", "--format", "json"]:
+    time.sleep({stage_delays[0]!r})
     mode = {inventory_mode!r}
     if mode == "malformed":
         print("{{")
@@ -405,6 +411,7 @@ if arguments == ["chat", "--list-models", "--format", "json"]:
         print(json.dumps({{
             "models": [
                 {{"model_id": "claude-sonnet-5"}},
+                {{"model_id": "quiet"}},
                 {{"model_id": "empty"}},
                 {{"model_id": "nonzero"}},
                 {{"model_id": "timeout"}},
@@ -418,6 +425,7 @@ if arguments == ["chat", "--list-models", "--format", "json"]:
     raise SystemExit(0)
 
 if arguments == ["chat", "--list-sessions", "--format", "json"]:
+    time.sleep({stage_delays[2]!r})
     marker = Path.cwd() / ".selected-model"
     model = marker.read_text() if marker.is_file() else ""
     if model == "malformed-session":
@@ -437,6 +445,7 @@ if arguments == ["chat", "--list-sessions", "--format", "json"]:
     raise SystemExit(0)
 
 model = arguments[arguments.index("--model") + 1]
+time.sleep({stage_delays[1]!r})
 (Path.cwd() / ".selected-model").write_text(model)
 if model == "timeout":
     time.sleep(60)
@@ -447,7 +456,8 @@ if model == "empty":
     raise SystemExit(0)
 response = json.dumps({{"verdict": "approved", "findings": []}})
 sys.stdout.write("\\x1b[36mKiro CLI\\x1b[0m\\n> " + response + "\\n\\n▸ Credits: 0.25\\n")
-print("token=super-secret-token-value", file=sys.stderr)
+if model != "quiet":
+    print("token=super-secret-token-value", file=sys.stderr)
 """,
     )
 
@@ -641,6 +651,38 @@ def test_empty_kiro_response_records_zero_byte_stderr_evidence(tmp_path: Path) -
     assert attempt["result"] == "empty"
     assert stderr_path.name == "stderr.log"
     assert stderr_path.read_bytes() == b""
+
+
+def test_kiro_attempt_artifacts_are_private_including_empty_stderr(tmp_path: Path) -> None:
+    fake_kiro = write_fake_kiro(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "quiet",
+        "--response-contract",
+        "findings-json",
+        env={"KIRO_BIN": str(fake_kiro)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt_dir = Path(receipt["attempts"][0]["evidence"]["request"]).parent
+    artifacts = [
+        attempt_dir / name
+        for name in (
+            "request.json",
+            "models.json",
+            "response.log",
+            "session.json",
+            "response.md",
+            "stderr.log",
+        )
+    ]
+    assert {stat.S_IMODE(path.stat().st_mode) for path in artifacts} == {0o600}
+    assert (attempt_dir / "stderr.log").read_bytes() == b""
 
 
 def test_proprietary_kiro_runs_with_an_authorizing_policy(tmp_path: Path) -> None:
@@ -7781,6 +7823,36 @@ def test_invoke_kiro_uses_isolated_exact_commands_and_persists_evidence(
         "path": str(tmp_path / "models.json"),
         "sha256": cli.sha256_bytes(models_bytes),
     }
+
+
+def test_invoke_kiro_uses_one_deadline_across_all_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_kiro = write_fake_kiro(tmp_path, stage_delays=(0.4, 0.7, 0.4))
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    exit_code, error, response = cli.invoke_kiro(
+        kiro_bin=str(fake_kiro),
+        prompt="Review synthetic source.",
+        model="claude-sonnet-5",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="verdict",
+        timeout_seconds=1,
+        **kiro_paths(tmp_path),
+    )
+
+    assert exit_code == 124
+    assert error == "review attempt timed out"
+    assert response.response == ""
+    observations = [
+        json.loads(line) for line in (tmp_path / "kiro-observations.jsonl").read_text().splitlines()
+    ]
+    assert [observation["argv"][:2] for observation in observations] == [
+        ["chat", "--list-models"],
+        ["chat", "--no-interactive"],
+    ]
 
 
 @pytest.mark.parametrize(
