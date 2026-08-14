@@ -7825,11 +7825,14 @@ def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
         b"\x1b[0m"
     )
 
-    assert cli.normalize_kiro_output(stdout) == "first line\nbody"
-    assert cli.normalize_kiro_output(fenced_json) == (
+    assert cli.normalize_kiro_output(stdout, "findings-json") == "first line\nbody"
+    assert cli.normalize_kiro_output(fenced_json, "findings-json") == (
         '{\n  "verdict": "approved",\n  "findings": []\n}'
     )
-    assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n") == ""
+    assert cli.normalize_kiro_output(fenced_json, "document") == (
+        'json\n{\n  "verdict": "approved",\n  "findings": []\n}'
+    )
+    assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n", "document") == ""
 
 
 def test_kiro_process_environment_is_an_exact_allowlist() -> None:

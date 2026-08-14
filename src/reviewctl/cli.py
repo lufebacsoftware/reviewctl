@@ -1669,7 +1669,7 @@ def kiro_process_environment(source: Mapping[str, str]) -> dict[str, str]:
     return environment
 
 
-def normalize_kiro_output(stdout: bytes) -> str:
+def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
     """Remove Kiro terminal framing without rewriting response content."""
     text = ANSI_ESCAPE.sub("", stdout.decode(errors="replace")).replace("\r", "")
     lines = text.splitlines()
@@ -1680,7 +1680,12 @@ def normalize_kiro_output(stdout: bytes) -> str:
     lines = lines[start:]
     while lines and (not lines[-1].strip() or lines[-1].strip().startswith("▸ Credits:")):
         lines.pop()
-    if len(lines) > 1 and lines[0].strip() == "json" and lines[1].lstrip().startswith(("{", "[")):
+    if (
+        response_contract.endswith("-json")
+        and len(lines) > 1
+        and lines[0].strip() == "json"
+        and lines[1].lstrip().startswith(("{", "["))
+    ):
         lines.pop(0)
     return "\n".join(lines)
 
@@ -1882,7 +1887,7 @@ def invoke_kiro(
                 model,
                 None,
                 None,
-                normalize_kiro_output(stdout),
+                normalize_kiro_output(stdout, response_contract),
             ),
         )
 
