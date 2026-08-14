@@ -130,9 +130,20 @@ timeout, private evidence, a dynamic model check, and session recovery. Those
 controls are advisory read-only and tool controls with source isolation
 unavailable; they are not OS sandbox enforcement.
 
-Proprietary Kiro source requires an explicit policy allowing the exact Kiro
-model before bytes are sent. Synthetic runs do not require that policy. Potzal
-and federation remain unrelated and optional.
+Proprietary Kiro source requires both policy decisions below for the requested
+model before bytes are sent:
+
+```toml
+[models."MODEL_ID"]
+source_allowed = true
+allow_unresolved_identity = true
+```
+
+The second setting is an explicit waiver because Kiro does not expose a
+resolved model identity. `reviewctl` records that waiver in the receipt; it does
+not qualify the backend or prove which model executed. Synthetic runs require
+neither the policy nor the waiver. Potzal and federation remain unrelated and
+optional.
 
 Handle Kiro agent errors as follows:
 
