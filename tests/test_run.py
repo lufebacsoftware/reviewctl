@@ -661,6 +661,26 @@ def test_empty_kiro_response_records_zero_byte_stderr_evidence(tmp_path: Path) -
     assert stderr_path.read_bytes() == b""
 
 
+def test_failed_kiro_inventory_does_not_advertise_missing_evidence(tmp_path: Path) -> None:
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "claude-sonnet-5",
+        env={"KIRO_BIN": str(tmp_path / "missing-kiro")},
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    evidence = receipt["attempts"][0]["evidence"]
+    assert evidence["request"] is None
+    assert evidence["response"] is None
+    assert evidence["session"] is None
+    assert evidence["finalResponse"] is None
+    assert Path(evidence["stderr"]).is_file()
+
+
 def test_kiro_attempt_artifacts_are_private_including_empty_stderr(tmp_path: Path) -> None:
     fake_kiro = write_fake_kiro(tmp_path)
 
