@@ -377,11 +377,19 @@ import time
 from pathlib import Path
 
 arguments = sys.argv[1:]
+stdin_payload = None
+if (
+    arguments != ["chat", "--list-models", "--format", "json"]
+    and arguments != ["chat", "--list-sessions", "--format", "json"]
+    and arguments[-1:] == ["never"]
+):
+    stdin_payload = sys.stdin.read()
 observation = {{
     "argv": arguments,
     "cwd": str(Path.cwd().resolve()),
     "entries": sorted(item.name for item in Path.cwd().iterdir()),
     "environment": dict(os.environ),
+    "stdin": stdin_payload,
 }}
 with Path({str(observations)!r}).open("a") as stream:
     stream.write(json.dumps(observation) + "\\n")
@@ -7852,8 +7860,8 @@ def test_invoke_kiro_uses_isolated_exact_commands_and_persists_evidence(
         "claude-sonnet-5",
         "--wrap",
         "never",
-        packet,
     ]
+    assert observations[1]["stdin"] == packet
     assert observations[1]["entries"] == []
     assert observations[2]["argv"] == ["chat", "--list-sessions", "--format", "json"]
     assert observations[1]["cwd"] == observations[2]["cwd"]

@@ -1764,7 +1764,10 @@ def invoke_kiro(
         return stderr
 
     def run_process(
-        command: list[str], cwd: Path, timeout_cap: float | None = None
+        command: list[str],
+        cwd: Path,
+        timeout_cap: float | None = None,
+        input_bytes: bytes | None = None,
     ) -> tuple[int, bytes, bytes, str]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1775,12 +1778,13 @@ def invoke_kiro(
                 command,
                 cwd=cwd,
                 env=environment,
+                stdin=subprocess.PIPE if input_bytes is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
             try:
-                stdout, stderr = process.communicate(timeout=timeout)
+                stdout, stderr = process.communicate(input=input_bytes, timeout=timeout)
                 return process.returncode, stdout, stderr, ""
             except subprocess.TimeoutExpired:
                 terminate_process_group(process)
@@ -1829,7 +1833,6 @@ def invoke_kiro(
             model,
             "--wrap",
             "never",
-            inline_packet,
         ]
         write_private_exclusive(
             request_path,
@@ -1849,7 +1852,9 @@ def invoke_kiro(
             )
             + b"\n",
         )
-        code, stdout, invocation_stderr, transport_error = run_process(command, cwd)
+        code, stdout, invocation_stderr, transport_error = run_process(
+            command, cwd, input_bytes=inline_packet.encode()
+        )
         write_private_exclusive(response_path, stdout)
         stderr_chunks.append(invocation_stderr)
         if code != 0:

@@ -143,7 +143,8 @@ def kiro_session_id(payload: bytes, cwd: Path) -> str:
 Add `invoke_kiro(...) -> tuple[int, str, PersistedResponse]` with the same keyword fields used by `invoke_pi`, except that it receives no session path. It must use `tempfile.TemporaryDirectory(prefix="reviewctl-kiro-")`, call:
 
 ```text
-kiro-cli chat --no-interactive --model MODEL --wrap never INLINE_PACKET
+kiro-cli chat --no-interactive --model MODEL --wrap never
+# stdin: INLINE_PACKET
 ```
 
 and then call `kiro-cli chat --list-sessions --format json` in the same directory. Use `openrouter_packet()` only as the existing generic inline-packet builder; do not call OpenRouter or persist any OpenRouter credential/provider configuration. Record `requestedMaxOutputTokens` with `outputTokenLimitEnforced: false`. Strip only terminal framing known from Kiro, retain raw stdout/stderr separately, and return no response if a session identity cannot be reproduced.
