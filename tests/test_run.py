@@ -360,6 +360,98 @@ if model == 'failure' or model.endswith('/failure'):
     )
 
 
+def write_fake_kiro(path: Path, *, inventory_mode: str = "valid") -> Path:
+    observations = path / "kiro-observations.jsonl"
+    return write_fake_python_executable(
+        path,
+        "kiro-cli",
+        f"""import json
+import os
+import sys
+import time
+from pathlib import Path
+
+arguments = sys.argv[1:]
+observation = {{
+    "argv": arguments,
+    "cwd": str(Path.cwd().resolve()),
+    "entries": sorted(item.name for item in Path.cwd().iterdir()),
+    "environment": dict(os.environ),
+}}
+with Path({str(observations)!r}).open("a") as stream:
+    stream.write(json.dumps(observation) + "\\n")
+
+if arguments == ["chat", "--list-models", "--format", "json"]:
+    mode = {inventory_mode!r}
+    if mode == "malformed":
+        print("{{")
+    elif mode == "nonzero":
+        print("inventory failed", file=sys.stderr)
+        raise SystemExit(19)
+    elif mode == "duplicate":
+        print(json.dumps({{
+            "models": [
+                {{"model_id": "claude-sonnet-5"}},
+                {{"model_id": "claude-sonnet-5"}},
+            ],
+            "default_model": "claude-sonnet-5",
+        }}))
+    elif mode == "bad-default":
+        print(json.dumps({{
+            "models": [{{"model_id": "claude-sonnet-5"}}],
+            "default_model": "missing",
+        }}))
+    else:
+        print(json.dumps({{
+            "models": [
+                {{"model_id": "claude-sonnet-5"}},
+                {{"model_id": "empty"}},
+                {{"model_id": "nonzero"}},
+                {{"model_id": "timeout"}},
+                {{"model_id": "malformed-session"}},
+                {{"model_id": "absent-session"}},
+                {{"model_id": "nonzero-session"}},
+                {{"model_id": "timeout-session"}},
+            ],
+            "default_model": "claude-sonnet-5",
+        }}))
+    raise SystemExit(0)
+
+if arguments == ["chat", "--list-sessions", "--format", "json"]:
+    marker = Path.cwd() / ".selected-model"
+    model = marker.read_text() if marker.is_file() else ""
+    if model == "malformed-session":
+        print("{{")
+    elif model == "absent-session":
+        print("[]")
+    elif model == "nonzero-session":
+        print("session inventory failed", file=sys.stderr)
+        raise SystemExit(23)
+    elif model == "timeout-session":
+        time.sleep(60)
+    else:
+        print(json.dumps([{{
+            "cwd": str(Path.cwd().resolve()),
+            "sessions": [{{"sessionId": "123e4567-e89b-12d3-a456-426614174000"}}],
+        }}]))
+    raise SystemExit(0)
+
+model = arguments[arguments.index("--model") + 1]
+(Path.cwd() / ".selected-model").write_text(model)
+if model == "timeout":
+    time.sleep(60)
+if model == "nonzero":
+    print("token=super-secret-token-value", file=sys.stderr)
+    raise SystemExit(17)
+if model == "empty":
+    raise SystemExit(0)
+response = json.dumps({{"verdict": "approved", "findings": []}})
+sys.stdout.write("\\x1b[36mKiro CLI\\x1b[0m\\n> " + response + "\\n\\n▸ Credits: 0.25\\n")
+print("token=super-secret-token-value", file=sys.stderr)
+""",
+    )
+
+
 def review_arguments(tmp_path: Path, *models: str) -> list[str]:
     prompt = tmp_path / "prompt.md"
     source = tmp_path / "source.py"
@@ -415,6 +507,144 @@ def test_run_transport_choices_accept_kiro() -> None:
     )
 
     assert namespace.transport == "kiro"
+
+
+def test_kiro_is_an_account_included_tournament_transport() -> None:
+    candidate = cli.parse_tournament_candidates(
+        {
+            "candidates": [
+                {
+                    "id": "kiro-seat",
+                    "family": "kiro",
+                    "model": "claude-sonnet-5",
+                    "transport": "kiro",
+                    "cost_mode": "account-included",
+                }
+            ]
+        }
+    )[0]
+
+    assert candidate.transport == "kiro"
+
+
+def test_run_rejects_kiro_auto_before_creating_artifacts(tmp_path: Path) -> None:
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "auto",
+    )
+
+    assert result.returncode == 2
+    assert "kiro review model auto" in result.stderr.lower()
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_proprietary_kiro_requires_an_authorizing_policy_for_every_kiro_route(
+    tmp_path: Path,
+) -> None:
+    fake_kiro = write_fake_kiro(tmp_path)
+    arguments = [
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "claude-sonnet-5",
+        "--source-class",
+        "proprietary",
+    ]
+
+    missing = run_cli(*arguments, env={"KIRO_BIN": str(fake_kiro)})
+    assert missing.returncode == 2
+    assert "proprietary kiro reviews require --policy" in missing.stderr.lower()
+
+    policy = tmp_path / "denied.toml"
+    policy.write_text('[models."claude-sonnet-5"]\nsource_allowed = false\n')
+    denied = run_cli(*arguments, "--policy", str(policy), env={"KIRO_BIN": str(fake_kiro)})
+    assert denied.returncode == 2
+    assert "does not allow kiro model claude-sonnet-5" in denied.stderr.lower()
+    assert not (tmp_path / "kiro-observations.jsonl").exists()
+
+
+def test_proprietary_kiro_policy_checks_each_kiro_route(tmp_path: Path) -> None:
+    policy = tmp_path / "partial.toml"
+    policy.write_text('[models."claude-sonnet-5"]\nsource_allowed = true\n')
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--route",
+        "kiro:claude-sonnet-5",
+        "--route",
+        "kiro:empty",
+        "--source-class",
+        "proprietary",
+        "--policy",
+        str(policy),
+    )
+
+    assert result.returncode == 2
+    assert "does not allow kiro model empty" in result.stderr.lower()
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_identity(
+    tmp_path: Path,
+) -> None:
+    fake_kiro = write_fake_kiro(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "claude-sonnet-5",
+        "--response-contract",
+        "findings-json",
+        env={"KIRO_BIN": str(fake_kiro)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    attempt = receipt["attempts"][0]
+    assert receipt["model"] == {"requested": ["claude-sonnet-5"], "resolved": None}
+    assert receipt["response"]["provider"] is None
+    assert attempt["model"] == {"requested": "claude-sonnet-5", "resolved": None}
+    assert attempt["provider"] == {"requested": [], "resolved": None}
+    assert attempt["result"] == "accepted"
+    assert attempt["evidence"]["request"].endswith("request.json")
+    assert attempt["evidence"]["response"].endswith("response.log")
+    assert attempt["evidence"]["session"].endswith("session.json")
+    assert attempt["evidence"]["finalResponse"].endswith("response.md")
+    assert attempt["evidence"]["stderr"].endswith("stderr.log")
+    assert Path(attempt["evidence"]["finalResponse"]).read_text() == (
+        '{"verdict": "approved", "findings": []}'
+    )
+
+
+def test_proprietary_kiro_runs_with_an_authorizing_policy(tmp_path: Path) -> None:
+    fake_kiro = write_fake_kiro(tmp_path)
+    policy = tmp_path / "allowed.toml"
+    policy.write_text('[models."claude-sonnet-5"]\nsource_allowed = true\n')
+
+    result = run_cli(
+        *review_arguments(tmp_path),
+        "--transport",
+        "kiro",
+        "--model",
+        "claude-sonnet-5",
+        "--source-class",
+        "proprietary",
+        "--response-contract",
+        "findings-json",
+        "--policy",
+        str(policy),
+        env={"KIRO_BIN": str(fake_kiro)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["policy"]["sha256"] == cli.sha256_bytes(policy.read_bytes())
 
 
 def test_receipt_contract_allowlist_matches_cli_contract_choices() -> None:
@@ -7404,6 +7634,271 @@ def test_invoke_agy_reports_a_missing_binary(tmp_path: Path) -> None:
     assert exit_code == 127
     assert "No such file or directory" in error
     assert response.response == ""
+
+
+def kiro_paths(tmp_path: Path) -> dict[str, Path]:
+    return {
+        "request_path": tmp_path / "request.json",
+        "models_path": tmp_path / "models.json",
+        "response_path": tmp_path / "response.log",
+        "session_path": tmp_path / "session.json",
+        "diagnostic_path": tmp_path / "stderr.log",
+    }
+
+
+def invoke_fake_kiro(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model: str = "claude-sonnet-5",
+    inventory_mode: str = "valid",
+    timeout_seconds: int = 7,
+) -> tuple[int, str, cli.PersistedResponse]:
+    fake_kiro = write_fake_kiro(tmp_path, inventory_mode=inventory_mode)
+    source = tmp_path / "source.py"
+    source.write_text("def send() -> None: pass\n")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "must-not-leak")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "must-not-leak")
+    monkeypatch.setenv("SOME_TOKEN", "must-not-leak")
+    return cli.invoke_kiro(
+        kiro_bin=str(fake_kiro),
+        prompt="Review the bounded synthetic source.",
+        model=model,
+        files=[source],
+        max_output_tokens=123,
+        response_contract="findings-json",
+        timeout_seconds=timeout_seconds,
+        **kiro_paths(tmp_path),
+    )
+
+
+def test_normalize_kiro_output_strips_only_terminal_framing() -> None:
+    stdout = "\x1b[36mKiro CLI\x1b[0m\r\n> first line\r\nbody\r\n\r\n▸ Credits: 0.25\r\n".encode()
+
+    assert cli.normalize_kiro_output(stdout) == "first line\nbody"
+    assert cli.normalize_kiro_output(b"Kiro CLI\nno response marker\n") == ""
+
+
+def test_kiro_process_environment_is_an_exact_allowlist() -> None:
+    source = {
+        "PATH": "/bin",
+        "HOME": "/real/home",
+        "LANG": "en_US.UTF-8",
+        "SSL_CERT_FILE": "/cert.pem",
+        "OPENROUTER_API_KEY": "secret",
+        "AWS_SESSION_TOKEN": "secret",
+        "CUSTOM_TOKEN": "secret",
+    }
+
+    assert cli.kiro_process_environment(source) == {
+        "PATH": "/bin",
+        "HOME": "/real/home",
+        "LANG": "en_US.UTF-8",
+        "SSL_CERT_FILE": "/cert.pem",
+        "KIRO_LOG_NO_COLOR": "1",
+    }
+
+
+def test_invoke_kiro_uses_isolated_exact_commands_and_persists_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(tmp_path, monkeypatch)
+
+    assert exit_code == 0
+    assert error == "token=super-secret-token-value\n"
+    assert response == cli.PersistedResponse(
+        "123e4567-e89b-12d3-a456-426614174000",
+        None,
+        response.duration_ms,
+        None,
+        "claude-sonnet-5",
+        None,
+        None,
+        '{"verdict": "approved", "findings": []}',
+    )
+    observations = [
+        json.loads(line) for line in (tmp_path / "kiro-observations.jsonl").read_text().splitlines()
+    ]
+    assert observations[0]["argv"] == ["chat", "--list-models", "--format", "json"]
+    packet = cli.openrouter_packet(
+        "Review the bounded synthetic source.", [tmp_path / "source.py"], "findings-json"
+    )
+    assert observations[1]["argv"] == [
+        "chat",
+        "--no-interactive",
+        "--trust-tools=",
+        "--agent",
+        "kiro_default",
+        "--model",
+        "claude-sonnet-5",
+        "--wrap",
+        "never",
+        packet,
+    ]
+    assert observations[1]["entries"] == []
+    assert observations[2]["argv"] == ["chat", "--list-sessions", "--format", "json"]
+    assert observations[1]["cwd"] == observations[2]["cwd"]
+    assert observations[1]["cwd"] != str(tmp_path)
+    assert "--- BEGIN source.py ---" in packet
+    assert "def send() -> None: pass" in packet
+    assert str(tmp_path / "source.py") not in packet
+    for key in ("OPENROUTER_API_KEY", "AWS_ACCESS_KEY_ID", "SOME_TOKEN"):
+        assert key not in observations[1]["environment"]
+    expected_stdout = (
+        '\x1b[36mKiro CLI\x1b[0m\n> {"verdict": "approved", "findings": []}\n\n▸ Credits: 0.25\n'
+    ).encode()
+    assert (tmp_path / "response.log").read_bytes() == expected_stdout
+    assert (tmp_path / "stderr.log").read_text() == "[REDACTED_CREDENTIAL]\n"
+    session = json.loads((tmp_path / "session.json").read_text())
+    assert session[0]["sessions"][0]["sessionId"] == response.conversation_id
+    models_bytes = (tmp_path / "models.json").read_bytes()
+    manifest = json.loads((tmp_path / "request.json").read_text())
+    assert manifest["model"] == "claude-sonnet-5"
+    assert manifest["requestedMaxOutputTokens"] == 123
+    assert manifest["outputTokenLimitEnforced"] is False
+    assert manifest["models"] == {
+        "path": str(tmp_path / "models.json"),
+        "sha256": cli.sha256_bytes(models_bytes),
+    }
+
+
+@pytest.mark.parametrize(
+    ("inventory_mode", "model", "expected_code"),
+    [
+        ("malformed", "claude-sonnet-5", 502),
+        ("nonzero", "claude-sonnet-5", 19),
+        ("duplicate", "claude-sonnet-5", 502),
+        ("bad-default", "claude-sonnet-5", 502),
+        ("valid", "unlisted", 502),
+        ("valid", "auto", 502),
+    ],
+)
+def test_invoke_kiro_fails_closed_on_unobservable_model_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inventory_mode: str,
+    model: str,
+    expected_code: int,
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(
+        tmp_path, monkeypatch, model=model, inventory_mode=inventory_mode
+    )
+
+    assert exit_code == expected_code
+    assert error
+    assert response.response == ""
+    observations = (tmp_path / "kiro-observations.jsonl").read_text().splitlines()
+    assert len(observations) == 1
+
+
+@pytest.mark.parametrize("model", ["malformed-session", "absent-session"])
+def test_invoke_kiro_fails_closed_without_a_coherent_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(tmp_path, monkeypatch, model=model)
+
+    assert exit_code == 502
+    assert "session" in error.lower()
+    assert response.response == ""
+    assert (tmp_path / "response.log").is_file()
+
+
+@pytest.mark.parametrize(
+    ("model", "timeout_seconds", "expected_code"),
+    [("nonzero-session", 7, 23), ("timeout-session", 1, 124)],
+)
+def test_invoke_kiro_fails_closed_on_session_inventory_process_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    timeout_seconds: int,
+    expected_code: int,
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(
+        tmp_path, monkeypatch, model=model, timeout_seconds=timeout_seconds
+    )
+
+    assert exit_code == expected_code
+    assert error
+    assert response.response == ""
+
+
+@pytest.mark.parametrize(
+    ("model", "timeout_seconds", "expected_code"),
+    [("nonzero", 7, 17), ("timeout", 1, 124)],
+)
+def test_invoke_kiro_preserves_process_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    timeout_seconds: int,
+    expected_code: int,
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(
+        tmp_path, monkeypatch, model=model, timeout_seconds=timeout_seconds
+    )
+
+    assert exit_code == expected_code
+    assert error
+    assert response.response == ""
+
+
+def test_invoke_kiro_reports_a_missing_binary(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    exit_code, error, response = cli.invoke_kiro(
+        kiro_bin=str(tmp_path / "missing-kiro"),
+        prompt="Review synthetic source.",
+        model="claude-sonnet-5",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="verdict",
+        timeout_seconds=1,
+        **kiro_paths(tmp_path),
+    )
+
+    assert exit_code == 127
+    assert "not found" in error.lower()
+    assert response.response == ""
+
+
+def test_invoke_kiro_maps_operating_system_execution_errors_to_127(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    def fail_to_execute(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_to_execute)
+    exit_code, error, response = cli.invoke_kiro(
+        kiro_bin="kiro-cli",
+        prompt="Review synthetic source.",
+        model="claude-sonnet-5",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="verdict",
+        timeout_seconds=1,
+        **kiro_paths(tmp_path),
+    )
+
+    assert exit_code == 127
+    assert "denied" in error
+    assert response.response == ""
+
+
+def test_invoke_kiro_preserves_empty_output_with_a_valid_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(tmp_path, monkeypatch, model="empty")
+
+    assert exit_code == 0
+    assert error == ""
+    assert response.conversation_id == "123e4567-e89b-12d3-a456-426614174000"
+    assert response.response == ""
+    assert (tmp_path / "response.log").read_bytes() == b""
 
 
 def test_usage_private_gemini_product_review(tmp_path: Path) -> None:

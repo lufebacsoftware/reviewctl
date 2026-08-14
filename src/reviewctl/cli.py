@@ -89,7 +89,7 @@ RESPONSE_CONTRACTS = {
 }
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 90
 DEFAULT_REVIEW_MAX_ATTEMPTS = 1
-TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "pi"}
+TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
 ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 RETRIABLE_REVIEW_RESULTS = {
@@ -116,6 +116,10 @@ CODEX_FINDINGS_SCHEMA = {
         "reviewedFiles": REVIEWED_FILES_SCHEMA,
     },
 }
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+KIRO_SESSION_ID = re.compile(
+    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+)
 
 _STRING_SCHEMA = {"type": "string", "minLength": 1}
 _STRING_LIST_SCHEMA = {"type": "array", "items": _STRING_SCHEMA}
@@ -1642,6 +1646,235 @@ def openrouter_packet(
     return f"{prompt}\n\n{contract}\n\n{fragments}"
 
 
+def kiro_process_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Retain local Kiro login paths while excluding ambient provider credentials."""
+    allowed = (
+        "PATH",
+        "SYSTEMROOT",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+    environment = {key: source[key] for key in allowed if key in source}
+    environment["KIRO_LOG_NO_COLOR"] = "1"
+    return environment
+
+
+def normalize_kiro_output(stdout: bytes) -> str:
+    """Remove Kiro terminal framing without rewriting response content."""
+    text = ANSI_ESCAPE.sub("", stdout.decode(errors="replace")).replace("\r", "")
+    lines = text.splitlines()
+    start = next((index for index, line in enumerate(lines) if line.startswith("> ")), None)
+    if start is None:
+        return ""
+    lines[start] = lines[start][2:]
+    lines = lines[start:]
+    while lines and (not lines[-1].strip() or lines[-1].strip().startswith("▸ Credits:")):
+        lines.pop()
+    return "\n".join(lines)
+
+
+def kiro_model_inventory(payload: bytes) -> tuple[tuple[str, ...], str]:
+    """Read only exact Kiro model identifiers observed from the installed CLI."""
+    try:
+        value = json.loads(payload, parse_constant=reject_nonstandard_json_constant)
+    except (json.JSONDecodeError, UnicodeError, ValueError) as error:
+        raise ValueError("Kiro returned malformed model inventory") from error
+    if type(value) is not dict:
+        raise ValueError("Kiro returned malformed model inventory")
+    models = value.get("models")
+    default_model = value.get("default_model")
+    if type(models) is not list or type(default_model) is not str or not default_model.strip():
+        raise ValueError("Kiro returned malformed model inventory")
+    identifiers: list[str] = []
+    for item in models:
+        identifier = item.get("model_id") if type(item) is dict else None
+        if (
+            type(identifier) is not str
+            or not identifier.strip()
+            or identifier != identifier.strip()
+        ):
+            raise ValueError("Kiro returned malformed model inventory")
+        identifiers.append(identifier)
+    if not identifiers or len(identifiers) != len(set(identifiers)):
+        raise ValueError("Kiro returned malformed model inventory")
+    if default_model not in identifiers:
+        raise ValueError("Kiro returned malformed model inventory")
+    return tuple(identifiers), default_model
+
+
+def kiro_session_id(payload: bytes, cwd: Path) -> str:
+    """Require one reproducible UUID session for the isolated Kiro working directory."""
+    try:
+        value = json.loads(payload, parse_constant=reject_nonstandard_json_constant)
+    except (json.JSONDecodeError, UnicodeError, ValueError):
+        return ""
+    if type(value) is not list or len(value) != 1 or type(value[0]) is not dict:
+        return ""
+    sessions = value[0].get("sessions")
+    if (
+        value[0].get("cwd") != str(cwd.resolve())
+        or type(sessions) is not list
+        or len(sessions) != 1
+    ):
+        return ""
+    session = sessions[0]
+    identifier = session.get("sessionId") if type(session) is dict else None
+    if type(identifier) is not str or not KIRO_SESSION_ID.fullmatch(identifier):
+        return ""
+    return identifier
+
+
+def invoke_kiro(
+    *,
+    kiro_bin: str,
+    prompt: str,
+    model: str,
+    files: list[Path],
+    max_output_tokens: int,
+    response_contract: str,
+    timeout_seconds: int,
+    request_path: Path,
+    models_path: Path,
+    response_path: Path,
+    session_path: Path,
+    diagnostic_path: Path,
+) -> tuple[int, str, PersistedResponse]:
+    """Run Kiro from an empty directory and retain its runtime-owned evidence."""
+    blank = PersistedResponse("", None, None, None, model, None, None, "")
+    environment = kiro_process_environment(os.environ)
+    stderr_chunks: list[bytes] = []
+    started = time.monotonic()
+
+    def persist_stderr() -> str:
+        stderr = b"".join(stderr_chunks).decode(errors="replace")
+        if stderr:
+            diagnostic_path.write_text(redact_diagnostic(stderr, limit=100_000))
+        return stderr
+
+    def run_process(command: list[str], cwd: Path, timeout: int) -> tuple[int, bytes, bytes, str]:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+                return process.returncode, stdout, stderr, ""
+            except subprocess.TimeoutExpired:
+                terminate_process_group(process)
+                stdout, stderr = process.communicate()
+                return 124, stdout, stderr, "review attempt timed out"
+        except FileNotFoundError:
+            return 127, b"", b"", f"Kiro transport executable not found: {kiro_bin}"
+        except OSError as error:
+            return 127, b"", b"", f"Kiro transport could not execute: {error}"
+
+    with tempfile.TemporaryDirectory(prefix="reviewctl-kiro-") as directory:
+        cwd = Path(directory).resolve()
+        inventory_command = [kiro_bin, "chat", "--list-models", "--format", "json"]
+        code, inventory_stdout, inventory_stderr, transport_error = run_process(
+            inventory_command, cwd, min(10, timeout_seconds)
+        )
+        models_path.write_bytes(inventory_stdout)
+        stderr_chunks.append(inventory_stderr)
+        if code != 0:
+            stderr = persist_stderr()
+            return code, transport_error or stderr or "Kiro model inventory failed", blank
+        try:
+            models, _default_model = kiro_model_inventory(inventory_stdout)
+        except ValueError as error:
+            persist_stderr()
+            return 502, str(error), blank
+        if model == "auto":
+            persist_stderr()
+            return (
+                502,
+                "Kiro model auto is rejected because resolved identity is unobservable",
+                blank,
+            )
+        if model not in models:
+            persist_stderr()
+            return 502, f"Kiro model is not listed by the installed CLI: {model}", blank
+
+        inline_packet = openrouter_packet(prompt, files, response_contract)
+        command = [
+            kiro_bin,
+            "chat",
+            "--no-interactive",
+            "--trust-tools=",
+            "--agent",
+            "kiro_default",
+            "--model",
+            model,
+            "--wrap",
+            "never",
+            inline_packet,
+        ]
+        request_path.write_bytes(
+            canonical_json(
+                {
+                    "command": command,
+                    "model": model,
+                    "models": {
+                        "path": str(models_path),
+                        "sha256": sha256_bytes(inventory_stdout),
+                    },
+                    "outputTokenLimitEnforced": False,
+                    "prompt": inline_packet,
+                    "requestedMaxOutputTokens": max_output_tokens,
+                    "responseContract": response_contract,
+                }
+            )
+            + b"\n"
+        )
+        code, stdout, invocation_stderr, transport_error = run_process(
+            command, cwd, timeout_seconds
+        )
+        response_path.write_bytes(stdout)
+        stderr_chunks.append(invocation_stderr)
+        if code != 0:
+            stderr = persist_stderr()
+            return code, transport_error or stderr or "Kiro review invocation failed", blank
+
+        session_command = [kiro_bin, "chat", "--list-sessions", "--format", "json"]
+        code, session_stdout, session_stderr, transport_error = run_process(
+            session_command, cwd, timeout_seconds
+        )
+        session_path.write_bytes(session_stdout)
+        stderr_chunks.append(session_stderr)
+        stderr = persist_stderr()
+        if code != 0:
+            return code, transport_error or stderr or "Kiro session inventory failed", blank
+        session = kiro_session_id(session_stdout, cwd)
+        if not session:
+            return 502, "Kiro returned no coherent session for the review directory", blank
+        return (
+            0,
+            stderr,
+            PersistedResponse(
+                session,
+                None,
+                round((time.monotonic() - started) * 1000),
+                None,
+                model,
+                None,
+                None,
+                normalize_kiro_output(stdout),
+            ),
+        )
+
+
 def numeric_value(value: object) -> float | None:
     if not isinstance(value, int | float) or isinstance(value, bool):
         return None
@@ -2665,8 +2898,42 @@ def execute_codex_backend(request: BackendRequest) -> BackendExecution:
 
 
 def execute_kiro_backend(request: BackendRequest) -> BackendExecution:
-    del request
-    return BackendExecution(127, "Kiro transport is not implemented", None, BackendEvidence())
+    request_path = request.attempt_dir / "request.json"
+    models_path = request.attempt_dir / "models.json"
+    response_path = request.attempt_dir / "response.log"
+    session_path = request.attempt_dir / "session.json"
+    final_response_path = request.attempt_dir / "response.md"
+    diagnostic_path = request.attempt_dir / "stderr.log"
+    exit_code, diagnostic, response = invoke_kiro(
+        kiro_bin=os.environ.get("KIRO_BIN", "kiro-cli"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        models_path=models_path,
+        response_path=response_path,
+        session_path=session_path,
+        diagnostic_path=diagnostic_path,
+    )
+    final_evidence = None
+    if response.response:
+        final_response_path.write_text(response.response)
+        final_evidence = final_response_path
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(
+            request=request_path,
+            response=response_path,
+            session=session_path,
+            final_response=final_evidence,
+            stderr=diagnostic_path,
+        ),
+    )
 
 
 def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
@@ -3172,6 +3439,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     routes, route_profile = review_routes(parser, args)
     if any(route.transport == "pi" and "/" not in route.model for route in routes):
         parser.error("pi review models must use provider/model identity")
+    if any(route.transport == "kiro" and route.model == "auto" for route in routes):
+        parser.error("Kiro review model auto is rejected because resolved identity is unobservable")
     route_transports = {route.transport for route in routes}
     transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
     transport_defaults, execution_config = load_transport_defaults(
@@ -3188,9 +3457,17 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             parser.error("provider preferences require at least one openrouter route")
         parser.error("provider preferences require --transport openrouter")
     policy_digest: str | None = None
+    loaded_policy: dict[str, Any] | None = None
     if args.policy:
-        load_policy(args.policy)
+        loaded_policy = load_policy(args.policy)
         policy_digest = policy_sha256(args.policy)
+    kiro_routes = [route for route in routes if route.transport == "kiro"]
+    if args.source_class == "proprietary" and kiro_routes:
+        if loaded_policy is None:
+            parser.error("proprietary Kiro reviews require --policy")
+        for route in kiro_routes:
+            if not source_allowed(loaded_policy, route.model):
+                parser.error(f"policy does not allow Kiro model {route.model}")
     artifact_root = Path(args.artifact_root)
     log_path = (
         Path(args.log_file).expanduser()
@@ -3227,6 +3504,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     }
     attempts: list[dict[str, Any]] = []
     accepted: PersistedResponse | None = None
+    accepted_capabilities: BackendCapabilities | None = None
     accepted_review: dict[str, Any] | None = None
     accepted_attempt: int | None = None
     promoted_fragments: tuple[PromotedFragment, ...] = ()
@@ -3380,7 +3658,9 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 route_index=route_index,
                 transport=transport,
             )
-            execution = backend_registry.require(transport).execute(
+            backend = backend_registry.require(transport)
+            capabilities = backend.descriptor.capabilities
+            execution = backend.execute(
                 BackendRequest(
                     prompt=attempt_prompt,
                     model=transport_model,
@@ -3423,9 +3703,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 gate_result = "transport-failed"
             elif persisted is None:
                 gate_result = "missing-response"
-            elif persisted.model != transport_model:
+            elif capabilities.resolved_model_identity and persisted.model != transport_model:
                 gate_result = "model-mismatch"
-            elif not resolved_provider_matches(provider_preferences, persisted.provider):
+            elif capabilities.resolved_provider_identity and not resolved_provider_matches(
+                provider_preferences, persisted.provider
+            ):
                 gate_result = "provider-mismatch"
             elif not persisted.response.strip():
                 gate_result = "empty"
@@ -3541,12 +3823,23 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 "diagnostic": redact_diagnostic(stderr),
                 "exitCode": exit_code,
                 "isolation": ("macos-source-root-deny" if codex_source_roots else None),
-                "model": {"requested": model, "resolved": persisted.model if persisted else None},
+                "model": {
+                    "requested": model,
+                    "resolved": (
+                        persisted.model
+                        if persisted is not None and capabilities.resolved_model_identity
+                        else None
+                    ),
+                },
                 "provider": {
                     "requested": provider_preferences.get("only", [])
                     if provider_preferences
                     else [],
-                    "resolved": persisted.provider if persisted else None,
+                    "resolved": (
+                        persisted.provider
+                        if persisted is not None and capabilities.resolved_provider_identity
+                        else None
+                    ),
                 },
                 "providerPreferences": provider_preferences,
                 "rawResponse": raw_response,
@@ -3656,6 +3949,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             )
             if result == "accepted":
                 accepted = persisted
+                accepted_capabilities = capabilities
                 accepted_review = review
                 accepted_attempt = number
                 break
@@ -3686,7 +3980,13 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         "createdAt": utc_now(),
         "model": {
             "requested": requested_models,
-            "resolved": accepted.model if accepted else None,
+            "resolved": (
+                accepted.model
+                if accepted is not None
+                and accepted_capabilities is not None
+                and accepted_capabilities.resolved_model_identity
+                else None
+            ),
         },
         "policy": {"sha256": policy_digest},
         "prompt": {
@@ -3736,7 +4036,12 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "conversationId": accepted.conversation_id,
             "costUsd": accepted.cost_usd,
             "durationMs": accepted.duration_ms,
-            "provider": accepted.provider,
+            "provider": (
+                accepted.provider
+                if accepted_capabilities is not None
+                and accepted_capabilities.resolved_provider_identity
+                else None
+            ),
         }
         if args.response_contract == "findings-json":
             receipt["findings"] = accepted_review["findings"] if accepted_review else []
