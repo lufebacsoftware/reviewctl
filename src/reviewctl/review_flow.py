@@ -203,6 +203,15 @@ def _valid_completion_manifest(
         or violations[0] not in FINDINGS_CONTRACT_VIOLATION_CODES
     ):
         return False
+    covered_fields = tuple(field for field in required_fields if field not in missing)
+    if not _coverage_matches_violation(
+        violations[0],
+        required_fields,
+        covered_fields,
+        missing_fields,
+        fragment_count=1 if require_findings_gap else 0,
+    ):
+        return False
     if type(invalid_fragment_indexes) is not sequence_type or not all(
         _is_nonnegative_int(index) for index in invalid_fragment_indexes
     ):
@@ -750,12 +759,14 @@ def consolidate(
     accepted_review: dict[str, Any] | None,
     promoted_fragments: tuple[PromotedFragment, ...],
     accepted_attempt: int | None,
+    *,
+    contract_context: ContractContext,
 ) -> ConsolidatedReview:
     """Combine accepted and partial findings without manufacturing acceptance or dispute."""
     validated_fragments: list[tuple[PromotedFragment, dict[str, Any]]] = []
     for fragment in promoted_fragments:
         finding = _validated_promoted_finding(fragment)
-        if finding is not None:
+        if finding is not None and finding["path"] in contract_context.file_names:
             validated_fragments.append((fragment, finding))
 
     groups: dict[str, dict[str, Any]] = {}
@@ -821,7 +832,10 @@ def consolidate(
         )
 
     for accepted_finding in accepted_findings:
-        if not _valid_finding(accepted_finding):
+        if (
+            not _valid_finding(accepted_finding)
+            or accepted_finding["path"] not in contract_context.file_names
+        ):
             return ConsolidatedReview(
                 status="unavailable",
                 verdict=None,
@@ -1622,6 +1636,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             legacy_review,
             tuple(all_promoted),
             accepted_attempt if _is_positive_int(accepted_attempt) else None,
+            contract_context=ContractContext(file_names=source_file_names or ()),
         ).to_dict()
         if receipt.get("consolidatedReview") != expected_consolidation:
             reject("consolidated-review")

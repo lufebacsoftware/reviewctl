@@ -250,6 +250,7 @@ def v2_findings_receipt() -> dict[str, object]:
             {"verdict": "approved", "findings": []},
             (promoted_fragment,),
             2,
+            contract_context=ContractContext(file_names=("source.py",)),
         ).to_dict(),
     }
     return _sign_receipt(receipt)
@@ -302,7 +303,12 @@ def v2_invalid_findings_receipt() -> dict[str, object]:
             }
         ],
         "fallbackRelationships": [],
-        "consolidatedReview": consolidate(None, (), None).to_dict(),
+        "consolidatedReview": consolidate(
+            None,
+            (),
+            None,
+            contract_context=ContractContext(file_names=("source.py",)),
+        ).to_dict(),
     }
     return _sign_receipt(receipt)
 
@@ -824,6 +830,36 @@ def test_build_completion_context_requires_a_typed_gap_manifest() -> None:
         build_completion_context(None, (), allowed_file_names=("source.py",))
 
 
+def test_build_completion_context_rejects_review_declaration_with_missing_verdict() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",), review_declaration_required=True)
+    payload = json.dumps(
+        {
+            "verdict": "changes-requested",
+            "findings": [finding()],
+            "reviewedFiles": [],
+        }
+    )
+    evaluation = contract.evaluate(
+        payload,
+        contract.prepare(context),
+        context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
+    request = replace(
+        evaluation.completion_request,
+        missing_fields=("verdict", "findings", "reviewedFiles"),
+    )
+
+    with pytest.raises(ValueError, match="invalid completion manifest"):
+        build_completion_context(
+            request,
+            promoted(finding()),
+            allowed_file_names=("source.py",),
+            review_declaration_required=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -931,6 +967,7 @@ def test_promoted_and_consolidated_values_are_deeply_immutable() -> None:
         {"verdict": "changes-requested", "findings": [finding()]},
         (fragment,),
         accepted_attempt=2,
+        contract_context=ContractContext(file_names=("source.py",)),
     )
 
     with pytest.raises(TypeError):
@@ -1069,6 +1106,41 @@ def test_render_completion_prompt_rejects_gap_manifest_for_another_context() -> 
         allowed_file_names=("source.py",),
     )
     malicious = replace(context, missing_fields=("findings", "reviewedFiles"))
+
+    with pytest.raises(ValueError, match="^invalid completion context$"):
+        render_completion_prompt("Review the packet.", malicious)
+
+
+def test_render_completion_prompt_rejects_review_declaration_with_missing_verdict() -> None:
+    contract = get_contract("findings-json")
+    contract_context = ContractContext(file_names=("source.py",), review_declaration_required=True)
+    evaluation = contract.evaluate(
+        json.dumps(
+            {
+                "verdict": "changes-requested",
+                "findings": [finding()],
+                "reviewedFiles": [],
+            }
+        ),
+        contract.prepare(contract_context),
+        contract_context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
+    fragments = promote_fragments(
+        evaluation,
+        contract_context=contract_context,
+        gate_result="contract-incomplete",
+        attempt=1,
+        route_index=0,
+        raw_response_digest=evaluation.payload_digest,
+    )
+    context = build_completion_context(
+        evaluation.completion_request,
+        fragments,
+        allowed_file_names=("source.py",),
+        review_declaration_required=True,
+    )
+    malicious = replace(context, missing_fields=("verdict", "findings", "reviewedFiles"))
 
     with pytest.raises(ValueError, match="^invalid completion context$"):
         render_completion_prompt("Review the packet.", malicious)
@@ -1231,7 +1303,12 @@ def test_consolidate_without_a_real_accepted_attempt_is_unavailable() -> None:
         *promoted(finding(), attempt=2),
         *promoted(finding(), attempt=1),
     )
-    result = consolidate(None, fragments, None)
+    result = consolidate(
+        None,
+        fragments,
+        None,
+        contract_context=ContractContext(file_names=("source.py",)),
+    )
 
     assert isinstance(result, ConsolidatedReview)
     assert result.status == "unavailable"
@@ -1243,13 +1320,36 @@ def test_consolidate_without_a_real_accepted_attempt_is_unavailable() -> None:
     assert [source["attempt"] for source in result.findings[0].sources] == [1, 2]
 
 
+def test_consolidate_discards_identity_valid_fragment_outside_authoritative_scope() -> None:
+    outside = promoted(finding(path="outside.py"))[0]
+
+    result = consolidate(
+        None,
+        (outside,),
+        None,
+        contract_context=ContractContext(file_names=("source.py",)),
+    )
+
+    assert result.findings == ()
+
+
+def test_consolidate_requires_explicit_authoritative_context() -> None:
+    with pytest.raises(TypeError, match="contract_context"):
+        consolidate(None, (), None)  # type: ignore[call-arg]
+
+
 def test_consolidate_confirms_accepted_match_and_preserves_partial_only_severity() -> None:
     matched = finding(severity="medium", title="Matched")
     partial_only = finding(severity="critical", path="other.py", line=9, title="Partial")
     fragments = (*promoted(partial_only, attempt=2), *promoted(matched, attempt=1))
     accepted = {"verdict": "changes-requested", "findings": [matched]}
 
-    result = consolidate(accepted, fragments, accepted_attempt=3)
+    result = consolidate(
+        accepted,
+        fragments,
+        accepted_attempt=3,
+        contract_context=ContractContext(file_names=("other.py", "source.py")),
+    )
 
     assert result.status == "accepted"
     assert result.verdict == "changes-requested"
@@ -1262,7 +1362,12 @@ def test_consolidate_confirms_accepted_match_and_preserves_partial_only_severity
 
 
 def test_consolidate_approved_only_from_real_accepted_review() -> None:
-    result = consolidate({"verdict": "approved", "findings": []}, (), accepted_attempt=2)
+    result = consolidate(
+        {"verdict": "approved", "findings": []},
+        (),
+        accepted_attempt=2,
+        contract_context=ContractContext(file_names=("source.py",)),
+    )
 
     assert result.status == "accepted"
     assert result.verdict == "approved"
@@ -1274,6 +1379,7 @@ def test_consolidate_does_not_approve_when_unconfirmed_partial_findings_remain()
         {"verdict": "approved", "findings": []},
         promoted(finding()),
         accepted_attempt=2,
+        contract_context=ContractContext(file_names=("source.py",)),
     )
 
     assert result.status == "accepted"
@@ -1292,6 +1398,7 @@ def test_consolidate_rejects_invalid_accepted_attempt_but_preserves_partial_evid
         {"verdict": "approved", "findings": []},
         promoted(finding()),
         accepted_attempt=accepted_attempt,  # type: ignore[arg-type]
+        contract_context=ContractContext(file_names=("source.py",)),
     )
 
     assert result.status == "unavailable"
@@ -1331,7 +1438,12 @@ def test_consolidate_discards_promoted_fragments_with_divergent_identity(tamper:
     else:
         fragment = replace(fragment, raw_response_digest="1" * 64)
 
-    result = consolidate(None, (fragment,), None)
+    result = consolidate(
+        None,
+        (fragment,),
+        None,
+        contract_context=ContractContext(file_names=("source.py",)),
+    )
 
     assert result.status == "unavailable"
     assert result.findings == ()
@@ -1346,8 +1458,9 @@ def test_consolidate_validates_mixed_untrusted_fragments_before_sorting() -> Non
         replace(valid, payload_digest=None),  # type: ignore[arg-type]
     )
 
-    forward = consolidate(None, (valid, *invalid), None)
-    reverse = consolidate(None, tuple(reversed((valid, *invalid))), None)
+    context = ContractContext(file_names=("source.py",))
+    forward = consolidate(None, (valid, *invalid), None, contract_context=context)
+    reverse = consolidate(None, tuple(reversed((valid, *invalid))), None, contract_context=context)
 
     assert canonical_json(forward.to_dict()) == canonical_json(reverse.to_dict())
     assert forward.status == "unavailable"
@@ -1357,7 +1470,12 @@ def test_consolidate_validates_mixed_untrusted_fragments_before_sorting() -> Non
 
 
 def test_consolidate_rejects_an_impossible_accepted_verdict_finding_pair() -> None:
-    result = consolidate({"verdict": "approved", "findings": [finding()]}, (), accepted_attempt=2)
+    result = consolidate(
+        {"verdict": "approved", "findings": [finding()]},
+        (),
+        accepted_attempt=2,
+        contract_context=ContractContext(file_names=("source.py",)),
+    )
 
     assert result.status == "unavailable"
     assert result.approved is False
@@ -1368,6 +1486,7 @@ def test_consolidate_fails_closed_for_invalid_accepted_finding() -> None:
         {"verdict": "changes-requested", "findings": [{"title": "partial"}]},
         (),
         accepted_attempt=2,
+        contract_context=ContractContext(file_names=("source.py",)),
     )
 
     assert result.status == "unavailable"
@@ -1376,7 +1495,12 @@ def test_consolidate_fails_closed_for_invalid_accepted_finding() -> None:
 def test_consolidate_ignores_invalid_untrusted_promoted_object() -> None:
     fragment = replace(promoted(finding())[0], finding={"title": "partial"})
 
-    result = consolidate({"verdict": "approved", "findings": []}, (fragment,), accepted_attempt=2)
+    result = consolidate(
+        {"verdict": "approved", "findings": []},
+        (fragment,),
+        accepted_attempt=2,
+        contract_context=ContractContext(file_names=("source.py",)),
+    )
 
     assert result.status == "accepted"
     assert result.findings == ()
@@ -1392,8 +1516,14 @@ def test_consolidation_is_canonical_across_input_permutations_and_keeps_duplicat
     )
     accepted = {"verdict": "changes-requested", "findings": [beta]}
 
-    forward = consolidate(accepted, fragments, accepted_attempt=4)
-    reverse = consolidate(accepted, tuple(reversed(fragments)), accepted_attempt=4)
+    context = ContractContext(file_names=("a.py", "b.py"))
+    forward = consolidate(accepted, fragments, accepted_attempt=4, contract_context=context)
+    reverse = consolidate(
+        accepted,
+        tuple(reversed(fragments)),
+        accepted_attempt=4,
+        contract_context=context,
+    )
 
     assert canonical_json(forward.to_dict()) == canonical_json(reverse.to_dict())
     assert [item.finding["path"] for item in forward.findings] == ["a.py", "b.py"]
@@ -1922,6 +2052,7 @@ def test_validate_v2_receipt_accepts_complete_duplicate_findings() -> None:
         normalized,
         (prior_fragment,),
         2,
+        contract_context=ContractContext(file_names=("source.py",)),
     ).to_dict()
     _sign_receipt(receipt)
 
@@ -2173,7 +2304,10 @@ def test_validate_v2_receipt_derives_fallback_reason_from_source_attempt(
     first["promotedFragments"] = []
     receipt["fallbackRelationships"][0]["promotedFragmentIds"] = []
     receipt["consolidatedReview"] = consolidate(
-        {"verdict": "approved", "findings": []}, (), 2
+        {"verdict": "approved", "findings": []},
+        (),
+        2,
+        contract_context=ContractContext(file_names=("source.py",)),
     ).to_dict()
     if source_kind == "pre-gate":
         first["result"] = "timeout"
@@ -2221,7 +2355,12 @@ def test_validate_v2_receipt_accepts_contract_data_error_without_evaluation() ->
     receipt["fallbackRelationships"] = []
     receipt.pop("verdict")
     receipt.pop("findings")
-    receipt["consolidatedReview"] = consolidate(None, (), None).to_dict()
+    receipt["consolidatedReview"] = consolidate(
+        None,
+        (),
+        None,
+        contract_context=ContractContext(file_names=("source.py",)),
+    ).to_dict()
     _sign_receipt(receipt)
 
     assert validate_v2_receipt(receipt) == ()
@@ -2256,7 +2395,12 @@ def test_validate_v2_receipt_rejects_malformed_evaluation_error(field: str, valu
     receipt["fallbackRelationships"] = []
     receipt.pop("verdict")
     receipt.pop("findings")
-    receipt["consolidatedReview"] = consolidate(None, (), None).to_dict()
+    receipt["consolidatedReview"] = consolidate(
+        None,
+        (),
+        None,
+        contract_context=ContractContext(file_names=("source.py",)),
+    ).to_dict()
     _sign_receipt(receipt)
 
     assert "contract-evaluation" in validate_v2_receipt(receipt)

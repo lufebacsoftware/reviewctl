@@ -3644,7 +3644,12 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             relationship.to_dict() for relationship in fallback_relationships
         ]
         receipt["consolidatedReview"] = consolidate(
-            accepted_review, promoted_fragments, accepted_attempt
+            accepted_review,
+            promoted_fragments,
+            accepted_attempt,
+            contract_context=ContractContext(
+                file_names=tuple(item["name"] for item in source_files)
+            ),
         ).to_dict()
     if accepted:
         receipt["response"] = {
