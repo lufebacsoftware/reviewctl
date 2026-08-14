@@ -54,6 +54,7 @@ from reviewctl.contracts import (
     exact_json_object,
     get_contract,
     require_string_json_object_keys,
+    valid_review_basename,
 )
 from reviewctl.review_flow import (
     FallbackRelationship,
@@ -830,6 +831,8 @@ def validate_request(
             fail(parser, f"review file does not exist: {file}")
         if file.stat().st_size > MAX_FRAGMENT_BYTES:
             fail(parser, f"review file exceeds {MAX_FRAGMENT_BYTES} bytes: {file}")
+    if not all(valid_review_basename(file.name) for file in files):
+        fail(parser, "review files must have safe printable basenames")
     if len({file.name for file in files}) != len(files):
         fail(parser, "review files must have unique basenames")
     return prompt, files

@@ -13,12 +13,80 @@ from reviewctl.contracts import (
     FragmentKind,
     canonical_json,
     get_contract,
+    valid_contract_context,
     valid_finding,
+    valid_review_basename,
 )
 
 
 class TextSubclass(str):
     pass
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "source.py\0",
+        "source.py\n",
+        "source.py\t",
+        "source\u202e.py",
+        chr(0xD800),
+    ],
+)
+def test_review_basename_rejects_non_printable_names(name: str) -> None:
+    assert valid_review_basename(name) is False
+    assert valid_contract_context(ContractContext(file_names=(name,))) is False
+
+
+@pytest.mark.parametrize("name", ["café.py", "审计.py", "emoji-🧾.py"])
+def test_review_basename_accepts_printable_unicode(name: str) -> None:
+    assert name.isprintable()
+    assert valid_review_basename(name) is True
+    assert valid_contract_context(ContractContext(file_names=(name,))) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [None, b"source.py", TextSubclass("source.py"), "", "   ", ".", "..", "a/b", "a\\b"],
+)
+def test_review_basename_requires_an_exact_safe_basename(name: object) -> None:
+    assert valid_review_basename(name) is False
+
+
+@pytest.mark.parametrize("name", ["source.py\0", "source.py\n", "source.py\t", "source\u202e.py"])
+def test_findings_contract_rejects_unsafe_matching_scope_without_exception(name: str) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=(name,))
+    prepared = replace(
+        contract.prepare(ContractContext(file_names=("source.py",))), file_names=(name,)
+    )
+    prepared = replace(
+        prepared,
+        digest=hashlib.sha256(canonical_json(prepared.identity_material)).hexdigest(),
+    )
+
+    evaluation = contract.evaluate(
+        json.dumps(finding_payload(path=name)),
+        prepared,
+        context,
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("prepared-contract",)
+    assert evaluation.value is None
+
+
+def test_findings_contract_accepts_printable_unicode_scope() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("revisión-🧾.py",))
+
+    evaluation = contract.evaluate(
+        json.dumps(finding_payload(path="revisión-🧾.py"), ensure_ascii=False),
+        contract.prepare(context),
+        context,
+    )
+
+    assert evaluation.status is EvaluationStatus.COMPLETE
 
 
 def test_findings_contract_prepares_a_stable_portable_contract() -> None:
@@ -209,6 +277,11 @@ def test_valid_finding_requires_strict_canonical_serializability() -> None:
     assert valid_finding(legitimate) is True
     assert valid_finding({**legitimate, "line": 10**5000}) is False
     assert valid_finding({**legitimate, "title": chr(0xD800)}) is False
+
+
+@pytest.mark.parametrize("path", ["source.py\0", "source.py\n", "source.py\t", "source\u202e.py"])
+def test_valid_finding_rejects_unsafe_paths(path: str) -> None:
+    assert valid_finding(finding_payload(path=path)["findings"][0]) is False
 
 
 def test_findings_contract_evaluates_and_hashes_a_normalized_value() -> None:

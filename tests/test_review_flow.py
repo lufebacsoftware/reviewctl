@@ -2433,6 +2433,15 @@ def test_validate_v2_receipt_rejects_invalid_authoritative_source(mutation: str)
     assert "receipt-source" in validate_v2_receipt(receipt)
 
 
+@pytest.mark.parametrize("name", ["source.py\0", "source.py\n", "source.py\t", "source\u202e.py"])
+def test_validate_v2_receipt_rejects_non_printable_source_names(name: str) -> None:
+    receipt = v2_findings_receipt()
+    receipt["source"]["files"][0]["name"] = name
+    _sign_receipt(receipt)
+
+    assert "receipt-source" in validate_v2_receipt(receipt)
+
+
 def test_validate_v2_receipt_rejects_context_names_invented_beyond_source() -> None:
     receipt = v2_findings_receipt()
     evaluation = receipt["attempts"][1]["contractEvaluation"]

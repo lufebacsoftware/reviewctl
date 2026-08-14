@@ -95,6 +95,18 @@ class ContractContext:
     review_declaration_required: bool = False
 
 
+def valid_review_basename(value: object) -> bool:
+    """Return whether a value is a safe printable basename for review identity."""
+    return (
+        type(value) is str
+        and bool(value.strip())
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and value.isprintable()
+    )
+
+
 def valid_contract_context(value: object, *, require_file_names: bool = False) -> bool:
     """Validate canonical contract facts before they affect identity or semantics."""
     if not isinstance(value, ContractContext):
@@ -105,15 +117,7 @@ def valid_contract_context(value: object, *, require_file_names: bool = False) -
         and type(value.review_declaration_required) is bool
         and type(file_names) is tuple
         and (not require_file_names or bool(file_names))
-        and all(
-            type(file_name) is str
-            and bool(file_name.strip())
-            and file_name not in {".", ".."}
-            and "/" not in file_name
-            and "\\" not in file_name
-            and not _contains_surrogate(file_name)
-            for file_name in file_names
-        )
+        and all(valid_review_basename(file_name) for file_name in file_names)
         and list(file_names) == sorted(set(file_names))
     )
 
@@ -316,6 +320,8 @@ def valid_finding(value: object) -> bool:
     if not isinstance(value["severity"], str) or value["severity"] not in FINDING_SEVERITIES:
         return False
     if type(value["line"]) is not int or value["line"] < 1:
+        return False
+    if not valid_review_basename(value["path"]):
         return False
     if not all(
         isinstance(value[field], str) and bool(value[field].strip())

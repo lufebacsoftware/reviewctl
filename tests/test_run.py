@@ -4764,6 +4764,29 @@ def test_rejects_duplicate_file_basenames_before_creating_artifacts(tmp_path: Pa
     assert not (tmp_path / "artifacts").exists()
 
 
+def test_rejects_non_printable_file_basename_before_creating_artifacts(tmp_path: Path) -> None:
+    source = tmp_path / "source.py\n"
+    source.write_text("pass\n")
+
+    result = run_cli(
+        "run",
+        "--review-id",
+        "unsafe-basename",
+        "--prompt",
+        "Review this synthetic packet.",
+        "--model",
+        "accepted",
+        "--file",
+        str(source),
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+    )
+
+    assert result.returncode == 2
+    assert "safe printable basenames" in result.stderr
+    assert not (tmp_path / "artifacts").exists()
+
+
 def test_freezes_source_bytes_before_the_model_receives_them(tmp_path: Path) -> None:
     source = tmp_path / "source.py"
     source.write_text("before\n")
@@ -6610,7 +6633,7 @@ def test_structured_contract_extracts_a_portable_finding() -> None:
                 "findings": [
                     {
                         "severity": "critical",
-                        "path": "src/example.py",
+                        "path": "example.py",
                         "line": 12,
                         "title": "Idempotency key is not unique",
                         "evidence": "A second request is accepted.",
@@ -6627,7 +6650,7 @@ def test_structured_contract_extracts_a_portable_finding() -> None:
         "findings": [
             {
                 "severity": "critical",
-                "path": "src/example.py",
+                "path": "example.py",
                 "line": 12,
                 "title": "Idempotency key is not unique",
                 "evidence": "A second request is accepted.",

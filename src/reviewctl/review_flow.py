@@ -21,6 +21,7 @@ from reviewctl.contracts import (
     get_contract,
     valid_contract_context,
     valid_finding,
+    valid_review_basename,
 )
 
 COMPLETION_CONTEXT_START = "<reviewctl-completion-context>"
@@ -954,11 +955,7 @@ def _receipt_source_file_names(receipt: dict[str, Any]) -> tuple[str, ...] | Non
         name = file.get("name")
         path = file.get("path")
         if (
-            not isinstance(name, str)
-            or not name.strip()
-            or name in {".", ".."}
-            or "/" in name
-            or "\\" in name
+            not valid_review_basename(name)
             or not isinstance(path, str)
             or not path.strip()
             or not _is_sha256(file.get("sha256"))
