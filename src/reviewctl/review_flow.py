@@ -50,6 +50,16 @@ SUPPORTED_ATTEMPT_RESULTS = frozenset(
 PRECONTRACT_ATTEMPT_RESULTS = SUPPORTED_ATTEMPT_RESULTS - {"accepted", "incomplete"}
 EARLY_INVALID_VIOLATIONS = frozenset({"prepared-contract", "invalid-json", "top-level-not-object"})
 SEMANTIC_INVALID_VIOLATIONS = FINDINGS_CONTRACT_VIOLATION_CODES - EARLY_INVALID_VIOLATIONS
+_VIOLATION_COVERAGE_RULES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "response-fields": (frozenset(), frozenset({"findings"})),
+    "verdict": (frozenset(), frozenset({"verdict", "findings"})),
+    "findings-shape": (frozenset(), frozenset({"verdict", "findings"})),
+    "finding-fields": (frozenset(), frozenset({"findings"})),
+    "finding-value": (frozenset(), frozenset({"findings"})),
+    "finding-path": (frozenset(), frozenset({"findings"})),
+    "verdict-invariant": (frozenset(), frozenset({"verdict", "findings"})),
+    "review-declaration": (frozenset({"verdict"}), frozenset({"findings", "reviewedFiles"})),
+}
 
 
 class _FrozenDict(dict[str, Any]):
@@ -216,6 +226,34 @@ def _valid_incomplete_coverage(
         and "findings" not in covered
         and "findings" in missing
     )
+
+
+def _coverage_matches_violation(
+    violation: object,
+    required_fields: list[str] | tuple[str, ...],
+    covered_fields: list[str] | tuple[str, ...],
+    missing_fields: list[str] | tuple[str, ...],
+    *,
+    fragment_count: int,
+) -> bool:
+    """Match serialized coverage to the v1 findings-contract producer semantics."""
+    if type(violation) is not str or violation not in _VIOLATION_COVERAGE_RULES:
+        return False
+    if not _is_nonnegative_int(fragment_count) or not _valid_incomplete_coverage(
+        required_fields, covered_fields, missing_fields
+    ):
+        return False
+    required = set(required_fields)
+    covered = set(covered_fields)
+    missing = set(missing_fields)
+    must_cover, must_miss = _VIOLATION_COVERAGE_RULES[violation]
+    if not must_cover.issubset(required) or not must_miss.issubset(required):
+        return False
+    if not must_cover.issubset(covered) or not must_miss.issubset(missing):
+        return False
+    # A serialized finding fragment is evidence that the findings collection was
+    # only partially valid; it can never turn that field into covered producer state.
+    return fragment_count == 0 or "findings" in missing
 
 
 def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | None:
@@ -522,10 +560,12 @@ def _valid_incomplete_evaluation(
             or coverage.required_fields != required_fields
         ):
             return False
-        if not _valid_incomplete_coverage(
+        if not _coverage_matches_violation(
+            evaluation.violations[0],
             coverage.required_fields,
             coverage.covered_fields,
             coverage.missing_fields,
+            fragment_count=len(evaluation.valid_fragments),
         ):
             return False
 
@@ -1316,8 +1356,16 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         violations=violations_value,
                         review_declaration_required=declaration_required,
                     )
-                    incomplete_coverage_valid = coverage_valid and _valid_incomplete_coverage(
-                        coverage[0], coverage[1], coverage[2]
+                    incomplete_coverage_valid = (
+                        coverage_valid
+                        and len(violations_value) == 1
+                        and _coverage_matches_violation(
+                            violations_value[0],
+                            coverage[0],
+                            coverage[1],
+                            coverage[2],
+                            fragment_count=len(contract_fragments),
+                        )
                     )
                     state_valid = (
                         state_valid
@@ -1341,8 +1389,12 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     if invalid_code in EARLY_INVALID_VIOLATIONS:
                         invalid_coverage_valid = evaluation.get("coverage") is None
                     elif invalid_code in SEMANTIC_INVALID_VIOLATIONS:
-                        invalid_coverage_valid = coverage_valid and _valid_incomplete_coverage(
-                            coverage[0], coverage[1], coverage[2]
+                        invalid_coverage_valid = coverage_valid and _coverage_matches_violation(
+                            invalid_code,
+                            coverage[0],
+                            coverage[1],
+                            coverage[2],
+                            fragment_count=len(contract_fragments),
                         )
                     else:
                         invalid_coverage_valid = False

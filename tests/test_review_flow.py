@@ -2454,6 +2454,168 @@ def test_validate_v2_receipt_accepts_generated_invalid_evaluation_shapes(
     assert validate_v2_receipt(receipt) == ()
 
 
+def semantic_violation_cases() -> list[tuple[str, ContractContext, str, tuple[str, ...]]]:
+    valid = finding()
+    missing_title = {**valid}
+    del missing_title["title"]
+    invalid_value = {**valid, "severity": "urgent"}
+    invalid_path = {**valid, "path": "invented.py"}
+    declaration_context = ContractContext(
+        file_names=("source.py",), review_declaration_required=True
+    )
+    return [
+        (
+            json.dumps(
+                {
+                    "verdict": "changes-requested",
+                    "findings": [valid],
+                    "extra": True,
+                }
+            ),
+            ContractContext(file_names=("source.py",)),
+            "response-fields",
+            ("findings",),
+        ),
+        (
+            json.dumps(
+                {
+                    "findings": [valid],
+                    "reviewedFiles": ["source.py"],
+                    "extra": True,
+                }
+            ),
+            declaration_context,
+            "response-fields",
+            ("findings",),
+        ),
+        (
+            json.dumps({"verdict": "unavailable", "findings": [valid]}),
+            ContractContext(file_names=("source.py",)),
+            "verdict",
+            ("verdict", "findings"),
+        ),
+        (
+            json.dumps({"verdict": "changes-requested", "findings": {}}),
+            ContractContext(file_names=("source.py",)),
+            "findings-shape",
+            ("verdict", "findings"),
+        ),
+        (
+            json.dumps({"verdict": "changes-requested", "findings": [missing_title, valid]}),
+            ContractContext(file_names=("source.py",)),
+            "finding-fields",
+            ("findings",),
+        ),
+        (
+            json.dumps({"verdict": "changes-requested", "findings": [invalid_value, valid]}),
+            ContractContext(file_names=("source.py",)),
+            "finding-value",
+            ("findings",),
+        ),
+        (
+            json.dumps({"verdict": "changes-requested", "findings": [invalid_path, valid]}),
+            ContractContext(file_names=("source.py",)),
+            "finding-path",
+            ("findings",),
+        ),
+        (
+            json.dumps({"verdict": "approved", "findings": [valid]}),
+            ContractContext(file_names=("source.py",)),
+            "verdict-invariant",
+            ("verdict", "findings"),
+        ),
+        (
+            json.dumps(
+                {
+                    "verdict": "changes-requested",
+                    "findings": [valid],
+                    "reviewedFiles": [],
+                }
+            ),
+            declaration_context,
+            "review-declaration",
+            ("findings", "reviewedFiles"),
+        ),
+    ]
+
+
+def receipt_for_semantic_evaluation(
+    payload: str, context: ContractContext
+) -> tuple[dict[str, object], object]:
+    contract = get_contract("findings-json")
+    evaluation = contract.evaluate(
+        payload,
+        contract.prepare(context),
+        context,
+        evidence=EvaluationContext(packet_digest="b" * 64),
+    )
+    receipt = v2_invalid_findings_receipt()
+    transport = "codex" if context.review_declaration_required else "llm"
+    receipt["sourceClass"] = "proprietary" if context.review_declaration_required else "synthetic"
+    receipt["transport"] = transport
+    receipt["routes"] = [{"model": "first", "transport": transport}]
+    attempt = receipt["attempts"][0]
+    attempt["route"] = {"model": "first", "transport": transport}
+    attempt["transport"] = transport
+    attempt["rawResponse"]["sha256"] = evaluation.payload_digest
+    attempt["rawResponse"]["characters"] = len(payload)
+    attempt["contractEvaluation"] = _evaluation_dict(
+        evaluation,
+        file_names=context.file_names,
+        review_declaration_required=context.review_declaration_required,
+    )
+    _sign_receipt(receipt)
+    return receipt, evaluation
+
+
+@pytest.mark.parametrize(
+    ("payload", "context", "expected_violation", "mandatory_missing"),
+    semantic_violation_cases(),
+)
+def test_validate_v2_receipt_accepts_exact_producer_semantic_coverage(
+    payload: str,
+    context: ContractContext,
+    expected_violation: str,
+    mandatory_missing: tuple[str, ...],
+) -> None:
+    receipt, evaluation = receipt_for_semantic_evaluation(payload, context)
+
+    assert evaluation.violations == (expected_violation,)
+    assert evaluation.coverage is not None
+    assert set(mandatory_missing).issubset(evaluation.coverage.missing_fields)
+    assert validate_v2_receipt(receipt) == ()
+
+
+@pytest.mark.parametrize(
+    ("payload", "context", "expected_violation", "mandatory_missing"),
+    [
+        (payload, context, violation, field)
+        for payload, context, violation, fields in semantic_violation_cases()
+        for field in fields
+    ],
+)
+def test_validate_v2_receipt_rejects_semantic_coverage_that_covers_mandatory_gap(
+    payload: str,
+    context: ContractContext,
+    expected_violation: str,
+    mandatory_missing: str,
+) -> None:
+    receipt, evaluation = receipt_for_semantic_evaluation(payload, context)
+    serialized = receipt["attempts"][0]["contractEvaluation"]
+    coverage = serialized["coverage"]
+    coverage["missingFields"].remove(mandatory_missing)
+    required = coverage["requiredFields"]
+    covered = set(coverage["coveredFields"])
+    covered.add(mandatory_missing)
+    coverage["coveredFields"] = [field for field in required if field in covered]
+    if serialized["completionRequest"] is not None:
+        serialized["completionRequest"]["missingFields"] = list(coverage["missingFields"])
+    _sign_receipt(receipt)
+
+    assert evaluation.violations == (expected_violation,)
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
 def test_validate_v2_receipt_accepts_generated_prepared_contract_failure() -> None:
     contract = get_contract("findings-json")
     context = ContractContext(file_names=("source.py",))
