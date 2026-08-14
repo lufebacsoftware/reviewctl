@@ -927,15 +927,18 @@ def _receipt_source_file_names(receipt: dict[str, Any]) -> tuple[str, ...] | Non
         return None
     names: list[str] = []
     for file in files:
-        if type(file) is not dict:
+        if type(file) is not dict or set(file) != {"name", "path", "sha256"}:
             return None
         name = file.get("name")
+        path = file.get("path")
         if (
             not isinstance(name, str)
             or not name.strip()
             or name in {".", ".."}
             or "/" in name
             or "\\" in name
+            or not isinstance(path, str)
+            or not path.strip()
             or not _is_sha256(file.get("sha256"))
         ):
             return None

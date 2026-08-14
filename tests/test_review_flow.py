@@ -1782,6 +1782,10 @@ def test_validate_v2_receipt_rejects_route_authority_contradictions(
         "empty-files",
         "non-object-file",
         "missing-name",
+        "missing-path",
+        "non-string-path",
+        "empty-path",
+        "extra-file-field",
         "non-basename",
         "empty-name",
         "invalid-digest",
@@ -1804,6 +1808,14 @@ def test_validate_v2_receipt_rejects_invalid_authoritative_source(mutation: str)
         files[0] = "source.py"
     elif mutation == "missing-name":
         files[0].pop("name")
+    elif mutation == "missing-path":
+        files[0].pop("path")
+    elif mutation == "non-string-path":
+        files[0]["path"] = ["/bounded/source.py"]
+    elif mutation == "empty-path":
+        files[0]["path"] = " "
+    elif mutation == "extra-file-field":
+        files[0]["size"] = 1
     elif mutation == "non-basename":
         files[0]["name"] = "nested/source.py"
     elif mutation == "empty-name":
