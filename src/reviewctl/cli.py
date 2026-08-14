@@ -91,7 +91,7 @@ DEFAULT_REVIEW_TIMEOUT_SECONDS = 90
 DEFAULT_REVIEW_MAX_ATTEMPTS = 1
 TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
-ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "pi"}
+ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 RETRIABLE_REVIEW_RESULTS = {
     "timeout",
     "transport-failed",
@@ -398,7 +398,8 @@ def parse_route(value: str) -> ReviewRoute:
     transport, separator, model = value.partition(":")
     if not separator or transport not in ROUTE_TRANSPORTS or not model.strip():
         raise ValueError(
-            "routes must use transport:model with transport in llm, codex, openrouter, agy, pi"
+            "routes must use transport:model with transport in "
+            "llm, codex, openrouter, agy, kiro, pi"
         )
     return ReviewRoute(transport=transport, model=model.strip())
 
@@ -2663,6 +2664,11 @@ def execute_codex_backend(request: BackendRequest) -> BackendExecution:
     )
 
 
+def execute_kiro_backend(request: BackendRequest) -> BackendExecution:
+    del request
+    return BackendExecution(127, "Kiro transport is not implemented", None, BackendEvidence())
+
+
 def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
     request_path = request.attempt_dir / "request.json"
     response_path = request.attempt_dir / "response.json"
@@ -2790,6 +2796,29 @@ def build_backend_registry() -> BackendRegistry:
             "unqualified",
         ),
         execute_codex_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "kiro",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "KIRO_BIN",
+            "kiro-cli",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                True,
+                True,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_kiro_backend,
     )
     registry.register(
         BackendDescriptor(
@@ -4313,7 +4342,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--source-class", choices=("proprietary", "synthetic"), default="synthetic")
     run.add_argument("--response-contract", choices=sorted(RESPONSE_CONTRACTS), default="verdict")
     run.add_argument(
-        "--transport", choices=("llm", "codex", "openrouter", "agy", "pi"), default="llm"
+        "--transport",
+        choices=("llm", "codex", "openrouter", "agy", "kiro", "pi"),
+        default="llm",
     )
     run.set_defaults(handler=lambda namespace: run_review(parser, namespace))
 

@@ -152,7 +152,14 @@ def assert_execution_has_transport_semantics_only(execution: BackendExecution) -
 def test_build_backend_registry_has_exact_inventory_and_unqualified_descriptors() -> None:
     descriptors = cli.build_backend_registry().descriptors()
 
-    assert tuple(item.name for item in descriptors) == ("agy", "codex", "llm", "openrouter", "pi")
+    assert tuple(item.name for item in descriptors) == (
+        "agy",
+        "codex",
+        "kiro",
+        "llm",
+        "openrouter",
+        "pi",
+    )
     assert {item.qualification for item in descriptors} == {"unqualified"}
 
 
@@ -219,6 +226,25 @@ def test_route_transports_match_registered_backend_names() -> None:
                 True,
                 True,
                 False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+        ),
+        (
+            "kiro",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "KIRO_BIN",
+            "kiro-cli",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                True,
+                True,
                 SourceIsolation.UNAVAILABLE,
             ),
         ),
@@ -344,19 +370,20 @@ def test_execute_llm_backend_preserves_failure_without_persisted_response(
 
 
 @pytest.mark.parametrize(
-    ("environment", "execute", "invoker", "executable_argument"),
+    ("environment", "execute_name", "invoker", "executable_argument"),
     [
-        ("LLM_BIN", cli.execute_llm_backend, "invoke_llm", "llm_bin"),
-        ("CODEX_BIN", cli.execute_codex_backend, "invoke_codex", "codex_bin"),
-        ("AGY_BIN", cli.execute_agy_backend, "invoke_agy", "agy_bin"),
-        ("PI_BIN", cli.execute_pi_backend, "invoke_pi", "pi_bin"),
+        ("LLM_BIN", "execute_llm_backend", "invoke_llm", "llm_bin"),
+        ("CODEX_BIN", "execute_codex_backend", "invoke_codex", "codex_bin"),
+        ("AGY_BIN", "execute_agy_backend", "invoke_agy", "agy_bin"),
+        ("KIRO_BIN", "execute_kiro_backend", None, None),
+        ("PI_BIN", "execute_pi_backend", "invoke_pi", "pi_bin"),
     ],
 )
-def test_backend_executable_override_reaches_legacy_invoker(
+def test_backend_executable_override_reaches_implemented_invoker_or_safe_stub(
     environment: str,
-    execute: backends.BackendExecutor,
-    invoker: str,
-    executable_argument: str,
+    execute_name: str,
+    invoker: str | None,
+    executable_argument: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -365,6 +392,15 @@ def test_backend_executable_override_reaches_legacy_invoker(
     executable = f"/test/bin/{environment.lower()}"
     captured: dict[str, object] = {}
     response = PersistedResponse("", None, None, None, "", None, None, "")
+    execute = getattr(cli, execute_name)
+
+    if invoker is None:
+        monkeypatch.setenv(environment, executable)
+        assert execute(request) == BackendExecution(
+            127, "Kiro transport is not implemented", None, BackendEvidence()
+        )
+        assert cli.build_backend_registry().require("kiro").descriptor.executable_env == environment
+        return
 
     def fake_invoker(**kwargs: object) -> object:
         captured.update(kwargs)
@@ -377,6 +413,7 @@ def test_backend_executable_override_reaches_legacy_invoker(
 
     execute(request)
 
+    assert executable_argument is not None
     assert captured[executable_argument] == executable
 
 

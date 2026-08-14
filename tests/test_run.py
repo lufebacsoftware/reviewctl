@@ -394,6 +394,29 @@ def test_receipt_transport_allowlist_matches_registered_backend_descriptors() ->
     assert review_flow.SUPPORTED_REVIEW_TRANSPORTS == frozenset(registered)
 
 
+def test_route_parser_accepts_kiro_and_lists_it_in_validation_errors() -> None:
+    assert cli.parse_route("kiro:requested-model") == cli.ReviewRoute(
+        transport="kiro", model="requested-model"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "^routes must use transport:model with transport in "
+            "llm, codex, openrouter, agy, kiro, pi$"
+        ),
+    ):
+        cli.parse_route("unknown:model")
+
+
+def test_run_transport_choices_accept_kiro() -> None:
+    namespace = cli.build_parser().parse_args(
+        ["run", "--review-id", "kiro-choice", "--model", "requested-model", "--transport", "kiro"]
+    )
+
+    assert namespace.transport == "kiro"
+
+
 def test_receipt_contract_allowlist_matches_cli_contract_choices() -> None:
     assert review_flow.SUPPORTED_RESPONSE_CONTRACTS == frozenset(cli.RESPONSE_CONTRACTS)
 
