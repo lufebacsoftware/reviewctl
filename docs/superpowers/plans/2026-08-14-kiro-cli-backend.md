@@ -86,7 +86,7 @@ Create `write_fake_kiro()` in `tests/test_run.py`. It must record argv, cwd, sel
 assert command[:2] == [str(fake_kiro), "chat"]
 assert "--no-interactive" in command
 assert "--trust-tools=" in command
-assert command[command.index("--model") + 1] == "claude-sonnet-5"
+assert command[command.index("--model") + 1] == "requested-model"
 assert Path(observed_cwd).is_relative_to(Path("/private/tmp")) or observed_cwd != str(source.parent)
 assert original_source_path not in prompt
 assert "--- BEGIN source.py ---" in prompt
@@ -194,7 +194,7 @@ Expected: failure because Kiro guidance is absent.
 
 - [ ] **Step 3: Add bounded documentation**
 
-Document example routing as `--route kiro:claude-sonnet-5`, but explicitly label the identifier illustrative and runtime-discovered. Do not copy current model names, prices, credit multipliers, provider commands, or qualification tables into project instruction files.
+Document example routing as `--route kiro:MODEL_ID`. Select `MODEL_ID` from the runtime inventory returned by `kiro-cli chat --list-models --format json`; do not copy concrete current model names, prices, credit multipliers, provider commands, or qualification tables into repository or project instruction files.
 
 - [ ] **Step 4: Run documentation tests and confirm GREEN**
 

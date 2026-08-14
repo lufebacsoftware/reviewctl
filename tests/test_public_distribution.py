@@ -220,6 +220,25 @@ def test_global_design_lists_kiro_and_justifies_the_native_adapter() -> None:
 
     assert "`llm`, `openrouter`, `agy`, `pi`, `codex`, and `kiro`" in design
     assert "subscription access unavailable through pi or openrouter" in design
+    for boundary in (
+        (
+            "for qualified merge-gate backends, reviewctl makes every original "
+            "source root inaccessible"
+        ),
+        (
+            "an advisory formal attempt such as unqualified kiro with "
+            "`sourceisolation: unavailable` is not an isolation guarantee"
+        ),
+        (
+            "cannot become qualified merge-gate evidence until a qualified external sandbox "
+            "denies all original source roots and organization qualification proves the boundary"
+        ),
+        (
+            "reviewctl still allows the `run` transport to invoke such an advisory attempt "
+            "and persist its observed evidence"
+        ),
+    ):
+        assert boundary in design
 
 
 def test_public_kiro_guidance_does_not_publish_a_static_model_table() -> None:
@@ -228,6 +247,7 @@ def test_public_kiro_guidance_does_not_publish_a_static_model_table() -> None:
         ROOT / "docs" / "HELP-LLM.md",
         ROOT / "docs" / "PROJECT-INTEGRATION.md",
         ROOT / "docs" / "superpowers" / "specs" / "2026-08-12-global-best-match-review-design.md",
+        ROOT / "docs" / "superpowers" / "plans" / "2026-08-14-kiro-cli-backend.md",
     )
     lines = [line.lower() for path in paths for line in path.read_text().splitlines()]
     combined = "\n".join(lines)
@@ -246,12 +266,24 @@ def test_public_kiro_guidance_does_not_publish_a_static_model_table() -> None:
         "$",
     ):
         assert forbidden_static_detail not in combined
-    assert combined.count("kiro:claude-sonnet-5") == 1
-    assert sum("claude-sonnet-" in line for line in lines) == 1
-    assert (
-        "illustrative example (current at writing; check "
-        "`kiro-cli chat --list-models --format json` before use):"
-    ) in help_text
+    route_tokens = {
+        token.strip("`'\".,;()[]{}")
+        for token in combined.split()
+        if token.strip("`'\".,;()[]{}").startswith("kiro:")
+    }
+    assert route_tokens == {"kiro:model_id"}
+    assert "claude-sonnet-" not in combined
+    assert "`kiro-cli chat --list-models --format json`" in help_text
+    assert "reviewctl run --review-id id --route kiro:model_id" in help_text
+
+    plan = " ".join(
+        (ROOT / "docs" / "superpowers" / "plans" / "2026-08-14-kiro-cli-backend.md")
+        .read_text()
+        .lower()
+        .split()
+    )
+    assert "document example routing as `--route kiro:model_id`" in plan
+    assert "select `model_id` from the runtime inventory" in plan
 
 
 def test_architecture_defines_partial_review_and_consolidation_semantics() -> None:

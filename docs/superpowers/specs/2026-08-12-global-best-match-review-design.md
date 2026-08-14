@@ -276,12 +276,12 @@ and tool control, and declares `sourceIsolation: unavailable`.
 
 ### Review and editable execution
 
-A formal review attempt is non-editable and never runs a backend against the
-source checkout. reviewctl first creates a separate staging area containing
-only the frozen packet, then makes every original source root inaccessible to
-the backend through a qualified backend-native boundary or an OS/container
-sandbox. Merely changing cwd or instructing the model not to write is not
-source isolation.
+Qualified merge-gate formal attempts are non-editable and never run a backend
+against the source checkout. For qualified merge-gate backends, reviewctl makes
+every original source root inaccessible through a qualified backend-native
+boundary or an OS/container sandbox after preparing a separate staging area
+that contains only the frozen packet. Merely changing cwd or instructing the
+model not to write is not source isolation.
 
 The staging area is filesystem-read-only when the platform and backend support
 enforcement; otherwise it is a disposable writable copy inside the sandbox.
@@ -292,11 +292,15 @@ reviewctl hashes the staged packet before and after execution. An unexpected
 mutation produces `source-mutated`, discards the staging area, and prevents
 acceptance or fragment promotion from that attempt. A backend with
 `reviewReadOnly: advisory` or `sourceIsolation: unavailable` is ineligible for
-qualified merge-gate review unless reviewctl supplies a qualified
-`external-sandbox` that denies all original source roots. Such an adapter may
-still be invocable through the formal `run` transport for advisory evidence,
-but availability and a valid receipt do not qualify its model or strengthen its
-declared isolation. Kiro currently has this advisory boundary.
+qualified merge-gate review. reviewctl still allows the `run` transport to
+invoke such an advisory attempt and persist its observed evidence; that is the
+current behavior, not a claim that every formal attempt has merge-gate
+isolation. An advisory formal attempt such as unqualified Kiro with
+`sourceIsolation: unavailable` is not an isolation guarantee. It cannot become
+qualified merge-gate evidence until a qualified external sandbox denies all
+original source roots and organization qualification proves the boundary.
+Availability and a valid receipt do not qualify its model or strengthen its
+declared isolation.
 
 Editable execution is a separate change-producing operation:
 
