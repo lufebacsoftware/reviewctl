@@ -75,7 +75,8 @@ empty working directory, passes a reduced environment, selects the built-in
 `kiro_default` agent without granting tool trust, and supplies the inline frozen packet over
 standard input so bounded source is not constrained by the process argument-size limit.
 Inventory, invocation, and session recovery share one total timeout; retained
-evidence is written with mode `0600`.
+evidence is written with mode `0600`. The request manifest links the raw model
+inventory and its digest even when inventory discovery or validation fails.
 
 This boundary provides advisory read-only behavior and tool control with
 `sourceIsolation: unavailable`. The disposable directory and reduced process

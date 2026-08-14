@@ -661,7 +661,7 @@ def test_empty_kiro_response_records_zero_byte_stderr_evidence(tmp_path: Path) -
     assert stderr_path.read_bytes() == b""
 
 
-def test_failed_kiro_inventory_does_not_advertise_missing_evidence(tmp_path: Path) -> None:
+def test_failed_kiro_inventory_links_only_the_evidence_that_exists(tmp_path: Path) -> None:
     result = run_cli(
         *review_arguments(tmp_path),
         "--transport",
@@ -674,7 +674,12 @@ def test_failed_kiro_inventory_does_not_advertise_missing_evidence(tmp_path: Pat
     assert result.returncode == 1
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
     evidence = receipt["attempts"][0]["evidence"]
-    assert evidence["request"] is None
+    request_path = Path(evidence["request"])
+    request = json.loads(request_path.read_text())
+    models_path = Path(request["models"]["path"])
+    assert request["inventoryExitCode"] == 127
+    assert models_path.is_file()
+    assert request["models"]["sha256"] == cli.sha256_bytes(models_path.read_bytes())
     assert evidence["response"] is None
     assert evidence["session"] is None
     assert evidence["finalResponse"] is None
@@ -7901,6 +7906,14 @@ def test_invoke_kiro_uses_isolated_exact_commands_and_persists_evidence(
     models_bytes = (tmp_path / "models.json").read_bytes()
     manifest = json.loads((tmp_path / "request.json").read_text())
     assert manifest["model"] == "claude-sonnet-5"
+    assert manifest["inventoryCommand"] == [
+        str(tmp_path / "kiro-cli"),
+        "chat",
+        "--list-models",
+        "--format",
+        "json",
+    ]
+    assert manifest["inventoryExitCode"] == 0
     assert manifest["requestedMaxOutputTokens"] == 123
     assert manifest["outputTokenLimitEnforced"] is False
     assert manifest["models"] == {

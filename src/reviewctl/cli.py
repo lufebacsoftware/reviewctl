@@ -1766,13 +1766,11 @@ def invoke_kiro(
     def run_process(
         command: list[str],
         cwd: Path,
-        timeout_cap: float | None = None,
         input_bytes: bytes | None = None,
     ) -> tuple[int, bytes, bytes, str]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return 124, b"", b"", "review attempt timed out"
-        timeout = min(remaining, timeout_cap) if timeout_cap is not None else remaining
         try:
             process = subprocess.Popen(
                 command,
@@ -1784,7 +1782,7 @@ def invoke_kiro(
                 start_new_session=True,
             )
             try:
-                stdout, stderr = process.communicate(input=input_bytes, timeout=timeout)
+                stdout, stderr = process.communicate(input=input_bytes, timeout=remaining)
                 return process.returncode, stdout, stderr, ""
             except subprocess.TimeoutExpired:
                 terminate_process_group(process)
@@ -1797,11 +1795,43 @@ def invoke_kiro(
 
     with tempfile.TemporaryDirectory(prefix="reviewctl-kiro-") as directory:
         cwd = Path(directory).resolve()
+        inline_packet = openrouter_packet(prompt, files, response_contract)
+        command = [
+            kiro_bin,
+            "chat",
+            "--no-interactive",
+            "--agent",
+            "kiro_default",
+            "--model",
+            model,
+            "--wrap",
+            "never",
+        ]
         inventory_command = [kiro_bin, "chat", "--list-models", "--format", "json"]
         code, inventory_stdout, inventory_stderr, transport_error = run_process(
-            inventory_command, cwd, 10
+            inventory_command, cwd
         )
         write_private_exclusive(models_path, inventory_stdout)
+        write_private_exclusive(
+            request_path,
+            canonical_json(
+                {
+                    "command": command,
+                    "inventoryCommand": inventory_command,
+                    "inventoryExitCode": code,
+                    "model": model,
+                    "models": {
+                        "path": str(models_path),
+                        "sha256": sha256_bytes(inventory_stdout),
+                    },
+                    "outputTokenLimitEnforced": False,
+                    "prompt": inline_packet,
+                    "requestedMaxOutputTokens": max_output_tokens,
+                    "responseContract": response_contract,
+                }
+            )
+            + b"\n",
+        )
         stderr_chunks.append(inventory_stderr)
         if code != 0:
             stderr = persist_stderr()
@@ -1822,36 +1852,6 @@ def invoke_kiro(
             persist_stderr()
             return 502, f"Kiro model is not listed by the installed CLI: {model}", blank
 
-        inline_packet = openrouter_packet(prompt, files, response_contract)
-        command = [
-            kiro_bin,
-            "chat",
-            "--no-interactive",
-            "--agent",
-            "kiro_default",
-            "--model",
-            model,
-            "--wrap",
-            "never",
-        ]
-        write_private_exclusive(
-            request_path,
-            canonical_json(
-                {
-                    "command": command,
-                    "model": model,
-                    "models": {
-                        "path": str(models_path),
-                        "sha256": sha256_bytes(inventory_stdout),
-                    },
-                    "outputTokenLimitEnforced": False,
-                    "prompt": inline_packet,
-                    "requestedMaxOutputTokens": max_output_tokens,
-                    "responseContract": response_contract,
-                }
-            )
-            + b"\n",
-        )
         code, stdout, invocation_stderr, transport_error = run_process(
             command, cwd, input_bytes=inline_packet.encode()
         )
