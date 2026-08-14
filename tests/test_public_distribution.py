@@ -156,6 +156,163 @@ def test_architecture_keeps_legacy_adapters_unqualified_until_conformance() -> N
         assert unsupported_claim not in architecture
 
 
+def test_architecture_documents_the_unqualified_kiro_backend_boundary() -> None:
+    architecture = " ".join((ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split())
+
+    for statement in (
+        "kiro is a registered native agent-cli adapter",
+        "remains unqualified",
+        "`kiro-cli`",
+        "`kiro_bin`",
+        "`reviewctl setup check --backend kiro`",
+        "version-only local discovery",
+        "`kiro-cli chat --list-models --format json`",
+        "availability and a valid receipt do not qualify a model",
+        "disposable controlled working directory",
+        "reduced environment",
+        "`reviewctl_readonly`",
+        "no tools, allowed tools, mcp servers, inherited mcp configuration, or resources",
+        "exact configuration and digest are retained",
+        "inline frozen packet",
+        "one total timeout",
+        "mode `0600`",
+        "dynamic model check",
+        "session recovery",
+        "initial adapter accepts only `findings-json`",
+        "fail before artifacts or source transmission",
+        "forced to `term=dumb` with standard no-color settings",
+        "only a boundary at byte zero is removed",
+        "invalid utf-8 or ansi remaining inside the json payload fails the attempt",
+        "`extension.mergegateeligible: false`",
+        "any merge gate must reject that explicit indicator",
+        "receipt verification rejects an accepted kiro receipt if either value is absent "
+        "or changed",
+        "legacy schema-v1 receipts cannot claim kiro",
+        "verification also requires `extension.kirounresolvedidentitywaiver: true`",
+        "advisory read-only",
+        "`sourceisolation: unavailable`",
+        "not os sandbox enforcement",
+    ):
+        assert statement in architecture
+
+
+def test_help_documents_kiro_selection_policy_and_failure_recovery() -> None:
+    help_text = " ".join((ROOT / "docs" / "HELP-LLM.md").read_text().lower().split())
+
+    for guidance in (
+        "`--transport kiro --model model_id`",
+        "`--route kiro:model_id`",
+        "`auto` is rejected",
+        "currently supports only `--response-contract findings-json`",
+        "cannot be separated from kiro ui framing without rewriting possible model content",
+        "forces a dumb, no-color terminal",
+        "a banner or later prompt-like line is not a response boundary",
+        "rejects invalid utf-8 or ansi inside the json payload instead of repairing it",
+        '`extension.backendqualification = "unqualified"`',
+        "`extension.mergegateeligible = false`",
+        "merge automation must reject that flag",
+        "`reviewctl verify` rejects a kiro receipt if either value is missing or changed",
+        "legacy schema-v1 receipts that claim the kiro transport fail verification",
+        "`extension.kirounresolvedidentitywaiver = true`",
+        "does not use openrouter",
+        "does not inherit ambient provider, aws, or api-token variables",
+        "proprietary kiro source requires both policy decisions",
+        "source_allowed = true",
+        "allow_unresolved_identity = true",
+        "records that waiver in the receipt",
+        "does not qualify the backend or prove which model executed",
+        "synthetic runs require neither the policy nor the waiver",
+        "rerun `kiro-cli chat --list-models --format json`",
+        "inspect the attempt evidence and do not treat the result as approval",
+        "run `reviewctl setup check --backend kiro`",
+        "supported by `run`, routes, and tournaments",
+    ):
+        assert guidance in help_text
+
+
+def test_project_guidance_keeps_kiro_rosters_out_of_instruction_files() -> None:
+    guide = " ".join((ROOT / "docs" / "PROJECT-INTEGRATION.md").read_text().lower().split())
+
+    assert "projects may state when review is required and which commands to run" in guide
+    assert "must not embed kiro model tables" in guide
+
+
+def test_global_design_lists_kiro_and_justifies_the_native_adapter() -> None:
+    design = " ".join(
+        (ROOT / "docs" / "superpowers" / "specs" / "2026-08-12-global-best-match-review-design.md")
+        .read_text()
+        .lower()
+        .split()
+    )
+
+    assert "`llm`, `openrouter`, `agy`, `pi`, `codex`, and `kiro`" in design
+    assert "subscription access unavailable through pi or openrouter" in design
+    for boundary in (
+        (
+            "for qualified merge-gate backends, reviewctl makes every original "
+            "source root inaccessible"
+        ),
+        (
+            "an advisory formal attempt such as unqualified kiro with "
+            "`sourceisolation: unavailable` is not an isolation guarantee"
+        ),
+        (
+            "cannot become qualified merge-gate evidence until a qualified external sandbox "
+            "denies all original source roots and organization qualification proves the boundary"
+        ),
+        (
+            "reviewctl still allows the `run` transport to invoke such an advisory attempt "
+            "and persist its observed evidence"
+        ),
+    ):
+        assert boundary in design
+
+
+def test_public_kiro_guidance_does_not_publish_a_static_model_table() -> None:
+    paths = (
+        ROOT / "docs" / "ARCHITECTURE.md",
+        ROOT / "docs" / "HELP-LLM.md",
+        ROOT / "docs" / "PROJECT-INTEGRATION.md",
+        ROOT / "docs" / "superpowers" / "specs" / "2026-08-12-global-best-match-review-design.md",
+        ROOT / "docs" / "superpowers" / "plans" / "2026-08-14-kiro-cli-backend.md",
+    )
+    lines = [line.lower() for path in paths for line in path.read_text().splitlines()]
+    combined = "\n".join(lines)
+    help_text = " ".join((ROOT / "docs" / "HELP-LLM.md").read_text().lower().split())
+
+    compact_lines = [line.replace(" ", "") for line in lines]
+    assert not any(
+        line.startswith(("|model|", "|kiromodel|", "|price|", "|credits|"))
+        for line in compact_lines
+    )
+    for forbidden_static_detail in (
+        "kiro models:",
+        "kiro model roster:",
+        "price:",
+        "credits per",
+        "$",
+    ):
+        assert forbidden_static_detail not in combined
+    route_tokens = {
+        token.strip("`'\".,;()[]{}")
+        for token in combined.split()
+        if token.strip("`'\".,;()[]{}").startswith("kiro:")
+    }
+    assert route_tokens == {"kiro:model_id"}
+    assert "claude-sonnet-" not in combined
+    assert "`kiro-cli chat --list-models --format json`" in help_text
+    assert "reviewctl run --review-id id --route kiro:model_id" in help_text
+
+    plan = " ".join(
+        (ROOT / "docs" / "superpowers" / "plans" / "2026-08-14-kiro-cli-backend.md")
+        .read_text()
+        .lower()
+        .split()
+    )
+    assert "document example routing as `--route kiro:model_id`" in plan
+    assert "select `model_id` from the runtime inventory" in plan
+
+
 def test_architecture_defines_partial_review_and_consolidation_semantics() -> None:
     architecture = " ".join((ROOT / "docs" / "ARCHITECTURE.md").read_text().lower().split())
 

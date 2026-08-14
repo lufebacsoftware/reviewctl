@@ -30,7 +30,7 @@ COMPLETION_CONTEXT_START = "<reviewctl-completion-context>"
 COMPLETION_CONTEXT_END = "</reviewctl-completion-context>"
 # Pure receipt validation cannot construct the CLI registry, so this allowlist is
 # kept synchronized with build_backend_registry() by a focused registry test.
-SUPPORTED_REVIEW_TRANSPORTS = frozenset({"agy", "codex", "llm", "openrouter", "pi"})
+SUPPORTED_REVIEW_TRANSPORTS = frozenset({"agy", "codex", "kiro", "llm", "openrouter", "pi"})
 RECEIPT_CONTRACT_VERSIONS = {
     "document": "legacy-1",
     "verdict": "legacy-1",
@@ -1748,6 +1748,27 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             reject("result")
     else:
         reject("result")
+
+    accepted_uses_kiro = accepted is not None and accepted.get("transport") == "kiro"
+    qualification = receipt.get("extension.backendQualification")
+    merge_gate_eligible = receipt.get("extension.mergeGateEligible")
+    if accepted_uses_kiro:
+        if qualification != "unqualified" or merge_gate_eligible is not False:
+            reject("backend-qualification")
+    elif qualification is not None or merge_gate_eligible is not None:
+        reject("backend-qualification")
+
+    expected_kiro_waiver = (
+        source_is_proprietary
+        and routes_valid
+        and any(route is not None and route[1] == "kiro" for route in route_identities)
+    )
+    kiro_waiver = receipt.get("extension.kiroUnresolvedIdentityWaiver")
+    if expected_kiro_waiver:
+        if kiro_waiver is not True:
+            reject("kiro-identity-waiver")
+    elif kiro_waiver is not None:
+        reject("kiro-identity-waiver")
 
     if result_is_accepted:
         if present_result_view_fields != expected_result_view_fields:

@@ -92,6 +92,92 @@ fail an unfiltered check of local executables. Explicitly selecting one reports
 its non-qualifying state and exits `1`. Missing or unverified selected
 executables also exit `1`.
 
+## Kiro backend
+
+Kiro is supported by `run`, routes, and tournaments as a registered native
+agent-CLI adapter, but it remains unqualified. Availability and a valid receipt
+do not qualify a model. The organization owns qualification and its private
+operating evidence.
+
+The executable defaults to `kiro-cli`; set `KIRO_BIN` to override it. This
+version-only check is local discovery and does not call a model or provider:
+
+```bash
+reviewctl setup check --backend kiro
+```
+
+Kiro owns the current runtime model inventory. Query the installed CLI, choose
+an exact returned model ID, and pass it explicitly:
+
+```bash
+kiro-cli chat --list-models --format json
+reviewctl run --review-id ID --transport kiro --model MODEL_ID \
+  --prompt-file FILE --file SOURCE
+reviewctl run --review-id ID --route kiro:MODEL_ID \
+  --prompt-file FILE --file SOURCE
+```
+
+The supported selection forms are `--transport kiro --model MODEL_ID` and
+`--route kiro:MODEL_ID`. `auto` is rejected because the resolved identity is
+unobservable. Do not copy the returned model roster, prices, credits, or
+provider commands into repository or project instruction documents.
+
+Kiro currently supports only `--response-contract findings-json`. Other
+contracts fail before artifacts or source transmission because terminal-rendered
+document, verdict, and product output cannot be separated from Kiro UI framing
+without rewriting possible model content.
+The adapter forces a dumb, no-color terminal and accepts the Kiro response
+boundary only at byte zero; a banner or later prompt-like line is not a
+response boundary. It rejects invalid UTF-8 or ANSI inside the JSON payload
+instead of repairing it; raw stdout is still retained.
+
+The adapter reuses the user's local Kiro subscription and login. It does not use
+OpenRouter and does not inherit ambient provider, AWS, or API-token variables.
+It uses a disposable controlled working directory, reduced environment, and a
+workspace-local `reviewctl_readonly` agent with no tools, allowed tools, MCP
+servers, inherited MCP configuration, or resources. The request manifest
+retains that exact agent configuration and digest. The frozen packet travels
+over standard input; inventory, invocation, and session recovery share one
+total timeout. Those controls are advisory read-only and tool controls with
+source isolation unavailable; they are not OS sandbox enforcement.
+
+Proprietary Kiro source requires both policy decisions below for the requested
+model before bytes are sent:
+
+```toml
+[models."MODEL_ID"]
+source_allowed = true
+allow_unresolved_identity = true
+```
+
+The second setting is an explicit waiver because Kiro does not expose a
+resolved model identity. `reviewctl` records that waiver in the receipt; it does
+not qualify the backend or prove which model executed. Synthetic runs require
+neither the policy nor the waiver. Potzal and federation remain unrelated and
+optional.
+
+An accepted Kiro receipt means the response passed `findings-json`; it is not a
+qualified merge approval. The receipt records
+`extension.backendQualification = "unqualified"` and
+`extension.mergeGateEligible = false`. Merge automation must reject that flag,
+and `reviewctl verify` rejects a Kiro receipt if either value is missing or
+changed. Humans or a later qualified reviewer may still use the advisory
+findings.
+Legacy schema-v1 receipts that claim the Kiro transport fail verification;
+Kiro receipts require schema v2 and its backend-qualification fields.
+For proprietary routing that includes Kiro, `reviewctl verify` also requires
+`extension.kiroUnresolvedIdentityWaiver = true`.
+
+Handle Kiro agent errors as follows:
+
+- Unknown or unlisted model: rerun
+  `kiro-cli chat --list-models --format json` and select the exact returned ID.
+- `auto`: select an explicit model ID.
+- Missing or malformed session or inventory: inspect the attempt evidence and
+  do not treat the result as approval.
+- Missing executable: run `reviewctl setup check --backend kiro` and correct
+  `KIRO_BIN` or the local installation.
+
 ## Diagnose failures
 
 Errors are actionable for LLMs. Use the receipt fields instead of guessing or

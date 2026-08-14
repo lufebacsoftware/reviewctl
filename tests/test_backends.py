@@ -152,7 +152,14 @@ def assert_execution_has_transport_semantics_only(execution: BackendExecution) -
 def test_build_backend_registry_has_exact_inventory_and_unqualified_descriptors() -> None:
     descriptors = cli.build_backend_registry().descriptors()
 
-    assert tuple(item.name for item in descriptors) == ("agy", "codex", "llm", "openrouter", "pi")
+    assert tuple(item.name for item in descriptors) == (
+        "agy",
+        "codex",
+        "kiro",
+        "llm",
+        "openrouter",
+        "pi",
+    )
     assert {item.qualification for item in descriptors} == {"unqualified"}
 
 
@@ -219,6 +226,25 @@ def test_route_transports_match_registered_backend_names() -> None:
                 True,
                 True,
                 False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+        ),
+        (
+            "kiro",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "KIRO_BIN",
+            "kiro-cli",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                True,
+                True,
                 SourceIsolation.UNAVAILABLE,
             ),
         ),
@@ -344,19 +370,20 @@ def test_execute_llm_backend_preserves_failure_without_persisted_response(
 
 
 @pytest.mark.parametrize(
-    ("environment", "execute", "invoker", "executable_argument"),
+    ("environment", "execute_name", "invoker", "executable_argument"),
     [
-        ("LLM_BIN", cli.execute_llm_backend, "invoke_llm", "llm_bin"),
-        ("CODEX_BIN", cli.execute_codex_backend, "invoke_codex", "codex_bin"),
-        ("AGY_BIN", cli.execute_agy_backend, "invoke_agy", "agy_bin"),
-        ("PI_BIN", cli.execute_pi_backend, "invoke_pi", "pi_bin"),
+        ("LLM_BIN", "execute_llm_backend", "invoke_llm", "llm_bin"),
+        ("CODEX_BIN", "execute_codex_backend", "invoke_codex", "codex_bin"),
+        ("AGY_BIN", "execute_agy_backend", "invoke_agy", "agy_bin"),
+        ("KIRO_BIN", "execute_kiro_backend", "invoke_kiro", "kiro_bin"),
+        ("PI_BIN", "execute_pi_backend", "invoke_pi", "pi_bin"),
     ],
 )
-def test_backend_executable_override_reaches_legacy_invoker(
+def test_backend_executable_override_reaches_implemented_invoker_or_safe_stub(
     environment: str,
-    execute: backends.BackendExecutor,
-    invoker: str,
-    executable_argument: str,
+    execute_name: str,
+    invoker: str | None,
+    executable_argument: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -365,6 +392,7 @@ def test_backend_executable_override_reaches_legacy_invoker(
     executable = f"/test/bin/{environment.lower()}"
     captured: dict[str, object] = {}
     response = PersistedResponse("", None, None, None, "", None, None, "")
+    execute = getattr(cli, execute_name)
 
     def fake_invoker(**kwargs: object) -> object:
         captured.update(kwargs)
@@ -377,7 +405,70 @@ def test_backend_executable_override_reaches_legacy_invoker(
 
     execute(request)
 
+    assert executable_argument is not None
     assert captured[executable_argument] == executable
+
+
+def test_execute_kiro_backend_maps_all_persisted_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    request.attempt_dir.mkdir()
+    expected_response = PersistedResponse(
+        "123e4567-e89b-12d3-a456-426614174000",
+        None,
+        12,
+        None,
+        request.model,
+        None,
+        None,
+        "accepted response",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_invoke_kiro(**kwargs: object) -> tuple[int, str, PersistedResponse]:
+        captured.update(kwargs)
+        for name in ("request_path", "models_path", "response_path", "session_path"):
+            path = kwargs[name]
+            assert isinstance(path, Path)
+            path.write_text("{}")
+        diagnostic_path = kwargs["diagnostic_path"]
+        assert isinstance(diagnostic_path, Path)
+        diagnostic_path.write_text("redacted")
+        return 0, "diagnostic", expected_response
+
+    monkeypatch.setattr(cli, "invoke_kiro", fake_invoke_kiro)
+    execution = cli.execute_kiro_backend(request)
+
+    assert captured["kiro_bin"] == "kiro-cli"
+    assert captured["model"] == request.model
+    assert (request.attempt_dir / "response.md").read_text() == "accepted response"
+    assert execution == BackendExecution(
+        0,
+        "diagnostic",
+        expected_response,
+        BackendEvidence(
+            request=request.attempt_dir / "request.json",
+            response=request.attempt_dir / "response.log",
+            session=request.attempt_dir / "session.json",
+            final_response=request.attempt_dir / "response.md",
+            stderr=request.attempt_dir / "stderr.log",
+        ),
+    )
+
+
+def test_execute_kiro_backend_omits_empty_final_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    request.attempt_dir.mkdir()
+    response = PersistedResponse("session", None, 1, None, request.model, None, None, "")
+    monkeypatch.setattr(cli, "invoke_kiro", lambda **_kwargs: (0, "", response))
+
+    execution = cli.execute_kiro_backend(request)
+
+    assert execution.evidence.final_response is None
+    assert not (request.attempt_dir / "response.md").exists()
 
 
 def test_execute_codex_backend_persists_rejected_response_and_maps_evidence(

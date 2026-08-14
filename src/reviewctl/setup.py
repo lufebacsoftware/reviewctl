@@ -24,15 +24,9 @@ _SENSITIVE_LABEL = rf"(?:(?:[a-z0-9]+[-_])+)?{_CREDENTIAL_SUFFIX}"
 _DELIMITED_SENSITIVE_LABEL = rf"(?<![a-z0-9_-]){_SENSITIVE_LABEL}(?![a-z0-9_-])"
 _URI_USERINFO = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _BEARER_CREDENTIAL = re.compile(r"(?i)(\bbearer)(\s+)[^\s,;\"']+")
-_RECOGNIZABLE_SK_KEY = re.compile(
-    r"(?<![a-zA-Z0-9_-])(sk-)[a-zA-Z0-9_-]{16,}(?![a-zA-Z0-9_-])"
-)
-_QUOTED_SENSITIVE_VALUE = re.compile(
-    rf'(?i)("\b{_SENSITIVE_LABEL}\b"\s*:\s*)"(?:\\.|[^"\\])*"'
-)
-_SENSITIVE_VALUE = re.compile(
-    rf"(?im)({_DELIMITED_SENSITIVE_LABEL})(\s*[:=]\s*)[^\r\n]*"
-)
+_RECOGNIZABLE_SK_KEY = re.compile(r"(?<![a-zA-Z0-9_-])(sk-)[a-zA-Z0-9_-]{16,}(?![a-zA-Z0-9_-])")
+_QUOTED_SENSITIVE_VALUE = re.compile(rf'(?i)("\b{_SENSITIVE_LABEL}\b"\s*:\s*)"(?:\\.|[^"\\])*"')
+_SENSITIVE_VALUE = re.compile(rf"(?im)({_DELIMITED_SENSITIVE_LABEL})(\s*[:=]\s*)[^\r\n]*")
 
 ExecutableLookup = Callable[[str, str | None], str | None]
 
@@ -80,9 +74,7 @@ def _combined_output(stdout: object, stderr: object) -> str:
 
 
 def probe_version(executable: str, environ: Mapping[str, str]) -> tuple[str | None, str | None]:
-    child_environment = {
-        key: environ[key] for key in ("PATH", "SYSTEMROOT") if key in environ
-    }
+    child_environment = {key: environ[key] for key in ("PATH", "SYSTEMROOT") if key in environ}
     try:
         completed = subprocess.run(
             [executable, "--version"],

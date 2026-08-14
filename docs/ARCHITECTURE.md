@@ -53,6 +53,63 @@ The five legacy compatibility adapters are explicitly unqualified: `llm`,
 `openrouter`, `agy`, `pi`, and `codex`. They preserve existing route behavior
 without claiming conformance. Availability is not qualification.
 
+Kiro is a registered native agent-CLI adapter and remains unqualified. Its
+default executable is `kiro-cli`; `KIRO_BIN` overrides that executable.
+`reviewctl setup check --backend kiro` performs version-only local discovery:
+it does not authenticate or call a model or provider. Availability and a valid
+receipt do not qualify a model. Qualification and the current operating roster
+remain the organization's private evidence responsibility.
+
+Kiro owns its runtime model inventory. Read it from the installed CLI with
+`kiro-cli chat --list-models --format json`, then select one exact returned ID
+with `--transport kiro --model MODEL_ID` or `--route kiro:MODEL_ID`. `auto` is
+rejected because resolved model identity is unobservable. Never copy that
+inventory, model prices, credit values, or provider commands into this
+repository or a project's instruction files.
+
+The adapter reuses the user's local Kiro subscription and login, so it can avoid
+OpenRouter for models available through that account. The adapter does not use
+OpenRouter and does not inherit ambient provider, AWS, or API-token variables.
+For a formal invocation it performs a dynamic model check, creates a disposable
+controlled working directory, passes a reduced environment, and installs a
+workspace-local `reviewctl_readonly` agent with no tools, allowed tools, MCP
+servers, inherited MCP configuration, or resources. Its exact configuration and
+digest are retained in the request manifest. The adapter supplies the inline frozen packet over
+standard input so bounded source is not constrained by the process argument-size limit.
+Inventory, invocation, and session recovery share one total timeout; retained
+evidence is written with mode `0600`. The request manifest links the raw model
+inventory and its digest even when inventory discovery or validation fails.
+The initial adapter accepts only `findings-json`. Kiro's terminal-rendered
+`document`, `verdict`, and product output cannot be separated from UI framing
+without rewriting possible response content, so those contracts fail before
+artifacts or source transmission.
+The child terminal is forced to `TERM=dumb` with standard no-color settings.
+Only a boundary at byte zero is removed; a banner or prompt-like line later in
+the stream is not a response boundary. Invalid UTF-8 or ANSI remaining inside
+the JSON payload fails the attempt while raw stdout remains evidence.
+
+This boundary provides advisory read-only behavior and tool control with
+`sourceIsolation: unavailable`. The disposable directory and reduced process
+environment are not OS sandbox enforcement. Proprietary Kiro source therefore
+requires both `source_allowed = true` and `allow_unresolved_identity = true`
+for the requested model before any source bytes are sent. The second decision
+is an explicit, receipt-recorded waiver: it does not turn the requested model
+into an observed identity or qualify the backend. Synthetic runs do not require
+that policy or waiver.
+
+For Kiro, receipt `result: accepted` means only that the response passed the
+declared contract. The same receipt records
+`extension.backendQualification: unqualified` and
+`extension.mergeGateEligible: false`. Any merge gate must reject that explicit
+indicator. Receipt verification rejects an accepted Kiro receipt if either
+value is absent or changed; the advisory response remains available for
+consolidation or later review instead of being discarded.
+Legacy schema-v1 receipts cannot claim Kiro because that schema predates the
+backend-qualification boundary.
+For a proprietary schema-v2 route set containing Kiro, verification also
+requires `extension.kiroUnresolvedIdentityWaiver: true` and rejects that field
+on receipts where no such waiver applies.
+
 Setup diagnostics observe only executable presence and version for registered
 executable backends. Setup diagnostics never authenticate, call a model or
 provider, or write configuration. The next gate is backend conformance before

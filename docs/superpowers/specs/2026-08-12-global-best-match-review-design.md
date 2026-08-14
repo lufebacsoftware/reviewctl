@@ -194,13 +194,13 @@ Agent compatibility and execution backends are separate concerns. Cursor,
 Codex, Pi, or Claude may invoke `reviewctl`; independently, `reviewctl` may use
 one of those tools as the bounded runner that reaches an LLM.
 
-The current `llm`, `openrouter`, `agy`, `pi`, and `codex` transports become
+The current `llm`, `openrouter`, `agy`, `pi`, `codex`, and `kiro` transports are
 adapters behind one execution-backend seam rather than permanent branches in
-the orchestration CLI. The initial backend families are:
+the orchestration CLI. The backend families are:
 
-| Family | Initial adapters | Purpose |
+| Family | Current or planned adapters | Purpose |
 | --- | --- | --- |
-| Agent CLI | `pi`, `codex`, `claude`, `cursor`, `agy` | Reuse an installed agent, its authentication, subscriptions, and model access. |
+| Agent CLI | Current: `pi`, `codex`, `agy`, `kiro`; planned candidates: `claude`, `cursor` | Reuse an installed agent, its authentication, subscriptions, and model access. |
 | Provider gateway | `openrouter`, `openai-compatible` | Call a provider or local gateway directly when request and response identity are observable. |
 | Generic model CLI | `llm` | Preserve the existing generic plugin-based route. |
 | Agent protocol | `acp` | Future adapter for agents exposing a stable Agent Client Protocol server. |
@@ -267,14 +267,21 @@ adapter remains justified when it can reuse a subscription or login Pi cannot,
 exposes a capability Pi lacks, or provides stronger evidence. Pi is therefore
 preferred by capability match, not a mandatory dependency.
 
+Kiro is the current concrete example: its native adapter is justified by local
+subscription access unavailable through Pi or OpenRouter. It reads Kiro's
+runtime-owned inventory with `kiro-cli chat --list-models --format json` and
+requires an exact returned model ID; it does not publish or infer a static
+roster. The adapter is registered but unqualified, reports advisory read-only
+and tool control, and declares `sourceIsolation: unavailable`.
+
 ### Review and editable execution
 
-A formal review attempt is non-editable and never runs a backend against the
-source checkout. reviewctl first creates a separate staging area containing
-only the frozen packet, then makes every original source root inaccessible to
-the backend through a qualified backend-native boundary or an OS/container
-sandbox. Merely changing cwd or instructing the model not to write is not
-source isolation.
+Qualified merge-gate formal attempts are non-editable and never run a backend
+against the source checkout. For qualified merge-gate backends, reviewctl makes
+every original source root inaccessible through a qualified backend-native
+boundary or an OS/container sandbox after preparing a separate staging area
+that contains only the frozen packet. Merely changing cwd or instructing the
+model not to write is not source isolation.
 
 The staging area is filesystem-read-only when the platform and backend support
 enforcement; otherwise it is a disposable writable copy inside the sandbox.
@@ -284,10 +291,16 @@ instructions alone are insufficient.
 reviewctl hashes the staged packet before and after execution. An unexpected
 mutation produces `source-mutated`, discards the staging area, and prevents
 acceptance or fragment promotion from that attempt. A backend with
-`reviewReadOnly: advisory` is eligible for formal review only when reviewctl
-supplies a qualified `external-sandbox` that denies all original source roots.
-`reviewReadOnly: unsupported` or `sourceIsolation: unavailable` is ineligible
-for formal review and remains exploratory/editable only.
+`reviewReadOnly: advisory` or `sourceIsolation: unavailable` is ineligible for
+qualified merge-gate review. reviewctl still allows the `run` transport to
+invoke such an advisory attempt and persist its observed evidence; that is the
+current behavior, not a claim that every formal attempt has merge-gate
+isolation. An advisory formal attempt such as unqualified Kiro with
+`sourceIsolation: unavailable` is not an isolation guarantee. It cannot become
+qualified merge-gate evidence until a qualified external sandbox denies all
+original source roots and organization qualification proves the boundary.
+Availability and a valid receipt do not qualify its model or strengthen its
+declared isolation.
 
 Editable execution is a separate change-producing operation:
 
@@ -340,8 +353,8 @@ reviewctl setup show --format human|json
 ```
 
 `discover` observes local executables and declarative configuration. `check`
-runs adapter-specific synthetic probes when explicitly requested or already
-authorized by policy. `show` renders the effective topology. Discovery never
+performs version-only local executable discovery; it does not authenticate or
+call a model or provider. `show` renders the effective topology. Discovery never
 installs tools, logs in, changes global agent rules, or promotes a backend to
 supported without conformance evidence.
 
