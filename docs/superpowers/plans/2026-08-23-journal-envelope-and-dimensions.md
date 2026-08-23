@@ -29,7 +29,7 @@
 - Modify: `tests/test_journal.py`
 - Modify: `tests/test_cli_front_door.py`
 
-- [ ] **Step 1: Test project identity and local origin creation**
+- [x] **Step 1: Test project identity and local origin creation**
 
 ```python
 def test_init_writes_portable_project_id_and_local_origin(tmp_path: Path) -> None:
@@ -44,7 +44,7 @@ def test_init_writes_portable_project_id_and_local_origin(tmp_path: Path) -> Non
     assert (tmp_path / ".reviewctl/identity.json").stat().st_mode & 0o777 == 0o600
 ```
 
-- [ ] **Step 2: Test the versioned envelope and contiguous sequence**
+- [x] **Step 2: Test the versioned envelope and contiguous sequence**
 
 ```python
 def test_new_events_have_identity_sequence_and_continuity(tmp_path: Path) -> None:
@@ -64,7 +64,7 @@ def test_new_events_have_identity_sequence_and_continuity(tmp_path: Path) -> Non
     assert journal.verify() == []
 ```
 
-- [ ] **Step 3: Test tamper, gap, and identity detection**
+- [x] **Step 3: Test tamper, gap, and identity detection**
 
 ```python
 def test_journal_verify_reports_tamper_gap_and_identity_mismatch(tmp_path: Path) -> None:
@@ -85,7 +85,7 @@ def test_journal_verify_reports_tamper_gap_and_identity_mismatch(tmp_path: Path)
     assert any("event digest" in violation for violation in violations)
 ```
 
-- [ ] **Step 4: Run the new tests and verify RED**
+- [x] **Step 4: Run the new tests and verify RED**
 
 ```bash
 uv run pytest -q tests/test_config.py::test_init_writes_portable_project_id_and_local_origin tests/test_journal.py::test_new_events_have_identity_sequence_and_continuity tests/test_journal.py::test_journal_verify_reports_tamper_gap_and_identity_mismatch
@@ -103,19 +103,19 @@ Expected: failures because the identity store, envelope fields, and `verify()` i
 - Modify: `tests/test_config.py`
 - Modify: `tests/test_cli_front_door.py`
 
-- [ ] **Step 1: Add `ProjectSettings.project_id` and validate explicit IDs**
+- [x] **Step 1: Add `ProjectSettings.project_id` and validate explicit IDs**
 
 Accept `project.id` in TOML, validate the portable identifier with the same safe ASCII rule used for review IDs, and preserve existing configs by deriving a local `project-<sha256>` fallback from the resolved project configuration path. Mark the fallback in doctor output as `portableProjectId: false`; explicit IDs report `true`. Never silently rewrite a non-empty journal from a local fallback to an explicit ID.
 
-- [ ] **Step 2: Add `ProjectIdentityStore`**
+- [x] **Step 2: Add `ProjectIdentityStore`**
 
 Implement a small module that creates `.reviewctl/identity.json` once, with `projectId`, `originId`, `createdAt`, and `schemaVersion`. Use private directory/file modes and atomic temporary-file replacement. If an existing identity has a different explicit project ID, return `journal_corrupt` rather than silently changing origin history.
 
-- [ ] **Step 3: Make `init` write the project ID and create the local identity**
+- [x] **Step 3: Make `init` write the project ID and create the local identity**
 
 Generate `project-<24 hex chars>` only for a new template, keep `--force` explicit, and create the identity after writing the config. Keep credentials and model names out of the identity file.
 
-- [ ] **Step 4: Run identity/config tests and Ruff**
+- [x] **Step 4: Run identity/config tests and Ruff**
 
 ```bash
 uv run pytest -q tests/test_config.py tests/test_cli_front_door.py
@@ -131,23 +131,23 @@ uv run ruff check src/reviewctl/identity.py src/reviewctl/config.py src/reviewct
 - Modify: `tests/test_journal.py`
 - Modify: `tests/test_api.py`
 
-- [ ] **Step 1: Add canonical event and envelope digest helpers**
+- [x] **Step 1: Add canonical event and envelope digest helpers**
 
 Normalize an event after assigning `eventId`, `at`, and `reviewId`. Set `schemaVersion`, identity, sequence, and previous digest. Compute `eventSha256` from sorted compact JSON with only `eventSha256` omitted. Do not hash the trailing newline. The event returned by `append` must exactly match the persisted event.
 
-- [ ] **Step 2: Serialize appends under a journal lock**
+- [x] **Step 2: Serialize appends under a journal lock**
 
 Open the journal with append/create flags, lock the descriptor with POSIX `fcntl.flock`, reread the final non-empty line, calculate the next sequence and previous digest, write one complete UTF-8 line, fsync, and unlock in `finally`. A missing or failed lock returns `journal_unavailable` rather than writing without continuity evidence.
 
-- [ ] **Step 3: Verify structural continuity during reads**
+- [x] **Step 3: Verify structural continuity during reads**
 
 Add `ProjectJournal.verify() -> list[str]` and make `read_with_diagnostic()` call it after JSON parsing. Verify schema version, project/origin identity, contiguous sequence, previous digest, and event digest for versioned events. Accept a legacy prefix before the first versioned event and report it as a compatibility fact rather than a violation.
 
-- [ ] **Step 4: Pass project/origin identity from `ReviewClient`**
+- [x] **Step 4: Pass project/origin identity from `ReviewClient`**
 
 Load the identity store in `ReviewClient.from_project` and construct `ProjectJournal` with its IDs. Review receipts and packet metadata record the project/origin IDs and the journal head sequence, but never include the origin identity as a secret or provider credential.
 
-- [ ] **Step 5: Run journal/API tests**
+- [x] **Step 5: Run journal/API tests**
 
 ```bash
 uv run pytest -q tests/test_journal.py tests/test_api.py
@@ -161,11 +161,11 @@ uv run pytest -q tests/test_journal.py tests/test_api.py
 - Modify: `tests/test_cli_front_door.py`
 - Modify: `docs/HELP-LLM.md`
 
-- [ ] **Step 1: Add `reviewctl journal verify`**
+- [x] **Step 1: Add `reviewctl journal verify`**
 
 Expose a read-only command that prints `{valid, projectId, originId, sequence, compatibility, violations}` as JSON. Return exit 0 for a valid legacy-prefix or versioned journal and exit 5 for corruption. It must not repair, truncate, or rewrite the journal.
 
-- [ ] **Step 2: Test valid, legacy, tampered, and sequence-gap journals**
+- [x] **Step 2: Test valid, legacy, tampered, and sequence-gap journals**
 
 The tests must assert that the command reports violations without changing the journal bytes.
 

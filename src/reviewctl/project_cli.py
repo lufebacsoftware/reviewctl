@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import sys
 from dataclasses import asdict
@@ -13,12 +14,15 @@ from typing import Any
 from reviewctl.api import ReviewClient, ReviewRequest, ReviewResult
 from reviewctl.config import ReviewConfig, load_config
 from reviewctl.errors import Diagnostic, JournalOperationError, exit_code_for
+from reviewctl.identity import ProjectIdentityStore
+from reviewctl.journal import ProjectJournal
 from reviewctl.pi_transport import PiTransport
 
 PROJECT_TEMPLATE = '''# Project-local reviewctl configuration.
 # Keep the project private by default. Change privacy_mode to "sensitive" to
 # require local execution for every profile.
 [project]
+id = "{project_id}"
 visibility = "private"
 privacy_mode = "private"
 
@@ -133,7 +137,7 @@ def init_project(args: Any) -> int:
             "text",
         )
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    template = PROJECT_TEMPLATE.replace(
+    template = PROJECT_TEMPLATE.format(project_id="project-" + secrets.token_hex(12)).replace(
         'privacy_mode = "private"', f'privacy_mode = "{args.mode}"'
     )
     if args.mode == "sensitive":
@@ -144,8 +148,14 @@ def init_project(args: Any) -> int:
     try:
         os.fchmod(descriptor, 0o600)
         os.write(descriptor, template.encode("utf-8"))
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    try:
+        config_value = load_config(config, user_path=None)
+        ProjectIdentityStore(project).ensure(config_value.project.project_id)
+    except (OSError, UnicodeError, ValueError) as error:
+        return _diagnostic_result(Diagnostic("invalid_request", str(error)), "text")
     print(config)
     return 0
 
@@ -273,6 +283,58 @@ def set_finding_status(args: Any) -> int:
     return 0
 
 
+def verify_journal_project(args: Any) -> int:
+    project = _project_path(args.project)
+    try:
+        config = load_config(project)
+        identity = ProjectIdentityStore(project).read_existing()
+        journal = ProjectJournal(
+            project / ".reviewctl" / "journal.jsonl",
+            project_id=config.project.project_id if identity is not None else None,
+            origin_id=identity.origin_id if identity is not None else None,
+        )
+        violations = journal.verify()
+        events, diagnostic = journal.read_with_diagnostic()
+    except JournalOperationError as error:
+        payload = {
+            "valid": False,
+            "projectId": None,
+            "originId": None,
+            "sequence": None,
+            "compatibility": "invalid",
+            "violations": [error.diagnostic.message],
+            "diagnostic": error.diagnostic.to_dict(),
+        }
+        if args.format == "json":
+            _print_json(payload)
+        else:
+            print(f"invalid journal: {error.diagnostic.message}")
+        return exit_code_for(error.diagnostic.code)
+    except ValueError as error:
+        return _diagnostic_result(Diagnostic("config_invalid", str(error)), args.format)
+    versioned = [event for event in events if event.get("schemaVersion") == 1]
+    payload: dict[str, Any] = {
+        "valid": not violations and diagnostic is None,
+        "projectId": journal.project_id
+        or (versioned[0].get("projectId") if versioned else config.project.project_id),
+        "originId": journal.origin_id or (versioned[0].get("originId") if versioned else None),
+        "sequence": versioned[-1].get("sequence", 0) if versioned else 0,
+        "compatibility": journal.compatibility(),
+        "violations": violations,
+    }
+    if diagnostic is not None:
+        payload["diagnostic"] = diagnostic.to_dict()
+    if args.format == "json":
+        _print_json(payload)
+    else:
+        print(f"valid: {'yes' if payload['valid'] else 'no'}")
+        print(f"compatibility: {payload['compatibility']}")
+        print(f"sequence: {payload['sequence']}")
+        for violation in violations:
+            print(f"violation: {violation}")
+    return 0 if payload["valid"] else 5
+
+
 def _capability_payload() -> dict[str, object]:
     capabilities = PiTransport.capabilities()
     payload = {key: _json_default(value) for key, value in asdict(capabilities).items()}
@@ -364,6 +426,13 @@ def add_project_commands(commands: Any) -> None:
     set_status.add_argument("--reason", default="")
     set_status.add_argument("--format", choices=("text", "json"), default="text")
     set_status.set_defaults(handler=set_finding_status)
+
+    journal = commands.add_parser("journal", help="inspect the project journal")
+    journal_commands = journal.add_subparsers(dest="journal_command")
+    verify = journal_commands.add_parser("verify", help="verify journal continuity read-only")
+    verify.add_argument("--project", default=".")
+    verify.add_argument("--format", choices=("text", "json"), default="text")
+    verify.set_defaults(handler=verify_journal_project)
 
     doctor = commands.add_parser("doctor", help="inspect safe local review configuration")
     doctor.add_argument("--project", default=".")

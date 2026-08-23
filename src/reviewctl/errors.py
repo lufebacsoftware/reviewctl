@@ -34,6 +34,7 @@ ERROR_EXIT_CODES = {
     "contract_failed": 3,
     "receipt_invalid": 5,
     "journal_corrupt": 5,
+    "journal_unavailable": 3,
 }
 
 

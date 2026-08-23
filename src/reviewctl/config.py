@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ VISIBILITIES = frozenset({"public", "private", "unknown"})
 EXECUTION_MODES = frozenset({"local", "remote"})
 TOOL_MODES = frozenset({"none", "read-only"})
 DEFAULT_USER_CONFIG = Path("~/.config/reviewctl/config.toml")
+PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,8 @@ class ProjectSettings:
     name: str
     visibility: str
     privacy_mode: str
+    project_id: str
+    portable_project_id: bool
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,24 @@ def _positive_int(value: object, name: str, default: int, maximum: int | None = 
     return value
 
 
+def _project_identity(
+    value: object, *, project_path: Path, resolved_project: Path | None
+) -> tuple[str, bool]:
+    if value is not None:
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or not PROJECT_ID.fullmatch(value.strip())
+        ):
+            raise ConfigError(
+                "project.id must contain only letters, numbers, dot, dash, or underscore"
+            )
+        return value.strip(), True
+    config_path = resolved_project or _config_path(project_path)
+    digest = hashlib.sha256(str(config_path.parent).encode("utf-8")).hexdigest()[:24]
+    return f"project-{digest}", False
+
+
 def _profile(name: str, value: object, privacy_mode: str) -> ReviewProfile:
     if not isinstance(value, dict):
         raise ConfigError(f"profiles.{name} must be a TOML table")
@@ -211,6 +233,9 @@ def load_config(
         "project.name",
         (resolved_project.parent.name if resolved_project else "review-project"),
     )
+    project_id, portable_project_id = _project_identity(
+        project_table.get("id"), project_path=project_path, resolved_project=resolved_project
+    )
     profiles_table = merged.get("profiles", {})
     if not isinstance(profiles_table, dict):
         raise ConfigError("profiles must be a TOML table")
@@ -237,7 +262,9 @@ def load_config(
         )
     raw_digest = hashlib.sha256(project_raw + b"\n" + user_raw).hexdigest()
     return ReviewConfig(
-        project=ProjectSettings(project_name, visibility, project_privacy),
+        project=ProjectSettings(
+            project_name, visibility, project_privacy, project_id, portable_project_id
+        ),
         profiles=profiles,
         path=resolved_project or resolved_user,
         digest=raw_digest,

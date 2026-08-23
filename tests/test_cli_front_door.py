@@ -225,3 +225,23 @@ def test_findings_set_status_reports_invalid_transition(tmp_path: Path, capsys) 
     payload = json.loads(capsys.readouterr().out)
     assert payload["diagnostic"]["code"] == "invalid_request"
     assert "open -> verified" in payload["diagnostic"]["message"]
+
+
+def test_journal_verify_reports_validity_without_rewriting_bytes(tmp_path: Path, capsys) -> None:
+    assert run_cli(["init", "--project", str(tmp_path)]) == 0
+    capsys.readouterr()
+    journal = ProjectJournal(
+        tmp_path / ".reviewctl/journal.jsonl",
+        project_id=load_config(tmp_path / "reviewctl.toml", user_path=None).project.project_id,
+        origin_id=json.loads((tmp_path / ".reviewctl/identity.json").read_text())["originId"],
+    )
+    journal.append({"type": "review_started", "reviewId": "r1"})
+    before = journal.path.read_bytes()
+
+    assert run_cli(["journal", "verify", "--project", str(tmp_path), "--format", "json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["sequence"] == 1
+    assert payload["compatibility"] == "versioned"
+    assert journal.path.read_bytes() == before

@@ -22,6 +22,7 @@ from reviewctl.contracts import (
     get_contract,
 )
 from reviewctl.errors import ConfigError, Diagnostic
+from reviewctl.identity import ProjectIdentityStore
 from reviewctl.journal import ProjectJournal
 
 
@@ -125,12 +126,19 @@ class ReviewClient:
         project_dir: Path,
         config: ReviewConfig,
         transports: Mapping[str, ReviewTransport],
+        *,
+        project_id: str | None = None,
+        origin_id: str | None = None,
     ) -> None:
         self.project_dir = project_dir.expanduser().resolve()
         self.config = config
         self.transports = transports
         self.review_root = self.project_dir / ".reviewctl" / "reviews"
-        self._journal = ProjectJournal(self.project_dir / ".reviewctl" / "journal.jsonl")
+        self._journal = ProjectJournal(
+            self.project_dir / ".reviewctl" / "journal.jsonl",
+            project_id=project_id,
+            origin_id=origin_id,
+        )
 
     @classmethod
     def from_project(
@@ -141,11 +149,18 @@ class ReviewClient:
     ) -> ReviewClient:
         project_dir = project_dir.expanduser().resolve()
         config = load_config(project_dir)
+        identity = ProjectIdentityStore(project_dir).ensure(config.project.project_id)
         if transports is None:
             from reviewctl.pi_transport import PiTransport
 
             transports = {"pi": PiTransport()}
-        return cls(project_dir, config, transports)
+        return cls(
+            project_dir,
+            config,
+            transports,
+            project_id=identity.project_id,
+            origin_id=identity.origin_id,
+        )
 
     def journal(self) -> ProjectJournal:
         return self._journal
@@ -278,6 +293,8 @@ class ReviewClient:
         packet = {
             "promptDigest": _digest(request.prompt.encode()),
             "contractDigest": prepared.digest,
+            "projectId": self.config.project.project_id,
+            "originId": self._journal.origin_id,
             "files": [
                 {"name": path.name, "path": str(path), "sha256": source_digests[path]}
                 for path in source_files_tuple
@@ -568,6 +585,9 @@ class ReviewClient:
             "route": route,
             "status": status,
             "configDigest": self.config.digest,
+            "projectId": self.config.project.project_id,
+            "originId": self._journal.origin_id,
+            "journalSequence": self._journal.head_sequence(),
             "privacyMode": self.config.project.privacy_mode,
             "at": _now(),
             "findings": list(findings),

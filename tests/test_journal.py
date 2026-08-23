@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
+from reviewctl.errors import JournalOperationError
 from reviewctl.journal import ProjectJournal
 
 
@@ -215,3 +218,70 @@ def test_projection_reports_invalid_status_event_as_journal_corruption(tmp_path:
     assert diagnostic is not None
     assert diagnostic.code == "journal_corrupt"
     assert "open -> verified" in diagnostic.message
+
+
+def test_new_events_have_identity_sequence_and_continuity(tmp_path: Path) -> None:
+    journal = ProjectJournal(
+        tmp_path / "journal.jsonl", project_id="project-1", origin_id="origin-1"
+    )
+
+    first = journal.append({"type": "review_started", "reviewId": "r1"})
+    second = journal.append({"type": "review_finished", "reviewId": "r1"})
+
+    assert first["schemaVersion"] == 1
+    assert first["sequence"] == 1
+    assert second["sequence"] == 2
+    assert first["projectId"] == second["projectId"] == "project-1"
+    assert first["originId"] == second["originId"] == "origin-1"
+    assert second["previousEventSha256"] == first["eventSha256"]
+    assert journal.verify() == []
+
+
+def test_journal_verify_reports_tamper_gap_and_identity_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "journal.jsonl"
+    journal = ProjectJournal(path, project_id="project-1", origin_id="origin-1")
+    journal.append({"type": "review_started", "reviewId": "r1"})
+    journal.append({"type": "review_finished", "reviewId": "r1"})
+
+    lines = path.read_text().splitlines()
+    second = json.loads(lines[1])
+    second["sequence"] = 4
+    second["projectId"] = "project-2"
+    lines[1] = json.dumps(second, sort_keys=True, separators=(",", ":"))
+    path.write_text("\n".join(lines) + "\n")
+
+    violations = journal.verify()
+
+    assert any("sequence" in violation for violation in violations)
+    assert any("project identity" in violation for violation in violations)
+    assert any("event digest" in violation for violation in violations)
+
+
+def test_versioned_event_extends_a_legacy_prefix_with_canonical_digest(tmp_path: Path) -> None:
+    path = tmp_path / "journal.jsonl"
+    legacy = {"type": "review_started", "reviewId": "legacy"}
+    path.write_text(json.dumps(legacy) + "\n")
+    journal = ProjectJournal(path, project_id="project-1", origin_id="origin-1")
+
+    event = journal.append({"type": "review_finished", "reviewId": "new"})
+
+    canonical = json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()
+    assert event["sequence"] == 1
+    assert event["previousEventSha256"] == hashlib.sha256(canonical).hexdigest()
+    assert journal.verify() == []
+    assert journal.compatibility() == "legacy-prefix"
+
+
+def test_append_requires_a_supported_lock(tmp_path: Path, monkeypatch) -> None:
+    import reviewctl.journal as journal_module
+
+    monkeypatch.setattr(journal_module, "fcntl", None)
+    journal = ProjectJournal(
+        tmp_path / "journal.jsonl", project_id="project-1", origin_id="origin-1"
+    )
+
+    with pytest.raises(JournalOperationError) as error:
+        journal.append({"type": "review_started", "reviewId": "r1"})
+
+    assert error.value.diagnostic.code == "journal_unavailable"
+    assert journal.path.read_bytes() == b""

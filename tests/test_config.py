@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from reviewctl.cli import run_cli
 from reviewctl.config import ConfigError, load_config, parse_route
 
 
@@ -114,3 +116,16 @@ def test_parse_route_requires_known_transport_and_model() -> None:
         parse_route("missing-colon")
     with pytest.raises(ConfigError, match="route"):
         parse_route("pi:")
+
+
+def test_init_writes_portable_project_id_and_local_origin(tmp_path: Path) -> None:
+    assert run_cli(["init", "--project", str(tmp_path)]) == 0
+
+    config = load_config(tmp_path / "reviewctl.toml", user_path=None)
+    identity = json.loads((tmp_path / ".reviewctl/identity.json").read_text())
+
+    assert config.project.project_id.startswith("project-")
+    assert config.project.portable_project_id is True
+    assert identity["projectId"] == config.project.project_id
+    assert identity["originId"].startswith("origin-")
+    assert (tmp_path / ".reviewctl/identity.json").stat().st_mode & 0o777 == 0o600

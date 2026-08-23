@@ -201,6 +201,9 @@ def test_review_receipt_is_json_and_records_route(tmp_path: Path) -> None:
 
     assert receipt["route"] == "pi:fake/model"
     assert receipt["status"] == "accepted"
+    assert receipt["projectId"].startswith("project-")
+    assert receipt["originId"].startswith("origin-")
+    assert receipt["journalSequence"] >= 1
 
 
 def test_client_reuses_finding_identity_across_reviews(tmp_path: Path) -> None:
