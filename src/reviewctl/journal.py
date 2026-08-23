@@ -127,6 +127,22 @@ class ProjectJournal:
         self, event: dict[str, Any], events: list[dict[str, Any]]
     ) -> dict[str, Any]:
         identities = self._journal_identity(events)
+        if (
+            identities[0] is not None
+            and self.project_id is not None
+            and identities[0] != self.project_id
+        ) or (
+            identities[1] is not None
+            and self.origin_id is not None
+            and identities[1] != self.origin_id
+        ):
+            raise JournalOperationError(
+                Diagnostic(
+                    "journal_corrupt",
+                    "configured journal identity does not match the existing journal head",
+                    next="use the journal's project and origin identity or migrate explicitly",
+                )
+            )
         project_id = self.project_id or identities[0]
         origin_id = self.origin_id or identities[1]
         if project_id is None or origin_id is None:

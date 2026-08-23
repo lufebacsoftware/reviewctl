@@ -243,6 +243,13 @@ class ReviewClient:
                 )
                 return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
             try:
+                if path.stat().st_size > MAX_SOURCE_BYTES:
+                    diagnostic = Diagnostic(
+                        "invalid_request",
+                        f"review file exceeds the {MAX_SOURCE_BYTES} byte limit: {requested_path}",
+                        next="select a smaller bounded file or split the review",
+                    )
+                    return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
                 source_bytes = path.read_bytes()
                 source_bytes.decode("utf-8")
             except (OSError, UnicodeDecodeError) as error:

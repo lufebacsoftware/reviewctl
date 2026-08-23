@@ -285,3 +285,17 @@ def test_append_requires_a_supported_lock(tmp_path: Path, monkeypatch) -> None:
 
     assert error.value.diagnostic.code == "journal_unavailable"
     assert journal.path.read_bytes() == b""
+
+
+def test_append_rejects_a_different_configured_identity(tmp_path: Path) -> None:
+    path = tmp_path / "journal.jsonl"
+    original = ProjectJournal(path, project_id="project-1", origin_id="origin-1")
+    original.append({"type": "review_started", "reviewId": "r1"})
+    before = path.read_bytes()
+    other = ProjectJournal(path, project_id="project-2", origin_id="origin-2")
+
+    with pytest.raises(JournalOperationError) as error:
+        other.append({"type": "review_finished", "reviewId": "r1"})
+
+    assert error.value.diagnostic.code == "journal_corrupt"
+    assert path.read_bytes() == before

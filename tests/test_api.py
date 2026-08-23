@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from reviewctl.api import ReviewClient, ReviewRequest, verify_project_receipt
+from reviewctl.api import MAX_SOURCE_BYTES, ReviewClient, ReviewRequest, verify_project_receipt
 from reviewctl.backends import BackendEvidence, BackendExecution, PersistedResponse
 from reviewctl.errors import JournalOperationError
 
@@ -190,6 +190,20 @@ def test_client_does_not_require_cli_parser(tmp_path: Path) -> None:
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
 
     assert client.config.project.privacy_mode == "private"
+
+
+def test_client_rejects_oversized_source_before_reading_it(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    oversized = tmp_path / "oversized.txt"
+    with oversized.open("wb") as stream:
+        stream.truncate(MAX_SOURCE_BYTES + 1)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+
+    result = client.review(ReviewRequest(prompt="review", files=(oversized,)))
+
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "exceeds" in result.diagnostic.message
 
 
 def test_review_receipt_is_json_and_records_route(tmp_path: Path) -> None:

@@ -6,10 +6,16 @@ import json
 import os
 import secrets
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - journal support is POSIX-only
+    fcntl = None
 
 from reviewctl.errors import Diagnostic, JournalOperationError
 
@@ -45,8 +51,25 @@ class ProjectIdentityStore:
     def ensure(self, project_id: str) -> ProjectIdentity:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
-        if self.path.exists():
-            identity = self._read()
+        with self._identity_lock():
+            if self.path.exists():
+                identity = self._read()
+            else:
+                identity = ProjectIdentity(
+                    project_id=project_id,
+                    origin_id="origin-" + secrets.token_hex(12),
+                    created_at=_now(),
+                )
+                if fcntl is None:
+                    raise JournalOperationError(
+                        Diagnostic(
+                            "journal_unavailable",
+                            "this platform has no supported project identity lock primitive",
+                            retryable=True,
+                            next="run reviewctl on a POSIX filesystem with advisory locking",
+                        )
+                    )
+                self._write(identity)
             if identity.project_id != project_id:
                 raise JournalOperationError(
                     Diagnostic(
@@ -59,14 +82,6 @@ class ProjectIdentityStore:
                     )
                 )
             return identity
-
-        identity = ProjectIdentity(
-            project_id=project_id,
-            origin_id="origin-" + secrets.token_hex(12),
-            created_at=_now(),
-        )
-        self._write(identity)
-        return identity
 
     def read_existing(self) -> ProjectIdentity | None:
         """Read an existing identity without creating or modifying local state."""
@@ -120,3 +135,31 @@ class ProjectIdentityStore:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+    @contextmanager
+    def _identity_lock(self):
+        if fcntl is None:
+            yield
+            return
+        lock_path = self.root / "identity.lock"
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        acquired = False
+        try:
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except OSError as error:
+                raise JournalOperationError(
+                    Diagnostic(
+                        "journal_unavailable",
+                        f"could not lock project identity: {error}",
+                        retryable=True,
+                        next="check filesystem locking and retry",
+                    )
+                ) from error
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
