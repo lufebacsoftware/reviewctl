@@ -1,0 +1,271 @@
+"""Pi JSON-mode transport for bounded review attempts."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import signal
+import subprocess
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+from reviewctl.artifacts import ArtifactStore
+from reviewctl.backends import (
+    BackendCapabilities,
+    BackendEvidence,
+    BackendExecution,
+    BackendRequest,
+    PersistedResponse,
+    ReadOnlyCapability,
+    SourceIsolation,
+)
+
+
+@dataclass(frozen=True)
+class PiProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool
+
+
+ProcessRunner = Callable[..., PiProcessResult]
+
+
+def _run_process(
+    command: list[str], *, input_text: str, timeout_seconds: int, cwd: Path
+) -> PiProcessResult:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(
+            input=input_text.encode("utf-8"), timeout=timeout_seconds
+        )
+    except subprocess.TimeoutExpired as error:
+        stdout = error.stdout if isinstance(error.stdout, bytes) else b""
+        stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            trailing_stdout, trailing_stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            trailing_stdout, trailing_stderr = process.communicate()
+        return PiProcessResult(
+            124,
+            trailing_stdout if trailing_stdout else stdout,
+            trailing_stderr if trailing_stderr else stderr,
+            True,
+        )
+    except OSError as error:
+        process.kill()
+        process.wait()
+        return PiProcessResult(127, b"", str(error).encode("utf-8"), False)
+    return PiProcessResult(process.returncode, stdout, stderr, False)
+
+
+def _text_blocks(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        block.get("text", "")
+        for block in content
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        )
+    )
+
+
+def _normalize_response(value: str) -> str:
+    """Remove one conventional Markdown JSON fence without repairing content."""
+    stripped = value.strip()
+    if not stripped.startswith("```") or not stripped.endswith("```"):
+        return value
+    lines = stripped.splitlines()
+    if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"}:
+        return "\n".join(lines[1:-1]).strip()
+    return value
+
+
+def _usage(value: object) -> tuple[float | None, int | None, int | None]:
+    if not isinstance(value, dict):
+        return None, None, None
+    cost = value.get("cost")
+    cost_value = cost.get("total") if isinstance(cost, dict) else cost
+    cost_result = (
+        float(cost_value)
+        if isinstance(cost_value, (int, float))
+        and not isinstance(cost_value, bool)
+        and math.isfinite(float(cost_value))
+        and cost_value >= 0
+        else None
+    )
+    input_tokens = value.get("input")
+    output_tokens = value.get("output")
+    return (
+        cost_result,
+        input_tokens if type(input_tokens) is int and input_tokens >= 0 else None,
+        output_tokens if type(output_tokens) is int and output_tokens >= 0 else None,
+    )
+
+
+def _persisted_response(
+    stdout: bytes, requested_model: str, duration_ms: int
+) -> PersistedResponse | None:
+    session_id = ""
+    assistant: dict[str, object] | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "session" and isinstance(event.get("id"), str):
+            session_id = event["id"]
+        if event.get("type") == "message_end":
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                assistant = message
+        if event.get("type") == "agent_end":
+            messages = event.get("messages")
+            if isinstance(messages, list):
+                for message in messages:
+                    if isinstance(message, dict) and message.get("role") == "assistant":
+                        assistant = message
+    if assistant is None:
+        return None
+    cost, input_tokens, output_tokens = _usage(assistant.get("usage"))
+    provider = assistant.get("provider") if isinstance(assistant.get("provider"), str) else None
+    model = assistant.get("model") if isinstance(assistant.get("model"), str) else ""
+    if provider and model and "/" not in provider and not model.startswith(f"{provider}/"):
+        model = f"{provider}/{model}"
+    return PersistedResponse(
+        conversation_id=session_id,
+        cost_usd=cost,
+        duration_ms=duration_ms,
+        input_tokens=input_tokens,
+        model=model or requested_model,
+        output_tokens=output_tokens,
+        provider=provider,
+        response=_normalize_response(_text_blocks(assistant.get("content"))),
+    )
+
+
+class PiTransport:
+    """Invoke Pi with a bounded stdin packet and private observed artifacts."""
+
+    def __init__(self, *, pi_bin: str = "pi", run_process: ProcessRunner = _run_process) -> None:
+        self.pi_bin = pi_bin
+        self.run_process = run_process
+
+    @classmethod
+    def capabilities(cls) -> BackendCapabilities:
+        return BackendCapabilities(
+            review_read_only=ReadOnlyCapability.ENFORCED,
+            editable_execution=False,
+            structured_output=True,
+            resolved_model_identity=True,
+            resolved_provider_identity=True,
+            conversation_identity=True,
+            usage_reporting=True,
+            timeout_control=True,
+            tool_control=True,
+            source_isolation=SourceIsolation.UNAVAILABLE,
+        )
+
+    def execute(self, request: BackendRequest) -> BackendExecution:
+        request.attempt_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = ArtifactStore(request.attempt_dir)
+        session_path = request.attempt_dir / "session.jsonl"
+        tool_flags = ["--no-tools"] if request.tools == "none" else [
+            "--tools",
+            "read,grep,find,ls",
+        ]
+        command = [
+            self.pi_bin,
+            "--mode",
+            "json",
+            "--print",
+            *tool_flags,
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--no-approve",
+            "--thinking",
+            "minimal",
+            "--system-prompt",
+            "Return only raw JSON matching the requested review contract; "
+            "do not use Markdown fences.",
+            "--model",
+            request.model,
+            "--session",
+            str(session_path),
+        ]
+        packet = request.prompt
+        for path in request.files:
+            packet += f"\n\n--- FILE {path.name} ---\n" + path.read_text(encoding="utf-8")
+        request_payload = {
+            "command": command,
+            "model": request.model,
+            "responseContract": request.response_contract,
+            "requestedMaxOutputTokens": request.max_output_tokens,
+            "outputTokenLimitEnforced": False,
+            "tools": request.tools,
+            "files": [path.name for path in request.files],
+        }
+        artifacts.write_text(
+            "request.json", json.dumps(request_payload, ensure_ascii=True, sort_keys=True, indent=2)
+        )
+        started = time.monotonic()
+        result = self.run_process(
+            command,
+            input_text=packet,
+            timeout_seconds=request.timeout_seconds,
+            cwd=request.source_roots[0] if request.source_roots else request.attempt_dir,
+        )
+        if result.stdout:
+            response_path = artifacts.write_bytes("events.jsonl", result.stdout)
+        else:
+            response_path = None
+        stderr_path = None
+        if result.stderr:
+            stderr_path = artifacts.write_bytes("stderr.log", result.stderr)
+        persisted = _persisted_response(
+            result.stdout,
+            request.model,
+            round((time.monotonic() - started) * 1000),
+        )
+        diagnostic = ""
+        if result.timed_out:
+            diagnostic = "review attempt timed out"
+        elif result.returncode != 0:
+            diagnostic = result.stderr.decode(errors="replace").strip() or "Pi process failed"
+        elif persisted is None or not persisted.response.strip():
+            diagnostic = "empty_response"
+        return BackendExecution(
+            exit_code=result.returncode,
+            diagnostic=diagnostic,
+            response=persisted,
+            evidence=BackendEvidence(
+                response=response_path,
+                session=session_path if session_path.is_file() else None,
+                stderr=stderr_path,
+            ),
+        )

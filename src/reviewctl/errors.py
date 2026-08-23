@@ -1,0 +1,54 @@
+"""Stable diagnostics shared by the Python API and CLI."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ReviewctlError(Exception):
+    """Base exception for user-actionable reviewctl failures."""
+
+
+class ConfigError(ReviewctlError, ValueError):
+    """The project or user configuration is invalid."""
+
+
+ERROR_EXIT_CODES = {
+    "invalid_request": 2,
+    "config_invalid": 2,
+    "route_invalid": 2,
+    "privacy_denied": 4,
+    "transport_unavailable": 3,
+    "timeout": 3,
+    "empty_response": 3,
+    "contract_failed": 3,
+    "receipt_invalid": 5,
+    "journal_corrupt": 5,
+}
+
+
+@dataclass(frozen=True)
+class Diagnostic:
+    """Safe, machine-readable explanation of one failed or incomplete operation."""
+
+    code: str
+    message: str
+    retryable: bool = False
+    next: str | None = None
+    artifacts: tuple[Path, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "next": self.next,
+            "artifacts": [str(path) for path in self.artifacts],
+        }
+
+
+def exit_code_for(code: str) -> int:
+    """Map a stable diagnostic code to a stable CLI exit status."""
+    return ERROR_EXIT_CODES.get(code, 1)

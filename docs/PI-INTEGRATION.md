@@ -27,6 +27,55 @@ leave any unproduced evidence locator as `null`. A failed process still retains
 the non-empty event, session, or stderr artifacts it actually produced;
 reviewctl does not manufacture empty files as evidence.
 
+## Project-local quick path
+
+For a new local project, the short path is:
+
+```bash
+reviewctl init --project .
+reviewctl doctor --project . --format json
+reviewctl review --project . --profile default \
+  --prompt "Review the selected change and return actionable findings." \
+  --file src/example.py --format json
+reviewctl status --project . --format json
+reviewctl findings --project . --status open --format json
+```
+
+`init` creates a private `reviewctl.toml` with a Pi profile and refuses to
+overwrite an existing file unless `--force` is supplied. Credentials remain in
+Pi or the environment. `doctor` is read-only: it reports route, privacy,
+contract, executable, and capability metadata without authenticating or
+calling a model.
+
+The project API tries profile routes in order. A timeout, empty response,
+transport failure, or incomplete contract may move to the next route. Valid
+findings from an incomplete response are retained and supplied as bounded
+completion context; they remain marked as partial until a later attempt
+completes the contract. The receipt records `attempts` and
+`fallbackRelationships`, so a fallback is inspectable rather than an implicit
+retry.
+
+`max_attempts` is a per-route retry allowance, capped at three. A profile with
+two routes and `max_attempts = 2` can therefore make at most four bounded
+attempts; each attempt and transition is recorded in the receipt.
+
+Project receipts have a local SHA-256 envelope for detecting accidental
+corruption and can be checked offline:
+
+```bash
+reviewctl verify .reviewctl/reviews/<review-id>/receipt.json
+```
+
+The SHA-256 is not a cryptographic signature or shared trust root; anyone who
+can rewrite a local receipt can also recompute it. Federation and signed
+exchange bundles are separate future work. The stable project exit meanings
+are: `0` accepted review (findings may
+exist), `1` caller-selected `--fail-on` threshold, `2` invalid input or
+configuration, `3` unavailable/timeout/empty/contract failure, `4` privacy
+denial, and `5` receipt or journal verification failure. Diagnostic messages
+are bounded and do not include prompts, source, credentials, or raw provider
+responses.
+
 An interactive `pi` transcript is never an approval, a merge decision, or a
 formal review receipt. The transcript may inform the prompt, but the formal
 question must be promoted through `reviewctl`. A `reviewctl --route pi:...`

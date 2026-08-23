@@ -60,6 +60,8 @@ from reviewctl.contracts import (
 from reviewctl.contracts import (
     canonical_json as contract_canonical_json,
 )
+from reviewctl.errors import Diagnostic, ReviewctlError, exit_code_for
+from reviewctl.project_cli import add_project_commands
 from reviewctl.review_flow import (
     FallbackRelationship,
     PromotedFragment,
@@ -4540,6 +4542,28 @@ def verify_receipt(args: argparse.Namespace) -> int:
     except (OSError, UnicodeError, ValueError):
         violations = ("json-receipt",)
     else:
+        if (
+            isinstance(receipt, dict)
+            and "reviewId" in receipt
+            and "configDigest" in receipt
+            and "sha256" in receipt
+        ):
+            from reviewctl.api import verify_project_receipt
+
+            diagnostic = verify_project_receipt(receipt_path)
+            violations = (diagnostic.code,) if diagnostic is not None else ()
+            valid = not violations
+            print(
+                json.dumps(
+                    {
+                        "receipt": str(receipt_path),
+                        "valid": valid,
+                        "violations": list(violations),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0 if valid else exit_code_for("receipt_invalid")
         if not isinstance(receipt, dict):
             violations = ("receipt-object",)
         elif "receiptSchemaVersion" not in receipt:
@@ -5212,14 +5236,23 @@ def build_parser() -> argparse.ArgumentParser:
     council_plan.set_defaults(
         handler=lambda namespace: write_product_council_plan(parser, namespace)
     )
+    add_project_commands(commands)
     return parser
 
 
-def main() -> None:
+def run_cli(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
-        raise SystemExit(args.handler(args))
+        return int(args.handler(args))
     except RuntimeError as error:
         print(f"reviewctl: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
+        return 1
+    except ReviewctlError as error:
+        diagnostic = Diagnostic("config_invalid", str(error))
+        print(f"reviewctl: {diagnostic.code}: {diagnostic.message}", file=sys.stderr)
+        return exit_code_for(diagnostic.code)
+
+
+def main(argv: list[str] | None = None) -> None:
+    raise SystemExit(run_cli(argv))

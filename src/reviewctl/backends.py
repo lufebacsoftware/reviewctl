@@ -47,6 +47,15 @@ class BackendCapabilities:
     tool_control: bool
     source_isolation: SourceIsolation
 
+    @property
+    def output_token_limit_enforced(self) -> bool:
+        """Whether the backend enforces the requested output-token ceiling.
+
+        This remains a runtime capability until the descriptor schema can grow
+        without breaking consumers that compare its serialized shape exactly.
+        """
+        return False
+
 
 @dataclass(frozen=True)
 class BackendDescriptor:
@@ -96,6 +105,7 @@ class BackendRequest:
     source_class: str
     source_roots: tuple[Path, ...]
     provider_preferences: dict[str, object] | None
+    tools: str = "none"
 
 
 @dataclass(frozen=True)

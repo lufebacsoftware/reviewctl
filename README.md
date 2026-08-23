@@ -33,6 +33,24 @@ as an accepted review.
 
 ## Run a review
 
+For the simpler project-local workflow, initialize once and use the Pi-backed
+front door:
+
+```bash
+reviewctl init --project .
+reviewctl doctor --project . --format json
+reviewctl review --project . --profile default \
+  --prompt "Review this change and return actionable findings." \
+  --file src/example.py --format json
+reviewctl findings --project . --status open
+```
+
+Project reviews keep a private append-only journal under `.reviewctl/`, try
+ordered routes, preserve validated findings from incomplete attempts, and
+write receipts that can be checked offline with `reviewctl verify`. The
+existing `run` command below remains the compatibility and organization-level
+path.
+
 ```bash
 reviewctl run \
   --review-id payment-idempotency \

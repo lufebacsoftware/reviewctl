@@ -3,6 +3,44 @@
 Use `reviewctl explore` for resumable Pi conversations and product or
 architecture exploration. Use `reviewctl run` for a bounded formal review.
 
+For the project-local product path, use `reviewctl init`, `reviewctl review`,
+`reviewctl status`, `reviewctl findings`, and `reviewctl doctor`. This path is
+backed by the same Pi transport and writes a project journal plus verifiable
+receipts:
+
+```bash
+reviewctl init --project .
+reviewctl doctor --project . --format json
+reviewctl review --project . --profile default \
+  --prompt "Review the selected change and return actionable findings." \
+  --file src/example.py --format json
+reviewctl verify .reviewctl/reviews/<review-id>/receipt.json
+```
+
+The project config is private by default. `privacy_mode = "private"` permits
+an explicitly configured remote route; `privacy_mode = "sensitive"` rejects
+remote profiles and requires a local route. `doctor` only inspects config and
+the local Pi executable; it does not authenticate, call a model, or print
+credentials. Do not put API keys or model inventories in `reviewctl.toml`.
+
+Project routes are best-effort and ordered. A timeout, empty response,
+transport failure, or incomplete contract may use the next route. Valid
+findings from an incomplete response are retained as partial evidence and
+passed to the next bounded completion attempt. They do not become an accepted
+review until a later response satisfies the contract. Inspect `attempts`,
+`fallbackRelationships`, and `diagnostic` in the receipt instead of retrying
+blindly.
+
+`max_attempts` is a per-route retry allowance, capped at three. A profile with
+two routes and `max_attempts = 2` can therefore make at most four bounded
+attempts; each attempt and transition is recorded in the receipt.
+
+Project diagnostics use stable codes and exit statuses: `invalid_request`,
+`config_invalid`, or `route_invalid` → 2; `transport_unavailable`, `timeout`,
+`empty_response`, or `contract_failed` → 3; `privacy_denied` → 4; and
+`receipt_invalid` or `journal_corrupt` → 5. Diagnostics are deliberately safe:
+they never include prompts, source, credentials, or raw provider responses.
+
 ## Exploration
 
 ```bash
@@ -284,6 +322,9 @@ reviewctl verify RECEIPT.json
 
 Never edit an old receipt to make it pass verification.
 
+Project receipts use a local SHA-256 checksum to detect accidental corruption;
+it is not a signature and does not establish trust against a writer who can
+rewrite the receipt. Signed federation bundles are separate future work.
 Receipt v1 verification remains digest-only. Receipt v2 verification also
 checks its structure offline, including attempt identity, fallback provenance,
 promotion, accepted-attempt binding, and consolidation. Verification does not
