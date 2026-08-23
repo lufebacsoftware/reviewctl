@@ -51,6 +51,22 @@ write receipts that can be checked offline with `reviewctl verify`. The
 existing `run` command below remains the compatibility and organization-level
 path.
 
+The project journal deduplicates repeated observations by stable finding ID.
+Use the lifecycle command to record a human or CI decision without rewriting
+history:
+
+```bash
+reviewctl findings --project . --status open --format json
+reviewctl findings set-status --project . \
+  --id finding-<stable-id> --status fixed \
+  --reason "patched in commit abc123" --format json
+```
+
+Supported statuses are `open`, `disputed`, `fixed`, `verified`, and
+`dismissed`. The command appends a `finding_status_changed` event; it never
+edits an earlier journal line. Re-observing a finding updates its observation
+count but does not reset its lifecycle status.
+
 ```bash
 reviewctl run \
   --review-id payment-idempotency \
@@ -275,6 +291,7 @@ recovery guidance. The same material is available in
 [Help for LLMs](docs/HELP-LLM.md).
 
 Read [the architecture and canonical vocabulary](docs/ARCHITECTURE.md),
+[the current project handoff and roadmap](docs/HANDOFF.md),
 [the council policy](docs/COUNCIL.md), [evidence contract](docs/EVIDENCE.md),
 [Pi and reviewctl integration](docs/PI-INTEGRATION.md),
 [project-instruction integration guide](docs/PROJECT-INTEGRATION.md), and

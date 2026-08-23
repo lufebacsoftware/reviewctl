@@ -151,3 +151,77 @@ def test_verify_accepts_project_receipt_and_rejects_tampering(tmp_path: Path, ca
     receipt.write_text(receipt.read_text().replace("accepted", "tampered"))
     assert run_cli(["verify", str(receipt)]) == 5
     assert json.loads(capsys.readouterr().out)["valid"] is False
+
+
+def test_findings_set_status_appends_a_status_event(tmp_path: Path, capsys) -> None:
+    journal = ProjectJournal(tmp_path / ".reviewctl/journal.jsonl")
+    journal.append(
+        {
+            "type": "finding_observed",
+            "reviewId": "review-1",
+            "findingId": "finding-1",
+            "status": "open",
+            "path": "src/app.py",
+            "message": "Handle the error",
+            "severity": "high",
+        }
+    )
+
+    assert run_cli(
+        [
+            "findings",
+            "set-status",
+            "--project",
+            str(tmp_path),
+            "--id",
+            "finding-1",
+            "--status",
+            "fixed",
+            "--reason",
+            "patched",
+            "--format",
+            "json",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["findingId"] == "finding-1"
+    assert payload["status"] == "fixed"
+    assert payload["statusReason"] == "patched"
+    assert json.loads((tmp_path / ".reviewctl/journal.jsonl").read_text().splitlines()[-1])[
+        "type"
+    ] == "finding_status_changed"
+
+
+def test_findings_set_status_reports_invalid_transition(tmp_path: Path, capsys) -> None:
+    journal = ProjectJournal(tmp_path / ".reviewctl/journal.jsonl")
+    journal.append(
+        {
+            "type": "finding_observed",
+            "reviewId": "review-1",
+            "findingId": "finding-1",
+            "status": "open",
+            "path": "src/app.py",
+            "message": "Handle the error",
+            "severity": "high",
+        }
+    )
+
+    assert run_cli(
+        [
+            "findings",
+            "set-status",
+            "--project",
+            str(tmp_path),
+            "--id",
+            "finding-1",
+            "--status",
+            "verified",
+            "--format",
+            "json",
+        ]
+    ) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["diagnostic"]["code"] == "invalid_request"
+    assert "open -> verified" in payload["diagnostic"]["message"]

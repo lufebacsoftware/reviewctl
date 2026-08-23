@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from reviewctl.api import ReviewClient, ReviewRequest, verify_project_receipt
 from reviewctl.backends import BackendEvidence, BackendExecution, PersistedResponse
+from reviewctl.errors import JournalOperationError
 
 
 class FakeTransport:
@@ -198,3 +201,62 @@ def test_review_receipt_is_json_and_records_route(tmp_path: Path) -> None:
 
     assert receipt["route"] == "pi:fake/model"
     assert receipt["status"] == "accepted"
+
+
+def test_client_reuses_finding_identity_across_reviews(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    response = (
+        '{"verdict":"changes-requested","findings":[{"severity":"high",'
+        '"path":"app.py","line":1,"title":"Handle failure",'
+        '"evidence":"e","reproduction":"r"}]}'
+    )
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport(response)})
+
+    first = client.review(ReviewRequest(prompt="review one"))
+    second = client.review(ReviewRequest(prompt="review two"))
+
+    assert first.status == "accepted"
+    assert second.status == "accepted"
+    findings = client.journal().findings()
+    assert len(findings) == 1
+    assert findings[0]["observations"] == 2
+    assert findings[0]["firstReviewId"] == first.review_id
+    assert findings[0]["lastReviewId"] == second.review_id
+
+    receipt = json.loads(second.receipt_path.read_text())
+    assert receipt["findings"][0]["findingId"] == findings[0]["findingId"]
+
+
+def test_reobservation_does_not_reopen_a_fixed_finding(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    response = (
+        '{"verdict":"changes-requested","findings":[{"severity":"high",'
+        '"path":"app.py","line":1,"title":"Handle failure",'
+        '"evidence":"e","reproduction":"r"}]}'
+    )
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport(response)})
+
+    first = client.review(ReviewRequest(prompt="review one"))
+    finding_id = client.journal().findings()[0]["findingId"]
+    client.journal().append_status_change(finding_id, "fixed", reason="patched")
+    second = client.review(ReviewRequest(prompt="review two"))
+
+    assert first.status == "accepted"
+    assert second.status == "accepted"
+    finding = client.journal().finding(finding_id)
+    assert finding is not None
+    assert finding["status"] == "fixed"
+    assert finding["observations"] == 2
+
+
+def test_client_findings_does_not_hide_journal_corruption(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    journal_path = tmp_path / ".reviewctl/journal.jsonl"
+    journal_path.parent.mkdir(parents=True)
+    journal_path.write_text('{"type":"finding_status_changed","findingId":"f1"}\n')
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+
+    with pytest.raises(JournalOperationError) as error:
+        client.findings()
+
+    assert error.value.diagnostic.code == "journal_corrupt"

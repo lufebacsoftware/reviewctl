@@ -15,6 +15,14 @@ class ConfigError(ReviewctlError, ValueError):
     """The project or user configuration is invalid."""
 
 
+class JournalOperationError(ReviewctlError, ValueError):
+    """A journal mutation was rejected with a stable diagnostic."""
+
+    def __init__(self, diagnostic: Diagnostic) -> None:
+        super().__init__(diagnostic.message)
+        self.diagnostic = diagnostic
+
+
 ERROR_EXIT_CODES = {
     "invalid_request": 2,
     "config_invalid": 2,

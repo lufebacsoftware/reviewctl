@@ -35,6 +35,22 @@ blindly.
 two routes and `max_attempts = 2` can therefore make at most four bounded
 attempts; each attempt and transition is recorded in the receipt.
 
+Project findings are a rebuildable projection over the append-only journal.
+Repeated observations reuse a stable `findingId`; they do not create duplicate
+current findings or reopen a finding that is already `fixed`, `verified`,
+`dismissed`, or `disputed`. Status decisions are explicit and auditable:
+
+```bash
+reviewctl findings --project . --status open --format json
+reviewctl findings set-status --project . \
+  --id finding-<stable-id> --status fixed \
+  --reason "patched in commit abc123" --format json
+```
+
+Allowed statuses are `open`, `disputed`, `fixed`, `verified`, and `dismissed`.
+An invalid transition or unknown ID returns `invalid_request` with exit status
+2. The command appends `finding_status_changed`; it never rewrites the journal.
+
 Project diagnostics use stable codes and exit statuses: `invalid_request`,
 `config_invalid`, or `route_invalid` → 2; `transport_unavailable`, `timeout`,
 `empty_response`, or `contract_failed` → 3; `privacy_denied` → 4; and

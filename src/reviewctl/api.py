@@ -85,6 +85,19 @@ def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _finding_id(finding: Finding) -> str:
+    identity = {
+        "path": finding.path,
+        "line": finding.line,
+        "title": finding.title,
+        "reproduction": finding.reproduction,
+    }
+    canonical = json.dumps(
+        identity, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return "finding-" + _digest(canonical)[:24]
+
+
 def _review_id(value: str | None) -> str:
     if value is not None and value.strip():
         return value.strip()
@@ -416,7 +429,7 @@ class ReviewClient:
                         status="accepted",
                         packet_digest=packet_digest,
                         usage=execution.response,
-                        findings=[asdict(finding) for finding in findings],
+                        findings=[self._finding_payload(finding) for finding in findings],
                         attempts=attempts,
                         fallback_relationships=fallback_relationships,
                     )
@@ -490,7 +503,7 @@ class ReviewClient:
             packet_digest=packet_digest,
             diagnostic=diagnostic,
             usage=last_usage,
-            findings=[asdict(finding) for finding in findings],
+            findings=[self._finding_payload(finding) for finding in findings],
             attempts=attempts,
             fallback_relationships=fallback_relationships,
         )
@@ -512,18 +525,28 @@ class ReviewClient:
         return tuple(merged)
 
     def _record_findings(self, review_id: str, findings: Sequence[Finding]) -> None:
-        for index, finding in enumerate(findings):
+        for finding in findings:
             self._journal.append(
                 {
-                    "type": "finding",
+                    "type": "finding_observed",
                     "reviewId": review_id,
-                    "findingId": f"{review_id}-{index}",
+                    "findingId": _finding_id(finding),
                     "status": "open",
                     "path": finding.path,
+                    "line": finding.line,
                     "message": finding.title,
                     "severity": finding.severity,
+                    "evidence": finding.evidence,
+                    "reproduction": finding.reproduction,
                 }
             )
+
+    @staticmethod
+    def _finding_payload(finding: Finding) -> dict[str, Any]:
+        return {
+            **asdict(finding),
+            "findingId": _finding_id(finding),
+        }
 
     def _write_receipt(
         self,

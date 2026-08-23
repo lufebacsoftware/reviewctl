@@ -299,6 +299,14 @@ The first journal implementation is local and inspectable. It may use JSONL
 events and content-addressed artifact files without requiring a database.
 Derived views are rebuildable.
 
+Finding observations are keyed by a stable identity derived from the semantic
+finding fields. Repeated observations update the projection's observation
+metadata but do not reset its lifecycle status. Status decisions are separate
+append-only events with the allowed states `open`, `disputed`, `fixed`,
+`verified`, and `dismissed`; a projection must reject invalid transitions and
+must never rewrite an earlier event. The CLI exposes these decisions through
+`reviewctl findings set-status`.
+
 Each review stores:
 
     review/review-id/

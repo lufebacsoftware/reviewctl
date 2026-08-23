@@ -59,6 +59,20 @@ retry.
 two routes and `max_attempts = 2` can therefore make at most four bounded
 attempts; each attempt and transition is recorded in the receipt.
 
+The project journal is append-only. Its current findings view collapses
+repeated `finding_observed` events by stable `findingId` and applies later
+`finding_status_changed` events. To record a decision:
+
+```bash
+reviewctl findings set-status --project . \
+  --id finding-<stable-id> --status fixed \
+  --reason "patched in commit abc123" --format json
+```
+
+The lifecycle is `open`, `disputed`, `fixed`, `verified`, or `dismissed`.
+Re-observation does not reset an existing status. Invalid transitions and
+unknown IDs are safe `invalid_request` diagnostics rather than silent writes.
+
 Project receipts have a local SHA-256 envelope for detecting accidental
 corruption and can be checked offline:
 

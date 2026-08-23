@@ -12,7 +12,7 @@ from typing import Any
 
 from reviewctl.api import ReviewClient, ReviewRequest, ReviewResult
 from reviewctl.config import ReviewConfig, load_config
-from reviewctl.errors import Diagnostic, exit_code_for
+from reviewctl.errors import Diagnostic, JournalOperationError, exit_code_for
 from reviewctl.pi_transport import PiTransport
 
 PROJECT_TEMPLATE = '''# Project-local reviewctl configuration.
@@ -184,6 +184,8 @@ def review_project(args: Any) -> int:
 
 def _status_payload(config: ReviewConfig, client: ReviewClient) -> dict[str, Any]:
     events, diagnostic = client.journal().read_with_diagnostic()
+    projected_findings, projection_diagnostic = client.journal().findings_with_diagnostic()
+    diagnostic = diagnostic or projection_diagnostic
     review_ids = {event.get("reviewId") for event in events if event.get("reviewId")}
     payload: dict[str, Any] = {
         "project": config.project.name,
@@ -193,7 +195,7 @@ def _status_payload(config: ReviewConfig, client: ReviewClient) -> dict[str, Any
         "journal": {
             "events": len(events),
             "reviews": len(review_ids),
-            "findings": len([event for event in events if event.get("type") == "finding"]),
+            "findings": len(projected_findings),
         },
     }
     if diagnostic is not None:
@@ -223,10 +225,7 @@ def findings_project(args: Any) -> int:
         client = ReviewClient.from_project(_project_path(args.project))
     except ValueError as error:
         return _diagnostic_result(Diagnostic("config_invalid", str(error)), args.format)
-    findings, diagnostic = client.journal().read_with_diagnostic()
-    selected = [event for event in findings if event.get("type") == "finding"]
-    if args.status:
-        selected = [event for event in selected if event.get("status") == args.status]
+    selected, diagnostic = client.journal().findings_with_diagnostic(status=args.status)
     payload: object = selected
     if diagnostic is not None:
         payload = {"findings": selected, "diagnostic": diagnostic.to_dict()}
@@ -241,6 +240,37 @@ def findings_project(args: Any) -> int:
         if diagnostic is not None:
             print(f"diagnostic: {diagnostic.code}: {diagnostic.message}")
     return exit_code_for(diagnostic.code) if diagnostic is not None else 0
+
+
+def set_finding_status(args: Any) -> int:
+    try:
+        client = ReviewClient.from_project(_project_path(args.project))
+        client.journal().append_status_change(
+            args.finding_id,
+            args.finding_status,
+            reason=args.reason,
+        )
+        finding = client.journal().finding(args.finding_id)
+    except JournalOperationError as error:
+        return _diagnostic_result(error.diagnostic, args.format)
+    except ValueError as error:
+        return _diagnostic_result(Diagnostic("config_invalid", str(error)), args.format)
+    if finding is None:
+        return _diagnostic_result(
+            Diagnostic("invalid_request", f"finding not found: {args.finding_id}"),
+            args.format,
+        )
+    if args.format == "json":
+        _print_json(finding)
+    else:
+        print(
+            f"[{finding.get('status', 'unknown')}] "
+            f"{finding.get('findingId', args.finding_id)} — "
+            f"{finding.get('message', '')}"
+        )
+        if finding.get("statusReason"):
+            print(f"reason: {finding['statusReason']}")
+    return 0
 
 
 def _capability_payload() -> dict[str, object]:
@@ -319,6 +349,21 @@ def add_project_commands(commands: Any) -> None:
     findings.add_argument("--status")
     findings.add_argument("--format", choices=("text", "json"), default="text")
     findings.set_defaults(handler=findings_project)
+    findings_commands = findings.add_subparsers(dest="findings_command")
+    set_status = findings_commands.add_parser(
+        "set-status", help="append an auditable finding status transition"
+    )
+    set_status.add_argument("--project", default=".")
+    set_status.add_argument("--id", dest="finding_id", required=True)
+    set_status.add_argument(
+        "--status",
+        dest="finding_status",
+        choices=("open", "disputed", "fixed", "verified", "dismissed"),
+        required=True,
+    )
+    set_status.add_argument("--reason", default="")
+    set_status.add_argument("--format", choices=("text", "json"), default="text")
+    set_status.set_defaults(handler=set_finding_status)
 
     doctor = commands.add_parser("doctor", help="inspect safe local review configuration")
     doctor.add_argument("--project", default=".")

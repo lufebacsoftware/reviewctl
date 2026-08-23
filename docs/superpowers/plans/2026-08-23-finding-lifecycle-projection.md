@@ -17,7 +17,7 @@
 - Modify: `tests/test_api.py`
 - Modify: `tests/test_cli_front_door.py`
 
-- [ ] **Step 1: Add a test that repeated observations collapse to one current finding**
+- [x] **Step 1: Add a test that repeated observations collapse to one current finding**
 
 ```python
 def test_findings_projection_collapses_repeated_observations(tmp_path: Path) -> None:
@@ -111,7 +111,7 @@ def test_invalid_finding_status_transition_is_rejected(tmp_path: Path) -> None:
 
 Import `pytest` in the test module. The test intentionally exercises the journal interface before its projection implementation exists.
 
-- [ ] **Step 2: Add a test that API observations reuse a stable identity**
+- [x] **Step 2: Add a test that API observations reuse a stable identity**
 
 ```python
 def test_client_reuses_finding_identity_across_reviews(tmp_path: Path) -> None:
@@ -135,7 +135,7 @@ def test_client_reuses_finding_identity_across_reviews(tmp_path: Path) -> None:
     assert findings[0]["lastReviewId"] == second.review_id
 ```
 
-- [ ] **Step 3: Add a test for the CLI status command**
+- [x] **Step 3: Add a test for the CLI status command**
 
 ```python
 def test_findings_set_status_appends_a_status_event(tmp_path: Path, capsys) -> None:
@@ -176,7 +176,7 @@ def test_findings_set_status_appends_a_status_event(tmp_path: Path, capsys) -> N
     assert json.loads((tmp_path / ".reviewctl/journal.jsonl").read_text().splitlines()[-1])["type"] == "finding_status_changed"
 ```
 
-- [ ] **Step 4: Run only the new tests and verify the intended RED failure**
+- [x] **Step 4: Run only the new tests and verify the intended RED failure**
 
 Run:
 
@@ -193,7 +193,7 @@ Expected: FAIL because the new projection, stable identity, and `findings set-st
 - Modify: `src/reviewctl/errors.py`
 - Test: `tests/test_journal.py`
 
-- [ ] **Step 1: Define the supported statuses and transition map**
+- [x] **Step 1: Define the supported statuses and transition map**
 
 Add module constants:
 
@@ -210,13 +210,13 @@ FINDING_TRANSITIONS = {
 
 Add `finding_status(finding_id)` to return the current projected status or `None`, and add `append_status_change(finding_id, status, reason="")` that appends a `finding_status_changed` event only after validating the source finding, target status, and transition.
 
-- [ ] **Step 2: Replace raw-event filtering with a projection reducer**
+- [x] **Step 2: Replace raw-event filtering with a projection reducer**
 
 Implement `findings()` by reading events once and reducing all legacy `finding`, `finding_observed`, and `finding_status_changed` events into a dictionary keyed by `findingId`. For an observation, preserve the first observation fields and update `lastReviewId`, `lastObservedAt`, and `observations`. For a status event, update `status`, `statusChangedAt`, and optional `statusReason`. Return findings in first-observation order and filter status after reduction.
 
 Legacy `type = "finding"` events remain accepted as open observations. Events missing a `findingId` are ignored by the projection and reported only through the existing journal corruption diagnostic if their structure is invalid; do not break old journals that contain non-projecting events.
 
-- [ ] **Step 3: Verify journal tests pass and preserve legacy behavior**
+- [x] **Step 3: Verify journal tests pass and preserve legacy behavior**
 
 Run:
 
@@ -232,7 +232,7 @@ Expected: all journal tests pass, including the existing legacy `finding` projec
 - Modify: `src/reviewctl/api.py`
 - Test: `tests/test_api.py`
 
-- [ ] **Step 1: Add a private stable identity helper**
+- [x] **Step 1: Add a private stable identity helper**
 
 Canonicalize only the semantic identity fields (`path`, `line`, `title`, and `reproduction`) with sorted JSON and derive:
 
@@ -244,15 +244,15 @@ def _finding_id(finding: Finding) -> str:
 
 This keeps evidence and severity changes attached to the same issue while keeping the identity opaque and deterministic inside a project journal.
 
-- [ ] **Step 2: Change `_record_findings` to append `finding_observed` events**
+- [x] **Step 2: Change `_record_findings` to append `finding_observed` events**
 
 Use `_finding_id` for each normalized `Finding`, include `evidence`, `reproduction`, `line`, and `title` in the event, and set `status = "open"` only for a finding first seen by the projection. Re-observation must not reset a finding that is already `fixed`, `verified`, `dismissed`, or `disputed`; the journal reducer owns that rule.
 
-- [ ] **Step 3: Include stable IDs in receipts without changing the public `Finding` dataclass**
+- [x] **Step 3: Include stable IDs in receipts without changing the public `Finding` dataclass**
 
 Serialize receipt findings as the current finding fields plus `findingId`. Keep `ReviewResult.findings` unchanged so existing Python callers do not need to change.
 
-- [ ] **Step 4: Run API tests and the full journal/API subset**
+- [x] **Step 4: Run API tests and the full journal/API subset**
 
 Run:
 
@@ -270,7 +270,7 @@ Expected: all tests pass, including stable identity reuse and receipt verificati
 - Modify: `src/reviewctl/errors.py`
 - Test: `tests/test_cli_front_door.py`
 
-- [ ] **Step 1: Add `findings set-status` as a nested subcommand**
+- [x] **Step 1: Add `findings set-status` as a nested subcommand**
 
 Keep `reviewctl findings --status ...` backward compatible and add:
 
@@ -285,11 +285,11 @@ reviewctl findings set-status \
 
 The command loads the project journal, calls `append_status_change`, prints the resulting projected finding, and maps missing IDs or invalid transitions to `invalid_request` (exit 2). It must not print source, prompts, credentials, or raw model output.
 
-- [ ] **Step 2: Add JSON and text output tests**
+- [x] **Step 2: Add JSON and text output tests**
 
 Test accepted status change, missing finding, invalid transition, and journal append-only preservation. The JSON response must contain `findingId`, `status`, and `statusReason` when supplied.
 
-- [ ] **Step 3: Run the focused CLI tests**
+- [x] **Step 3: Run the focused CLI tests**
 
 Run:
 
@@ -308,15 +308,15 @@ Expected: all front-door tests pass.
 - Modify: `docs/HANDOFF.md`
 - Modify: `docs/superpowers/specs/2026-08-23-reviewctl-open-source-tool-design.md`
 
-- [ ] **Step 1: Document the finding lifecycle**
+- [x] **Step 1: Document the finding lifecycle**
 
 Document the five statuses, the append-only status command, stable finding IDs, and the rule that repeated observations do not reopen or reset a finding.
 
-- [ ] **Step 2: Remove stale handoff instructions**
+- [x] **Step 2: Remove stale handoff instructions**
 
 Update the handoff date and replace the old “next safe action is to inspect and commit the Kiro change” paragraph with the completed current state and the next bounded roadmap item. Do not claim federation, signatures, or non-Pi transports are complete.
 
-- [ ] **Step 3: Run documentation consistency checks**
+- [x] **Step 3: Run documentation consistency checks**
 
 Run:
 
@@ -332,9 +332,9 @@ Expected: no stale handoff instruction remains, lifecycle references agree, and 
 **Files:**
 - Review: the complete diff from `4c9d4db`
 - Test: all `tests/`
-- Evidence: local receipt and review artifacts under `/Users/luisfernando/Code/reviews/artifacts/`
+- Evidence: local receipt and review artifacts under the configured private review artifact root
 
-- [ ] **Step 1: Run the full verification suite**
+- [x] **Step 1: Run the full verification suite**
 
 ```bash
 uv run pytest -q
@@ -344,15 +344,15 @@ git diff --check
 
 Expected: zero test failures, Ruff clean, and no whitespace errors.
 
-- [ ] **Step 2: Run a local journal lifecycle canary**
+- [x] **Step 2: Run a local journal lifecycle canary**
 
 Create a temporary project, initialize it, write two observations with the fake transport, change the resulting finding to `fixed`, run `findings --status fixed`, and verify that the journal contains both observation events plus one status event and that no prior line changed.
 
-- [ ] **Step 3: Run two-axis review of the diff**
+- [x] **Step 3: Run two-axis review of the diff**
 
 Review `git diff 4c9d4db...HEAD` against `docs/superpowers/specs/2026-08-23-reviewctl-open-source-tool-design.md` and the repository standards. Separately run the requested advisory Pi reviews when the configured models are available. Record findings, fix concrete issues, and rerun the affected tests.
 
-- [ ] **Step 4: Commit the bounded iteration**
+- [x] **Step 4: Commit the bounded iteration**
 
 ```bash
 git add docs/superpowers/plans/2026-08-23-finding-lifecycle-projection.md \

@@ -1,6 +1,6 @@
 # reviewctl — Project Handoff
 
-**Date:** 2026-08-14
+**Date:** 2026-08-23
 **Repository:** local `reviewctl` checkout
 **Purpose:** point-in-time operational handoff and roadmap
 
@@ -35,6 +35,13 @@ and fallback transition is recorded. `reviewctl verify` checks the local
 receipt checksum and detects accidental corruption; it is not a signature or
 shared trust root. Signed exchange and federation remain future work.
 
+The project journal now projects one current finding per stable `findingId`.
+Repeated observations increase the observation count without resetting the
+finding lifecycle. `reviewctl findings set-status` appends explicit
+`finding_status_changed` events for `open`, `disputed`, `fixed`, `verified`,
+and `dismissed`; the journal remains the canonical record and the projection
+can be rebuilt from scratch.
+
 Evidence from this iteration:
 
 - full suite: `uv run pytest -q` — 100% pass;
@@ -65,7 +72,7 @@ Kiro, `llm`, and OpenRouter. Registration and availability are not
 qualification. Kiro remains an advisory, unqualified backend and is not
 eligible for a merge gate.
 
-## Closed in this iteration
+## Earlier backend closure: Kiro
 
 The immediate blocker was Kiro stopping in a non-interactive review with:
 
@@ -106,7 +113,7 @@ Keep these ownership rules stable:
 |---|---|
 | Review contracts, acceptance, fallback, consolidation, receipts | `reviewctl` |
 | Model/provider qualification and operating roster | Organization evidence store |
-| Project review journal and finding lifecycle | Project owner / future journal layer |
+| Project review journal and finding lifecycle | `reviewctl` append-only journal and projection |
 | Portable operation identity and federation commitments | Cljedger, if integrated later |
 | Storage or distribution of opaque signed bundles | Optional Potzal or another transport |
 | Editable changes | Separate change-attempt backend, never a review receipt |
@@ -142,10 +149,10 @@ the authority for review acceptance.
   and capability prerequisites without authenticating or calling a model.
 - Pi timeout, empty, fenced-JSON, malformed-contract, and fallback paths have
   bounded diagnostics and persisted artifacts.
+- Stable finding identity, deduplicated projection, and append-only lifecycle
+  status changes are implemented and covered by focused tests.
 - Keep the exact Kiro invocation and approval failure in `HELP-LLM` recovery
   guidance if the warning or failure appears again.
-- Separate and commit the Kiro fix and this front-door slice from the
-  pre-existing workspace changes using exact hunks.
 - Run bounded conformance fixtures for every currently used local backend:
   timeout, empty output, malformed structured output, identity behavior,
   credential redaction, and tool/working-directory boundaries.
@@ -154,12 +161,12 @@ the authority for review acceptance.
 
 - Define the journal event envelope and stable `OrganizationId + ProjectId`
   identity.
-- Persist immutable receipt references, finding lifecycle events, adjudications,
-  waivers, fixes, and verification observations.
+- Persist immutable receipt references, adjudications, waivers, and
+  verification observations alongside the now-implemented finding lifecycle.
 - Add versioned review dimensions with privacy classification and compatibility
   rules.
-- Rebuild query projections from the journal; never make a projection the
-  canonical record.
+- Add projections for review, adjudication, and dimension queries while
+  keeping the finding projection rebuildable.
 - Add deterministic fixtures for event identity, ordering, supersession,
   replay, and dimension compatibility.
 
@@ -202,12 +209,10 @@ At handoff time the checkout contains pre-existing uncommitted changes in:
 - `src/reviewctl/cli.py`
 - `tests/test_run.py`
 
-The Kiro change shares two of those files with unrelated Gemini 3.7 routing
-changes. Before committing, split the intended hunks carefully; do not reset
-or overwrite the existing work.
-
-The next safe action is to inspect `git diff`, isolate the Kiro flag and its
-test assertion, commit that bounded change, and then continue with Phase 1.
+The Kiro/Gemini changes share two of those files. Before committing any future
+work, split intended hunks carefully; do not reset or overwrite the existing
+work. The finding-lifecycle iteration is committed separately from those
+pending changes.
 
 ## Canonical documentation
 
