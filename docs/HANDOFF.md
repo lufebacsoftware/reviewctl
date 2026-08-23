@@ -67,6 +67,21 @@ Evidence from this iteration:
   traversal, local/remote route enforcement, timeout process cleanup, and
   malformed finding handling; Muse independently reviewed the post-fix shape.
 
+The journal-envelope and dimension work is committed as `f63ced9`, `784e2f1`,
+and `8f717f8`. Muse found three concrete envelope defects in the first pass:
+identity-creation races, configured identity override, and unbounded source
+reads. They were reproduced with regression tests and fixed before Muse's
+post-fix receipt approved the bounded slice. The dimensions review was also
+approved by Muse. Ox-alpha and Qwen 3.8 were invoked through `reviewctl` for
+both rounds; their receipts verify structurally but record `timeout`/
+`unavailable`, so they are availability evidence rather than approvals.
+
+The relevant private evidence records are named:
+
+- `reviewctl-envelope-implementation/envelope-{ox,muse,qwen}`;
+- `reviewctl-envelope-postfix/muse`;
+- `reviewctl-dimensions-implementation/dimensions-{ox,muse,qwen}`.
+
 The two external review routes were advisory. The source, tests, runtime
 canary, and verified receipt are the acceptance evidence.
 

@@ -210,15 +210,15 @@ Cover project-required dimensions, profile additions, duplicate rejection, stabl
 - Spec: `docs/ARCHITECTURE.md`, `docs/adr/0001-append-only-journals.md`, and this plan
 - Evidence: receipts under the configured private review artifact root
 
-- [ ] **Step 1: Run Ox-alpha, Muse, and Qwen 3.8 reviews**
+- [x] **Step 1: Run Ox-alpha, Muse, and Qwen 3.8 reviews**
 
 Use bounded `reviewctl` receipts with at most three attached source files per round. Use `pi:openrouter/stealth/ox-alpha`, `pi:openrouter/meta/muse-spark-1.2-contributor`, and `pi:openrouter/qwen/qwen3.8-max` when the local catalog and route are available. A timeout or custom-model warning is recorded as unavailable/advisory, never approval.
 
-- [ ] **Step 2: Reproduce every concrete finding locally**
+- [x] **Step 2: Reproduce every concrete finding locally**
 
 For each external finding, write a failing regression test, fix the root cause, rerun the focused test, then run the full suite. Do not merge model consensus without repository evidence.
 
-- [ ] **Step 3: Run final verification and a two-machine simulation**
+- [x] **Step 3: Run final verification and a two-machine simulation**
 
 ```bash
 uv run pytest -q
@@ -228,7 +228,7 @@ git diff --check
 
 Simulate two origin journals for one ProjectId, verify each locally, and confirm the current implementation does not claim federation or signatures.
 
-- [ ] **Step 4: Update handoff and commit only bounded hunks**
+- [x] **Step 4: Update handoff and commit only bounded hunks**
 
 Document implemented envelope/dimension behavior, known limitations, model receipt paths, and the remaining signed export/import work. Preserve pre-existing unrelated changes in the dirty checkout.
 

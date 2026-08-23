@@ -330,3 +330,20 @@ def test_append_rejects_a_different_configured_identity(tmp_path: Path) -> None:
 
     assert error.value.diagnostic.code == "journal_corrupt"
     assert path.read_bytes() == before
+
+
+def test_two_origins_can_verify_independently_for_one_project(tmp_path: Path) -> None:
+    first = ProjectJournal(
+        tmp_path / "amelia.jsonl", project_id="project-shared", origin_id="origin-amelia"
+    )
+    second = ProjectJournal(
+        tmp_path / "eloisa.jsonl", project_id="project-shared", origin_id="origin-eloisa"
+    )
+
+    first.append({"type": "review_started", "reviewId": "r-amelia"})
+    second.append({"type": "review_started", "reviewId": "r-eloisa"})
+
+    assert first.verify() == []
+    assert second.verify() == []
+    assert first.events()[0]["projectId"] == second.events()[0]["projectId"]
+    assert first.events()[0]["originId"] != second.events()[0]["originId"]
