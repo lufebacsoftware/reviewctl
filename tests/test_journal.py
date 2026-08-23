@@ -70,6 +70,37 @@ def test_findings_projection_filters_status(tmp_path: Path) -> None:
     assert [finding["findingId"] for finding in journal.findings(status="open")] == ["f1"]
 
 
+def test_findings_projection_filters_and_unions_dimensions(tmp_path: Path) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.append(
+        {
+            "type": "finding_observed",
+            "reviewId": "r1",
+            "findingId": "f1",
+            "status": "open",
+            "path": "src/a.py",
+            "message": "one",
+            "dimensions": ["security"],
+        }
+    )
+    journal.append(
+        {
+            "type": "finding_observed",
+            "reviewId": "r2",
+            "findingId": "f1",
+            "status": "open",
+            "path": "src/a.py",
+            "message": "one",
+            "dimensions": ["architecture"],
+        }
+    )
+
+    findings = journal.findings(dimension="security")
+
+    assert len(findings) == 1
+    assert findings[0]["dimensions"] == ["architecture", "security"]
+
+
 def test_findings_projection_collapses_repeated_observations(tmp_path: Path) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     journal.append(

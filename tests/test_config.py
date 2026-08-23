@@ -118,6 +118,37 @@ def test_parse_route_requires_known_transport_and_model() -> None:
         parse_route("pi:")
 
 
+def test_review_dimensions_are_normalized_and_project_required(tmp_path: Path) -> None:
+    project = tmp_path / "reviewctl.toml"
+    project.write_text(
+        '[project]\n'
+        'required_dimensions = ["security"]\n'
+        '[profiles.default]\n'
+        'dimensions = ["architecture", "security"]\n'
+    )
+
+    config = load_config(project, user_path=None)
+
+    assert config.project.required_dimensions == ("security",)
+    assert config.profile("default").dimensions == ("architecture", "security")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '["security", "security"]',
+        '["not-a-common-dimension"]',
+        '["custom." ]',
+    ],
+)
+def test_invalid_review_dimensions_are_rejected(tmp_path: Path, value: str) -> None:
+    project = tmp_path / "reviewctl.toml"
+    project.write_text(f"[profiles.default]\ndimensions = {value}\n")
+
+    with pytest.raises(ConfigError, match="dimension"):
+        load_config(project, user_path=None)
+
+
 def test_init_writes_portable_project_id_and_local_origin(tmp_path: Path) -> None:
     assert run_cli(["init", "--project", str(tmp_path)]) == 0
 

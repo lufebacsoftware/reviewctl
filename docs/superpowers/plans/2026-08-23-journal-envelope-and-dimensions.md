@@ -187,19 +187,19 @@ Explain that checksum/continuity proves local journal integrity, not authorship;
 - Modify: `docs/HELP-LLM.md`
 - Modify: `docs/HANDOFF.md`
 
-- [ ] **Step 1: Normalize dimensions at the config boundary**
+- [x] **Step 1: Normalize dimensions at the config boundary**
 
 Add `dimensions = ["correctness"]` to a profile, allow `ReviewRequest.dimensions` to override it only by adding explicit names, and canonicalize to sorted unique strings. Reject duplicates, empty values, invalid names, names not prefixed with `custom.` outside the common set, more than 32 dimensions, and attempts to remove a project-required dimension.
 
-- [ ] **Step 2: Record dimensions in receipts and journal events**
+- [x] **Step 2: Record dimensions in receipts and journal events**
 
 Persist `dimensions`, `dimensionSchemaVersion = 1`, and `dimensionCoverage = {requested, observed: [], unresolved: requested}`. Do not call requested dimensions satisfied based only on a model response in this slice.
 
-- [ ] **Step 3: Add dimension filters to the project findings/status views**
+- [x] **Step 3: Add dimension filters to the project findings/status views**
 
 Support `reviewctl findings --dimension security` and `reviewctl status --dimension security`. Filtering must use journal metadata and remain deterministic after projection rebuild.
 
-- [ ] **Step 4: Test configuration precedence, receipts, and aggregation**
+- [x] **Step 4: Test configuration precedence, receipts, and aggregation**
 
 Cover project-required dimensions, profile additions, duplicate rejection, stable sorted serialization, and filtering across two reviews.
 

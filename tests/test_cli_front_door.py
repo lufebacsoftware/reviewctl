@@ -90,6 +90,46 @@ def test_findings_reads_append_only_project_journal(tmp_path: Path, capsys) -> N
     assert json.loads(capsys.readouterr().out)[0]["findingId"] == "finding-1"
 
 
+def test_findings_and_status_filter_by_dimension(tmp_path: Path, capsys) -> None:
+    journal = ProjectJournal(tmp_path / ".reviewctl/journal.jsonl")
+    journal.append(
+        {
+            "type": "review_started",
+            "reviewId": "review-security",
+            "dimensions": ["security"],
+        }
+    )
+    journal.append(
+        {
+            "type": "finding_observed",
+            "reviewId": "review-security",
+            "findingId": "finding-security",
+            "status": "open",
+            "path": "src/app.py",
+            "message": "Handle the error",
+            "dimensions": ["security"],
+        }
+    )
+
+    assert run_cli(
+        [
+            "findings",
+            "--project",
+            str(tmp_path),
+            "--dimension",
+            "security",
+            "--format",
+            "json",
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)[0]["findingId"] == "finding-security"
+
+    assert run_cli(
+        ["status", "--project", str(tmp_path), "--dimension", "security", "--format", "json"]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["journal"]["reviews"] == 1
+
+
 def test_doctor_reports_route_and_capability_without_credentials(tmp_path: Path, capsys) -> None:
     (tmp_path / "reviewctl.toml").write_text(
         "[project]\nprivacy_mode = \"private\"\n"
@@ -102,6 +142,7 @@ def test_doctor_reports_route_and_capability_without_credentials(tmp_path: Path,
     output = capsys.readouterr().out
     payload = json.loads(output)
     assert payload["privacyMode"] == "private"
+    assert payload["portableProjectId"] is False
     default_profile = next(
         profile for profile in payload["profiles"] if profile["name"] == "default"
     )

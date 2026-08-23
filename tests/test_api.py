@@ -206,6 +206,38 @@ def test_client_rejects_oversized_source_before_reading_it(tmp_path: Path) -> No
     assert "exceeds" in result.diagnostic.message
 
 
+def test_review_records_sorted_dimensions_and_unresolved_coverage(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+
+    result = client.review(
+        ReviewRequest(prompt="review", dimensions=("security", "architecture"))
+    )
+
+    assert result.status == "accepted"
+    receipt = json.loads(result.receipt_path.read_text())
+    assert receipt["dimensionSchemaVersion"] == 1
+    assert receipt["dimensions"] == ["architecture", "correctness", "security"]
+    assert receipt["dimensionCoverage"] == {
+        "requested": ["architecture", "correctness", "security"],
+        "observed": [],
+        "unresolved": ["architecture", "correctness", "security"],
+    }
+    started = client.journal().events()[0]
+    assert started["dimensions"] == ["architecture", "correctness", "security"]
+
+
+def test_review_rejects_duplicate_request_dimensions(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+
+    result = client.review(ReviewRequest(prompt="review", dimensions=("security", "security")))
+
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "duplicate" in result.diagnostic.message
+
+
 def test_review_receipt_is_json_and_records_route(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})

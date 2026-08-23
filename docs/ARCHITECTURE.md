@@ -211,6 +211,40 @@ The canonical term is **append-only journal**, not “write-only database.” A
 journal is readable for verification and replay; its derived projections may be
 discarded and rebuilt.
 
+## Local project journal envelope and dimensions
+
+The local project journal is a JSONL append-only stream. `reviewctl init` gives
+the project an explicit portable `project.id` in `reviewctl.toml` and creates a
+machine-local `originId` in `.reviewctl/identity.json` with mode `0600`. New
+events carry `schemaVersion`, `projectId`, `originId`, a contiguous origin
+`sequence`, `previousEventSha256`, and an `eventSha256` over canonical sorted
+compact JSON without the trailing newline. POSIX locking and fsync protect one
+append; an unavailable lock is an operational error, never permission to write
+without continuity evidence.
+
+Older un-enveloped events remain readable as a legacy prefix. When a new
+versioned event follows that prefix, its previous digest is the canonical digest
+of the preceding parsed event. `reviewctl journal verify` is read-only and
+reports continuity, identity, digest, sequence, and compatibility facts. This
+integrity envelope is not a signature, trust root, export bundle, or proof of
+federation.
+
+Review dimensions are versioned metadata, not model claims. Common dimensions
+are `correctness`, `architecture`, `security`, `privacy`, `financial`, `fiscal`,
+`release`, `public-api`, and `ui-accessibility`. Project and profile
+configuration can require dimensions; a review request may add more with
+`--dimension`. Custom dimensions use the bounded `custom.<slug>` namespace.
+Receipts record the canonical requested set and an explicit coverage object:
+`observed` is empty and `unresolved` contains the requested set until a future
+contract declares an independently verified observation. Findings and status
+views can filter by dimension because the journal facts and rebuildable
+projection retain the metadata.
+
+The project journal remains local-first. Two machines may independently append
+events for the same explicit `ProjectId`, but reviewctl does not yet merge,
+sign, import, deduplicate, or resolve those streams. Signed allow-listed
+exchange and optional storage/distribution remain a later federation layer.
+
 ## Identity
 
 A project journal is bound to `OrganizationId + ProjectId`. The owning

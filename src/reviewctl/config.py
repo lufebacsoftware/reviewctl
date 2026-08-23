@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import ConfigError
 
 SUPPORTED_TRANSPORTS = frozenset({"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"})
@@ -34,6 +35,7 @@ class ProjectSettings:
     privacy_mode: str
     project_id: str
     portable_project_id: bool
+    required_dimensions: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class ReviewProfile:
     max_output_tokens: int | None
     execution: str
     tools: str
+    dimensions: tuple[str, ...]
 
     @property
     def parsed_routes(self) -> tuple[Route, ...]:
@@ -155,7 +158,12 @@ def _project_identity(
     return f"project-{digest}", False
 
 
-def _profile(name: str, value: object, privacy_mode: str) -> ReviewProfile:
+def _profile(
+    name: str,
+    value: object,
+    privacy_mode: str,
+    required_dimensions: tuple[str, ...],
+) -> ReviewProfile:
     if not isinstance(value, dict):
         raise ConfigError(f"profiles.{name} must be a TOML table")
     raw_routes = value.get("routes", [])
@@ -190,6 +198,14 @@ def _profile(name: str, value: object, privacy_mode: str) -> ReviewProfile:
         for route in parsed_routes
     ):
         raise ConfigError(f"local profile {name!r} cannot use a remote OpenRouter route")
+    try:
+        dimensions = normalize_dimensions(
+            value.get("dimensions"),
+            label=f"profiles.{name}.dimensions",
+            default=required_dimensions,
+        )
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
     return ReviewProfile(
         name=name,
         routes=routes,
@@ -199,6 +215,7 @@ def _profile(name: str, value: object, privacy_mode: str) -> ReviewProfile:
         max_output_tokens=max_output_tokens,
         execution=execution,
         tools=tools,
+        dimensions=dimensions,
     )
 
 
@@ -236,12 +253,20 @@ def load_config(
     project_id, portable_project_id = _project_identity(
         project_table.get("id"), project_path=project_path, resolved_project=resolved_project
     )
+    try:
+        required_dimensions = normalize_dimensions(
+            project_table.get("required_dimensions"),
+            label="project.required_dimensions",
+            default=("correctness",),
+        )
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
     profiles_table = merged.get("profiles", {})
     if not isinstance(profiles_table, dict):
         raise ConfigError("profiles must be a TOML table")
     project_profile_names = set(project.get("profiles", {}))
     profiles = {
-        name: _profile(name, profile, project_privacy)
+        name: _profile(name, profile, project_privacy, required_dimensions)
         for name, profile in profiles_table.items()
     }
     if project_privacy == "sensitive":
@@ -259,11 +284,17 @@ def load_config(
             max_output_tokens=8000,
             execution="local",
             tools="none",
+            dimensions=required_dimensions,
         )
     raw_digest = hashlib.sha256(project_raw + b"\n" + user_raw).hexdigest()
     return ReviewConfig(
         project=ProjectSettings(
-            project_name, visibility, project_privacy, project_id, portable_project_id
+            project_name,
+            visibility,
+            project_privacy,
+            project_id,
+            portable_project_id,
+            required_dimensions,
         ),
         profiles=profiles,
         path=resolved_project or resolved_user,

@@ -13,6 +13,7 @@ from typing import Any
 
 from reviewctl.api import ReviewClient, ReviewRequest, ReviewResult
 from reviewctl.config import ReviewConfig, load_config
+from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError, exit_code_for
 from reviewctl.identity import ProjectIdentityStore
 from reviewctl.journal import ProjectJournal
@@ -25,9 +26,11 @@ PROJECT_TEMPLATE = '''# Project-local reviewctl configuration.
 id = "{project_id}"
 visibility = "private"
 privacy_mode = "private"
+required_dimensions = ["correctness"]
 
 [profiles.default]
 routes = ["pi:openrouter/stealth/ox-alpha"]
+dimensions = ["correctness"]
 response_contract = "findings-json"
 execution = "remote"
 tools = "none"
@@ -154,6 +157,8 @@ def init_project(args: Any) -> int:
     try:
         config_value = load_config(config, user_path=None)
         ProjectIdentityStore(project).ensure(config_value.project.project_id)
+    except JournalOperationError as error:
+        return _diagnostic_result(error.diagnostic, "text")
     except (OSError, UnicodeError, ValueError) as error:
         return _diagnostic_result(Diagnostic("invalid_request", str(error)), "text")
     print(config)
@@ -168,6 +173,8 @@ def review_project(args: Any) -> int:
             else args.prompt
         )
         client = ReviewClient.from_project(_project_path(args.project))
+    except JournalOperationError as error:
+        return _diagnostic_result(error.diagnostic, args.format)
     except (OSError, UnicodeError, ValueError) as error:
         return _diagnostic_result(Diagnostic("invalid_request", str(error)), args.format)
     result = client.review(
@@ -176,6 +183,7 @@ def review_project(args: Any) -> int:
             files=tuple(Path(value).expanduser() for value in args.files),
             profile=args.profile,
             review_id=args.review_id,
+            dimensions=tuple(args.dimensions),
         )
     )
     _print_result(result, args.format)
@@ -192,15 +200,34 @@ def review_project(args: Any) -> int:
     return exit_code_for(result.status)
 
 
-def _status_payload(config: ReviewConfig, client: ReviewClient) -> dict[str, Any]:
+def _status_payload(
+    config: ReviewConfig, client: ReviewClient, *, dimension: str | None = None
+) -> dict[str, Any]:
     events, diagnostic = client.journal().read_with_diagnostic()
-    projected_findings, projection_diagnostic = client.journal().findings_with_diagnostic()
+    projected_findings, projection_diagnostic = client.journal().findings_with_diagnostic(
+        dimension=dimension
+    )
     diagnostic = diagnostic or projection_diagnostic
+    if dimension is not None:
+        try:
+            selected_dimension = normalize_dimensions([dimension], label="status dimension")[0]
+        except ValueError as error:
+            diagnostic = Diagnostic("invalid_request", str(error))
+            selected_dimension = None
+        if selected_dimension is not None:
+            events = [
+                event
+                for event in events
+                if selected_dimension in event.get("dimensions", [])
+            ]
     review_ids = {event.get("reviewId") for event in events if event.get("reviewId")}
     payload: dict[str, Any] = {
         "project": config.project.name,
+        "projectId": config.project.project_id,
+        "portableProjectId": config.project.portable_project_id,
         "visibility": config.project.visibility,
         "privacyMode": config.project.privacy_mode,
+        "requiredDimensions": list(config.project.required_dimensions),
         "profiles": sorted(config.profiles),
         "journal": {
             "events": len(events),
@@ -216,9 +243,11 @@ def _status_payload(config: ReviewConfig, client: ReviewClient) -> dict[str, Any
 def status_project(args: Any) -> int:
     try:
         client = ReviewClient.from_project(_project_path(args.project))
+    except JournalOperationError as error:
+        return _diagnostic_result(error.diagnostic, args.format)
     except ValueError as error:
         return _diagnostic_result(Diagnostic("config_invalid", str(error)), args.format)
-    payload = _status_payload(client.config, client)
+    payload = _status_payload(client.config, client, dimension=args.dimension)
     if args.format == "json":
         _print_json(payload)
     else:
@@ -233,9 +262,13 @@ def status_project(args: Any) -> int:
 def findings_project(args: Any) -> int:
     try:
         client = ReviewClient.from_project(_project_path(args.project))
+    except JournalOperationError as error:
+        return _diagnostic_result(error.diagnostic, args.format)
     except ValueError as error:
         return _diagnostic_result(Diagnostic("config_invalid", str(error)), args.format)
-    selected, diagnostic = client.journal().findings_with_diagnostic(status=args.status)
+    selected, diagnostic = client.journal().findings_with_diagnostic(
+        status=args.status, dimension=args.dimension
+    )
     payload: object = selected
     if diagnostic is not None:
         payload = {"findings": selected, "diagnostic": diagnostic.to_dict()}
@@ -356,13 +389,17 @@ def doctor_project(args: Any) -> int:
             "tools": profile.tools,
             "timeoutSeconds": profile.timeout_seconds,
             "maxOutputTokens": profile.max_output_tokens,
+            "dimensions": list(profile.dimensions),
         }
         for profile in config.profiles.values()
     ]
     payload = {
         "project": config.project.name,
+        "projectId": config.project.project_id,
+        "portableProjectId": config.project.portable_project_id,
         "visibility": config.project.visibility,
         "privacyMode": config.project.privacy_mode,
+        "requiredDimensions": list(config.project.required_dimensions),
         "profiles": profiles,
         "transports": {
             "pi": {
@@ -375,6 +412,8 @@ def doctor_project(args: Any) -> int:
         _print_json(payload)
     else:
         print(f"project: {config.project.name}")
+        print(f"project id: {config.project.project_id}")
+        print(f"portable project id: {'yes' if config.project.portable_project_id else 'no'}")
         print(f"privacy: {config.project.privacy_mode}")
         for profile in profiles:
             print(f"profile {profile['name']}: {', '.join(profile['routes']) or '(no route)'}")
@@ -397,18 +436,21 @@ def add_project_commands(commands: Any) -> None:
     prompt.add_argument("--prompt-file")
     review.add_argument("--file", dest="files", action="append", default=[])
     review.add_argument("--review-id")
+    review.add_argument("--dimension", dest="dimensions", action="append", default=[])
     review.add_argument("--format", choices=("text", "json"), default="text")
     review.add_argument("--fail-on", choices=tuple(FINDING_SEVERITY_RANK), default=None)
     review.set_defaults(handler=review_project)
 
     status = commands.add_parser("status", help="show project review status")
     status.add_argument("--project", default=".")
+    status.add_argument("--dimension")
     status.add_argument("--format", choices=("text", "json"), default="text")
     status.set_defaults(handler=status_project)
 
     findings = commands.add_parser("findings", help="show findings from the project journal")
     findings.add_argument("--project", default=".")
     findings.add_argument("--status")
+    findings.add_argument("--dimension")
     findings.add_argument("--format", choices=("text", "json"), default="text")
     findings.set_defaults(handler=findings_project)
     findings_commands = findings.add_subparsers(dest="findings_command")

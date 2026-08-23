@@ -21,6 +21,7 @@ from reviewctl.contracts import (
     EvaluationStatus,
     get_contract,
 )
+from reviewctl.dimensions import DIMENSION_SCHEMA_VERSION, merge_dimensions, normalize_dimensions
 from reviewctl.errors import ConfigError, Diagnostic
 from reviewctl.identity import ProjectIdentityStore
 from reviewctl.journal import ProjectJournal
@@ -67,6 +68,7 @@ class ReviewRequest:
     files: tuple[Path, ...] = ()
     profile: str = "default"
     review_id: str | None = None
+    dimensions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -181,6 +183,20 @@ class ReviewClient:
             return ReviewResult(
                 "config_invalid", request.review_id or "invalid", Path(), (), diagnostic
             )
+        try:
+            request_dimensions = normalize_dimensions(
+                request.dimensions, label="review dimensions"
+            )
+        except ValueError as error:
+            diagnostic = Diagnostic("invalid_request", str(error))
+            return ReviewResult(
+                "invalid_request", request.review_id or "invalid", Path(), (), diagnostic
+            )
+        dimensions = merge_dimensions(
+            self.config.project.required_dimensions,
+            profile.dimensions,
+            request_dimensions,
+        )
         if self.config.project.privacy_mode == "sensitive" and profile.execution != "local":
             diagnostic = Diagnostic(
                 "privacy_denied",
@@ -292,6 +308,7 @@ class ReviewClient:
                 route="",
                 status="contract_failed",
                 diagnostic=diagnostic,
+                dimensions=dimensions,
             )
             return ReviewResult("contract_failed", review_id, receipt_path, (), diagnostic)
         routes = tuple(
@@ -302,6 +319,8 @@ class ReviewClient:
             "contractDigest": prepared.digest,
             "projectId": self.config.project.project_id,
             "originId": self._journal.origin_id,
+            "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
+            "dimensions": list(dimensions),
             "files": [
                 {"name": path.name, "path": str(path), "sha256": source_digests[path]}
                 for path in source_files_tuple
@@ -316,6 +335,8 @@ class ReviewClient:
                 "reviewId": review_id,
                 "route": f"{routes[0].transport}:{routes[0].model}",
                 "packetDigest": packet_digest,
+                "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
+                "dimensions": list(dimensions),
             }
         )
         attempts: list[dict[str, Any]] = []
@@ -445,7 +466,7 @@ class ReviewClient:
                     attempts.append(
                         {"attempt": index, "route": route_label, "status": "accepted"}
                     )
-                    self._record_findings(review_id, findings)
+                    self._record_findings(review_id, findings, dimensions=dimensions)
                     receipt_path = self._write_receipt(
                         artifacts,
                         review_id=review_id,
@@ -454,6 +475,7 @@ class ReviewClient:
                         packet_digest=packet_digest,
                         usage=execution.response,
                         findings=[self._finding_payload(finding) for finding in findings],
+                        dimensions=dimensions,
                         attempts=attempts,
                         fallback_relationships=fallback_relationships,
                     )
@@ -462,6 +484,8 @@ class ReviewClient:
                             "type": "review_finished",
                             "reviewId": review_id,
                             "status": "accepted",
+                            "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
+                            "dimensions": list(dimensions),
                         }
                     )
                     return ReviewResult("accepted", review_id, receipt_path, findings)
@@ -518,7 +542,7 @@ class ReviewClient:
                 "route_invalid", f"profile {profile.name!r} has no routes"
             )
         findings = self._merge_findings(partial_findings)
-        self._record_findings(review_id, findings)
+        self._record_findings(review_id, findings, dimensions=dimensions)
         receipt_path = self._write_receipt(
             artifacts,
             review_id=review_id,
@@ -528,11 +552,18 @@ class ReviewClient:
             diagnostic=diagnostic,
             usage=last_usage,
             findings=[self._finding_payload(finding) for finding in findings],
+            dimensions=dimensions,
             attempts=attempts,
             fallback_relationships=fallback_relationships,
         )
         self._journal.append(
-            {"type": "review_finished", "reviewId": review_id, "status": status}
+            {
+                "type": "review_finished",
+                "reviewId": review_id,
+                "status": status,
+                "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
+                "dimensions": list(dimensions),
+            }
         )
         return ReviewResult(status, review_id, receipt_path, findings, diagnostic)
 
@@ -548,7 +579,9 @@ class ReviewClient:
                     merged.append(finding)
         return tuple(merged)
 
-    def _record_findings(self, review_id: str, findings: Sequence[Finding]) -> None:
+    def _record_findings(
+        self, review_id: str, findings: Sequence[Finding], *, dimensions: Sequence[str]
+    ) -> None:
         for finding in findings:
             self._journal.append(
                 {
@@ -562,6 +595,8 @@ class ReviewClient:
                     "severity": finding.severity,
                     "evidence": finding.evidence,
                     "reproduction": finding.reproduction,
+                    "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
+                    "dimensions": list(dimensions),
                 }
             )
 
@@ -586,6 +621,7 @@ class ReviewClient:
         violations: Sequence[str] = (),
         attempts: Sequence[dict[str, Any]] = (),
         fallback_relationships: Sequence[dict[str, Any]] = (),
+        dimensions: Sequence[str] = (),
     ) -> Path:
         receipt: dict[str, Any] = {
             "reviewId": review_id,
@@ -596,6 +632,13 @@ class ReviewClient:
             "originId": self._journal.origin_id,
             "journalSequence": self._journal.head_sequence(),
             "privacyMode": self.config.project.privacy_mode,
+            "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
+            "dimensions": list(dimensions),
+            "dimensionCoverage": {
+                "requested": list(dimensions),
+                "observed": [],
+                "unresolved": list(dimensions),
+            },
             "at": _now(),
             "findings": list(findings),
             "violations": list(violations),

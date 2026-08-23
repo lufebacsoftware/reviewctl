@@ -42,6 +42,21 @@ finding lifecycle. `reviewctl findings set-status` appends explicit
 and `dismissed`; the journal remains the canonical record and the projection
 can be rebuilt from scratch.
 
+This iteration adds the local journal envelope. `reviewctl init` writes an
+explicit portable `project.id` and a private machine-local origin identity.
+New events carry schema version, project/origin IDs, contiguous sequence,
+previous-event digest, and canonical event digest. Existing JSONL events remain
+readable as a legacy prefix, and `reviewctl journal verify` checks continuity
+without rewriting bytes. Receipts and packet metadata carry the project/origin
+identities and journal sequence.
+
+Review dimensions are now bounded, sorted metadata. Project/profile settings
+and `review --dimension NAME` contribute to one canonical set; receipts record
+`dimensionSchemaVersion`, requested dimensions, and unresolved coverage rather
+than claiming a model satisfied them. `findings --dimension NAME` and
+`status --dimension NAME` query the rebuildable local projection. Custom names
+must use `custom.<slug>` and are length/count limited.
+
 Evidence from this iteration:
 
 - full suite: `uv run pytest -q` — 100% pass;
@@ -141,7 +156,7 @@ the authority for review acceptance.
 - A flaky one-second fake-`llm` subprocess test was made load-tolerant at five
   seconds; production timeout behavior was not changed.
 
-### Phase 1 — Operational closure: current
+### Phase 1 — Operational closure: complete
 
 - Project-first `init`, `review`, `status`, `findings`, `doctor`, and API flow
   are implemented and covered by focused tests.
@@ -151,22 +166,25 @@ the authority for review acceptance.
   bounded diagnostics and persisted artifacts.
 - Stable finding identity, deduplicated projection, and append-only lifecycle
   status changes are implemented and covered by focused tests.
+- Portable project/origin envelope, continuity verification, identity locking,
+  read-only journal verification, and bounded dimension metadata are implemented
+  and covered by focused tests.
 - Keep the exact Kiro invocation and approval failure in `HELP-LLM` recovery
   guidance if the warning or failure appears again.
 - Run bounded conformance fixtures for every currently used local backend:
   timeout, empty output, malformed structured output, identity behavior,
   credential redaction, and tool/working-directory boundaries.
 
-### Phase 2 — Project review journal
+### Phase 2 — Project review journal: current
 
-- Define the journal event envelope and stable `OrganizationId + ProjectId`
-  identity.
+- Add organization-owned identity assignment and explicit migration tooling for
+  projects that still use a local fallback project ID.
 - Persist immutable receipt references, adjudications, waivers, and
   verification observations alongside the now-implemented finding lifecycle.
-- Add versioned review dimensions with privacy classification and compatibility
-  rules.
-- Add projections for review, adjudication, and dimension queries while
-  keeping the finding projection rebuildable.
+- Add dimension definitions with privacy classification and compatibility rules;
+  current dimensions are metadata only.
+- Add projections for adjudication and verification queries while keeping the
+  finding projection rebuildable.
 - Add deterministic fixtures for event identity, ordering, supersession,
   replay, and dimension compatibility.
 
@@ -196,8 +214,9 @@ the authority for review acceptance.
 - Kiro's source isolation is currently unavailable at the OS boundary.
 - Kiro currently supports only `findings-json` through the native adapter.
 - Cursor and Claude Code are not currently qualified native review backends.
-- Federation, automatic synchronization, and multi-machine project journals
-  are designed but not implemented in the core.
+- Federation, automatic synchronization, signed exchange, and multi-machine
+  journal merge/conflict resolution are designed but not implemented in the
+  core.
 - Model names, prices, credits, and qualification results belong in private
   policy/evidence, not project instruction files.
 

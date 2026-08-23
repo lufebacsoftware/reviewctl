@@ -16,6 +16,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
     fcntl = None
 
+from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError
 
 FINDING_STATUSES = frozenset({"open", "disputed", "fixed", "verified", "dismissed"})
@@ -422,14 +423,26 @@ class ProjectJournal:
                     current["firstObservedAt"] = event.get("at")
                     current["lastObservedAt"] = event.get("at")
                     current["observations"] = 1
+                    current["dimensions"] = ProjectJournal._event_dimensions(event)
                     current["observationVariants"] = [
                         ProjectJournal._observation_variant(event)
                     ]
                     projected[finding_id] = current
                     continue
                 for key, value in event.items():
-                    if key not in {"eventId", "at", "type", "status", "reviewId"}:
+                    if key not in {
+                        "eventId",
+                        "at",
+                        "type",
+                        "status",
+                        "reviewId",
+                        "dimensions",
+                    }:
                         current[key] = value
+                current["dimensions"] = sorted(
+                    set(current.get("dimensions", []))
+                    | set(ProjectJournal._event_dimensions(event))
+                )
                 variant = ProjectJournal._observation_variant(event)
                 if variant not in current["observationVariants"]:
                     current["observationVariants"].append(variant)
@@ -466,24 +479,51 @@ class ProjectJournal:
 
     @staticmethod
     def _observation_variant(event: dict[str, Any]) -> dict[str, Any]:
-        return {
+        variant = {
             key: event[key]
             for key in ("path", "line", "message", "severity", "evidence", "reproduction")
             if key in event
         }
+        dimensions = ProjectJournal._event_dimensions(event)
+        if dimensions:
+            variant["dimensions"] = dimensions
+        return variant
+
+    @staticmethod
+    def _event_dimensions(event: dict[str, Any]) -> list[str]:
+        try:
+            return list(
+                normalize_dimensions(event.get("dimensions", []), label="journal dimensions")
+            )
+        except ValueError as error:
+            raise ValueError(str(error)) from error
 
     def findings_with_diagnostic(
-        self, *, status: str | None = None
+        self, *, status: str | None = None, dimension: str | None = None
     ) -> tuple[list[dict[str, Any]], Diagnostic | None]:
         events, diagnostic = self.read_with_diagnostic()
         if diagnostic is not None:
             return [], diagnostic
+        selected_dimension: str | None = None
+        if dimension is not None:
+            try:
+                selected_dimension = normalize_dimensions(
+                    [dimension], label="finding dimension"
+                )[0]
+            except ValueError as error:
+                return [], Diagnostic("invalid_request", str(error))
         try:
             findings = self._project(events)
         except ValueError as error:
             return [], Diagnostic("journal_corrupt", str(error))
         if status is not None:
             findings = [finding for finding in findings if finding.get("status") == status]
+        if selected_dimension is not None:
+            findings = [
+                finding
+                for finding in findings
+                if selected_dimension in finding.get("dimensions", [])
+            ]
         return findings, diagnostic
 
     def finding(self, finding_id: str) -> dict[str, Any] | None:
@@ -493,8 +533,12 @@ class ProjectJournal:
             None,
         )
 
-    def findings(self, *, status: str | None = None) -> list[dict[str, Any]]:
-        findings, diagnostic = self.findings_with_diagnostic(status=status)
+    def findings(
+        self, *, status: str | None = None, dimension: str | None = None
+    ) -> list[dict[str, Any]]:
+        findings, diagnostic = self.findings_with_diagnostic(
+            status=status, dimension=dimension
+        )
         if diagnostic is not None:
             raise JournalOperationError(diagnostic)
         return findings
