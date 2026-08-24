@@ -35,6 +35,14 @@ ERROR_EXIT_CODES = {
     "receipt_invalid": 5,
     "journal_corrupt": 5,
     "journal_unavailable": 3,
+    "github_checkout_stale": 2,
+    "github_command_failed": 3,
+    "github_metadata_invalid": 2,
+    "github_path_invalid": 2,
+    "github_source_not_utf8": 2,
+    "github_source_timeout": 3,
+    "github_source_too_large": 2,
+    "github_visibility_unknown": 4,
 }
 
 

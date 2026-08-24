@@ -252,6 +252,34 @@ def test_review_receipt_is_json_and_records_route(tmp_path: Path) -> None:
     assert receipt["journalSequence"] >= 1
 
 
+def test_review_persists_sanitized_source_context_in_packet_receipt_and_journal(
+    tmp_path: Path,
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    context = {
+        "kind": "github_pull_request",
+        "repository": "example/project",
+        "pullNumber": 7,
+        "baseSha": "a" * 40,
+        "headSha": "b" * 40,
+        "snapshotSha256": "c" * 64,
+        "diffSha256": "d" * 64,
+        "changedFiles": [{"path": "src/app.py", "sha256": "e" * 64}],
+        "evidence": ["github.pull_request"],
+    }
+
+    result = client.review(ReviewRequest(prompt="review", source_context=context))
+
+    assert result.status == "accepted"
+    packet = json.loads(result.receipt_path.with_name("packet.json").read_text())
+    receipt = json.loads(result.receipt_path.read_text())
+    started = client.journal().events()[0]
+    assert packet["sourceContext"] == context
+    assert receipt["sourceContext"] == context
+    assert started["sourceContext"] == context
+
+
 def test_client_reuses_finding_identity_across_reviews(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     response = (

@@ -195,6 +195,15 @@ review, or the approved Codex transport for proprietary source. Do not infer
 authorization from the model selected in `pi`; the formal transport and
 policy are recorded by `reviewctl`.
 
+## GitHub pull requests
+
+For a local-first pull-request review, use `reviewctl github review`. It reads
+PR metadata and the diff through `gh`, verifies the local checkout at the exact
+head SHA, and sends only the bounded snapshot through the existing project
+profile. The command is dry-run only: it creates a verified local receipt and
+publication plan without writing to GitHub. See `docs/GITHUB-REVIEWS.md` for
+the source boundary and fail-closed diagnostics.
+
 ### 4. Verify before using the result
 
 ```bash

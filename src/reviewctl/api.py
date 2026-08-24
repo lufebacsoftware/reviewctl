@@ -33,6 +33,7 @@ class ReviewTransport(Protocol):
 
 _REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
+MAX_SOURCE_CONTEXT_BYTES = 32 * 1024
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class ReviewRequest:
     profile: str = "default"
     review_id: str | None = None
     dimensions: tuple[str, ...] = ()
+    source_context: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,11 @@ def _finding_id(finding: Finding) -> str:
     return "finding-" + _digest(canonical)[:24]
 
 
+def finding_id(finding: Finding) -> str:
+    """Return the stable identity used by the project journal and adapters."""
+    return _finding_id(finding)
+
+
 def _review_id(value: str | None) -> str:
     if value is not None and value.strip():
         return value.strip()
@@ -118,6 +125,25 @@ def _execution_diagnostic(execution: BackendExecution) -> Diagnostic:
             retryable=True,
         )
     return Diagnostic("empty_response", "review transport returned no usable response")
+
+
+def _normalize_source_context(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("review source context must be an object")
+    try:
+        encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        normalized = json.loads(encoded)
+    except (TypeError, ValueError) as error:
+        raise ValueError("review source context must contain JSON-safe values") from error
+    if not isinstance(normalized, dict):
+        raise ValueError("review source context must be an object")
+    if len(encoded.encode("utf-8")) > MAX_SOURCE_CONTEXT_BYTES:
+        raise ValueError(
+            f"review source context exceeds the {MAX_SOURCE_CONTEXT_BYTES} byte limit"
+        )
+    return normalized
 
 
 class ReviewClient:
@@ -234,6 +260,11 @@ class ReviewClient:
                 next="choose a new --review-id or omit it",
             )
             return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
+        try:
+            source_context = _normalize_source_context(request.source_context)
+        except ValueError as error:
+            diagnostic = Diagnostic("invalid_request", str(error))
+            return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
         artifacts = ArtifactStore(attempt_root)
         source_files: list[Path] = []
         source_digests: dict[Path, str] = {}
@@ -309,6 +340,7 @@ class ReviewClient:
                 status="contract_failed",
                 diagnostic=diagnostic,
                 dimensions=dimensions,
+                source_context=source_context,
             )
             return ReviewResult("contract_failed", review_id, receipt_path, (), diagnostic)
         routes = tuple(
@@ -326,19 +358,22 @@ class ReviewClient:
                 for path in source_files_tuple
             ],
         }
+        if source_context is not None:
+            packet["sourceContext"] = source_context
         packet_bytes = json.dumps(packet, ensure_ascii=True, sort_keys=True).encode()
         packet_digest = _digest(packet_bytes)
         artifacts.write_bytes("packet.json", packet_bytes + b"\n")
-        self._journal.append(
-            {
-                "type": "review_started",
-                "reviewId": review_id,
-                "route": f"{routes[0].transport}:{routes[0].model}",
-                "packetDigest": packet_digest,
-                "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
-                "dimensions": list(dimensions),
-            }
-        )
+        started_event: dict[str, Any] = {
+            "type": "review_started",
+            "reviewId": review_id,
+            "route": f"{routes[0].transport}:{routes[0].model}",
+            "packetDigest": packet_digest,
+            "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
+            "dimensions": list(dimensions),
+        }
+        if source_context is not None:
+            started_event["sourceContext"] = source_context
+        self._journal.append(started_event)
         attempts: list[dict[str, Any]] = []
         fallback_relationships: list[dict[str, Any]] = []
         partial_findings: list[Finding] = []
@@ -478,6 +513,7 @@ class ReviewClient:
                         dimensions=dimensions,
                         attempts=attempts,
                         fallback_relationships=fallback_relationships,
+                        source_context=source_context,
                     )
                     self._journal.append(
                         {
@@ -555,6 +591,7 @@ class ReviewClient:
             dimensions=dimensions,
             attempts=attempts,
             fallback_relationships=fallback_relationships,
+            source_context=source_context,
         )
         self._journal.append(
             {
@@ -622,6 +659,7 @@ class ReviewClient:
         attempts: Sequence[dict[str, Any]] = (),
         fallback_relationships: Sequence[dict[str, Any]] = (),
         dimensions: Sequence[str] = (),
+        source_context: Mapping[str, Any] | None = None,
     ) -> Path:
         receipt: dict[str, Any] = {
             "reviewId": review_id,
@@ -645,6 +683,8 @@ class ReviewClient:
             "attempts": list(attempts),
             "fallbackRelationships": list(fallback_relationships),
         }
+        if source_context is not None:
+            receipt["sourceContext"] = dict(source_context)
         if packet_digest is not None:
             receipt["packetDigest"] = packet_digest
         if diagnostic is not None:

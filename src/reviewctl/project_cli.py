@@ -7,14 +7,30 @@ import os
 import secrets
 import shutil
 import sys
+import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from reviewctl.api import ReviewClient, ReviewRequest, ReviewResult
+from reviewctl.api import (
+    ReviewClient,
+    ReviewRequest,
+    ReviewResult,
+    finding_id,
+    verify_project_receipt,
+)
 from reviewctl.config import ReviewConfig, load_config
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError, exit_code_for
+from reviewctl.github import (
+    GitHubSourceError,
+    LocalGitHubSource,
+    PullRequestRef,
+    PullRequestSnapshot,
+    ReviewPublicationPlan,
+    build_publication_plan,
+)
 from reviewctl.identity import ProjectIdentityStore
 from reviewctl.journal import ProjectJournal
 from reviewctl.pi_transport import PiTransport
@@ -198,6 +214,114 @@ def review_project(args: Any) -> int:
     if result.diagnostic is not None:
         return exit_code_for(result.diagnostic.code)
     return exit_code_for(result.status)
+
+
+def _github_prompt(snapshot: PullRequestSnapshot) -> str:
+    return (
+        "Review this GitHub pull request as a bounded, read-only code review.\n"
+        f"Repository: {snapshot.ref.repository}\n"
+        f"Pull request: {snapshot.ref.number}\n"
+        f"Base commit: {snapshot.base_sha}\n"
+        f"Head commit: {snapshot.head_sha}\n"
+        "Return only the configured findings contract. Report actionable findings "
+        "with a path and line only when the line is present on the pull-request diff.\n\n"
+        "PULL REQUEST DIFF\n"
+        + snapshot.diff
+    )
+
+
+@contextmanager
+def _materialized_github_files(
+    project_dir: Path, snapshot: PullRequestSnapshot
+) -> Any:
+    staging_root = project_dir / ".reviewctl"
+    staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.TemporaryDirectory(prefix="github-source-", dir=staging_root) as directory:
+        paths: list[Path] = []
+        root = Path(directory)
+        for changed_file in snapshot.changed_files:
+            path = root / changed_file.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(changed_file.content, encoding="utf-8")
+            paths.append(path)
+        yield tuple(paths)
+
+
+def _github_plan_payload(plan: ReviewPublicationPlan) -> dict[str, Any]:
+    return {**plan.to_payload(), "planSha256": plan.plan_sha256, "mode": "dry-run"}
+
+
+def github_review_project(args: Any) -> int:
+    project = _project_path(args.project)
+    try:
+        client = ReviewClient.from_project(project)
+        snapshot = LocalGitHubSource(project).resolve(PullRequestRef(args.repo, args.pr))
+    except GitHubSourceError as error:
+        return _diagnostic_result(error.diagnostic, args.format)
+    except JournalOperationError as error:
+        return _diagnostic_result(error.diagnostic, args.format)
+    except (OSError, UnicodeError, ValueError) as error:
+        return _diagnostic_result(Diagnostic("invalid_request", str(error)), args.format)
+
+    try:
+        with _materialized_github_files(project, snapshot) as files:
+            result = client.review(
+                ReviewRequest(
+                    prompt=_github_prompt(snapshot),
+                    files=files,
+                    profile=args.profile,
+                    review_id=args.review_id,
+                    dimensions=tuple(args.dimensions),
+                    source_context=snapshot.to_context(),
+                )
+            )
+    except (OSError, UnicodeError, ValueError) as error:
+        return _diagnostic_result(Diagnostic("invalid_request", str(error)), args.format)
+
+    receipt_diagnostic = None
+    if result.status == "accepted":
+        receipt_diagnostic = verify_project_receipt(result.receipt_path)
+    plan_status = result.status if receipt_diagnostic is None else "receipt_invalid"
+    findings = (
+        tuple(
+            {
+                **asdict(finding),
+                "findingId": finding_id(finding),
+            }
+            for finding in result.findings
+        )
+        if plan_status == "accepted"
+        else ()
+    )
+    plan = build_publication_plan(
+        snapshot,
+        project_id=client.config.project.project_id,
+        review_id=result.review_id,
+        findings=findings,
+        review_status=plan_status,
+    )
+    payload = {
+        "snapshot": snapshot.to_context(),
+        "review": _result_payload(result),
+        "publicationPlan": _github_plan_payload(plan),
+    }
+    if receipt_diagnostic is not None:
+        payload["review"]["diagnostic"] = receipt_diagnostic.to_dict()
+    if args.format == "json":
+        _print_json(payload)
+    else:
+        print(f"repository: {snapshot.ref.repository}#{snapshot.ref.number}")
+        print(f"head: {snapshot.head_sha}")
+        print(f"review: {result.status} ({result.review_id})")
+        print(f"publication plan: dry-run ({'executable' if plan.executable else plan.reason})")
+        print(f"plan: {plan.plan_sha256}")
+        if receipt_diagnostic is not None:
+            print(f"diagnostic: {receipt_diagnostic.code}: {receipt_diagnostic.message}")
+    if receipt_diagnostic is not None:
+        return exit_code_for(receipt_diagnostic.code)
+    if result.status != "accepted":
+        return exit_code_for(result.status)
+    return 0
 
 
 def _status_payload(
@@ -440,6 +564,20 @@ def add_project_commands(commands: Any) -> None:
     review.add_argument("--format", choices=("text", "json"), default="text")
     review.add_argument("--fail-on", choices=tuple(FINDING_SEVERITY_RANK), default=None)
     review.set_defaults(handler=review_project)
+
+    github = commands.add_parser("github", help="run bounded GitHub pull-request workflows")
+    github_commands = github.add_subparsers(dest="github_command", required=True)
+    github_review = github_commands.add_parser(
+        "review", help="review a pull request and create a local publication plan"
+    )
+    github_review.add_argument("--repo", required=True)
+    github_review.add_argument("--pr", required=True, type=int)
+    github_review.add_argument("--project", default=".")
+    github_review.add_argument("--profile", default="default")
+    github_review.add_argument("--dimension", dest="dimensions", action="append", default=[])
+    github_review.add_argument("--review-id")
+    github_review.add_argument("--format", choices=("text", "json"), default="text")
+    github_review.set_defaults(handler=github_review_project)
 
     status = commands.add_parser("status", help="show project review status")
     status.add_argument("--project", default=".")

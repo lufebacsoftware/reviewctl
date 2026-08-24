@@ -83,11 +83,14 @@ The relevant private evidence records are named:
 - `reviewctl-dimensions-implementation/dimensions-{ox,muse,qwen}`.
 
 The next product roadmap is [GitHub/Pi review roadmap](superpowers/specs/2026-08-24-github-pi-review-roadmap.md).
-It keeps Pi behind the existing backend seam, starts with local checkout plus
-GitHub metadata, defaults to dry-run, and limits the first publisher to
-idempotent `COMMENT` reviews. Ox-alpha first reported four roadmap gaps and its
-post-fix receipt approved the revised document. No GitHub integration code has
-been added yet.
+Its Phase 0–1 implementation is now the local-first `reviewctl github review`
+dry-run path: provider-neutral snapshot/plan contracts, `gh` metadata plus
+exact local commit materialization, typed PR context in packet/receipt/journal,
+and reuse of the existing Pi-backed `ReviewClient`. The implementation plan is
+`superpowers/plans/2026-08-24-github-review-phase-0-1.md`. It still does not
+write to GitHub; the comment-only publisher remains a separately gated Phase 2
+plan. Ox-alpha first reported four roadmap gaps and its post-fix receipt
+approved the revised document.
 
 The two external review routes were advisory. The source, tests, runtime
 canary, and verified receipt are the acceptance evidence.
