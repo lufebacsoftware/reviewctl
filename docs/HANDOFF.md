@@ -82,6 +82,13 @@ The relevant private evidence records are named:
 - `reviewctl-envelope-postfix/muse`;
 - `reviewctl-dimensions-implementation/dimensions-{ox,muse,qwen}`.
 
+The next product roadmap is [GitHub/Pi review roadmap](superpowers/specs/2026-08-24-github-pi-review-roadmap.md).
+It keeps Pi behind the existing backend seam, starts with local checkout plus
+GitHub metadata, defaults to dry-run, and limits the first publisher to
+idempotent `COMMENT` reviews. Ox-alpha first reported four roadmap gaps and its
+post-fix receipt approved the revised document. No GitHub integration code has
+been added yet.
+
 The two external review routes were advisory. The source, tests, runtime
 canary, and verified receipt are the acceptance evidence.
 
