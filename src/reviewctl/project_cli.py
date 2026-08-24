@@ -20,6 +20,7 @@ from reviewctl.api import (
     finding_id,
     verify_project_receipt,
 )
+from reviewctl.artifacts import ArtifactStore
 from reviewctl.config import ReviewConfig, load_config
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError, exit_code_for
@@ -31,6 +32,7 @@ from reviewctl.github import (
     ReviewPublicationPlan,
     build_publication_plan,
 )
+from reviewctl.github_publisher import GitHubPublisher, PublicationResult, publication_key
 from reviewctl.identity import ProjectIdentityStore
 from reviewctl.journal import ProjectJournal
 from reviewctl.pi_transport import PiTransport
@@ -251,6 +253,72 @@ def _github_plan_payload(plan: ReviewPublicationPlan) -> dict[str, Any]:
     return {**plan.to_payload(), "planSha256": plan.plan_sha256, "mode": "dry-run"}
 
 
+def _persist_github_plan(plan: ReviewPublicationPlan, receipt_path: Path) -> Path:
+    artifacts = ArtifactStore(receipt_path.parent)
+    contents = json.dumps(
+        _github_plan_payload(plan), ensure_ascii=True, sort_keys=True, indent=2
+    )
+    return artifacts.write_text("publication-plan.json", contents + "\n")
+
+
+def _record_github_publication_events(
+    client: ReviewClient, plan: ReviewPublicationPlan, result: PublicationResult
+) -> None:
+    journal = client.journal()
+    common = {
+        "publicationKey": result.publication_key,
+        "reviewId": plan.review_id,
+        "repository": plan.repository,
+        "pullNumber": plan.pull_number,
+        "headSha": plan.head_sha,
+    }
+    for finding_id_value in result.skipped_finding_ids:
+        journal.append(
+            {
+                "type": "github_comment_skipped_duplicate",
+                **common,
+                "findingId": finding_id_value,
+            }
+        )
+    for comment_id in result.published_comment_ids:
+        journal.append(
+            {
+                "type": "github_comment_published",
+                **common,
+                "commentId": comment_id,
+            }
+        )
+    if result.summary_comment_id is not None:
+        journal.append(
+            {
+                "type": "github_summary_published",
+                **common,
+                "summaryCommentId": result.summary_comment_id,
+            }
+        )
+    if result.status in {"stale_head", "stale_head_race"}:
+        journal.append(
+            {
+                "type": (
+                    "github_publication_stale_head_race"
+                    if result.status == "stale_head_race"
+                    else "github_publication_stale_head"
+                ),
+                **common,
+                "observedHeadSha": result.observed_head_sha,
+            }
+        )
+    elif result.status in {"failed", "reconciliation_incomplete", "plan_invalid"}:
+        journal.append(
+            {
+                "type": "github_publication_failed",
+                **common,
+                "status": result.status,
+                "diagnostic": result.diagnostic.to_dict() if result.diagnostic else None,
+            }
+        )
+
+
 def github_review_project(args: Any) -> int:
     project = _project_path(args.project)
     try:
@@ -300,10 +368,59 @@ def github_review_project(args: Any) -> int:
         findings=findings,
         review_status=plan_status,
     )
+    publication_plan_artifact: Path | None = None
+    if result.receipt_path.is_file():
+        try:
+            publication_plan_artifact = _persist_github_plan(plan, result.receipt_path)
+        except (OSError, ValueError) as error:
+            return _diagnostic_result(
+                Diagnostic("receipt_invalid", f"could not persist publication plan: {error}"),
+                args.format,
+            )
+    client.journal().append(
+        {
+            "type": "github_publication_planned",
+            "reviewId": plan.review_id,
+            "repository": plan.repository,
+            "pullNumber": plan.pull_number,
+            "headSha": plan.head_sha,
+            "snapshotSha256": plan.snapshot_sha256,
+            "planSha256": plan.plan_sha256,
+            "executable": plan.executable,
+            "mode": "dry-run",
+        }
+    )
+    publication: PublicationResult | None = None
+    if args.publish and plan.executable:
+        client.journal().append(
+            {
+                "type": "github_publication_started",
+                "publicationKey": publication_key(plan),
+                "reviewId": plan.review_id,
+                "repository": plan.repository,
+                "pullNumber": plan.pull_number,
+                "headSha": plan.head_sha,
+            }
+        )
+        publication = GitHubPublisher(project).publish(plan)
+        _record_github_publication_events(client, plan, publication)
     payload = {
         "snapshot": snapshot.to_context(),
         "review": _result_payload(result),
         "publicationPlan": _github_plan_payload(plan),
+        "publicationPlanArtifact": (
+            str(publication_plan_artifact) if publication_plan_artifact is not None else None
+        ),
+        "publication": (
+            publication.to_payload()
+            if publication is not None
+            else {
+                "mode": "dry-run",
+                "requested": bool(args.publish),
+                "status": "not_requested" if not args.publish else "not_published",
+                "reason": plan.reason if not plan.executable else None,
+            }
+        ),
     }
     if receipt_diagnostic is not None:
         payload["review"]["diagnostic"] = receipt_diagnostic.to_dict()
@@ -315,12 +432,28 @@ def github_review_project(args: Any) -> int:
         print(f"review: {result.status} ({result.review_id})")
         print(f"publication plan: dry-run ({'executable' if plan.executable else plan.reason})")
         print(f"plan: {plan.plan_sha256}")
+        if publication_plan_artifact is not None:
+            print(f"plan artifact: {publication_plan_artifact}")
+        if publication is not None:
+            print(f"publication: {publication.status}")
+            if publication.diagnostic is not None:
+                print(
+                    f"publication diagnostic: {publication.diagnostic.code}: "
+                    f"{publication.diagnostic.message}"
+                )
         if receipt_diagnostic is not None:
             print(f"diagnostic: {receipt_diagnostic.code}: {receipt_diagnostic.message}")
     if receipt_diagnostic is not None:
         return exit_code_for(receipt_diagnostic.code)
     if result.status != "accepted":
         return exit_code_for(result.status)
+    if publication is not None and publication.status not in {
+        "published",
+        "skipped_duplicate",
+        "no_findings",
+    }:
+        code = publication.diagnostic.code if publication.diagnostic else publication.status
+        return exit_code_for(code)
     return 0
 
 
@@ -577,6 +710,8 @@ def add_project_commands(commands: Any) -> None:
     github_review.add_argument("--dimension", dest="dimensions", action="append", default=[])
     github_review.add_argument("--review-id")
     github_review.add_argument("--format", choices=("text", "json"), default="text")
+    github_review.add_argument("--publish", action="store_true")
+    github_review.add_argument("--publish-event", choices=("comment",), default="comment")
     github_review.set_defaults(handler=github_review_project)
 
     status = commands.add_parser("status", help="show project review status")

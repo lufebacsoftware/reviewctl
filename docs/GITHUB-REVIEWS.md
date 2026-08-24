@@ -21,7 +21,26 @@ reviewctl github review \
 
 The command never writes to GitHub. It produces the normal local review
 receipt and a deterministic `publicationPlan` for inspection. A successful
-plan is not a published comment, an approval, or a request for changes.
+plan is persisted as `publication-plan.json` beside the receipt; it is not a
+published comment, an approval, or a request for changes.
+
+To request the first supported external side effect explicitly:
+
+```bash
+reviewctl github review \
+  --repo OWNER/REPO \
+  --pr 123 \
+  --project . \
+  --publish \
+  --publish-event comment \
+  --format json
+```
+
+This can submit one grouped `COMMENT` review only after the receipt is
+accepted and verified. The publisher reconciles stable finding markers in
+existing review comments and review bodies, rechecks the head immediately
+before and after the POST, and records stale-head races without retrying. It
+does not support `approve` or `request-changes`.
 
 The project profile controls the transport and privacy policy. The command
 does not create a GitHub-specific Pi path or bypass the existing fallback,
@@ -61,9 +80,9 @@ the source condition; do not treat an unavailable receipt as approval.
 
 ## Publication boundary
 
-The current command has no publishing flag. Its plan maps a finding to an
-inline target only when the path and right-side line are present in the frozen
-diff; other findings remain summary-only. The future comment publisher will be
-a separate explicitly gated adapter with stale-head, pagination, marker
-reconciliation, and retry rules. It must consume this plan rather than
-recompute finding identity or decide whether a review was accepted.
+The plan maps a finding to an inline target only when the path and right-side
+line are present in the frozen diff; other findings remain summary-only. The
+comment publisher consumes this plan rather than recomputing finding identity
+or deciding whether a review was accepted. It fails closed if reconciliation
+cannot prove pagination exhaustion, and it never changes finding lifecycle
+state.

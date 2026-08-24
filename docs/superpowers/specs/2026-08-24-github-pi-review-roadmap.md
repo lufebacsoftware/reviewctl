@@ -1,10 +1,17 @@
 # reviewctl — GitHub PR Review Roadmap
 
-**Status:** Proposed roadmap
+**Status:** Implemented through Phase 2 locally; real GitHub canary pending
 **Date:** 2026-08-24
 **Scope:** Local-first GitHub pull-request review and controlled publication
 **Dependency decision:** Pi remains an optional execution adapter. GitHub is an
 input/output adapter. Neither becomes the authority for review evidence.
+
+The Phase 0–2 code path is now available as `reviewctl github review`: it
+freezes a local-first PR snapshot, reuses the existing Pi-backed project
+review, persists a dry-run publication plan, and supports explicit
+comment-only publication. Real GitHub mutation remains a separately approved
+canary because the repository/PR target and credential scope are deployment
+inputs, not unit-test fixtures.
 
 ## 1. Product direction
 
@@ -214,7 +221,7 @@ never manufactures approval.
   `PublicationResult` as provider-neutral contracts.
 - Add synthetic PR/diff fixtures, including renamed files, deleted files,
   multi-hunk diffs, generated files, and findings outside the diff.
-- Add `reviewctl github plan` with no network writes.
+- Add `reviewctl github review` dry-run output with no network writes.
 - Verify stable snapshot, diff, finding, and publication digests.
 
 Exit gate: deterministic plans from the same snapshot; no GitHub dependency in

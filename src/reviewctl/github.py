@@ -52,12 +52,21 @@ class CommandResult:
 
 class CommandRunner(Protocol):
     def __call__(
-        self, command: Sequence[str], *, cwd: Path, timeout_seconds: int
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path,
+        timeout_seconds: int,
+        input_bytes: bytes | None = None,
     ) -> CommandResult: ...
 
 
 def _run_command(
-    command: Sequence[str], *, cwd: Path, timeout_seconds: int
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+    input_bytes: bytes | None = None,
 ) -> CommandResult:
     try:
         completed = subprocess.run(
@@ -65,6 +74,7 @@ def _run_command(
             cwd=cwd,
             capture_output=True,
             check=False,
+            input=input_bytes,
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:

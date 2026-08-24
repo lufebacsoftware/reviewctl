@@ -43,6 +43,13 @@ ERROR_EXIT_CODES = {
     "github_source_timeout": 3,
     "github_source_too_large": 2,
     "github_visibility_unknown": 4,
+    "github_publication_plan_invalid": 2,
+    "github_publication_stale_head": 2,
+    "github_publication_stale_head_race": 3,
+    "github_publication_failed": 3,
+    "github_publication_timeout": 3,
+    "github_publication_response_invalid": 3,
+    "publication_reconciliation_incomplete": 3,
 }
 
 

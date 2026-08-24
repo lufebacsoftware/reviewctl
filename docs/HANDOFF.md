@@ -86,11 +86,21 @@ The next product roadmap is [GitHub/Pi review roadmap](superpowers/specs/2026-08
 Its Phase 0–1 implementation is now the local-first `reviewctl github review`
 dry-run path: provider-neutral snapshot/plan contracts, `gh` metadata plus
 exact local commit materialization, typed PR context in packet/receipt/journal,
-and reuse of the existing Pi-backed `ReviewClient`. The implementation plan is
-`superpowers/plans/2026-08-24-github-review-phase-0-1.md`. It still does not
-write to GitHub; the comment-only publisher remains a separately gated Phase 2
-plan. Ox-alpha first reported four roadmap gaps and its post-fix receipt
-approved the revised document.
+and reuse of the existing Pi-backed `ReviewClient`. The comment-only publisher
+is now also implemented behind explicit `--publish --publish-event comment`,
+with marker reconciliation, bounded pagination, stale-head checks, and
+append-only publication events. The two implementation plans are
+`superpowers/plans/2026-08-24-github-review-phase-0-1.md` and
+`superpowers/plans/2026-08-24-github-comment-publisher.md`. Approval and
+request-changes remain unsupported. Ox-alpha first reported four roadmap gaps
+and its post-fix receipt approved the revised document.
+
+The Phase 2 Ox-alpha implementation review was attempted through the formal
+Pi transport twice (broad and narrow publisher scopes). Both receipts verify
+structurally but ended as `timeout` with no response, so they are availability
+evidence rather than approvals. The local publisher suite and API-contract
+checks are the current acceptance evidence; a real GitHub canary still needs
+an explicit disposable repository/PR target.
 
 The two external review routes were advisory. The source, tests, runtime
 canary, and verified receipt are the acceptance evidence.
