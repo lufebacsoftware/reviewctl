@@ -127,12 +127,12 @@ class ProjectIdentityStore:
         )
         descriptor, temporary = tempfile.mkstemp(prefix="identity.", dir=self.root)
         try:
-            os.fchmod(descriptor, 0o600)
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        try:
+            try:
+                os.fchmod(descriptor, 0o600)
+                os.write(descriptor, payload)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
             os.replace(temporary, self.path)
             os.chmod(self.path, 0o600)
         finally:
@@ -163,6 +163,8 @@ class ProjectIdentityStore:
             acquired = True
             yield
         finally:
-            if acquired:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+            try:
+                if acquired:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
