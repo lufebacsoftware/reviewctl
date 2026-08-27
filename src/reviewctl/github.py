@@ -565,8 +565,10 @@ class LocalGitHubSource:
                 "local checkout HEAD does not match the pull-request head SHA",
             )
 
-        diff_endpoint = f"{endpoint}.diff"
-        diff_bytes = self._run("GitHub pull-request diff", ["gh", "api", diff_endpoint])
+        diff_bytes = self._run(
+            "GitHub pull-request diff",
+            ["gh", "api", endpoint, "--header", "Accept: application/vnd.github.diff"],
+        )
         if len(diff_bytes) > MAX_GITHUB_DIFF_BYTES:
             raise _source_diagnostic(
                 "github_source_too_large", "pull-request diff exceeds the bounded source limit"

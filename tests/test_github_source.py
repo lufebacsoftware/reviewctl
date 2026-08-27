@@ -16,6 +16,19 @@ from reviewctl.github import (
 
 HEAD = "b" * 40
 BASE = "a" * 40
+DIFF_HEADER = "Accept: application/vnd.github.diff"
+
+
+def _is_metadata_command(command) -> bool:
+    return command[:2] == ["gh", "api"] and len(command) == 3 and command[2].endswith("/pulls/7")
+
+
+def _is_diff_command(command) -> bool:
+    return (
+        command[:2] == ["gh", "api"]
+        and command[2].endswith("/pulls/7")
+        and command[3:] == ["--header", DIFF_HEADER]
+    )
 
 
 class FakeRunner:
@@ -34,9 +47,9 @@ class FakeRunner:
         self.cwds.append(cwd)
         self.timeouts.append(timeout_seconds)
         self.calls.append(tuple(command))
-        if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7"):
+        if _is_metadata_command(command):
             return CommandResult(0, json.dumps(self.metadata).encode(), b"")
-        if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7.diff"):
+        if _is_diff_command(command):
             return CommandResult(
                 0,
                 b"diff --git a/src/app.py b/src/app.py\n"
@@ -76,6 +89,20 @@ def test_local_source_freezes_metadata_diff_and_exact_commit_content(tmp_path: P
     assert runner.timeouts and set(runner.timeouts) == {17}
 
 
+def test_local_source_requests_diff_media_type(tmp_path: Path) -> None:
+    runner = FakeRunner()
+
+    LocalGitHubSource(tmp_path, runner=runner).resolve(PullRequestRef("example/project", 7))
+
+    assert (
+        "gh",
+        "api",
+        "repos/example/project/pulls/7",
+        "--header",
+        "Accept: application/vnd.github.diff",
+    ) in runner.calls
+
+
 def test_source_refuses_stale_checkout(tmp_path: Path) -> None:
     runner = FakeRunner(head="c" * 40)
 
@@ -99,7 +126,7 @@ def test_source_refuses_invalid_path_and_non_utf8_content(tmp_path: Path) -> Non
     class InvalidPathRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds):
             result = super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
-            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7.diff"):
+            if _is_diff_command(command):
                 return CommandResult(
                     0,
                     b"--- a/../secret\n+++ b/../secret\n@@ -0,0 +1,1 @@\n+x\n",
@@ -145,7 +172,7 @@ def test_source_rejects_control_characters_in_paths(tmp_path: Path) -> None:
     class ControlPathRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds):
             result = super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
-            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7.diff"):
+            if _is_diff_command(command):
                 return CommandResult(
                     0,
                     b"--- a/src/bad\x01.py\n+++ b/src/bad\x01.py\n@@ -0,0 +1,1 @@\n+bad\n",
@@ -212,7 +239,7 @@ def test_github_source_command_timeout_oserror_and_success(tmp_path: Path) -> No
 def test_github_source_rejects_malformed_metadata(tmp_path: Path, metadata: bytes) -> None:
     class MetadataRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds):
-            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7"):
+            if _is_metadata_command(command):
                 return CommandResult(0, metadata, b"")
             return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
 
@@ -233,7 +260,7 @@ def test_github_source_accepts_boolean_visibility_fallback(tmp_path: Path) -> No
 def test_github_source_rejects_diff_and_file_limits(tmp_path: Path) -> None:
     class LargeDiffRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds):
-            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7.diff"):
+            if _is_diff_command(command):
                 return CommandResult(0, b"x" * (github_module.MAX_GITHUB_DIFF_BYTES + 1), b"")
             return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
 
@@ -249,7 +276,7 @@ def test_github_source_rejects_diff_and_file_limits(tmp_path: Path) -> None:
 
     class ManyFilesRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds):
-            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7.diff"):
+            if _is_diff_command(command):
                 return CommandResult(0, many, b"")
             return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
 
@@ -274,7 +301,7 @@ def test_github_source_rejects_large_changed_file_and_invalid_snapshot(tmp_path:
     class InvalidShaRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds):
             result = super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
-            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7"):
+            if _is_metadata_command(command):
                 metadata = {
                     "base": {"sha": "bad"},
                     "head": {"sha": HEAD},
