@@ -124,6 +124,16 @@ def _usage(value: object) -> tuple[float | None, int | None, int | None]:
     )
 
 
+def _resolved_model(requested: str, provider: str | None, resolved: str) -> str:
+    if not resolved:
+        return ""
+    if "/" not in requested:
+        return resolved
+    if not provider or "/" in provider:
+        return ""
+    return resolved if resolved.startswith(f"{provider}/") else f"{provider}/{resolved}"
+
+
 def _persisted_response(
     stdout: bytes, requested_model: str, duration_ms: int
 ) -> PersistedResponse | None:
@@ -153,14 +163,12 @@ def _persisted_response(
     cost, input_tokens, output_tokens = _usage(assistant.get("usage"))
     provider = assistant.get("provider") if isinstance(assistant.get("provider"), str) else None
     model = assistant.get("model") if isinstance(assistant.get("model"), str) else ""
-    if provider and model and "/" not in provider and not model.startswith(f"{provider}/"):
-        model = f"{provider}/{model}"
     return PersistedResponse(
         conversation_id=session_id,
         cost_usd=cost,
         duration_ms=duration_ms,
         input_tokens=input_tokens,
-        model=model,
+        model=_resolved_model(requested_model, provider, model),
         output_tokens=output_tokens,
         provider=provider,
         response=_normalize_response(_text_blocks(assistant.get("content"))),

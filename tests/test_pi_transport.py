@@ -107,6 +107,23 @@ def test_pi_missing_resolved_model_stays_empty(tmp_path: Path) -> None:
     assert execution.response.model == ""
 
 
+def test_pi_unqualified_requested_model_stays_unqualified(tmp_path: Path) -> None:
+    events = [json.loads(line) for line in assistant_stream("{}").decode().splitlines()]
+    events[1]["message"]["provider"] = "provider"
+    events[1]["message"]["model"] = "model"
+    runner = FakeRunner(b"".join(json.dumps(event).encode() + b"\n" for event in events))
+
+    execution = PiTransport(run_process=runner).execute(replace(request(tmp_path), model="model"))
+
+    assert execution.response is not None
+    assert execution.response.model == "model"
+
+
+@pytest.mark.parametrize("provider", [None, "invalid/provider"])
+def test_pi_qualified_model_requires_atomic_provider(provider: str | None) -> None:
+    assert pi_module._resolved_model("provider/model", provider, "model") == ""
+
+
 def test_pi_empty_response_preserves_usage_and_diagnostic(tmp_path: Path) -> None:
     runner = FakeRunner(assistant_stream("", output=8000))
     execution = PiTransport(run_process=runner).execute(request(tmp_path))

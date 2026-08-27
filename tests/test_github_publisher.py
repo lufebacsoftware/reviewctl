@@ -392,13 +392,33 @@ def test_publisher_rejects_malformed_post_bodies(raw: bytes) -> None:
         publisher._post(make_plan(), make_plan().items)
 
 
-def test_publisher_rejects_posted_comment_without_id() -> None:
+@pytest.mark.parametrize("value", [None, [], {}, "", 0, -1, True])
+def test_publisher_rejects_invalid_posted_comment_id(value: object) -> None:
     publisher = GitHubPublisher(
-        Path("."), runner=lambda *args, **kwargs: CommandResult(0, b'[{"body":"x"}]', b"")
+        Path("."),
+        runner=lambda *args, **kwargs: CommandResult(0, json.dumps([{"id": value}]).encode(), b""),
     )
 
     with pytest.raises(publisher_module.GitHubPublisherError, match="valid comment ids"):
         publisher._published_comment_ids(make_plan(), 9001)
+
+
+@pytest.mark.parametrize("value", [None, [], {}, "", 0, -1, True])
+def test_publisher_rejects_invalid_created_review_id(value: object) -> None:
+    calls = 0
+
+    def runner(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return CommandResult(0, json.dumps({"id": value}).encode(), b"")
+        return CommandResult(0, b"[]", b"")
+
+    publisher = GitHubPublisher(Path("."), runner=runner)
+
+    with pytest.raises(publisher_module.GitHubPublisherError, match="review id"):
+        publisher._post(make_plan(), make_plan().items)
+    assert calls == 1
 
 
 def test_publisher_bounds_posted_comment_lookup() -> None:

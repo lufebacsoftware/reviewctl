@@ -202,12 +202,13 @@ class GitHubPublisher:
         for page in range(1, self.max_pages + 1):
             values = self._page(endpoint, page)
             for value in values:
-                if "id" not in value:
+                comment_id = value.get("id")
+                if type(comment_id) is not int or comment_id <= 0:
                     raise _failure(
                         "github_publication_response_invalid",
                         "GitHub publication did not return valid comment ids",
                     )
-                comment_ids.append(str(value["id"]))
+                comment_ids.append(str(comment_id))
             if len(values) < self.page_size:
                 return tuple(comment_ids)
         raise _failure(
@@ -259,14 +260,20 @@ class GitHubPublisher:
                 "github_publication_response_invalid",
                 "GitHub publication returned malformed JSON",
             ) from error
-        if not isinstance(value, dict) or "id" not in value:
+        if not isinstance(value, dict):
             raise _failure(
                 "github_publication_response_invalid",
                 "GitHub publication did not return a review id",
             )
+        review_id = value.get("id")
+        if type(review_id) is not int or review_id <= 0:
+            raise _failure(
+                "github_publication_response_invalid",
+                "GitHub publication did not return a valid review id",
+            )
         return {
-            "summaryCommentId": str(value["id"]),
-            "commentIds": self._published_comment_ids(plan, value["id"]),
+            "summaryCommentId": str(review_id),
+            "commentIds": self._published_comment_ids(plan, review_id),
         }
 
     def publish(self, plan: ReviewPublicationPlan) -> PublicationResult:

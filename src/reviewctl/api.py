@@ -327,11 +327,6 @@ class ReviewClient:
             return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
         artifacts = ArtifactStore(attempt_root)
         source_files_tuple = tuple(source_files)
-        source_artifacts = ArtifactStore(attempt_root / "source")
-        transport_files_tuple = tuple(
-            source_artifacts.write_bytes(path.name, contents)
-            for path, contents in zip(source_files_tuple, source_contents, strict=True)
-        )
         try:
             contract = get_contract(profile.response_contract)
             context = ContractContext(
@@ -426,6 +421,11 @@ class ReviewClient:
                     "findings if they remain relevant and return one complete response: "
                     + json.dumps([asdict(finding) for finding in partial_findings], sort_keys=True)
                 )
+            source_artifacts = ArtifactStore(attempt_artifacts.root / "source")
+            transport_files_tuple = tuple(
+                source_artifacts.write_bytes(path.name, contents)
+                for path, contents in zip(source_files_tuple, source_contents, strict=True)
+            )
             backend_request = BackendRequest(
                 prompt=prompt,
                 model=route.model,

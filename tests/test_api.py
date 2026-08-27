@@ -628,6 +628,7 @@ def test_client_freezes_source_bytes_across_fallback_attempts(tmp_path: Path) ->
             seen.append(request.files[0].read_bytes())
             if len(seen) == 1:
                 source.write_bytes(b"value = 2\n")
+                request.files[0].write_bytes(b"changed by first attempt\n")
                 return BackendExecution(1, "provider failed", None, BackendEvidence())
             return BackendExecution(
                 0,
