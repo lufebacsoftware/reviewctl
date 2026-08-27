@@ -9291,16 +9291,55 @@ def test_cli_task8_kiro_deadline_and_gemini_empty_output(tmp_path: Path, monkeyp
     )
     assert result[0] == 124
 
+    def assert_gemini_launch(
+        command: list[str],
+        cwd: str,
+        env: dict[str, str],
+        stdin: object,
+        stdout: object,
+        stderr: object,
+        start_new_session: bool,
+    ) -> None:
+        assert command == [
+            "gemini",
+            "--model",
+            "model",
+            "--prompt",
+            "Read the complete review packet from standard input. Do not use tools or edit files.",
+            "--output-format",
+            "json",
+            "--approval-mode",
+            "plan",
+            "--sandbox",
+            "--skip-trust",
+        ]
+        assert Path(cwd).name.startswith("reviewctl-gemini-")
+        assert env == cli.gemini_process_environment(os.environ)
+        assert stdin is subprocess.PIPE
+        assert stdout is subprocess.PIPE
+        assert stderr is subprocess.PIPE
+        assert start_new_session is True
+
     class EmptyProcess:
         returncode = 0
-
-        def __init__(self, *args, **kwargs):
-            pass
 
         def communicate(self, **kwargs):
             return b"", b""
 
-    monkeypatch.setattr(cli.subprocess, "Popen", EmptyProcess)
+    def empty_popen(
+        command: list[str],
+        *,
+        cwd: str,
+        env: dict[str, str],
+        stdin: object,
+        stdout: object,
+        stderr: object,
+        start_new_session: bool,
+    ) -> EmptyProcess:
+        assert_gemini_launch(command, cwd, env, stdin, stdout, stderr, start_new_session)
+        return EmptyProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", empty_popen)
     kwargs = {
         "gemini_bin": "gemini",
         "prompt": "review",
@@ -9320,7 +9359,20 @@ def test_cli_task8_kiro_deadline_and_gemini_empty_output(tmp_path: Path, monkeyp
         def communicate(self, **kwargs):
             return b'{"session_id":"s","response":"response"}', b"diag"
 
-    monkeypatch.setattr(cli.subprocess, "Popen", DiagnosticProcess)
+    def diagnostic_popen(
+        command: list[str],
+        *,
+        cwd: str,
+        env: dict[str, str],
+        stdin: object,
+        stdout: object,
+        stderr: object,
+        start_new_session: bool,
+    ) -> DiagnosticProcess:
+        assert_gemini_launch(command, cwd, env, stdin, stdout, stderr, start_new_session)
+        return DiagnosticProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", diagnostic_popen)
     diagnostic_result = cli.invoke_gemini(
         **{
             **kwargs,
@@ -9338,11 +9390,55 @@ def test_cli_task8_gemini_edge_processes(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "source.py"
     source.write_text("pass\n")
 
-    class OSErrorProcess:
-        def __init__(self, *args, **kwargs):
-            raise PermissionError("gemini denied")
+    def assert_gemini_launch(
+        command: list[str],
+        cwd: str,
+        env: dict[str, str],
+        stdin: object,
+        stdout: object,
+        stderr: object,
+        start_new_session: bool,
+    ) -> None:
+        assert command == [
+            "gemini",
+            "--model",
+            "model",
+            "--prompt",
+            "Read the complete review packet from standard input. Do not use tools or edit files.",
+            "--output-format",
+            "json",
+            "--approval-mode",
+            "plan",
+            "--sandbox",
+            "--skip-trust",
+        ]
+        assert Path(cwd).name.startswith("reviewctl-gemini-")
+        assert env == cli.gemini_process_environment(os.environ)
+        assert stdin is subprocess.PIPE
+        assert stdout is subprocess.PIPE
+        assert stderr is subprocess.PIPE
+        assert start_new_session is True
 
-    monkeypatch.setattr(cli.subprocess, "Popen", OSErrorProcess)
+    def strict_popen(process_factory: Callable[[], object]) -> Callable[..., object]:
+        def launch(
+            command: list[str],
+            *,
+            cwd: str,
+            env: dict[str, str],
+            stdin: object,
+            stdout: object,
+            stderr: object,
+            start_new_session: bool,
+        ) -> object:
+            assert_gemini_launch(command, cwd, env, stdin, stdout, stderr, start_new_session)
+            return process_factory()
+
+        return launch
+
+    def denied_process() -> object:
+        raise PermissionError("gemini denied")
+
+    monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(denied_process))
     result = cli.invoke_gemini(
         gemini_bin="gemini",
         prompt="review",
@@ -9363,7 +9459,7 @@ def test_cli_task8_gemini_edge_processes(tmp_path: Path, monkeypatch) -> None:
     class TimeoutProcess:
         returncode = 0
 
-        def __init__(self, *args, **kwargs):
+        def __init__(self):
             self.calls = 0
             timeout_processes.append(self)
 
@@ -9375,7 +9471,7 @@ def test_cli_task8_gemini_edge_processes(tmp_path: Path, monkeypatch) -> None:
                 )
             return b"after", b"more"
 
-    monkeypatch.setattr(cli.subprocess, "Popen", TimeoutProcess)
+    monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(TimeoutProcess))
     terminated: list[tuple[object, float]] = []
 
     def record_termination(process: object, *, grace_seconds: float = 5) -> None:
@@ -9414,7 +9510,9 @@ def test_cli_task8_gemini_edge_processes(tmp_path: Path, monkeypatch) -> None:
         (b'{"session_id": "session"}', "no response"),
     ):
         monkeypatch.setattr(
-            cli.subprocess, "Popen", lambda *a, _payload=payload, **k: ResponseProcess(_payload)
+            cli.subprocess,
+            "Popen",
+            strict_popen(lambda payload=payload: ResponseProcess(payload)),
         )
         result = cli.invoke_gemini(
             gemini_bin="gemini",
@@ -9674,8 +9772,61 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
     assert cli.normalize_pi_response(fenced, "findings-json").startswith("{")
     assert cli.normalize_pi_response("```json\n[]\n```", "findings-json") == "```json\n[]\n```"
 
+    def assert_pi_launch(
+        command: list[str],
+        cwd: Path,
+        stdout: object,
+        stderr: object,
+        start_new_session: bool,
+        session_path: Path,
+    ) -> None:
+        assert command == [
+            "pi",
+            "--mode",
+            "json",
+            "--print",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--no-approve",
+            "--system-prompt",
+            cli.pi_system_prompt("findings-json"),
+            "--model",
+            "model",
+            "--session",
+            str(session_path),
+            f"@{source}",
+            "review\n\nReturn only the requested findings-json response. "
+            "Do not edit files, run commands, or use information outside the supplied files.",
+        ]
+        assert cwd == source.parent
+        assert stdout is subprocess.PIPE
+        assert stderr is subprocess.PIPE
+        assert start_new_session is True
+
+    def strict_popen(
+        process_factory: Callable[[], object], session_path: Path
+    ) -> Callable[..., object]:
+        def launch(
+            command: list[str],
+            *,
+            cwd: Path,
+            stdout: object,
+            stderr: object,
+            start_new_session: bool,
+        ) -> object:
+            assert_pi_launch(command, cwd, stdout, stderr, start_new_session, session_path)
+            return process_factory()
+
+        return launch
+
+    def denied_process() -> object:
+        raise OSError("pi denied")
+
     monkeypatch.setattr(
-        cli.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("pi denied"))
+        cli.subprocess, "Popen", strict_popen(denied_process, kwargs["session_path"])
     )
     assert cli.invoke_pi(**kwargs)[:2] == (127, "Pi transport could not execute: pi denied")
 
@@ -9706,7 +9857,7 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
     class Process:
         returncode = 0
 
-        def __init__(self, *args, **kwargs):
+        def __init__(self):
             self.calls = 0
             pi_timeout_processes.append(self)
 
@@ -9716,7 +9867,8 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
                 raise subprocess.TimeoutExpired("pi", 1, output=event.encode(), stderr=b"diag")
             return event.encode(), b"diag"
 
-    monkeypatch.setattr(cli.subprocess, "Popen", Process)
+    timeout_session = tmp_path / "timeout-session.json"
+    monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(Process, timeout_session))
     terminated: list[tuple[object, float]] = []
 
     def record_termination(process: object, *, grace_seconds: float = 5) -> None:
@@ -9728,7 +9880,7 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
             **kwargs,
             "request_path": tmp_path / "timeout-request.json",
             "response_path": tmp_path / "timeout-response.json",
-            "session_path": tmp_path / "timeout-session.json",
+            "session_path": timeout_session,
             "diagnostic_path": tmp_path / "timeout-stderr.log",
         }
     )
@@ -9739,13 +9891,15 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
     class SuccessfulProcess:
         returncode = 0
 
-        def __init__(self, *args, **kwargs):
+        def __init__(self):
             pass
 
         def communicate(self, **kwargs):
             return event.encode(), b""
 
-    monkeypatch.setattr(cli.subprocess, "Popen", SuccessfulProcess)
+    monkeypatch.setattr(
+        cli.subprocess, "Popen", strict_popen(SuccessfulProcess, kwargs["session_path"])
+    )
     success = cli.invoke_pi(**kwargs)
     assert success[0] == 0 and success[2].response.startswith("{")
 
@@ -9753,7 +9907,7 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
         pid = 42
         returncode = 0
 
-        def __init__(self, *args, **kwargs):
+        def __init__(self):
             self.calls = 0
             pi_timeout_processes.append(self)
 
@@ -9763,13 +9917,16 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
                 raise subprocess.TimeoutExpired("pi", 1)
             return b"", b""
 
-    monkeypatch.setattr(cli.subprocess, "Popen", EmptyTimeoutProcess)
+    empty_timeout_session = tmp_path / "empty-timeout-session.json"
+    monkeypatch.setattr(
+        cli.subprocess, "Popen", strict_popen(EmptyTimeoutProcess, empty_timeout_session)
+    )
     empty_timeout = cli.invoke_pi(
         **{
             **kwargs,
             "request_path": tmp_path / "empty-timeout-request.json",
             "response_path": tmp_path / "empty-timeout-response.json",
-            "session_path": tmp_path / "empty-timeout-session.json",
+            "session_path": empty_timeout_session,
             "diagnostic_path": tmp_path / "empty-timeout-stderr.log",
         }
     )
@@ -9790,9 +9947,51 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
         "session_path": session_path,
         "events_path": events_path,
     }
-    monkeypatch.setattr(
-        cli.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("denied"))
-    )
+
+    def assert_pi_exploration_launch(
+        command: list[str],
+        cwd: Path,
+        stdout: object,
+        stderr: object,
+        start_new_session: bool,
+    ) -> None:
+        assert command == [
+            "pi",
+            "--mode",
+            "json",
+            "--print",
+            "--model",
+            "model",
+            "--tools",
+            "read",
+            "--no-approve",
+            "--session",
+            str(session_path),
+            "explore",
+        ]
+        assert cwd == tmp_path
+        assert stdout is subprocess.PIPE
+        assert stderr is subprocess.PIPE
+        assert start_new_session is True
+
+    def strict_popen(process_factory: Callable[[], object]) -> Callable[..., object]:
+        def launch(
+            command: list[str],
+            *,
+            cwd: Path,
+            stdout: object,
+            stderr: object,
+            start_new_session: bool,
+        ) -> object:
+            assert_pi_exploration_launch(command, cwd, stdout, stderr, start_new_session)
+            return process_factory()
+
+        return launch
+
+    def denied_process() -> object:
+        raise OSError("denied")
+
+    monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(denied_process))
     assert cli.invoke_pi_exploration(**kwargs)[:2] == (
         127,
         "Pi exploration could not execute: denied",
@@ -9804,7 +10003,7 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
         pid = 1
         returncode = 0
 
-        def __init__(self, *args, **kwargs):
+        def __init__(self):
             self.calls = 0
             exploration_timeout_processes.append(self)
 
@@ -9814,7 +10013,7 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
                 raise subprocess.TimeoutExpired("pi", 1)
             return b"", b""
 
-    monkeypatch.setattr(cli.subprocess, "Popen", Process)
+    monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(Process))
     terminated: list[tuple[object, float]] = []
 
     def record_termination(process: object, *, grace_seconds: float = 5) -> None:
@@ -9827,13 +10026,13 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
     class Success:
         returncode = 0
 
-        def __init__(self, *args, **kwargs):
+        def __init__(self):
             pass
 
         def communicate(self, **kwargs):
             return b"", b""
 
-    monkeypatch.setattr(cli.subprocess, "Popen", Success)
+    monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(Success))
     assert cli.invoke_pi_exploration(**kwargs)[0] == 0
 
 
