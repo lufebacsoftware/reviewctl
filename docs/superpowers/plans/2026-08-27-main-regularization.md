@@ -540,7 +540,7 @@ Expected: Ruff and build exit zero; all tests pass; coverage reports exactly 100
 ```bash
 git status --short --branch
 git diff --name-status 36d90ba8e83dbec27c25e2935160626e2bcb0d8e...HEAD
-git -C /Users/luisfernando/Code/workspaces/reviewctl status --short --branch
+git -C ~/Code/workspaces/reviewctl status --short --branch
 ```
 
 Expected: the regularization worktree is clean, the primary checkout still has exactly its four
