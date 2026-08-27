@@ -80,6 +80,7 @@ def test_identity_store_lock_failure_and_unlock_failure(tmp_path: Path, monkeypa
     assert calls == [FakeFcntl.LOCK_EX]
 
     closed: list[int] = []
+    original_close = identity_module.os.close
 
     class UnlockFailure(FakeFcntl):
         @staticmethod
@@ -88,7 +89,12 @@ def test_identity_store_lock_failure_and_unlock_failure(tmp_path: Path, monkeypa
                 raise OSError("unlock failed")
 
     monkeypatch.setattr(identity_module, "fcntl", UnlockFailure)
-    monkeypatch.setattr(identity_module.os, "close", lambda descriptor: closed.append(descriptor))
+
+    def track_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(identity_module.os, "close", track_close)
     with pytest.raises(OSError, match="unlock failed"):
         with store._identity_lock():
             pass
@@ -120,14 +126,24 @@ def test_identity_write_cleans_temporary_files_on_every_failure(
     store.root.mkdir(parents=True, exist_ok=True)
     identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
     original = getattr(identity_module.os, operation)
+    original_close = identity_module.os.close
+    closed_descriptors: list[int] = []
 
     def fail(*args, **kwargs):
+        if operation == "close":
+            closed_descriptors.append(args[0])
+            try:
+                raise OSError(f"{operation} failed")
+            finally:
+                original_close(*args, **kwargs)
         raise OSError(f"{operation} failed")
 
     monkeypatch.setattr(identity_module.os, operation, fail)
     with pytest.raises(OSError, match=f"{operation} failed"):
         store._write(identity)
     assert [path for path in store.root.glob("identity.*") if path.name != "identity.json"] == []
+    if operation == "close":
+        assert closed_descriptors
     monkeypatch.setattr(identity_module.os, operation, original)
 
 
@@ -144,8 +160,12 @@ def test_identity_write_preserves_write_error_when_close_also_fails(
 
     def fail_close(descriptor: int) -> None:
         close_attempts.append(descriptor)
-        raise OSError("close failed")
+        try:
+            raise OSError("close failed")
+        finally:
+            original_close(descriptor)
 
+    original_close = identity_module.os.close
     monkeypatch.setattr(identity_module.os, "write", fail_write)
     monkeypatch.setattr(identity_module.os, "close", fail_close)
     with pytest.raises(OSError, match="write failed"):
@@ -202,10 +222,20 @@ def test_identity_lock_preserves_body_error_when_close_also_fails(
             pass
 
     monkeypatch.setattr(identity_module, "fcntl", SuccessfulFcntl)
+    original_close = identity_module.os.close
+    close_attempts: list[int] = []
+
+    def fail_close(descriptor: int) -> None:
+        close_attempts.append(descriptor)
+        try:
+            raise OSError("close failed")
+        finally:
+            original_close(descriptor)
+
     monkeypatch.setattr(
         identity_module.os,
         "close",
-        lambda descriptor: (_ for _ in ()).throw(OSError("close failed")),
+        fail_close,
     )
     store = ProjectIdentityStore(tmp_path)
     store.root.mkdir(parents=True)
@@ -215,3 +245,35 @@ def test_identity_lock_preserves_body_error_when_close_also_fails(
     with pytest.raises(OSError, match="close failed"):
         with store._identity_lock():
             pass
+    assert len(close_attempts) == 2
+
+
+def test_identity_lock_preserves_body_error_when_unlock_also_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class UnlockFailure:
+        LOCK_EX = 1
+        LOCK_UN = 2
+
+        @staticmethod
+        def flock(descriptor: int, mode: int) -> None:
+            if mode == UnlockFailure.LOCK_UN:
+                raise OSError("unlock failed")
+
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True)
+    monkeypatch.setattr(identity_module, "fcntl", UnlockFailure)
+    original_close = identity_module.os.close
+    closed: list[int] = []
+
+    def track_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(identity_module.os, "close", track_close)
+    with pytest.raises(RuntimeError, match="body failed"):
+        with store._identity_lock():
+            raise RuntimeError("body failed")
+    assert closed
+    with pytest.raises(OSError):
+        identity_module.os.fstat(closed[0])

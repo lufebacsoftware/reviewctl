@@ -162,31 +162,45 @@ class ProjectIdentityStore:
         lock_path = self.root / "identity.lock"
         descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         acquired = False
+        primary: BaseException | None = None
+        unlock_error: BaseException | None = None
+        close_error: BaseException | None = None
         try:
-            os.fchmod(descriptor, 0o600)
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-            except OSError as error:
-                raise JournalOperationError(
-                    Diagnostic(
-                        "journal_unavailable",
-                        f"could not lock project identity: {error}",
-                        retryable=True,
-                        next="check filesystem locking and retry",
-                    )
-                ) from error
-            acquired = True
-            yield
+                os.fchmod(descriptor, 0o600)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                except OSError as error:
+                    raise JournalOperationError(
+                        Diagnostic(
+                            "journal_unavailable",
+                            f"could not lock project identity: {error}",
+                            retryable=True,
+                            next="check filesystem locking and retry",
+                        )
+                    ) from error
+                acquired = True
+                try:
+                    yield
+                except BaseException as error:
+                    primary = error
+            except BaseException as error:
+                primary = error
         finally:
-            primary = sys.exc_info()[1]
             try:
                 if acquired:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                if primary is None:
-                    os.close(descriptor)
-                else:
                     try:
-                        os.close(descriptor)
-                    except BaseException:
-                        pass
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except BaseException as error:
+                        unlock_error = error
+            finally:
+                try:
+                    os.close(descriptor)
+                except BaseException as error:
+                    close_error = error
+        if primary is not None:
+            raise primary
+        if unlock_error is not None:
+            raise unlock_error
+        if close_error is not None:
+            raise close_error
