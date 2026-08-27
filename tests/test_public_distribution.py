@@ -32,10 +32,12 @@ def test_runtime_version_matches_project_metadata() -> None:
 def test_python_tooling_targets_314_consistently() -> None:
     project_file = (ROOT / "pyproject.toml").read_text()
     project = tomllib.loads(project_file)
+    lock = tomllib.loads((ROOT / "uv.lock").read_text())
 
     assert (ROOT / ".python-version").read_text() == "3.14\n"
     assert project["project"]["requires-python"] == ">=3.14"
     assert project["tool"]["ruff"]["target-version"] == "py314"
+    assert lock["requires-python"] == ">=3.14"
     for workflow_name in ("ci.yml", "release.yml"):
         workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text()
         assert 'python-version: "3.14"' in workflow
