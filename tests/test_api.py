@@ -482,6 +482,12 @@ def test_source_context_rejects_nonmapping_unsafe_and_nonobject_values(value: ob
         api_module._normalize_source_context(value)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("nonstandard", [float("nan"), float("inf"), -float("inf")])
+def test_source_context_rejects_nonstandard_json_numbers(nonstandard: float) -> None:
+    with pytest.raises(ValueError, match="JSON-safe"):
+        api_module._normalize_source_context({"nested": {"value": nonstandard}})
+
+
 def test_source_context_rejects_oversized_encoded_value() -> None:
     with pytest.raises(ValueError, match="limit"):
         api_module._normalize_source_context({"payload": "x" * 33_000})

@@ -133,7 +133,13 @@ def _normalize_source_context(value: Mapping[str, Any] | None) -> dict[str, Any]
     if not isinstance(value, Mapping):
         raise ValueError("review source context must be an object")
     try:
-        encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
         normalized = json.loads(encoded)
     except (TypeError, ValueError) as error:
         raise ValueError("review source context must contain JSON-safe values") from error
