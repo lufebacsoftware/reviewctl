@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -88,18 +89,34 @@ class ProjectJournal:
                     )
                 self._validate_event(normalized, events=events)
                 normalized = self._with_envelope(normalized, events)
+                original_size = os.fstat(descriptor).st_size
                 line = json.dumps(
                     normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":")
                 )
                 remaining = memoryview((line + "\n").encode("utf-8"))
-                while remaining:
-                    written = os.write(descriptor, remaining)
-                    if written == 0:
-                        raise OSError(f"could not finish appending journal {self.path}")
-                    remaining = remaining[written:]
-                os.fsync(descriptor)
+                try:
+                    while remaining:
+                        written = os.write(descriptor, remaining)
+                        if written == 0:
+                            raise OSError(f"could not finish appending journal {self.path}")
+                        remaining = remaining[written:]
+                    os.fsync(descriptor)
+                except BaseException:
+                    try:
+                        os.ftruncate(descriptor, original_size)
+                        os.fsync(descriptor)
+                    except BaseException:
+                        pass
+                    raise
         finally:
-            os.close(descriptor)
+            primary = sys.exc_info()[1]
+            if primary is None:
+                os.close(descriptor)
+            else:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
         return normalized
 
     @contextmanager

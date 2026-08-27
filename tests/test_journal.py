@@ -437,6 +437,70 @@ def test_journal_append_rejects_zero_length_write(tmp_path: Path, monkeypatch) -
         journal.append({"type": "review_started", "reviewId": "r1"})
 
 
+def test_journal_append_rolls_back_a_partial_failed_write(tmp_path: Path, monkeypatch) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.append({"type": "review_started", "reviewId": "r1"})
+    before = journal.path.read_bytes()
+    real_write = journal_module.os.write
+    write_calls = 0
+
+    def partial_then_fail(descriptor, contents):
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 1:
+            return real_write(descriptor, contents[: max(1, len(contents) // 2)])
+        raise OSError("disk full")
+
+    monkeypatch.setattr(journal_module.os, "write", partial_then_fail)
+
+    with pytest.raises(OSError, match="disk full"):
+        journal.append({"type": "review_finished", "reviewId": "r1"})
+
+    assert write_calls == 2
+    assert journal.path.read_bytes() == before
+    assert journal.verify() == []
+
+
+def test_journal_append_preserves_primary_when_rollback_and_close_fail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    real_open = journal_module.os.open
+    real_close = journal_module.os.close
+    descriptors: list[int] = []
+    rollback_attempts: list[tuple[int, int]] = []
+
+    def tracked_open(*args, **kwargs):
+        descriptor = real_open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def fail_rollback(descriptor, length):
+        rollback_attempts.append((descriptor, length))
+        raise OSError("rollback secondary")
+
+    monkeypatch.setattr(journal_module.os, "open", tracked_open)
+    monkeypatch.setattr(
+        journal_module.os,
+        "write",
+        lambda descriptor, contents: (_ for _ in ()).throw(RuntimeError("write primary")),
+    )
+    monkeypatch.setattr(journal_module.os, "ftruncate", fail_rollback)
+    monkeypatch.setattr(
+        journal_module.os,
+        "close",
+        lambda descriptor: (_ for _ in ()).throw(OSError("close secondary")),
+    )
+
+    with pytest.raises(RuntimeError, match="write primary"):
+        journal.append({"type": "review_started", "reviewId": "r1"})
+
+    monkeypatch.undo()
+    assert len(descriptors) == 1
+    assert rollback_attempts == [(descriptors[0], 0)]
+    real_close(descriptors[0])
+
+
 def test_journal_envelope_identity_and_read_diagnostics(tmp_path: Path, monkeypatch) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl", project_id="p", origin_id="o")
     with pytest.raises(JournalOperationError, match="identity"):
