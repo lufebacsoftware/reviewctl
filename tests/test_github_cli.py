@@ -14,7 +14,7 @@ from reviewctl.github_publisher import PublicationResult
 def write_config(project: Path) -> None:
     (project / "reviewctl.toml").write_text(
         '[project]\nprivacy_mode = "private"\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'routes = ["pi:fake/model"]\n'
         'execution = "local"\n'
     )
@@ -170,20 +170,23 @@ def test_github_dry_run_does_not_instantiate_publisher_and_records_plan_event(
 
     monkeypatch.setattr("reviewctl.project_cli.GitHubPublisher", ForbiddenPublisher)
 
-    assert run_cli(
-        [
-            "github",
-            "review",
-            "--repo",
-            "example/project",
-            "--pr",
-            "7",
-            "--project",
-            str(tmp_path),
-            "--format",
-            "json",
-        ]
-    ) == 0
+    assert (
+        run_cli(
+            [
+                "github",
+                "review",
+                "--repo",
+                "example/project",
+                "--pr",
+                "7",
+                "--project",
+                str(tmp_path),
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     assert [event["type"] for event in FakeClient.instance.journal().events] == [
         "github_publication_planned"
@@ -247,20 +250,23 @@ def test_github_invalid_review_without_receipt_does_not_write_plan_to_cwd(
     monkeypatch.setattr("reviewctl.project_cli.LocalGitHubSource", FakeSource)
     monkeypatch.setattr("reviewctl.project_cli.ReviewClient", InvalidClient)
 
-    assert run_cli(
-        [
-            "github",
-            "review",
-            "--repo",
-            "example/project",
-            "--pr",
-            "7",
-            "--project",
-            str(tmp_path),
-            "--format",
-            "json",
-        ]
-    ) == 2
+    assert (
+        run_cli(
+            [
+                "github",
+                "review",
+                "--repo",
+                "example/project",
+                "--pr",
+                "7",
+                "--project",
+                str(tmp_path),
+                "--format",
+                "json",
+            ]
+        )
+        == 2
+    )
     payload = json.loads(capsys.readouterr().out)
     assert payload["publicationPlanArtifact"] is None
     assert not (tmp_path / "publication-plan.json").exists()

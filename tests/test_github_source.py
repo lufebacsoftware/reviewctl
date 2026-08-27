@@ -142,8 +142,7 @@ def test_source_rejects_control_characters_in_paths(tmp_path: Path) -> None:
             if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7.diff"):
                 return CommandResult(
                     0,
-                    b"--- a/src/bad\x01.py\n+++ b/src/bad\x01.py\n"
-                    b"@@ -0,0 +1,1 @@\n+bad\n",
+                    b"--- a/src/bad\x01.py\n+++ b/src/bad\x01.py\n@@ -0,0 +1,1 @@\n+bad\n",
                     b"",
                 )
             return result

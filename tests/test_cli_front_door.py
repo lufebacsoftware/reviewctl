@@ -84,9 +84,10 @@ def test_findings_reads_append_only_project_journal(tmp_path: Path, capsys) -> N
         }
     )
 
-    assert run_cli(
-        ["findings", "--project", str(tmp_path), "--format", "json", "--status", "open"]
-    ) == 0
+    assert (
+        run_cli(["findings", "--project", str(tmp_path), "--format", "json", "--status", "open"])
+        == 0
+    )
     assert json.loads(capsys.readouterr().out)[0]["findingId"] == "finding-1"
 
 
@@ -111,31 +112,37 @@ def test_findings_and_status_filter_by_dimension(tmp_path: Path, capsys) -> None
         }
     )
 
-    assert run_cli(
-        [
-            "findings",
-            "--project",
-            str(tmp_path),
-            "--dimension",
-            "security",
-            "--format",
-            "json",
-        ]
-    ) == 0
+    assert (
+        run_cli(
+            [
+                "findings",
+                "--project",
+                str(tmp_path),
+                "--dimension",
+                "security",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
     assert json.loads(capsys.readouterr().out)[0]["findingId"] == "finding-security"
 
-    assert run_cli(
-        ["status", "--project", str(tmp_path), "--dimension", "security", "--format", "json"]
-    ) == 0
+    assert (
+        run_cli(
+            ["status", "--project", str(tmp_path), "--dimension", "security", "--format", "json"]
+        )
+        == 0
+    )
     assert json.loads(capsys.readouterr().out)["journal"]["reviews"] == 1
 
 
 def test_doctor_reports_route_and_capability_without_credentials(tmp_path: Path, capsys) -> None:
     (tmp_path / "reviewctl.toml").write_text(
-        "[project]\nprivacy_mode = \"private\"\n"
+        '[project]\nprivacy_mode = "private"\n'
         "[profiles.default]\n"
-        "routes = [\"pi:openrouter/stealth/ox-alpha\"]\n"
-        "execution = \"remote\"\n"
+        'routes = ["pi:openrouter/stealth/ox-alpha"]\n'
+        'execution = "remote"\n'
     )
 
     assert run_cli(["doctor", "--project", str(tmp_path), "--format", "json"]) == 0
@@ -171,9 +178,12 @@ def test_review_front_door_maps_transport_diagnostic_to_exit_code(
 
     monkeypatch.setattr("reviewctl.project_cli.ReviewClient", FakeClient)
 
-    assert run_cli(
-        ["review", "--project", str(tmp_path), "--prompt", "review this", "--format", "json"]
-    ) == 3
+    assert (
+        run_cli(
+            ["review", "--project", str(tmp_path), "--prompt", "review this", "--format", "json"]
+        )
+        == 3
+    )
     payload = json.loads(capsys.readouterr().out)
     assert payload["diagnostic"]["code"] == "timeout"
 
@@ -208,30 +218,34 @@ def test_findings_set_status_appends_a_status_event(tmp_path: Path, capsys) -> N
         }
     )
 
-    assert run_cli(
-        [
-            "findings",
-            "set-status",
-            "--project",
-            str(tmp_path),
-            "--id",
-            "finding-1",
-            "--status",
-            "fixed",
-            "--reason",
-            "patched",
-            "--format",
-            "json",
-        ]
-    ) == 0
+    assert (
+        run_cli(
+            [
+                "findings",
+                "set-status",
+                "--project",
+                str(tmp_path),
+                "--id",
+                "finding-1",
+                "--status",
+                "fixed",
+                "--reason",
+                "patched",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["findingId"] == "finding-1"
     assert payload["status"] == "fixed"
     assert payload["statusReason"] == "patched"
-    assert json.loads((tmp_path / ".reviewctl/journal.jsonl").read_text().splitlines()[-1])[
-        "type"
-    ] == "finding_status_changed"
+    assert (
+        json.loads((tmp_path / ".reviewctl/journal.jsonl").read_text().splitlines()[-1])["type"]
+        == "finding_status_changed"
+    )
 
 
 def test_findings_set_status_reports_invalid_transition(tmp_path: Path, capsys) -> None:
@@ -248,20 +262,23 @@ def test_findings_set_status_reports_invalid_transition(tmp_path: Path, capsys) 
         }
     )
 
-    assert run_cli(
-        [
-            "findings",
-            "set-status",
-            "--project",
-            str(tmp_path),
-            "--id",
-            "finding-1",
-            "--status",
-            "verified",
-            "--format",
-            "json",
-        ]
-    ) == 2
+    assert (
+        run_cli(
+            [
+                "findings",
+                "set-status",
+                "--project",
+                str(tmp_path),
+                "--id",
+                "finding-1",
+                "--status",
+                "verified",
+                "--format",
+                "json",
+            ]
+        )
+        == 2
+    )
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["diagnostic"]["code"] == "invalid_request"

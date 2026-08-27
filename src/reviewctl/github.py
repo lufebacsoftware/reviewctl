@@ -204,9 +204,7 @@ class PullRequestSnapshot:
                 item.to_payload() for item in sorted(self.changed_files, key=lambda x: x.path)
             ],
             "diffSha256": (
-                self.diff_sha256
-                if hasattr(self, "diff_sha256")
-                else canonical_sha256(self.diff)
+                self.diff_sha256 if hasattr(self, "diff_sha256") else canonical_sha256(self.diff)
             ),
             "evidence": list(self.evidence),
         }
@@ -334,11 +332,7 @@ def _body(
     location = f"{path}:{line}" if type(line) is int else path
     severity = _safe_text(finding.get("severity", "info"))
     title = _safe_text(finding.get("title", "Review finding"))
-    return (
-        f"{marker}\n"
-        f"reviewctl-head: {snapshot.head_sha}\n"
-        f"**{severity}** `{location}` — {title}"
-    )
+    return f"{marker}\nreviewctl-head: {snapshot.head_sha}\n**{severity}** `{location}` — {title}"
 
 
 def build_publication_plan(
@@ -557,10 +551,14 @@ class LocalGitHubSource:
                 "repository visibility is unknown; source transfer is blocked",
             )
 
-        local_head = self._decode(
-            "local checkout head",
-            self._run("local checkout head", ["git", "rev-parse", "HEAD"]),
-        ).strip().lower()
+        local_head = (
+            self._decode(
+                "local checkout head",
+                self._run("local checkout head", ["git", "rev-parse", "HEAD"]),
+            )
+            .strip()
+            .lower()
+        )
         if local_head != str(head_sha).lower():
             raise _source_diagnostic(
                 "github_checkout_stale",

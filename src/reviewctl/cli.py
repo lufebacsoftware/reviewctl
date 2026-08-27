@@ -1012,7 +1012,7 @@ def endpoint_price_per_million(endpoint: dict[str, object], field: str) -> float
     value = pricing.get(field) if isinstance(pricing, dict) else None
     try:
         return float(value) * 1_000_000
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -1586,7 +1586,7 @@ def unresolved_identity_waived(
 def reap_process(process: subprocess.Popen[bytes]) -> None:
     try:
         process.wait()
-    except (ChildProcessError, OSError):
+    except ChildProcessError, OSError:
         pass
 
 
@@ -1600,7 +1600,7 @@ def reap_process_without_blocking(process: subprocess.Popen[bytes]) -> None:
             daemon=True,
             name=f"reviewctl-reap-{process.pid}",
         ).start()
-    except (ChildProcessError, OSError):
+    except ChildProcessError, OSError:
         pass
 
 
@@ -1628,7 +1628,7 @@ def terminate_process_group(process: subprocess.Popen[bytes], *, grace_seconds: 
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             reap_process_without_blocking(process)
-        except (ChildProcessError, OSError):
+        except ChildProcessError, OSError:
             pass
 
 
@@ -1817,7 +1817,7 @@ def kiro_session_id(payload: bytes, cwd: Path) -> str:
     """Require one reproducible UUID session for the isolated Kiro working directory."""
     try:
         value = json.loads(payload, parse_constant=reject_nonstandard_json_constant)
-    except (json.JSONDecodeError, UnicodeError, ValueError):
+    except json.JSONDecodeError, UnicodeError, ValueError:
         return ""
     if type(value) is not list or len(value) != 1 or type(value[0]) is not dict:
         return ""
@@ -2168,7 +2168,7 @@ def invoke_gemini(
         return process.returncode, diagnostic, blank
     try:
         payload = json.loads(stdout, parse_constant=reject_nonstandard_json_constant)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+    except json.JSONDecodeError, UnicodeDecodeError, ValueError:
         return 502, "Gemini returned invalid JSON", blank
     if not isinstance(payload, dict):
         return 502, "Gemini returned a non-object response", blank
@@ -2569,7 +2569,7 @@ def normalize_pi_response(response: str, response_contract: str) -> str:
     candidate = match.group(1)
     try:
         value = json.loads(candidate, parse_constant=reject_nonstandard_json_constant)
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError, ValueError:
         return response
     return candidate if isinstance(value, dict) else response
 
@@ -4499,7 +4499,7 @@ def valid_receipt(receipt: dict[str, Any]) -> bool:
     unsigned = {key: value for key, value in receipt.items() if key != "sha256"}
     try:
         reproduced = sha256_bytes(canonical_json(unsigned))
-    except (TypeError, ValueError, UnicodeError, OverflowError):
+    except TypeError, ValueError, UnicodeError, OverflowError:
         return False
     return isinstance(recorded, str) and recorded == reproduced
 
@@ -4539,7 +4539,7 @@ def verify_receipt(args: argparse.Namespace) -> int:
             object_pairs_hook=exact_json_object,
             parse_constant=reject_nonstandard_constant,
         )
-    except (OSError, UnicodeError, ValueError):
+    except OSError, UnicodeError, ValueError:
         violations = ("json-receipt",)
     else:
         if (

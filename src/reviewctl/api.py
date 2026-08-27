@@ -140,9 +140,7 @@ def _normalize_source_context(value: Mapping[str, Any] | None) -> dict[str, Any]
     if not isinstance(normalized, dict):
         raise ValueError("review source context must be an object")
     if len(encoded.encode("utf-8")) > MAX_SOURCE_CONTEXT_BYTES:
-        raise ValueError(
-            f"review source context exceeds the {MAX_SOURCE_CONTEXT_BYTES} byte limit"
-        )
+        raise ValueError(f"review source context exceeds the {MAX_SOURCE_CONTEXT_BYTES} byte limit")
     return normalized
 
 
@@ -210,9 +208,7 @@ class ReviewClient:
                 "config_invalid", request.review_id or "invalid", Path(), (), diagnostic
             )
         try:
-            request_dimensions = normalize_dimensions(
-                request.dimensions, label="review dimensions"
-            )
+            request_dimensions = normalize_dimensions(request.dimensions, label="review dimensions")
         except ValueError as error:
             diagnostic = Diagnostic("invalid_request", str(error))
             return ReviewResult(
@@ -390,9 +386,7 @@ class ReviewClient:
                     f"transport {route.transport!r} is not registered",
                     retryable=True,
                 )
-                attempts.append(
-                    {"attempt": index, "route": route_label, "status": diagnostic.code}
-                )
+                attempts.append({"attempt": index, "route": route_label, "status": diagnostic.code})
                 last_diagnostic = diagnostic
                 self._journal.append(
                     {
@@ -433,7 +427,7 @@ class ReviewClient:
             )
             try:
                 execution = transport.execute(backend_request)
-            except (OSError, UnicodeError, ValueError):
+            except OSError, UnicodeError, ValueError:
                 diagnostic = Diagnostic(
                     "transport_unavailable", "review transport failed", retryable=True
                 )
@@ -456,9 +450,7 @@ class ReviewClient:
                 continue
             if execution.response is None or not execution.response.response.strip():
                 diagnostic = _execution_diagnostic(execution)
-                attempts.append(
-                    {"attempt": index, "route": route_label, "status": diagnostic.code}
-                )
+                attempts.append({"attempt": index, "route": route_label, "status": diagnostic.code})
                 last_diagnostic = diagnostic
                 if index < len(routes):
                     fallback_relationships.append(
@@ -498,9 +490,7 @@ class ReviewClient:
                     diagnostic = Diagnostic("contract_failed", str(error))
                 else:
                     findings = self._merge_findings(partial_findings, current_findings)
-                    attempts.append(
-                        {"attempt": index, "route": route_label, "status": "accepted"}
-                    )
+                    attempts.append({"attempt": index, "route": route_label, "status": "accepted"})
                     self._record_findings(review_id, findings, dimensions=dimensions)
                     receipt_path = self._write_receipt(
                         artifacts,

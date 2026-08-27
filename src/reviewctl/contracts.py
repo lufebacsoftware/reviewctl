@@ -383,7 +383,7 @@ def valid_finding(value: object) -> bool:
         return False
     try:
         canonical_json(value)
-    except (TypeError, ValueError, UnicodeError, OverflowError):
+    except TypeError, ValueError, UnicodeError, OverflowError:
         return False
     return True
 
@@ -483,7 +483,7 @@ class FindingsJsonContract:
         try:
             prepared_identity = canonical_json(prepared.identity_material)
             expected_identity = canonical_json(self.prepare(context).identity_material)
-        except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+        except TypeError, ValueError, UnicodeError, OverflowError, RecursionError:
             return rejected("prepared-contract")
         if (
             prepared_identity != expected_identity
@@ -497,11 +497,11 @@ class FindingsJsonContract:
                 object_pairs_hook=exact_json_object,
                 parse_constant=_reject_json_constant,
             )
-        except (ValueError, RecursionError):
+        except ValueError, RecursionError:
             return rejected("invalid-json")
         try:
             canonical_json(value)
-        except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+        except TypeError, ValueError, UnicodeError, OverflowError, RecursionError:
             return rejected("invalid-json")
         if _contains_surrogate(value):
             return rejected("invalid-json")

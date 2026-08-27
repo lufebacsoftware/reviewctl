@@ -119,9 +119,12 @@ class ProjectIdentityStore:
         return ProjectIdentity(project_id, origin_id, created_at, schema_version)
 
     def _write(self, identity: ProjectIdentity) -> None:
-        payload = json.dumps(
-            identity.to_dict(), ensure_ascii=True, sort_keys=True, indent=2
-        ).encode("utf-8") + b"\n"
+        payload = (
+            json.dumps(identity.to_dict(), ensure_ascii=True, sort_keys=True, indent=2).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
         descriptor, temporary = tempfile.mkstemp(prefix="identity.", dir=self.root)
         try:
             os.fchmod(descriptor, 0o600)

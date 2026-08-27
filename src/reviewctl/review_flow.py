@@ -286,7 +286,7 @@ def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | 
         expected_prepared_digest = (
             get_contract("findings-json").prepare(fragment.contract_context).digest
         )
-    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+    except AttributeError, KeyError, TypeError, ValueError, UnicodeError:
         return None
     fingerprint = _fragment_fingerprint(
         finding,
@@ -616,7 +616,7 @@ def _valid_incomplete_evaluation(
             and request.missing_fields == coverage.missing_fields
             and request.violations == evaluation.violations
         )
-    except (AttributeError, KeyError, TypeError, ValueError):
+    except AttributeError, KeyError, TypeError, ValueError:
         return False
 
 
@@ -692,7 +692,7 @@ def _promote_contract_fragments(
         return None
     try:
         expected_prepared = get_contract("findings-json").prepare(contract_context)
-    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+    except AttributeError, KeyError, TypeError, ValueError, UnicodeError:
         return None
     if prepared_digest != expected_prepared.digest:
         return None
@@ -866,7 +866,7 @@ def consolidate(
         return unavailable
     try:
         expected_prepared_digest = get_contract("findings-json").prepare(contract_context).digest
-    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+    except AttributeError, KeyError, TypeError, ValueError, UnicodeError:
         return unavailable
     validated_fragments: list[tuple[PromotedFragment, dict[str, Any]]] = []
     promoted_provenance: set[tuple[str, int]] = set()
@@ -937,7 +937,7 @@ def consolidate(
             contract.prepare(contract_context),
             contract_context,
         )
-    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+    except TypeError, ValueError, UnicodeError, OverflowError, RecursionError:
         accepted_evaluation = None
     if (
         accepted_evaluation is None
@@ -1087,7 +1087,7 @@ def _receipt_canonical_digest(value: object) -> str | None:
         if not has_exact_json_scalar_types(value):
             return None
         return hashlib.sha256(canonical_json(value)).hexdigest()
-    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+    except TypeError, ValueError, UnicodeError, OverflowError, RecursionError:
         return None
 
 
@@ -1464,7 +1464,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 if context_is_authoritative and type(evaluation.get("name")) is str:
                     try:
                         prepared = get_contract(evaluation["name"]).prepare(contract_context)
-                    except (KeyError, TypeError, ValueError, UnicodeError):
+                    except KeyError, TypeError, ValueError, UnicodeError:
                         prepared = None
                     if prepared is not None and prepared.version == evaluation.get("version"):
                         prepared_digest = prepared.digest
@@ -1671,7 +1671,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     route_index=route_index,
                     raw_response_digest=raw_digest,
                 )
-            except (AttributeError, KeyError, TypeError, ValueError):
+            except AttributeError, KeyError, TypeError, ValueError:
                 reproduced = None
             if reproduced is None:
                 reject("promoted-fragments")

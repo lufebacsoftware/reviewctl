@@ -37,7 +37,7 @@ from reviewctl.identity import ProjectIdentityStore
 from reviewctl.journal import ProjectJournal
 from reviewctl.pi_transport import PiTransport
 
-PROJECT_TEMPLATE = '''# Project-local reviewctl configuration.
+PROJECT_TEMPLATE = """# Project-local reviewctl configuration.
 # Keep the project private by default. Change privacy_mode to "sensitive" to
 # require local execution for every profile.
 [project]
@@ -54,7 +54,7 @@ execution = "remote"
 tools = "none"
 timeout_seconds = 300
 max_output_tokens = 8000
-'''
+"""
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
@@ -207,8 +207,7 @@ def review_project(args: Any) -> int:
     _print_result(result, args.format)
     if result.status == "accepted":
         if args.fail_on is not None and any(
-            FINDING_SEVERITY_RANK.get(finding.severity, 0)
-            >= FINDING_SEVERITY_RANK[args.fail_on]
+            FINDING_SEVERITY_RANK.get(finding.severity, 0) >= FINDING_SEVERITY_RANK[args.fail_on]
             for finding in result.findings
         ):
             return 1
@@ -227,15 +226,12 @@ def _github_prompt(snapshot: PullRequestSnapshot) -> str:
         f"Head commit: {snapshot.head_sha}\n"
         "Return only the configured findings contract. Report actionable findings "
         "with a path and line only when the line is present on the pull-request diff.\n\n"
-        "PULL REQUEST DIFF\n"
-        + snapshot.diff
+        "PULL REQUEST DIFF\n" + snapshot.diff
     )
 
 
 @contextmanager
-def _materialized_github_files(
-    project_dir: Path, snapshot: PullRequestSnapshot
-) -> Any:
+def _materialized_github_files(project_dir: Path, snapshot: PullRequestSnapshot) -> Any:
     staging_root = project_dir / ".reviewctl"
     staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(prefix="github-source-", dir=staging_root) as directory:
@@ -255,9 +251,7 @@ def _github_plan_payload(plan: ReviewPublicationPlan) -> dict[str, Any]:
 
 def _persist_github_plan(plan: ReviewPublicationPlan, receipt_path: Path) -> Path:
     artifacts = ArtifactStore(receipt_path.parent)
-    contents = json.dumps(
-        _github_plan_payload(plan), ensure_ascii=True, sort_keys=True, indent=2
-    )
+    contents = json.dumps(_github_plan_payload(plan), ensure_ascii=True, sort_keys=True, indent=2)
     return artifacts.write_text("publication-plan.json", contents + "\n")
 
 
@@ -473,9 +467,7 @@ def _status_payload(
             selected_dimension = None
         if selected_dimension is not None:
             events = [
-                event
-                for event in events
-                if selected_dimension in event.get("dimensions", [])
+                event for event in events if selected_dimension in event.get("dimensions", [])
             ]
     review_ids = {event.get("reviewId") for event in events if event.get("reviewId")}
     payload: dict[str, Any] = {

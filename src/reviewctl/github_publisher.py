@@ -50,8 +50,7 @@ class PublicationResult:
 
 def publication_key(plan: ReviewPublicationPlan) -> str:
     return (
-        f"github:{plan.repository}:{plan.pull_number}:{plan.review_id}:"
-        f"{plan.snapshot_sha256[:24]}"
+        f"github:{plan.repository}:{plan.pull_number}:{plan.review_id}:{plan.snapshot_sha256[:24]}"
     )
 
 
@@ -110,9 +109,7 @@ class GitHubPublisher:
         except (OSError, UnicodeError, ValueError) as error:
             raise _failure("github_publication_failed", f"{operation} could not run") from error
         if result.returncode == 124:
-            raise _failure(
-                "github_publication_timeout", f"{operation} timed out", retryable=True
-            )
+            raise _failure("github_publication_timeout", f"{operation} timed out", retryable=True)
         if result.returncode != 0:
             raise _failure(
                 "github_publication_failed",

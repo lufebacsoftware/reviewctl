@@ -193,10 +193,14 @@ class PiTransport:
         request.attempt_dir.mkdir(parents=True, exist_ok=True)
         artifacts = ArtifactStore(request.attempt_dir)
         session_path = request.attempt_dir / "session.jsonl"
-        tool_flags = ["--no-tools"] if request.tools == "none" else [
-            "--tools",
-            "read,grep,find,ls",
-        ]
+        tool_flags = (
+            ["--no-tools"]
+            if request.tools == "none"
+            else [
+                "--tools",
+                "read,grep,find,ls",
+            ]
+        )
         command = [
             self.pi_bin,
             "--mode",

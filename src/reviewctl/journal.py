@@ -124,9 +124,7 @@ class ProjectJournal:
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
 
-    def _with_envelope(
-        self, event: dict[str, Any], events: list[dict[str, Any]]
-    ) -> dict[str, Any]:
+    def _with_envelope(self, event: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
         identities = self._journal_identity(events)
         if (
             identities[0] is not None
@@ -168,9 +166,7 @@ class ProjectJournal:
                 "originId": origin_id,
             }
         )
-        versioned_events = [
-            item for item in events if item.get("schemaVersion") == 1
-        ]
+        versioned_events = [item for item in events if item.get("schemaVersion") == 1]
         previous = events[-1] if events else None
         if versioned_events:
             sequence = int(versioned_events[-1]["sequence"]) + 1
@@ -183,9 +179,7 @@ class ProjectJournal:
         versioned["eventSha256"] = _event_digest(versioned)
         return versioned
 
-    def _journal_identity(
-        self, events: list[dict[str, Any]]
-    ) -> tuple[str | None, str | None]:
+    def _journal_identity(self, events: list[dict[str, Any]]) -> tuple[str | None, str | None]:
         for event in events:
             if event.get("schemaVersion") == 1:
                 return event.get("projectId"), event.get("originId")
@@ -281,9 +275,7 @@ class ProjectJournal:
             return events, Diagnostic("journal_corrupt", "; ".join(violations))
         return events, None
 
-    def _read_descriptor(
-        self, descriptor: int
-    ) -> tuple[list[dict[str, Any]], Diagnostic | None]:
+    def _read_descriptor(self, descriptor: int) -> tuple[list[dict[str, Any]], Diagnostic | None]:
         try:
             os.lseek(descriptor, 0, os.SEEK_SET)
             raw = os.read(descriptor, os.fstat(descriptor).st_size)
@@ -424,9 +416,7 @@ class ProjectJournal:
                     current["lastObservedAt"] = event.get("at")
                     current["observations"] = 1
                     current["dimensions"] = ProjectJournal._event_dimensions(event)
-                    current["observationVariants"] = [
-                        ProjectJournal._observation_variant(event)
-                    ]
+                    current["observationVariants"] = [ProjectJournal._observation_variant(event)]
                     projected[finding_id] = current
                     continue
                 for key, value in event.items():
@@ -457,9 +447,7 @@ class ProjectJournal:
                 raise ValueError("invalid finding status event: missing findingId")
             current = projected.get(finding_id)
             if current is None:
-                raise ValueError(
-                    f"invalid finding status event: unknown finding {finding_id}"
-                )
+                raise ValueError(f"invalid finding status event: unknown finding {finding_id}")
             if event.get("from") != current.get("status"):
                 raise ValueError(
                     "invalid finding status transition source: "
@@ -507,9 +495,7 @@ class ProjectJournal:
         selected_dimension: str | None = None
         if dimension is not None:
             try:
-                selected_dimension = normalize_dimensions(
-                    [dimension], label="finding dimension"
-                )[0]
+                selected_dimension = normalize_dimensions([dimension], label="finding dimension")[0]
             except ValueError as error:
                 return [], Diagnostic("invalid_request", str(error))
         try:
@@ -536,9 +522,7 @@ class ProjectJournal:
     def findings(
         self, *, status: str | None = None, dimension: str | None = None
     ) -> list[dict[str, Any]]:
-        findings, diagnostic = self.findings_with_diagnostic(
-            status=status, dimension=dimension
-        )
+        findings, diagnostic = self.findings_with_diagnostic(status=status, dimension=dimension)
         if diagnostic is not None:
             raise JournalOperationError(diagnostic)
         return findings

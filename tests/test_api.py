@@ -67,7 +67,7 @@ class QueueTransport:
 def write_default_config(project: Path) -> None:
     (project / "reviewctl.toml").write_text(
         '[project]\nprivacy_mode = "private"\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'routes = ["pi:fake/model"]\n'
         'execution = "local"\n'
     )
@@ -112,9 +112,9 @@ def test_client_rejects_review_id_path_traversal(tmp_path: Path) -> None:
 def test_client_uses_max_attempts_as_bounded_per_route_retries(tmp_path: Path) -> None:
     (tmp_path / "reviewctl.toml").write_text(
         '[project]\nprivacy_mode = "private"\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'routes = ["pi:first/model"]\n'
-        'max_attempts = 2\n'
+        "max_attempts = 2\n"
         'execution = "remote"\n'
     )
     transport = QueueTransport([None, '{"verdict":"approved","findings":[]}'])
@@ -134,7 +134,7 @@ def test_client_uses_max_attempts_as_bounded_per_route_retries(tmp_path: Path) -
 def test_client_falls_back_and_keeps_valid_findings_from_partial_attempt(tmp_path: Path) -> None:
     (tmp_path / "reviewctl.toml").write_text(
         '[project]\nprivacy_mode = "private"\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'routes = ["pi:first/model", "pi:second/model"]\n'
         'execution = "remote"\n'
     )
@@ -210,9 +210,7 @@ def test_review_records_sorted_dimensions_and_unresolved_coverage(tmp_path: Path
     write_default_config(tmp_path)
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
 
-    result = client.review(
-        ReviewRequest(prompt="review", dimensions=("security", "architecture"))
-    )
+    result = client.review(ReviewRequest(prompt="review", dimensions=("security", "architecture")))
 
     assert result.status == "accepted"
     receipt = json.loads(result.receipt_path.read_text())

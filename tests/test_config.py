@@ -13,24 +13,20 @@ def test_project_config_wins_over_user_profile(tmp_path: Path) -> None:
     user = tmp_path / "user.toml"
     project = tmp_path / "reviewctl.toml"
     user.write_text(
-        '[profiles.default]\n'
-        'routes = ["pi:openrouter/stealth/ox-alpha"]\n'
-        'execution = "remote"\n'
+        '[profiles.default]\nroutes = ["pi:openrouter/stealth/ox-alpha"]\nexecution = "remote"\n'
     )
     project.write_text(
-        '[project]\n'
+        "[project]\n"
         'visibility = "private"\n'
         'privacy_mode = "private"\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'routes = ["pi:openrouter/meta/muse-spark-1.2-contributor"]\n'
         'execution = "remote"\n'
     )
 
     config = load_config(project, user_path=user)
 
-    assert config.profile("default").routes == (
-        "pi:openrouter/meta/muse-spark-1.2-contributor",
-    )
+    assert config.profile("default").routes == ("pi:openrouter/meta/muse-spark-1.2-contributor",)
 
 
 def test_user_stricter_privacy_cannot_be_weakened_by_project(tmp_path: Path) -> None:
@@ -47,9 +43,9 @@ def test_user_stricter_privacy_cannot_be_weakened_by_project(tmp_path: Path) -> 
 def test_sensitive_remote_profile_is_rejected_at_load(tmp_path: Path) -> None:
     project = tmp_path / "reviewctl.toml"
     project.write_text(
-        '[project]\n'
+        "[project]\n"
         'privacy_mode = "sensitive"\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'routes = ["pi:openrouter/stealth/ox-alpha"]\n'
         'execution = "remote"\n'
     )
@@ -62,7 +58,7 @@ def test_local_profile_rejects_explicit_openrouter_route(tmp_path: Path) -> None
     project = tmp_path / "reviewctl.toml"
     project.write_text(
         '[project]\nprivacy_mode = "sensitive"\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'routes = ["pi:openrouter/stealth/ox-alpha"]\n'
         'execution = "local"\n'
     )
@@ -83,9 +79,9 @@ def test_invalid_limits_and_privacy_mode_are_rejected_at_load(tmp_path: Path) ->
     project = tmp_path / "reviewctl.toml"
     project.write_text(
         '[project]\nprivacy_mode = "unknown"\n'
-        '[profiles.default]\n'
-        'timeout_seconds = 0\n'
-        'max_output_tokens = -1\n'
+        "[profiles.default]\n"
+        "timeout_seconds = 0\n"
+        "max_output_tokens = -1\n"
     )
 
     with pytest.raises(ConfigError):
@@ -121,9 +117,9 @@ def test_parse_route_requires_known_transport_and_model() -> None:
 def test_review_dimensions_are_normalized_and_project_required(tmp_path: Path) -> None:
     project = tmp_path / "reviewctl.toml"
     project.write_text(
-        '[project]\n'
+        "[project]\n"
         'required_dimensions = ["security"]\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'dimensions = ["architecture", "security"]\n'
     )
 
