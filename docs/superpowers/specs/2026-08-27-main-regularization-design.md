@@ -4,7 +4,8 @@
 
 Make the unpublished local `main` line reviewable and publishable without weakening the
 repository's existing release gates, disturbing the user's dirty primary checkout, or mixing
-the tournament scorer v2 change into the baseline repair.
+the tournament scorer v2 change into the baseline repair. Standardize the unpublished line on
+Python 3.14 before restoring the coverage gate.
 
 ## Recovered State
 
@@ -31,6 +32,26 @@ The failure is real coverage debt, not a Python-version artifact. The public bas
 declared `fail_under = 100`; the unpublished line added substantial source and tests while
 remaining outside remote CI.
 
+The same 1,379 tests and build also pass on Python 3.14.6, with the same 89.43% coverage result.
+Python 3.14 is a stable bugfix release line and Ruff supports `py314`, so the migration does not
+depend on a preview runtime or syntax target.
+
+## Python 3.14 Baseline
+
+Regularization raises the package minimum to Python 3.14 instead of carrying a compatibility
+matrix through the unpublished release:
+
+- set `requires-python = ">=3.14"`;
+- set Ruff's `target-version = "py314"`;
+- add a repository `.python-version` containing `3.14` for uv and local tooling;
+- run CI and release jobs on Python 3.14;
+- regenerate `uv.lock` so its declared Python requirement matches the package;
+- run the 100% coverage gate on Python 3.14.
+
+Historical plans keep their original version references because they describe the environment
+in which those changes were designed. User-facing compatibility documentation must describe
+3.14 as the current minimum.
+
 ## Considered Approaches
 
 ### Restore the declared gates (selected)
@@ -53,20 +74,23 @@ security and evidence changes. It is not the baseline-repair strategy.
 
 ## Change Boundaries
 
-1. Apply Ruff's formatter only to the 12 files reported by the exact CI command. Keep this as a
+1. Migrate package metadata, Ruff, uv, CI, release, and current compatibility documentation to
+   Python 3.14 in one bounded infrastructure commit. Verify the pre-existing test behavior on
+   3.14 before relying on the new default.
+2. Apply Ruff's formatter only to the 12 files reported by the exact CI command. Keep this as a
    mechanical commit with no semantic edits.
-2. Restore coverage module by module using focused tests. Prefer owner-native public behavior
+3. Restore coverage module by module using focused tests. Prefer owner-native public behavior
    and existing test seams; test private branches only when they encode observable security or
    evidence invariants.
-3. Do not add broad exclusions, `pragma: no cover`, omit rules, or threshold reductions merely
+4. Do not add broad exclusions, `pragma: no cover`, omit rules, or threshold reductions merely
    to satisfy the percentage. Any genuinely unreachable platform guard must be justified
    separately before exclusion.
-4. Do not refactor production code unless a test exposes a concrete defect or an untestable
+5. Do not refactor production code unless a test exposes a concrete defect or an untestable
    boundary. Such a change must follow red-green-refactor and remain separate from coverage-only
    commits.
-5. Do not merge the scorer v2 commits during regularization. After the baseline is green, rebase
+6. Do not merge the scorer v2 commits during regularization. After the baseline is green, rebase
    or replay that bounded branch and repeat its tests and E2E.
-6. Do not modify, stash, reset, or include the dirty files from the primary checkout. Do not push
+7. Do not modify, stash, reset, or include the dirty files from the primary checkout. Do not push
    or open a PR without an explicit publication authorization.
 
 ## Work Decomposition
@@ -86,13 +110,13 @@ would make the tests misleading.
 
 ## Verification and Acceptance
 
-The regularization branch is locally ready only when all commands pass freshly on Python 3.12:
+The regularization branch is locally ready only when all commands pass freshly on Python 3.14:
 
 ```bash
-uv sync --locked --python 3.12
-uv run --python 3.12 ruff check .
-uv run --python 3.12 ruff format --check .
-uv run --python 3.12 pytest --cov=reviewctl --cov-branch --cov-report=term-missing
+uv sync --locked --python 3.14
+uv run --python 3.14 ruff check .
+uv run --python 3.14 ruff format --check .
+uv run --python 3.14 pytest --cov=reviewctl --cov-branch --cov-report=term-missing
 uv build
 git diff --check origin/main...HEAD
 ```
@@ -100,6 +124,7 @@ git diff --check origin/main...HEAD
 Acceptance also requires:
 
 - exactly 100% statement and branch coverage under the retained policy;
+- package metadata, lock metadata, Ruff, local uv selection, CI, and release agree on Python 3.14;
 - no changes to the primary checkout's four dirty files;
 - a reviewable commit structure separating formatting, coverage groups, and any proven defects;
 - a recorded exact head SHA and diff inventory;
