@@ -242,6 +242,18 @@ os.execvp(sys.argv[3], sys.argv[3:])
     )
 
 
+def fake_isolated_codex_environment(path: Path, fake_codex: Path) -> dict[str, str]:
+    """Provide the explicit sandbox and auth fixtures required by proprietary reviews."""
+    auth = path / "auth.json"
+    auth.write_text('{"access_token":"test"}')
+    write_fake_sandbox_exec(path)
+    return {
+        "CODEX_AUTH_FILE": str(auth),
+        "CODEX_BIN": str(fake_codex),
+        "PATH": f"{path}{os.pathsep}{os.environ.get('PATH', os.defpath)}",
+    }
+
+
 def write_fake_age(path: Path) -> Path:
     return write_fake_python_executable(
         path,
@@ -3039,7 +3051,7 @@ def test_codex_transport_uses_an_isolated_snapshot_and_receipt(tmp_path: Path) -
         "codex",
         "--source-class",
         "proprietary",
-        env={"CODEX_BIN": str(fake_codex)},
+        env=fake_isolated_codex_environment(fake_codex_root, fake_codex),
     )
 
     assert result.returncode == 0, result.stderr
@@ -3095,7 +3107,7 @@ def test_codex_transport_enforces_the_structured_findings_contract(tmp_path: Pat
         "proprietary",
         "--response-contract",
         "findings-json",
-        env={"CODEX_BIN": str(fake_codex)},
+        env=fake_isolated_codex_environment(fake_codex_root, fake_codex),
     )
 
     assert result.returncode == 0, result.stderr
@@ -3143,7 +3155,7 @@ def test_generated_v2_receipt_canonicalizes_reversed_review_declaration(
         "proprietary",
         "--response-contract",
         "findings-json",
-        env={"CODEX_BIN": str(fake_codex)},
+        env=fake_isolated_codex_environment(fake_codex_root, fake_codex),
     )
 
     assert result.returncode == 0, result.stderr
@@ -3185,7 +3197,7 @@ def test_generated_v2_receipt_with_unicode_findings_verifies(tmp_path: Path) -> 
         "proprietary",
         "--response-contract",
         "findings-json",
-        env={"CODEX_BIN": str(fake_codex)},
+        env=fake_isolated_codex_environment(fake_codex_root, fake_codex),
     )
 
     assert result.returncode == 0, result.stderr
