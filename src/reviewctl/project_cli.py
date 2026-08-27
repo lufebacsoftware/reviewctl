@@ -145,14 +145,39 @@ def _replace_private_file(path: Path, contents: bytes) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
+        try:
+            stream = os.fdopen(descriptor, "wb")
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+            raise
+        try:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(contents)
             stream.flush()
             os.fsync(stream.fileno())
+        finally:
+            primary = sys.exc_info()[1]
+            if primary is None:
+                stream.close()
+            else:
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
         os.replace(temporary, path)
     finally:
-        temporary.unlink(missing_ok=True)
+        primary = sys.exc_info()[1]
+        if temporary.exists():
+            if primary is None:
+                temporary.unlink()
+            else:
+                try:
+                    temporary.unlink()
+                except BaseException:
+                    pass
 
 
 def init_project(args: Any) -> int:

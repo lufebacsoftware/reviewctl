@@ -280,6 +280,129 @@ def test_init_force_atomically_replaces_a_racing_symlink(
     assert not config.is_symlink()
 
 
+def test_private_file_replace_closes_descriptor_when_fdopen_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: list[int] = []
+
+    def fail_fdopen(descriptor, mode):
+        captured.append(descriptor)
+        raise RuntimeError("fdopen primary")
+
+    monkeypatch.setattr(project_cli.os, "fdopen", fail_fdopen)
+
+    with pytest.raises(RuntimeError, match="fdopen primary"):
+        project_cli._replace_private_file(tmp_path / "config", b"value")
+
+    assert len(captured) == 1
+    with pytest.raises(OSError):
+        os.fstat(captured[0])
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_private_file_replace_preserves_fdopen_failure_when_close_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    descriptors: list[int] = []
+
+    def fail_fdopen(descriptor, mode):
+        descriptors.append(descriptor)
+        raise RuntimeError("fdopen primary")
+
+    monkeypatch.setattr(project_cli.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(
+        project_cli.os,
+        "close",
+        lambda *args: (_ for _ in ()).throw(OSError("close secondary")),
+    )
+
+    with pytest.raises(RuntimeError, match="fdopen primary"):
+        project_cli._replace_private_file(tmp_path / "config", b"value")
+
+    monkeypatch.undo()
+    assert len(descriptors) == 1
+    os.close(descriptors[0])
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_private_file_replace_preserves_write_failure_when_stream_close_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FailingStream:
+        def __init__(self, descriptor: int) -> None:
+            self.descriptor = descriptor
+
+        def fileno(self) -> int:
+            return self.descriptor
+
+        def write(self, contents: bytes) -> None:
+            raise RuntimeError("write primary")
+
+        def close(self) -> None:
+            os.close(self.descriptor)
+            raise OSError("stream close secondary")
+
+    monkeypatch.setattr(
+        project_cli.os,
+        "fdopen",
+        lambda descriptor, mode: FailingStream(descriptor),
+    )
+
+    with pytest.raises(RuntimeError, match="write primary"):
+        project_cli._replace_private_file(tmp_path / "config", b"value")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_private_file_replace_removes_unmoved_temporary_file(tmp_path: Path, monkeypatch) -> None:
+    temporary_paths: list[Path] = []
+    real_mkstemp = project_cli.tempfile.mkstemp
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        temporary_paths.append(Path(name))
+        return descriptor, name
+
+    monkeypatch.setattr(project_cli.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(project_cli.os, "replace", lambda *args: None)
+
+    project_cli._replace_private_file(tmp_path / "config", b"value")
+
+    assert len(temporary_paths) == 1
+    assert not temporary_paths[0].exists()
+
+
+def test_private_file_replace_preserves_primary_when_cleanup_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    temporary_paths: list[Path] = []
+    real_mkstemp = project_cli.tempfile.mkstemp
+    real_unlink = Path.unlink
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        temporary_paths.append(Path(name))
+        return descriptor, name
+
+    def fail_unlink(path: Path, *, missing_ok: bool = False):
+        raise OSError("cleanup secondary")
+
+    monkeypatch.setattr(project_cli.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(
+        project_cli.os,
+        "replace",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("replace primary")),
+    )
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    with pytest.raises(RuntimeError, match="replace primary"):
+        project_cli._replace_private_file(tmp_path / "config", b"value")
+
+    monkeypatch.undo()
+    assert len(temporary_paths) == 1
+    real_unlink(temporary_paths[0])
+
+
 def test_init_reports_config_write_and_identity_errors(tmp_path: Path, monkeypatch, capsys) -> None:
     args = SimpleNamespace(project=str(tmp_path / "write"), force=False, mode="private")
     monkeypatch.setattr(
