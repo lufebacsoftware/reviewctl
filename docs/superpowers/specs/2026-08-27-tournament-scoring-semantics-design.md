@@ -24,6 +24,8 @@ positives and zero recall because the rubric minimum was critical.
 Tournament output will distinguish location detection from severity
 qualification:
 
+- `scoreSchemaVersion`: integer `2`. Reports without this field use the legacy
+  severity-gated scoring semantics.
 - `matched`: number of distinct expected findings detected at an adjudicated
   filename or symbol and line range, regardless of reported severity.
 - `severityQualified`: number of distinct expected findings for which at least
@@ -39,14 +41,32 @@ qualification:
 - `precision`: `matched / len(findings)`, or `1.0` when there are no findings.
 - `recall`: `matched / len(expected)`, or `1.0` when there are no expected
   findings.
+- `qualifiedPrecision`: `severityQualified / len(findings)`, or `1.0` when
+  there are no findings. This preserves the former severity-gated precision.
 - `qualifiedRecall`: `severityQualified / len(expected)`, or `1.0` when there
-  are no expected findings.
+  are no expected findings. This preserves the former severity-gated recall.
 
-One reported finding can establish at most one new location match, and one
-expected finding can be location-matched at most once. Severity qualification
-also assigns each reported finding to at most one not-yet-qualified expected
-finding. When multiple rubric entries share a location, both assignments remain
-deterministic in rubric order.
+The scorer computes two independent maximum-cardinality bipartite matchings:
+
+1. Detection edges connect a reported finding to every expected finding whose
+   existing filename-or-symbol and line-range predicate it satisfies.
+2. Qualification edges are the subset of detection edges where the reported
+   severity meets or exceeds the expected minimum.
+
+`matched` and `severityQualified` are the respective matching cardinalities.
+This makes overlapping ranges and co-located rubric entries independent of
+input order and guarantees `severityQualified <= matched`. The current
+location predicate itself is unchanged. A duplicate that does not establish a
+new detection match still counts toward `falsePositives`, but remains eligible
+to qualify an expected defect in the independent severity matching.
+
+The following invariants are normative:
+
+- `matched <= lineAccurate <= len(findings)`;
+- `severityQualified <= matched <= len(expected)`;
+- `matched + falsePositives == len(findings)`;
+- `qualifiedPrecision <= precision`;
+- `qualifiedRecall <= recall`.
 
 ## Example
 
@@ -55,6 +75,7 @@ same adjudicated location:
 
 ```json
 {
+  "scoreSchemaVersion": 2,
   "expected": 1,
   "matched": 1,
   "severityQualified": 0,
@@ -62,6 +83,7 @@ same adjudicated location:
   "lineAccurate": 2,
   "precision": 0.5,
   "recall": 1.0,
+  "qualifiedPrecision": 0.0,
   "qualifiedRecall": 0.0
 }
 ```
@@ -75,10 +97,11 @@ The existing keys keep their types. Their documented meaning becomes
 internally consistent with their names: `matched`, `precision`, and `recall`
 measure detection, while the new keys expose severity qualification.
 
-Consumers that need the old minimum-severity gate must switch from `recall` to
-`qualifiedRecall`. Because tournament reports are private qualification
-artifacts rather than a stable public interchange contract, no schema-version
-change is introduced in this bounded correction.
+Consumers that need the old minimum-severity gate must switch from `precision`
+and `recall` to `qualifiedPrecision` and `qualifiedRecall`. New score objects
+declare `scoreSchemaVersion = 2`; historical objects without the field are
+version 1. Historical and version-2 tournament scores are not directly
+comparable.
 
 Existing receipts are immutable and will not be rewritten. Rerunning a
 tournament creates a new report with the corrected metrics.
@@ -99,13 +122,18 @@ timeouts, candidate budgets, receipt validation, or existing evidence.
 1. Add a regression test for one critical expected finding and two high
    findings at the same location. Verify the exact example above and observe
    it fail against the current implementation.
-2. Update the existing mixed scoring test to assert detection and qualified
-   recall separately.
-3. Preserve tests for wrong filenames, accepted line ranges, and upward
-   severity escalation.
-4. Run the focused scorer tests, then the full test suite and formatting/lint
+2. Add a later-critical-duplicate case to prove a duplicate may qualify an
+   already detected expected defect.
+3. Add overlapping-range and co-located-severity cases whose greedy matching
+   cardinality is lower than the maximum.
+4. Cover the four empty/non-empty expected/findings quadrants and assert all
+   invariants.
+5. Update all four existing direct `score_findings()` tests to assert detection
+   and qualification separately while preserving wrong-filename, accepted
+   range, and upward-severity behavior.
+6. Run the focused scorer tests, then the full test suite and formatting/lint
    checks.
-5. Re-score the preserved Muse outbox findings with the corrected function and
+7. Re-score the preserved Muse outbox findings with the corrected function and
    verify the expected metrics without mutating the original tournament
    artifact.
 
@@ -116,5 +144,9 @@ timeouts, candidate budgets, receipt validation, or existing evidence.
 - Severity underestimation remains visible and cannot satisfy
   `qualifiedRecall`.
 - Duplicate findings do not inflate distinct defect recall.
+- Maximum matching prevents rubric or report ordering from changing metric
+  cardinalities.
+- Version-2 output exposes both detection and legacy-equivalent qualified
+  precision/recall.
 - Existing clean-case and location-safety behavior remains intact.
 - No unrelated dirty work enters the implementation commits.
