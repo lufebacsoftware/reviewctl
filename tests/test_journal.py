@@ -549,6 +549,14 @@ def test_journal_lock_failures_are_typed(tmp_path: Path, monkeypatch) -> None:
         with journal._exclusive_lock(-1):
             pass
 
+    monkeypatch.setattr(
+        journal_module.os,
+        "write",
+        lambda descriptor, contents: (_ for _ in ()).throw(RuntimeError("write primary")),
+    )
+    with pytest.raises(RuntimeError, match="write primary"):
+        journal.append({"type": "review_started"})
+
 
 def test_journal_read_and_verify_diagnostics(tmp_path: Path, monkeypatch) -> None:
     missing = ProjectJournal(tmp_path / "missing.jsonl")

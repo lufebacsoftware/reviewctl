@@ -144,7 +144,14 @@ class ProjectJournal:
         try:
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            primary = sys.exc_info()[1]
+            if primary is None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            else:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except BaseException:
+                    pass
 
     def _with_envelope(self, event: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
         identities = self._journal_identity(events)
