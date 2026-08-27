@@ -60,6 +60,27 @@ class FakeRunner:
         return PiProcessResult(returncode=0, stdout=self.stdout, stderr=b"", timed_out=False)
 
 
+def popen_factory(process: object, *, expected_command: list[str], expected_cwd: Path):
+    def fake_popen(
+        command: list[str],
+        *,
+        stdin: object,
+        stdout: object,
+        stderr: object,
+        cwd: Path,
+        start_new_session: bool,
+    ) -> object:
+        assert command == expected_command
+        assert stdin is subprocess.PIPE
+        assert stdout is subprocess.PIPE
+        assert stderr is subprocess.PIPE
+        assert cwd == expected_cwd
+        assert start_new_session is True
+        return process
+
+    return fake_popen
+
+
 def test_pi_request_uses_exact_model_and_no_tools_by_default(tmp_path: Path) -> None:
     runner = FakeRunner(assistant_stream('{"verdict":"approved","findings":[]}'))
     execution = PiTransport(run_process=runner).execute(request(tmp_path))
@@ -142,7 +163,11 @@ def test_run_process_returns_successful_process_result(
             return b"stdout", b"stderr"
 
     process = SuccessfulProcess()
-    monkeypatch.setattr(pi_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "Popen",
+        popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
+    )
 
     result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
 
@@ -171,7 +196,11 @@ def test_run_process_terminates_then_kills_a_timed_out_process(
 
     process = TimeoutProcess()
     signals: list[tuple[int, signal.Signals]] = []
-    monkeypatch.setattr(pi_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "Popen",
+        popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
+    )
     monkeypatch.setattr(
         pi_module.os,
         "killpg",
@@ -201,7 +230,11 @@ def test_run_process_preserves_partial_output_when_timeout_process_is_gone(
             return b"", b""
 
     process = GoneProcess()
-    monkeypatch.setattr(pi_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "Popen",
+        popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
+    )
 
     def process_gone(pid: int, sig: signal.Signals) -> None:
         raise ProcessLookupError(pid)
@@ -233,7 +266,11 @@ def test_run_process_reports_communication_oserror(
             self.waited = True
 
     process = BrokenProcess()
-    monkeypatch.setattr(pi_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "Popen",
+        popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
+    )
 
     result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
 
