@@ -707,6 +707,29 @@ class LocalGitHubSource:
                 source_path = _validate_relative_path(source_path)
             except ValueError as error:
                 raise _source_diagnostic("github_path_invalid", str(error)) from error
+            size_bytes = self._run(
+                "local committed source size",
+                ["git", "cat-file", "-s", f"{source_sha}:{source_path}"],
+            )
+            try:
+                blob_size = int(self._decode("local committed source size", size_bytes).strip())
+            except ValueError as error:
+                raise _source_diagnostic(
+                    "github_command_failed",
+                    "local committed source size returned invalid output",
+                    retryable=True,
+                ) from error
+            if blob_size < 0:
+                raise _source_diagnostic(
+                    "github_command_failed",
+                    "local committed source size returned invalid output",
+                    retryable=True,
+                )
+            if blob_size > MAX_GITHUB_FILE_BYTES:
+                raise _source_diagnostic(
+                    "github_source_too_large",
+                    f"changed file exceeds the bounded source limit: {item.path}",
+                )
             content_bytes = self._run(
                 "local committed source",
                 ["git", "show", f"{source_sha}:{source_path}"],

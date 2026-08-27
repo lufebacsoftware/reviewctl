@@ -62,6 +62,8 @@ class FakeRunner:
             )
         if command[:3] == ["git", "rev-parse", "HEAD"]:
             return CommandResult(0, f"{self.head}\n".encode(), b"")
+        if command[:3] == ["git", "cat-file", "-s"]:
+            return CommandResult(0, b"10\n", b"")
         if command[:2] == ["git", "show"]:
             return CommandResult(0, b"value = 2\n", b"")
         raise AssertionError(f"unexpected command: {command}")
@@ -517,6 +519,48 @@ def test_github_source_rejects_large_changed_file_and_invalid_snapshot(tmp_path:
             PullRequestRef("example/project", 7)
         )
     assert error.value.diagnostic.code == "github_metadata_invalid"
+
+
+def test_github_source_rejects_oversized_blob_before_capturing_content(tmp_path: Path) -> None:
+    class OversizedBlobRunner(FakeRunner):
+        git_show_calls = 0
+
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if command[:3] == ["git", "cat-file", "-s"]:
+                self.cwds.append(cwd)
+                self.timeouts.append(timeout_seconds)
+                self.calls.append(tuple(command))
+                return CommandResult(
+                    0, f"{github_module.MAX_GITHUB_FILE_BYTES + 1}\n".encode(), b""
+                )
+            if command[:2] == ["git", "show"]:
+                self.git_show_calls += 1
+                return CommandResult(0, b"x" * (github_module.MAX_GITHUB_FILE_BYTES + 1), b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    runner = OversizedBlobRunner()
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=runner).resolve(PullRequestRef("example/project", 7))
+
+    assert error.value.diagnostic.code == "github_source_too_large"
+    assert runner.git_show_calls == 0
+    assert runner.calls[-1] == ("git", "cat-file", "-s", f"{HEAD}:src/app.py")
+
+
+@pytest.mark.parametrize("size_output", [b"not-a-size\n", b"-1\n"])
+def test_github_source_rejects_invalid_blob_size_output(tmp_path: Path, size_output: bytes) -> None:
+    class InvalidSizeRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if command[:3] == ["git", "cat-file", "-s"]:
+                return CommandResult(0, size_output, b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=InvalidSizeRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+    assert error.value.diagnostic.code == "github_command_failed"
 
 
 def test_github_source_rejects_invalid_timeout_and_boolean_visibility_shape(tmp_path: Path) -> None:
