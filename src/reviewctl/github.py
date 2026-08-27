@@ -93,7 +93,9 @@ class GitHubSourceError(ReviewctlError):
 
 
 def _validate_relative_path(path: str) -> str:
-    value = path.strip()
+    value = path
+    if value != value.strip():
+        raise ValueError("path must not contain leading or trailing whitespace")
     if (
         not value
         or value.startswith("/")
@@ -290,8 +292,7 @@ def _diff_added_lines(snapshot: PullRequestSnapshot) -> set[tuple[str, int]]:
     new_line: int | None = None
     for raw in snapshot.diff.splitlines():
         if raw.startswith("+++ "):
-            path = raw[4:].strip()
-            current_path = None if path == "/dev/null" else path.removeprefix("b/")
+            current_path = _diff_path(raw[4:])
             new_line = None
             continue
         if raw.startswith("@@ "):
@@ -401,15 +402,76 @@ class _DiffFile:
     old_path: str | None = None
 
 
-def _diff_path(value: str) -> str | None:
-    path = value.strip()
+class _BinaryDiffError(ValueError):
+    """The pull-request diff contains content that source review cannot safely materialize."""
+
+
+class _UnsupportedDiffError(ValueError):
+    """The pull-request diff contains an entry without a materializable source path."""
+
+
+def _decode_git_path(value: str) -> str:
+    path = value
+    if not path.startswith('"') and not path.endswith('"'):
+        return path
+    if len(path) < 2 or not path.startswith('"') or not path.endswith('"'):
+        raise ValueError("path contains an unterminated quote")
+    encoded = path[1:-1]
+    decoded = bytearray()
+    escapes = {
+        "a": 7,
+        "b": 8,
+        "f": 12,
+        "n": 10,
+        "r": 13,
+        "t": 9,
+        "v": 11,
+        "\\": 92,
+        '"': 34,
+    }
+    index = 0
+    while index < len(encoded):
+        character = encoded[index]
+        if character != "\\":
+            decoded.extend(character.encode("utf-8"))
+            index += 1
+            continue
+        index += 1
+        if index == len(encoded):
+            raise ValueError("path contains an incomplete quoted escape")
+        character = encoded[index]
+        if character in escapes:
+            decoded.append(escapes[character])
+            index += 1
+            continue
+        if character in "01234567":
+            end = index
+            while end < len(encoded) and end < index + 3 and encoded[end] in "01234567":
+                end += 1
+            decoded.append(int(encoded[index:end], 8))
+            index = end
+            continue
+        raise ValueError("path contains an invalid quoted escape")
+    try:
+        return bytes(decoded).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("path is not valid UTF-8") from error
+
+
+def _diff_path(value: str, *, side_prefixed: bool = True) -> str | None:
+    path = _decode_git_path(value)
     if path == "/dev/null":
         return None
-    return _validate_relative_path(path.removeprefix("a/").removeprefix("b/"))
+    if side_prefixed and path.startswith(("a/", "b/")):
+        path = path[2:]
+    return _validate_relative_path(path)
 
 
 def _diff_files(diff: str) -> tuple[_DiffFile, ...]:
+    if diff and not diff.startswith("diff --git "):
+        raise _UnsupportedDiffError("non-empty pull-request diff must begin with diff --git")
     entries: list[_DiffFile] = []
+    entry_started = False
     old_path: str | None = None
     new_path: str | None = None
     status = "modified"
@@ -417,30 +479,40 @@ def _diff_files(diff: str) -> tuple[_DiffFile, ...]:
     rename_to: str | None = None
 
     def flush() -> None:
-        nonlocal old_path, new_path, status, rename_from, rename_to
+        nonlocal entry_started, old_path, new_path, status, rename_from, rename_to
         path = rename_to or new_path or old_path or rename_from
+        if entry_started and path is None:
+            raise _UnsupportedDiffError("pull-request diff entry has no materializable path")
         if path is not None:
             resolved_status = status
             if path == "/dev/null":
                 path = old_path or rename_from
                 resolved_status = "deleted"
-            if path is not None:
-                entries.append(
-                    _DiffFile(
-                        path=_diff_path(path) or path,
-                        status=resolved_status,
-                        old_path=_diff_path(rename_from or old_path),
-                    )
+            if path is None:
+                raise _UnsupportedDiffError("pull-request diff entry has no materializable path")
+            entries.append(
+                _DiffFile(
+                    path=_diff_path(path, side_prefixed=rename_to is None) or path,
+                    status=resolved_status,
+                    old_path=_diff_path(
+                        rename_from or old_path,
+                        side_prefixed=rename_from is None,
+                    ),
                 )
+            )
         old_path = None
         new_path = None
         status = "modified"
         rename_from = None
         rename_to = None
+        entry_started = False
 
     for raw in diff.splitlines():
         if raw.startswith("diff --git "):
             flush()
+            entry_started = True
+        elif raw.startswith("Binary files ") or raw == "GIT binary patch":
+            raise _BinaryDiffError("binary pull-request diffs are not supported")
         elif raw.startswith("new file mode"):
             status = "added"
         elif raw.startswith("deleted file mode"):
@@ -576,6 +648,10 @@ class LocalGitHubSource:
         diff = self._decode("GitHub pull-request diff", diff_bytes)
         try:
             diff_files = _diff_files(diff)
+        except _BinaryDiffError as error:
+            raise _source_diagnostic("github_source_binary", str(error)) from error
+        except _UnsupportedDiffError as error:
+            raise _source_diagnostic("github_source_unsupported", str(error)) from error
         except ValueError as error:
             raise _source_diagnostic("github_path_invalid", str(error)) from error
         if len(diff_files) > MAX_GITHUB_FILES:

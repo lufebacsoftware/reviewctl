@@ -129,6 +129,7 @@ def test_source_refuses_invalid_path_and_non_utf8_content(tmp_path: Path) -> Non
             if _is_diff_command(command):
                 return CommandResult(
                     0,
+                    b"diff --git a/../secret b/../secret\n"
                     b"--- a/../secret\n+++ b/../secret\n@@ -0,0 +1,1 @@\n+x\n",
                     b"",
                 )
@@ -175,7 +176,9 @@ def test_source_rejects_control_characters_in_paths(tmp_path: Path) -> None:
             if _is_diff_command(command):
                 return CommandResult(
                     0,
-                    b"--- a/src/bad\x01.py\n+++ b/src/bad\x01.py\n@@ -0,0 +1,1 @@\n+bad\n",
+                    b"diff --git a/src/bad\x01.py b/src/bad\x01.py\n"
+                    b"--- a/src/bad\x01.py\n+++ b/src/bad\x01.py\n"
+                    b"@@ -0,0 +1,1 @@\n+bad\n",
                     b"",
                 )
             return result
@@ -284,6 +287,117 @@ def test_github_source_rejects_diff_and_file_limits(tmp_path: Path) -> None:
         LocalGitHubSource(tmp_path, runner=ManyFilesRunner()).resolve(
             PullRequestRef("example/project", 7)
         )
+
+
+@pytest.mark.parametrize(
+    "binary_block",
+    [
+        b"Binary files /dev/null and b/image.png differ",
+        b"GIT binary patch",
+    ],
+)
+def test_github_source_rejects_binary_diff_blocks(tmp_path: Path, binary_block: bytes) -> None:
+    class BinaryDiffRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if _is_diff_command(command):
+                return CommandResult(
+                    0,
+                    b"diff --git a/image.png b/image.png\n"
+                    b"new file mode 100644\n" + binary_block + b"\n",
+                    b"",
+                )
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=BinaryDiffRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+    assert error.value.diagnostic.code == "github_source_binary"
+    assert "binary" in error.value.diagnostic.message
+
+
+@pytest.mark.parametrize(
+    "diff_body",
+    [
+        b"old mode 100644\nnew mode 100755\n",
+        b"new file mode 100644\n",
+        b"+++ /dev/null\n",
+    ],
+    ids=["mode-only", "empty-added-file", "dev-null-without-old-path"],
+)
+def test_github_source_rejects_diff_entries_without_materializable_paths(
+    tmp_path: Path, diff_body: bytes
+) -> None:
+    class UnsupportedDiffRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if _is_diff_command(command):
+                return CommandResult(
+                    0,
+                    b"diff --git a/script.sh b/script.sh\n" + diff_body,
+                    b"",
+                )
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=UnsupportedDiffRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+    assert error.value.diagnostic.code == "github_source_unsupported"
+    assert "materializable path" in error.value.diagnostic.message
+
+
+@pytest.mark.parametrize(
+    "malformed_diff",
+    [
+        b"--- a/source.py\n+++ b/source.py\n",
+        b"not a Git diff\n",
+    ],
+    ids=["headerless-fragment", "arbitrary-text"],
+)
+def test_github_source_rejects_nonempty_diff_without_git_header(
+    tmp_path: Path, malformed_diff: bytes
+) -> None:
+    class MalformedDiffRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if _is_diff_command(command):
+                return CommandResult(0, malformed_diff, b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=MalformedDiffRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+    assert error.value.diagnostic.code == "github_source_unsupported"
+    assert "diff --git" in error.value.diagnostic.message
+
+
+def test_github_source_decodes_c_quoted_utf8_paths(tmp_path: Path) -> None:
+    diff = (
+        b'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+        b"new file mode 100644\n"
+        b"--- /dev/null\n"
+        b'+++ "b/caf\\303\\251.py"\n'
+        b"@@ -0,0 +1,1 @@\n"
+        b"+value = 2\n"
+    )
+
+    class QuotedPathRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if _is_diff_command(command):
+                return CommandResult(0, diff, b"")
+            if command[:2] == ["git", "show"] and command[2] == f"{HEAD}:café.py":
+                return CommandResult(0, b"value = 2\n", b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    snapshot = LocalGitHubSource(tmp_path, runner=QuotedPathRunner()).resolve(
+        PullRequestRef("example/project", 7)
+    )
+
+    assert snapshot.changed_files[0].path == "café.py"
+    assert snapshot.changed_files[0].content == "value = 2\n"
 
 
 def test_github_source_rejects_large_changed_file_and_invalid_snapshot(tmp_path: Path) -> None:

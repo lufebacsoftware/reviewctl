@@ -237,6 +237,51 @@ def test_github_diff_parsing_covers_added_deleted_renamed_and_dev_null() -> None
     ) == {("new.py", 1)}
 
 
+def test_github_added_lines_decode_c_quoted_utf8_paths() -> None:
+    snapshot = github_module.PullRequestSnapshot(
+        PullRequestRef("owner/name"),
+        "a" * 40,
+        "b" * 40,
+        "private",
+        (github_module.ChangedFileSnapshot("café.py", "added", "x"),),
+        '--- /dev/null\n+++ "b/caf\\303\\251.py"\n@@ -0,0 +1,1 @@\n+x\n',
+    )
+
+    assert github_module._diff_added_lines(snapshot) == {("café.py", 1)}
+
+
+def test_github_c_quoted_path_decoder_handles_escape_failures() -> None:
+    assert github_module._decode_git_path('"a/foo\\\\bar.py"') == "a/foo\\bar.py"
+    with pytest.raises(ValueError, match="unterminated"):
+        github_module._decode_git_path('"unterminated')
+    with pytest.raises(ValueError, match="incomplete"):
+        github_module._decode_git_path('"bad\\"')
+    with pytest.raises(ValueError, match="invalid quoted"):
+        github_module._decode_git_path('"bad\\q"')
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        github_module._decode_git_path('"bad\\377"')
+
+
+def test_github_diff_path_removes_exactly_one_side_prefix() -> None:
+    assert github_module._diff_path("a/b/foo.py") == "b/foo.py"
+    assert github_module._diff_path("b/a/foo.py") == "a/foo.py"
+    with pytest.raises(ValueError, match="whitespace"):
+        github_module._diff_path("a/b/foo ")
+
+
+def test_github_diff_rename_paths_do_not_strip_repository_directories() -> None:
+    diff = (
+        "diff --git a/b/old.py b/b/new.py\n"
+        "similarity index 100%\n"
+        "rename from b/old.py\n"
+        "rename to b/new.py\n"
+    )
+
+    assert github_module._diff_files(diff) == (
+        github_module._DiffFile(path="b/new.py", status="renamed", old_path="b/old.py"),
+    )
+
+
 def test_github_command_runner_maps_timeout_oserror_and_success(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -283,4 +328,6 @@ def test_snapshot_context_and_added_line_fallback_branches() -> None:
         "@@ -1,0 +1,1 @@\n+x\n context\n+++ /dev/null\n",
     )
     assert github_module._diff_added_lines(with_lines) == {("file.py", 1)}
-    assert github_module._diff_files("+++ /dev/null\n") == ()
+    assert github_module._diff_files("") == ()
+    with pytest.raises(github_module._UnsupportedDiffError, match="diff --git"):
+        github_module._diff_files("+++ /dev/null\n")
