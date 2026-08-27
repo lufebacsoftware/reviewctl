@@ -612,6 +612,108 @@ def test_client_rejects_failed_execution_with_parseable_response(tmp_path: Path)
     assert result.diagnostic.code == "transport_unavailable"
 
 
+def test_client_freezes_source_bytes_across_fallback_attempts(tmp_path: Path) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:first/model", "pi:second/model"]\n'
+    )
+    source = tmp_path / "source.py"
+    initial = b"value = 1\n"
+    source.write_bytes(initial)
+    seen: list[bytes] = []
+
+    class MutatingFallbackTransport:
+        def execute(self, request):
+            seen.append(request.files[0].read_bytes())
+            if len(seen) == 1:
+                source.write_bytes(b"value = 2\n")
+                return BackendExecution(1, "provider failed", None, BackendEvidence())
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    "conversation",
+                    0.0,
+                    1,
+                    1,
+                    request.model,
+                    1,
+                    "fake",
+                    '{"verdict":"approved","findings":[]}',
+                ),
+                BackendEvidence(),
+            )
+
+    client = ReviewClient.from_project(tmp_path, transports={"pi": MutatingFallbackTransport()})
+
+    result = client.review(ReviewRequest(prompt="review", files=(source,)))
+
+    assert result.status == "accepted"
+    assert seen == [initial, initial]
+    packet = json.loads(result.receipt_path.with_name("packet.json").read_text())
+    assert packet["files"][0]["sha256"] == api_module._digest(initial)
+    packet_digest = api_module._digest(
+        json.dumps(packet, ensure_ascii=True, sort_keys=True).encode()
+    )
+    receipt = json.loads(result.receipt_path.read_text())
+    assert receipt["packetDigest"] == packet_digest
+    assert verify_project_receipt(result.receipt_path) is None
+
+
+@pytest.mark.parametrize(
+    ("conversation_id", "resolved_model"),
+    [(None, "fake/model"), ("", "fake/model"), ("conversation", "other/model")],
+)
+def test_client_rejects_invalid_response_identity_before_contract(
+    tmp_path: Path,
+    monkeypatch,
+    conversation_id: str | None,
+    resolved_model: str,
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:first/model", "pi:second/model"]\n'
+    )
+    real_contract = api_module.get_contract("findings-json")
+
+    class UnreachableEvaluation:
+        def prepare(self, context):
+            return real_contract.prepare(context)
+
+        def evaluate(self, *args, **kwargs):
+            raise AssertionError("response identity must be checked before contract evaluation")
+
+    monkeypatch.setattr(api_module, "get_contract", lambda name: UnreachableEvaluation())
+
+    class InvalidIdentityTransport:
+        def execute(self, request):
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    conversation_id,
+                    0.0,
+                    1,
+                    1,
+                    resolved_model,
+                    1,
+                    "fake",
+                    '{"verdict":"approved","findings":[]}',
+                ),
+                BackendEvidence(),
+            )
+
+    client = ReviewClient.from_project(tmp_path, transports={"pi": InvalidIdentityTransport()})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == "transport_unavailable"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "transport_unavailable"
+
+
 def test_merge_findings_deduplicates_identical_values() -> None:
     value = Finding("high", "source.py", 1, "title", "evidence", "reproduction")
     assert ReviewClient._merge_findings((value,), (value,)) == (value,)

@@ -160,7 +160,7 @@ def _persisted_response(
         cost_usd=cost,
         duration_ms=duration_ms,
         input_tokens=input_tokens,
-        model=model or requested_model,
+        model=model,
         output_tokens=output_tokens,
         provider=provider,
         response=_normalize_response(_text_blocks(assistant.get("content"))),

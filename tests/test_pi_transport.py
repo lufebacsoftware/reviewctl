@@ -96,6 +96,17 @@ def test_pi_request_uses_exact_model_and_no_tools_by_default(tmp_path: Path) -> 
     assert execution.response.model == "openrouter/stealth/ox-alpha"
 
 
+def test_pi_missing_resolved_model_stays_empty(tmp_path: Path) -> None:
+    events = [json.loads(line) for line in assistant_stream("{}").decode().splitlines()]
+    events[1]["message"].pop("model")
+    runner = FakeRunner(b"".join(json.dumps(event).encode() + b"\n" for event in events))
+
+    execution = PiTransport(run_process=runner).execute(request(tmp_path))
+
+    assert execution.response is not None
+    assert execution.response.model == ""
+
+
 def test_pi_empty_response_preserves_usage_and_diagnostic(tmp_path: Path) -> None:
     runner = FakeRunner(assistant_stream("", output=8000))
     execution = PiTransport(run_process=runner).execute(request(tmp_path))

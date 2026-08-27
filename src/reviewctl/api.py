@@ -262,6 +262,7 @@ class ReviewClient:
             diagnostic = Diagnostic("invalid_request", str(error))
             return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
         source_files: list[Path] = []
+        source_contents: list[bytes] = []
         source_digests: dict[Path, str] = {}
         for requested_path in request.files:
             candidate = requested_path.expanduser()
@@ -315,6 +316,7 @@ class ReviewClient:
                 )
                 return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
             source_files.append(path)
+            source_contents.append(source_bytes)
             source_digests[path] = _digest(source_bytes)
         if len({path.name for path in source_files}) != len(source_files):
             diagnostic = Diagnostic(
@@ -325,6 +327,11 @@ class ReviewClient:
             return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
         artifacts = ArtifactStore(attempt_root)
         source_files_tuple = tuple(source_files)
+        source_artifacts = ArtifactStore(attempt_root / "source")
+        transport_files_tuple = tuple(
+            source_artifacts.write_bytes(path.name, contents)
+            for path, contents in zip(source_files_tuple, source_contents, strict=True)
+        )
         try:
             contract = get_contract(profile.response_contract)
             context = ContractContext(
@@ -423,7 +430,7 @@ class ReviewClient:
                 prompt=prompt,
                 model=route.model,
                 response_contract=profile.response_contract,
-                files=source_files_tuple,
+                files=transport_files_tuple,
                 attempt_dir=attempt_root / f"attempt-{index:02d}",
                 timeout_seconds=profile.timeout_seconds,
                 max_output_tokens=profile.max_output_tokens or 0,
@@ -461,6 +468,27 @@ class ReviewClient:
                 or not execution.response.response.strip()
             ):
                 diagnostic = _execution_diagnostic(execution)
+                attempts.append({"attempt": index, "route": route_label, "status": diagnostic.code})
+                last_diagnostic = diagnostic
+                if index < len(routes):
+                    fallback_relationships.append(
+                        {
+                            "from": route_label,
+                            "to": f"{routes[index].transport}:{routes[index].model}",
+                            "reason": diagnostic.code,
+                        }
+                    )
+                continue
+            if (
+                not isinstance(execution.response.conversation_id, str)
+                or not execution.response.conversation_id.strip()
+                or execution.response.model != route.model
+            ):
+                diagnostic = Diagnostic(
+                    "transport_unavailable",
+                    "review transport returned invalid response identity",
+                    retryable=True,
+                )
                 attempts.append({"attempt": index, "route": route_label, "status": diagnostic.code})
                 last_diagnostic = diagnostic
                 if index < len(routes):
