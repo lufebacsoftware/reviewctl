@@ -104,6 +104,15 @@ class FakeRunner:
             value = self.head_values.pop(0) if len(self.head_values) > 1 else self.head_values[0]
             return CommandResult(0, json.dumps({"head": {"sha": value}}).encode(), b"")
         if endpoint.endswith("/comments"):
+            if endpoint.endswith("/reviews/9001/comments"):
+                page = int(
+                    next(field.split("=", 1)[1] for field in command if field.startswith("page="))
+                )
+                return CommandResult(
+                    0,
+                    json.dumps([{"id": 9002}, {"id": 9003}] if page == 1 else []).encode(),
+                    b"",
+                )
             page = int(
                 next(field.split("=", 1)[1] for field in command if field.startswith("page="))
             )
@@ -144,6 +153,39 @@ def test_publisher_reconciles_both_comment_and_review_bodies_and_posts_one_group
     assert runner.cwds and all(cwd == tmp_path.resolve() for cwd in runner.cwds)
     assert runner.timeouts and set(runner.timeouts) == {19}
     assert any(input_bytes is not None for input_bytes in runner.inputs)
+
+
+def test_publisher_recovers_inline_comment_ids_from_review_comments_endpoint() -> None:
+    class RealEndpointRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds, input_bytes=None):
+            if command[2].endswith("/reviews/9001/comments"):
+                self.calls.append(tuple(command))
+                return CommandResult(
+                    0,
+                    json.dumps([{"id": 9002}, {"id": 9003}]).encode(),
+                    b"",
+                )
+            if "--method" in command and command[command.index("--method") + 1] == "POST":
+                self.calls.append(tuple(command))
+                self.post_payload = json.loads(input_bytes.decode("utf-8"))
+                return CommandResult(0, b'{"id": 9001}', b"")
+            return super().__call__(
+                command,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                input_bytes=input_bytes,
+            )
+
+    runner = RealEndpointRunner(comments={1: [], 2: []}, reviews={1: [], 2: []})
+
+    result = GitHubPublisher(Path("."), runner=runner).publish(make_plan())
+
+    assert result.status == "published"
+    assert result.published_comment_ids == ("9002", "9003")
+    review_comment_calls = [
+        call for call in runner.calls if call[2].endswith("/reviews/9001/comments")
+    ]
+    assert len(review_comment_calls) == 1
 
 
 def test_publisher_skips_existing_markers_even_on_a_later_head() -> None:
@@ -341,15 +383,34 @@ def test_reconciliation_page_explicitly_uses_get_with_query_fields() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    "raw", [b"not-json", b"[]", b'{"id": 1, "comments": [1]}', b'{"comments": []}']
-)
+@pytest.mark.parametrize("raw", [b"not-json", b"[]", b'{"comments": []}'])
 def test_publisher_rejects_malformed_post_bodies(raw: bytes) -> None:
     publisher = GitHubPublisher(
         Path("."), runner=lambda *args, **kwargs: CommandResult(0, raw, b"")
     )
     with pytest.raises(publisher_module.GitHubPublisherError, match="publication"):
         publisher._post(make_plan(), make_plan().items)
+
+
+def test_publisher_rejects_posted_comment_without_id() -> None:
+    publisher = GitHubPublisher(
+        Path("."), runner=lambda *args, **kwargs: CommandResult(0, b'[{"body":"x"}]', b"")
+    )
+
+    with pytest.raises(publisher_module.GitHubPublisherError, match="valid comment ids"):
+        publisher._published_comment_ids(make_plan(), 9001)
+
+
+def test_publisher_bounds_posted_comment_lookup() -> None:
+    publisher = GitHubPublisher(
+        Path("."),
+        runner=lambda *args, **kwargs: CommandResult(0, b'[{"id": 1}]', b""),
+        page_size=1,
+        max_pages=1,
+    )
+
+    with pytest.raises(publisher_module.GitHubPublisherError, match="page budget"):
+        publisher._published_comment_ids(make_plan(), 9001)
 
 
 def test_publisher_returns_plan_and_empty_findings_statuses() -> None:

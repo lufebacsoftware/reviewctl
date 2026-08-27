@@ -368,10 +368,14 @@ def github_review_project(args: Any) -> int:
     findings = (
         tuple(
             {
-                **asdict(finding),
-                "findingId": finding_id(finding),
+                **asdict(mapped_finding),
+                "findingId": finding_id(original_finding),
             }
-            for finding in _map_github_finding_paths(snapshot, result.findings)
+            for original_finding, mapped_finding in zip(
+                result.findings,
+                _map_github_finding_paths(snapshot, result.findings),
+                strict=True,
+            )
         )
         if plan_status == "accepted"
         else ()

@@ -137,19 +137,20 @@ class GitHubPublisher:
         return head.lower()
 
     def _page(self, endpoint: str, page: int) -> list[dict[str, Any]]:
+        command = [
+            "gh",
+            "api",
+            endpoint,
+            "--method",
+            "GET",
+            "-f",
+            f"per_page={self.page_size}",
+            "-f",
+            f"page={page}",
+        ]
         raw = self._run(
             "GitHub publication reconciliation",
-            [
-                "gh",
-                "api",
-                endpoint,
-                "--method",
-                "GET",
-                "-f",
-                f"per_page={self.page_size}",
-                "-f",
-                f"page={page}",
-            ],
+            command,
         )
         try:
             value = json.loads(raw.decode("utf-8"))
@@ -192,6 +193,27 @@ class GitHubPublisher:
                     "GitHub reconciliation exceeded its page budget",
                 )
         return tuple(bodies)
+
+    def _published_comment_ids(
+        self, plan: ReviewPublicationPlan, review_id: object
+    ) -> tuple[str, ...]:
+        endpoint = f"repos/{plan.repository}/pulls/{plan.pull_number}/reviews/{review_id}/comments"
+        comment_ids: list[str] = []
+        for page in range(1, self.max_pages + 1):
+            values = self._page(endpoint, page)
+            for value in values:
+                if "id" not in value:
+                    raise _failure(
+                        "github_publication_response_invalid",
+                        "GitHub publication did not return valid comment ids",
+                    )
+                comment_ids.append(str(value["id"]))
+            if len(values) < self.page_size:
+                return tuple(comment_ids)
+        raise _failure(
+            "github_publication_response_invalid",
+            "GitHub publication comment lookup exceeded its page budget",
+        )
 
     @staticmethod
     def _summary_body(plan: ReviewPublicationPlan, items: Sequence[Any]) -> str:
@@ -242,17 +264,9 @@ class GitHubPublisher:
                 "github_publication_response_invalid",
                 "GitHub publication did not return a review id",
             )
-        comments = value.get("comments", [])
-        if not isinstance(comments, list) or not all(
-            isinstance(comment, dict) and "id" in comment for comment in comments
-        ):
-            raise _failure(
-                "github_publication_response_invalid",
-                "GitHub publication did not return valid comment ids",
-            )
         return {
             "summaryCommentId": str(value["id"]),
-            "commentIds": tuple(str(comment["id"]) for comment in comments),
+            "commentIds": self._published_comment_ids(plan, value["id"]),
         }
 
     def publish(self, plan: ReviewPublicationPlan) -> PublicationResult:

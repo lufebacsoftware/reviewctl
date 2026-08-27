@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import reviewctl.project_cli as project_cli
-from reviewctl.api import Finding, ReviewResult
+from reviewctl.api import Finding, ReviewResult, finding_id
 from reviewctl.cli import run_cli
 from reviewctl.errors import Diagnostic, JournalOperationError
 from reviewctl.github import (
@@ -208,6 +208,16 @@ def test_github_review_maps_unique_basename_to_snapshot_path_for_inline_target(
         "line": 1,
         "side": "RIGHT",
     }
+    assert payload["publicationPlan"]["items"][0]["findingId"] == finding_id(
+        Finding(
+            severity="high",
+            path="app.py",
+            line=1,
+            title="Handle failure",
+            evidence="private evidence",
+            reproduction="private reproduction",
+        )
+    )
 
 
 def test_github_finding_path_mapping_leaves_ambiguous_and_unknown_paths_unchanged() -> None:
