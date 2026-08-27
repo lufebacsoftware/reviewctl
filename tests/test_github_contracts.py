@@ -282,6 +282,33 @@ def test_github_diff_rename_paths_do_not_strip_repository_directories() -> None:
     )
 
 
+def test_github_pure_rename_has_no_added_lines_or_inline_target() -> None:
+    diff = (
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 100%\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+    )
+    snapshot = github_module.PullRequestSnapshot(
+        PullRequestRef("owner/name"),
+        "a" * 40,
+        "b" * 40,
+        "private",
+        (github_module.ChangedFileSnapshot("new.py", "renamed", "value\n", "old.py"),),
+        diff,
+    )
+
+    assert github_module._diff_added_lines(snapshot) == set()
+    plan = github_module.build_publication_plan(
+        snapshot,
+        project_id="project",
+        review_id="review",
+        findings=({"findingId": "rename", "path": "new.py", "line": 1},),
+        review_status="accepted",
+    )
+    assert plan.items[0].target is None
+
+
 def test_github_diff_parsers_keep_plus_plus_plus_hunk_lines_as_source() -> None:
     diff = (
         "diff --git a/src/counter.c b/src/counter.c\n"

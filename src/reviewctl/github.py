@@ -291,8 +291,10 @@ def _diff_added_lines(snapshot: PullRequestSnapshot) -> set[tuple[str, int]]:
     current_path: str | None = None
     new_line: int | None = None
     in_hunk = False
+    saw_diff_header = False
     for raw in snapshot.diff.splitlines():
         if raw.startswith("diff --git "):
+            saw_diff_header = True
             in_hunk = False
             current_path = None
             new_line = None
@@ -316,7 +318,7 @@ def _diff_added_lines(snapshot: PullRequestSnapshot) -> set[tuple[str, int]]:
             continue
         else:
             new_line += 1
-    if not current_path and len(snapshot.changed_files) == 1:
+    if not saw_diff_header and not current_path and len(snapshot.changed_files) == 1:
         only_path = snapshot.changed_files[0].path
         return {(only_path, line) for _, line in lines} if lines else {(only_path, 1)}
     return lines
