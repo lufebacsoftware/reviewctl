@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+import signal
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+import reviewctl.pi_transport as pi_module
 from reviewctl.backends import BackendRequest
 from reviewctl.pi_transport import PiProcessResult, PiTransport
 
@@ -121,3 +127,199 @@ def test_pi_transport_preserves_timeout_as_transport_diagnostic(tmp_path: Path) 
 
     assert execution.response is None
     assert "timed out" in execution.diagnostic
+
+
+def test_run_process_returns_successful_process_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class SuccessfulProcess:
+        pid = 123
+        returncode = 0
+
+        def communicate(self, *, input: bytes, timeout: int) -> tuple[bytes, bytes]:
+            assert input == b"prompt"
+            assert timeout == 4
+            return b"stdout", b"stderr"
+
+    process = SuccessfulProcess()
+    monkeypatch.setattr(pi_module.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(0, b"stdout", b"stderr", False)
+
+
+def test_run_process_terminates_then_kills_a_timed_out_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class TimeoutProcess:
+        pid = 456
+        returncode = -signal.SIGKILL
+
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise subprocess.TimeoutExpired(
+                    "pi", 4, output=b"partial stdout", stderr=b"partial stderr"
+                )
+            if self.communicate_calls == 2:
+                raise subprocess.TimeoutExpired("pi", 2)
+            return b"trailing stdout", b"trailing stderr"
+
+    process = TimeoutProcess()
+    signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(pi_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        pi_module.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(124, b"trailing stdout", b"trailing stderr", True)
+    assert signals == [(456, signal.SIGTERM), (456, signal.SIGKILL)]
+
+
+def test_run_process_preserves_partial_output_when_timeout_process_is_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class GoneProcess:
+        pid = 789
+        returncode = -signal.SIGTERM
+
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise subprocess.TimeoutExpired("pi", 4, output=b"partial", stderr=b"error")
+            return b"", b""
+
+    process = GoneProcess()
+    monkeypatch.setattr(pi_module.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    def process_gone(pid: int, sig: signal.Signals) -> None:
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(pi_module.os, "killpg", process_gone)
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(124, b"partial", b"error", True)
+
+
+def test_run_process_reports_communication_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class BrokenProcess:
+        pid = 101
+        returncode = 1
+
+        def __init__(self) -> None:
+            self.killed = False
+            self.waited = False
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            raise OSError("pipe broke")
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self) -> None:
+            self.waited = True
+
+    process = BrokenProcess()
+    monkeypatch.setattr(pi_module.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(127, b"", b"pipe broke", False)
+    assert process.killed is True
+    assert process.waited is True
+
+
+def test_text_blocks_accepts_strings_and_rejects_nonlists() -> None:
+    assert pi_module._text_blocks("plain text") == "plain text"
+    assert pi_module._text_blocks({"type": "text"}) == ""
+
+
+def test_normalize_response_preserves_noncanonical_fences() -> None:
+    value = "```yaml\n{}\n```"
+
+    assert pi_module._normalize_response(value) == value
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, (None, None, None)),
+        ({"cost": "invalid", "input": True, "output": -1}, (None, None, None)),
+        ({"cost": float("nan"), "input": -1, "output": 1.5}, (None, None, None)),
+        ({"cost": float("inf"), "input": 1, "output": 0}, (None, 1, 0)),
+    ],
+)
+def test_usage_rejects_nonmappings_and_invalid_numbers(
+    value: object, expected: tuple[float | None, int | None, int | None]
+) -> None:
+    assert pi_module._usage(value) == expected
+
+
+def test_persisted_response_skips_malformed_events_and_reads_agent_end_messages() -> None:
+    events = [
+        b"not json",
+        json.dumps([]).encode(),
+        json.dumps({"type": "session", "id": "session-7"}).encode(),
+        json.dumps({"type": "agent_end", "messages": None}).encode(),
+        json.dumps({"type": "message_end", "message": None}).encode(),
+        json.dumps({"type": "message_end", "message": {"role": "user"}}).encode(),
+        json.dumps(
+            {
+                "type": "agent_end",
+                "messages": [
+                    {"role": "user"},
+                    {
+                        "role": "assistant",
+                        "provider": "provider",
+                        "model": "provider/model",
+                        "usage": {"cost": 0.25, "input": 2, "output": 3},
+                        "content": [{"type": "text", "text": "answer"}],
+                    },
+                ],
+            }
+        ).encode(),
+    ]
+
+    persisted = pi_module._persisted_response(b"\n".join(events), "requested/model", 42)
+
+    assert persisted is not None
+    assert persisted.conversation_id == "session-7"
+    assert persisted.model == "provider/model"
+    assert persisted.provider == "provider"
+    assert persisted.cost_usd == 0.25
+    assert persisted.response == "answer"
+
+
+def test_pi_transport_includes_files_in_packet(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("print('source')\n")
+    runner = FakeRunner(assistant_stream('{"verdict":"approved","findings":[]}'))
+
+    execution = PiTransport(run_process=runner).execute(replace(request(tmp_path), files=(source,)))
+
+    assert execution.response is not None
+    assert "--- FILE source.py ---" in runner.last_stdin
+    assert "print('source')" in runner.last_stdin
+
+
+def test_pi_transport_reports_default_nonzero_diagnostic(tmp_path: Path) -> None:
+    def fail_process(command, *, input_text, timeout_seconds, cwd):
+        return PiProcessResult(2, b"", b"process failed", False)
+
+    execution = PiTransport(run_process=fail_process).execute(request(tmp_path))
+
+    assert execution.response is None
+    assert execution.diagnostic == "process failed"

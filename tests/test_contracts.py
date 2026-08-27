@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 
+import reviewctl.contracts as contracts_module
 from reviewctl.contracts import (
     ContractContext,
     ContractEvaluation,
@@ -13,7 +14,10 @@ from reviewctl.contracts import (
     FragmentKind,
     PreparedContract,
     canonical_json,
+    findings_required_fields,
     get_contract,
+    has_exact_json_scalar_types,
+    require_string_json_object_keys,
     valid_contract_context,
     valid_finding,
     valid_review_basename,
@@ -41,6 +45,22 @@ class HostileText(str):
 class HostileDict(dict[str, object]):
     def __iter__(self):
         raise AssertionError("hostile dictionary iteration executed")
+
+
+class HostileList(list[object]):
+    pass
+
+
+class HostileTuple(tuple[object, ...]):
+    pass
+
+
+class IntSubclass(int):
+    pass
+
+
+class FloatSubclass(float):
+    pass
 
 
 class HostileSchema(dict[str, object]):
@@ -266,6 +286,121 @@ def test_canonical_json_rejects_non_string_object_keys() -> None:
         canonical_json({"extension.example": {1: "hostile"}})
 
 
+@pytest.mark.parametrize(
+    "value",
+    [HostileDict(), HostileList(), HostileTuple(("value",))],
+)
+def test_require_string_json_object_keys_rejects_container_subclasses(value: object) -> None:
+    with pytest.raises(ValueError, match="unsupported JSON"):
+        require_string_json_object_keys(value)
+
+
+def test_require_string_json_object_keys_rejects_circular_values() -> None:
+    value: list[object] = []
+    value.append(value)
+
+    with pytest.raises(ValueError, match="circular JSON value"):
+        require_string_json_object_keys(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        TextSubclass("text"),
+        IntSubclass(1),
+        FloatSubclass(1.0),
+        HostileDict(),
+        HostileList(),
+        HostileTuple(("value",)),
+        {1: "non-string key"},
+    ],
+)
+def test_has_exact_json_scalar_types_rejects_hostile_scalar_and_container_subclasses(
+    value: object,
+) -> None:
+    assert has_exact_json_scalar_types(value) is False
+
+
+def test_has_exact_json_scalar_types_ignores_repeated_containers() -> None:
+    value: list[object] = []
+    value.append(value)
+
+    assert has_exact_json_scalar_types(value) is True
+
+
+def test_findings_required_fields_requires_an_exact_boolean() -> None:
+    with pytest.raises(ValueError, match="must be boolean"):
+        findings_required_fields(1)  # type: ignore[arg-type]
+
+
+def test_surrogate_dictionary_key_is_rejected() -> None:
+    assert contracts_module._contains_surrogate({"\ud800": "value"}) is True
+
+
+def test_findings_contract_stabilizes_prepared_serialization_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext()
+    prepared = contract.prepare(context)
+
+    def fail_serialization(value: object) -> bytes:
+        raise TypeError("serialization failed")
+
+    monkeypatch.setattr(contracts_module, "canonical_json", fail_serialization)
+    evaluation = contract.evaluate("{}", prepared, context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("prepared-contract",)
+
+
+def test_findings_contract_stabilizes_payload_serialization_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext()
+    prepared = contract.prepare(context)
+    original = contracts_module.canonical_json
+
+    def fail_payload_serialization(value: object) -> bytes:
+        if isinstance(value, dict) and value.get("verdict") == "approved":
+            raise TypeError("serialization failed")
+        return original(value)
+
+    monkeypatch.setattr(contracts_module, "canonical_json", fail_payload_serialization)
+    evaluation = contract.evaluate(
+        json.dumps({"verdict": "approved", "findings": []}), prepared, context
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+
+
+def test_findings_contract_rejects_surrogate_dictionary_key_after_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext()
+    prepared = contract.prepare(context)
+    original = contracts_module.canonical_json
+
+    def permit_surrogate_key(value: object) -> bytes:
+        try:
+            return original(value)
+        except UnicodeError:
+            return b"surrogate"
+
+    monkeypatch.setattr(contracts_module, "canonical_json", permit_surrogate_key)
+    evaluation = contract.evaluate(
+        '{"verdict":"approved","findings":[],"\\ud800":"value"}',
+        prepared,
+        context,
+    )
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("invalid-json",)
+
+
 def test_findings_contract_normalizes_reviewed_files_to_authoritative_context_order() -> None:
     contract = get_contract("findings-json")
     context = ContractContext(file_names=("alpha.py", "beta.py"), review_declaration_required=True)
@@ -489,6 +624,18 @@ def test_findings_contract_normalizes_a_required_review_declaration() -> None:
         "findings",
         "reviewedFiles",
     )
+
+
+@pytest.mark.parametrize("reviewed_file", [1, " "])
+def test_findings_contract_rejects_invalid_review_declaration_item(reviewed_file: object) -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=("source.py",), review_declaration_required=True)
+    payload = {"verdict": "approved", "findings": [], "reviewedFiles": [reviewed_file]}
+
+    evaluation = contract.evaluate(json.dumps(payload), contract.prepare(context), context)
+
+    assert evaluation.status is EvaluationStatus.INVALID
+    assert evaluation.violations == ("review-declaration",)
 
 
 def test_findings_contract_rejects_duplicate_json_fields() -> None:
