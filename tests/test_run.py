@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -8972,3 +8973,976 @@ def test_run_rejects_a_response_from_an_unpinned_openrouter_provider(
         "requested": ["deepinfra"],
         "resolved": "Cloudflare",
     }
+
+
+def test_cli_task8_schema_write_defaults_and_account_edges(tmp_path: Path, monkeypatch) -> None:
+    schema = {"required": ["verdict"], "properties": {"verdict": {"type": "string"}}}
+    codex_schema = cli.codex_schema(schema)
+    assert "reviewedFiles" in codex_schema["required"]
+    assert "reviewedFiles" in codex_schema["properties"]
+
+    destination = tmp_path / "raw.txt"
+    original_open = cli.os.open
+    original_write = cli.os.write
+    monkeypatch.setattr(cli.os, "write", lambda descriptor, contents: 0)
+    with pytest.raises(OSError, match="could not finish writing"):
+        cli.write_private_exclusive(destination, b"payload")
+    assert destination.read_bytes() == b""
+    monkeypatch.setattr(cli.os, "write", original_write)
+    monkeypatch.setattr(cli.os, "open", original_open)
+
+    parser = argparse.ArgumentParser()
+    with monkeypatch.context() as isolated:
+        isolated.setattr(cli.Path, "is_file", lambda self: False)
+        assert cli.load_transport_defaults(parser, None, "pi") == ({}, None)
+    with pytest.raises(SystemExit):
+        cli.load_transport_defaults(parser, str(tmp_path / "missing.toml"), "pi")
+    malformed = tmp_path / "malformed.toml"
+    malformed.write_text("not = [valid")
+    with pytest.raises(SystemExit):
+        cli.load_transport_defaults(parser, str(malformed), "pi")
+    absent = tmp_path / "absent.toml"
+    absent.write_text("[project]\nname = 'x'\n")
+    settings, metadata = cli.load_transport_defaults(parser, str(absent), "pi")
+    assert settings == {} and metadata and metadata["path"] == str(absent.resolve())
+    bad_table = tmp_path / "table.toml"
+    bad_table.write_text("[defaults]\npi = 'bad'\n")
+    with pytest.raises(SystemExit):
+        cli.load_transport_defaults(parser, str(bad_table), "pi")
+    invalid_value = tmp_path / "invalid.toml"
+    invalid_value.write_text("[defaults.pi]\ntimeout_seconds = true\n")
+    with pytest.raises(SystemExit):
+        cli.load_transport_defaults(parser, str(invalid_value), "pi")
+    invalid_attempts = tmp_path / "attempts.toml"
+    invalid_attempts.write_text("[defaults.pi]\nmax_attempts = 4\n")
+    with pytest.raises(SystemExit):
+        cli.load_transport_defaults(parser, str(invalid_attempts), "pi")
+    valid_defaults = tmp_path / "valid.toml"
+    valid_defaults.write_text("[defaults.pi]\ntimeout_seconds = 4\nmax_attempts = 2\n")
+    assert cli.load_transport_defaults(parser, str(valid_defaults), "pi")[0] == {
+        "timeout_seconds": 4,
+        "max_attempts": 2,
+    }
+
+    monkeypatch.setattr(cli.os, "getuid", lambda: (_ for _ in ()).throw(OSError("home")))
+    with pytest.raises(RuntimeError, match="login account home"):
+        cli.account_home()
+
+
+def test_cli_task8_process_cleanup_edges(monkeypatch) -> None:
+    class Process:
+        pid = 123
+
+        def wait(self, **kwargs):
+            raise OSError("wait")
+
+    cli.reap_process(Process())
+    cli.reap_process_without_blocking(Process())
+
+    class TimeoutProcess:
+        pid = 124
+
+        def wait(self, **kwargs):
+            if kwargs.get("timeout") == 0:
+                raise subprocess.TimeoutExpired("wait", 0)
+            raise ChildProcessError("gone")
+
+    class Thread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            self.kwargs["target"](self.kwargs["args"][0])
+
+    monkeypatch.setattr(cli.threading, "Thread", Thread)
+    cli.reap_process_without_blocking(TimeoutProcess())
+
+    process = SimpleNamespace(pid=1, wait=lambda **kwargs: None)
+    monkeypatch.setattr(cli.os, "killpg", lambda *args: (_ for _ in ()).throw(ProcessLookupError()))
+    cli.terminate_process_group(process)
+    cli.terminate_process_group(process, grace_seconds=0)
+
+    calls = []
+
+    def killpg(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            return None
+        raise ProcessLookupError()
+
+    class StubbornProcess:
+        pid = 2
+
+        def wait(self, **kwargs):
+            if kwargs.get("timeout") == 0:
+                raise ChildProcessError("gone")
+            raise subprocess.TimeoutExpired("wait", kwargs.get("timeout"))
+
+    timeout_process = StubbornProcess()
+    monkeypatch.setattr(cli.os, "killpg", killpg)
+    cli.terminate_process_group(timeout_process)
+
+
+def test_cli_task8_cleanup_wait_error_and_kiro_validation(tmp_path: Path, monkeypatch) -> None:
+    class WaitErrorProcess:
+        pid = 10
+
+        def wait(self, **kwargs):
+            if kwargs.get("timeout") == 5:
+                raise subprocess.TimeoutExpired("wait", 5)
+            raise OSError("wait failed")
+
+    monkeypatch.setattr(cli.os, "killpg", lambda *args: None)
+    cli.terminate_process_group(WaitErrorProcess())
+
+    for payload in (
+        b"not-json",
+        b"[]",
+        b"{}",
+        b'{"models": [], "default_model": "m"}',
+        b'{"models": [{"model_id": " m "}], "default_model": "m"}',
+        b'{"models": [{"model_id": "m"}, {"model_id": "m"}], "default_model": "m"}',
+        b'{"models": [{"model_id": "m"}], "default_model": "other"}',
+    ):
+        with pytest.raises(ValueError, match="malformed model inventory"):
+            cli.kiro_model_inventory(payload)
+    assert cli.kiro_model_inventory(b'{"models": [{"model_id": "m"}], "default_model": "m"}') == (
+        ("m",),
+        "m",
+    )
+
+    cwd = tmp_path.resolve()
+    for payload in (
+        b"not-json",
+        b"{}",
+        b"[]",
+        b'[{"cwd": "wrong", "sessions": []}]',
+        b'[{"cwd": "' + str(cwd).encode() + b'", "sessions": [{"sessionId": "bad"}]}]',
+    ):
+        assert cli.kiro_session_id(payload, cwd) == ""
+    assert cli.kiro_session_id(
+        b'[{"cwd": "'
+        + str(cwd).encode()
+        + b'", "sessions": [{"sessionId": "123e4567-e89b-12d3-a456-426614174000"}]}]',
+        cwd,
+    )
+
+
+def test_cli_task8_pi_helpers_and_gemini_usage_edges() -> None:
+    assert cli.pi_content_text("text") == "text"
+    assert cli.pi_content_text("") == ""
+    assert cli.pi_content_text({}) == ""
+    assert cli.pi_content_text([{"type": "text", "text": "a"}, {"text": 3}, "bad"]) == "a"
+    assert cli.pi_usage(None) == (None, None, None)
+    assert cli.pi_usage({}) == (None, None, None)
+    assert cli.pi_usage({"cost": {"total": 1.2}, "input": 2, "output": 3}) == (1.2, 2, 3)
+    assert cli.pi_resolved_model("plain", "provider", "resolved") == "resolved"
+    assert cli.pi_resolved_model("provider/requested", "bad/provider", "resolved") == ""
+    assert cli.pi_resolved_model("provider/requested", "provider", "other") == "provider/other"
+    assert cli.pi_persisted_response(b"bad-json\n42\n", "model", 1) == cli.PersistedResponse(
+        "", None, 1, None, "", None, None, ""
+    )
+    assert (
+        cli.pi_persisted_response(
+            b'{"type":"agent_end","messages":"bad"}\n', "model", 1
+        ).conversation_id
+        == ""
+    )
+    assert (
+        cli.pi_persisted_response(
+            b'{"type":"message_end","message":{"role":"user"}}\n', "model", 1
+        ).conversation_id
+        == ""
+    )
+    assert (
+        cli.pi_persisted_response(
+            b'{"type":"agent_end","messages":[{"role":"user"}]}\n', "model", 1
+        ).conversation_id
+        == ""
+    )
+    assert (
+        cli.pi_persisted_response(
+            b'{"type":"agent_end","messages":[{"role":"assistant","content":"answer","model":"m"}]}\n',
+            "model",
+            1,
+        ).response
+        == "answer"
+    )
+    assert cli.gemini_usage({}) == (None, None)
+    assert cli.gemini_usage({"stats": {"models": {"m": {"tokens": {"input": 2}}}}}) == (2, None)
+    assert cli.gemini_usage({"stats": {"models": {"m": {"tokens": {"output": 3}}}}}) == (None, 3)
+    assert cli.gemini_usage({"stats": {"models": {"m": {"tokens": "bad"}}}}) == (None, None)
+
+
+def test_cli_task8_kiro_deadline_and_gemini_empty_output(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    deadline_root = tmp_path / "deadline"
+    deadline_root.mkdir()
+    result = cli.invoke_kiro(
+        kiro_bin="kiro",
+        prompt="review",
+        model="model",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="document",
+        timeout_seconds=1,
+        **kiro_paths(tmp_path),
+    )
+    assert result[:2] == (502, "Kiro transport currently supports only findings-json")
+    result = cli.invoke_kiro(
+        kiro_bin="kiro",
+        prompt="review",
+        model="model",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=0,
+        **kiro_paths(deadline_root),
+    )
+    assert result[0] == 124
+
+    class EmptyProcess:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, **kwargs):
+            return b"", b""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", EmptyProcess)
+    kwargs = {
+        "gemini_bin": "gemini",
+        "prompt": "review",
+        "model": "model",
+        "files": [source],
+        "max_output_tokens": 1,
+        "response_contract": "findings-json",
+        "timeout_seconds": 1,
+        "request_path": tmp_path / "empty-request.json",
+        "response_path": tmp_path / "empty-response.json",
+        "session_path": tmp_path / "empty-session.json",
+        "diagnostic_path": tmp_path / "empty-stderr.log",
+    }
+    assert cli.invoke_gemini(**kwargs)[0] == 502
+
+    class DiagnosticProcess(EmptyProcess):
+        def communicate(self, **kwargs):
+            return b'{"session_id":"s","response":"response"}', b"diag"
+
+    monkeypatch.setattr(cli.subprocess, "Popen", DiagnosticProcess)
+    diagnostic_result = cli.invoke_gemini(
+        **{
+            **kwargs,
+            "request_path": tmp_path / "diag-request.json",
+            "response_path": tmp_path / "diag-response.json",
+            "session_path": tmp_path / "diag-session.json",
+            "diagnostic_path": tmp_path / "diag-stderr.log",
+        }
+    )
+    assert diagnostic_result[0] == 0
+    assert (tmp_path / "diag-stderr.log").read_text() == "diag"
+
+
+def test_cli_task8_gemini_edge_processes(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    class OSErrorProcess:
+        def __init__(self, *args, **kwargs):
+            raise PermissionError("gemini denied")
+
+    monkeypatch.setattr(cli.subprocess, "Popen", OSErrorProcess)
+    result = cli.invoke_gemini(
+        gemini_bin="gemini",
+        prompt="review",
+        model="model",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+        session_path=tmp_path / "session.json",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+    assert result[:2] == (127, "Gemini transport could not execute: gemini denied")
+
+    class TimeoutProcess:
+        returncode = 0
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(
+                    "gemini", 1, output=b"partial", stderr=b"diagnostic"
+                )
+            return b"after", b"more"
+
+    monkeypatch.setattr(cli.subprocess, "Popen", TimeoutProcess)
+    monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
+    timed = cli.invoke_gemini(
+        gemini_bin="gemini",
+        prompt="review",
+        model="model",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "timeout-request.json",
+        response_path=tmp_path / "timeout-response.json",
+        session_path=tmp_path / "timeout-session.json",
+        diagnostic_path=tmp_path / "timeout-stderr.log",
+    )
+    assert timed[:2] == (124, "review attempt timed out")
+    assert (tmp_path / "timeout-response.json").read_bytes() == b"partialafter"
+    assert (tmp_path / "timeout-stderr.log").read_bytes() == b"diagnosticmore"
+
+    class ResponseProcess:
+        returncode = 0
+
+        def __init__(self, payload: bytes):
+            self.payload = payload
+
+        def communicate(self, **kwargs):
+            return self.payload, b""
+
+    for payload, message in (
+        (b'{"response": "text"}', "no session identifier"),
+        (b'{"session_id": "session"}', "no response"),
+    ):
+        monkeypatch.setattr(
+            cli.subprocess, "Popen", lambda *a, _payload=payload, **k: ResponseProcess(_payload)
+        )
+        result = cli.invoke_gemini(
+            gemini_bin="gemini",
+            prompt="review",
+            model="model",
+            files=[source],
+            max_output_tokens=1,
+            response_contract="findings-json",
+            timeout_seconds=1,
+            request_path=tmp_path / f"{message}.request.json",
+            response_path=tmp_path / f"{message}.response.json",
+            session_path=tmp_path / f"{message}.session.json",
+            diagnostic_path=tmp_path / f"{message}.stderr.log",
+        )
+        assert result[0] == 502 and message in result[1]
+
+
+def test_cli_task8_read_proof_and_response_validation_edges(tmp_path: Path) -> None:
+    expected = {"source.py": "hash"}
+    for value in (
+        {},
+        {"reviewedFiles": "source.py"},
+        {"reviewedFiles": [""]},
+        {"reviewedFiles": ["  "]},
+        {"reviewedFiles": ["other.py"]},
+        {"reviewedFiles": ["/tmp/other/source.py"]},
+        {"reviewedFiles": ["source.py", "source.py"]},
+    ):
+        assert cli.validate_read_proof(value, expected) is False
+    assert cli.validate_read_proof({"reviewedFiles": ["source.py"]}, expected)
+    assert cli.validate_read_proof(
+        {"reviewedFiles": ["/tmp/reviewctl-input-1/source.py"]}, expected
+    )
+    assert cli.validate_read_proof({"reviewedFiles": []}, {})
+
+    review = product_review_payload()
+    review["reviewedFiles"] = ["source.py"]
+    assert (
+        cli.validate_review_response(
+            json.dumps(review), "product-review-json", expected_file_hashes=expected
+        )
+        is not None
+    )
+    assert cli.validate_review_response("not json", "product-review-json") is None
+    assert cli.validate_review_response("[]", "product-review-json") is None
+    broken_fields = dict(review)
+    broken_fields.pop("reviewedFiles")
+    assert (
+        cli.validate_review_response(
+            json.dumps(broken_fields), "product-review-json", expected_file_hashes=expected
+        )
+        is None
+    )
+    assert cli.review_validation_error("not json", "product-review-json") == (
+        "product-review-json: invalid JSON"
+    )
+    assert cli.review_validation_error("[]", "product-review-json") == (
+        "product-review-json: top-level response must be an object"
+    )
+    assert (
+        cli.review_validation_error(
+            json.dumps(broken_fields), "product-review-json", expected_file_hashes=expected
+        )
+        == "product-review-json: response fields do not match the required schema"
+    )
+    assert (
+        cli.review_validation_error(
+            json.dumps({**review, "reviewedFiles": ["other.py"]}),
+            "product-review-json",
+            expected_file_hashes=expected,
+        )
+        == "product-review-json: reviewedFiles proof does not match frozen inputs"
+    )
+    invalid_verdict = json.dumps({"verdict": "maybe", "findings": []})
+    assert cli.review_validation_error(invalid_verdict, "findings-json")
+
+
+def test_cli_task8_exploration_validation_and_lifecycle_edges(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    with pytest.raises(ValueError, match="invalid exploration id"):
+        cli.exploration_path(tmp_path, "bad/id")
+    with pytest.raises(ValueError, match="either"):
+        cli.read_exploration_prompt("prompt", "file")
+    with pytest.raises(ValueError, match="required"):
+        cli.read_exploration_prompt(None, None)
+    empty_prompt = tmp_path / "empty.md"
+    empty_prompt.write_text(" \n")
+    with pytest.raises(ValueError, match="must not be empty"):
+        cli.read_exploration_prompt(None, str(empty_prompt))
+
+    parser = argparse.ArgumentParser()
+    root = tmp_path / "explorations"
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    args = SimpleNamespace(
+        id="thread",
+        model="model",
+        prompt="explore",
+        prompt_file=None,
+        cwd=str(cwd),
+        tools="read",
+        timeout_seconds=3,
+        exploration_root=str(root),
+    )
+    persisted = cli.PersistedResponse("session", 0.1, 2, 3, "model", 4, "provider", "answer")
+    monkeypatch.setattr(cli, "invoke_pi_exploration", lambda **kwargs: (0, "", "", persisted))
+    assert cli.run_exploration_turn(parser, args, starting=True) == 0
+    assert (root / "thread" / "turns" / "001" / "response.md").read_text() == "answer"
+    with pytest.raises(SystemExit):
+        cli.run_exploration_turn(parser, args, starting=True)
+    args.id = "bad/id"
+    with pytest.raises(SystemExit):
+        cli.run_exploration_turn(parser, args, starting=True)
+    args.id = "missing-model"
+    args.model = None
+    with pytest.raises(SystemExit):
+        cli.run_exploration_turn(parser, args, starting=True)
+    args.model = "model"
+    args.cwd = str(tmp_path / "missing-cwd")
+    with pytest.raises(SystemExit):
+        cli.run_exploration_turn(parser, args, starting=True)
+
+    manifest_root = root / "resume"
+    manifest_root.mkdir(parents=True)
+    manifest = {
+        "id": "resume",
+        "model": "model",
+        "tools": "grep",
+        "cwd": str(cwd),
+        "turns": 0,
+    }
+    (manifest_root / "manifest.json").write_text(json.dumps(manifest))
+    resume = SimpleNamespace(
+        id="resume",
+        model=None,
+        prompt="continue",
+        prompt_file=None,
+        cwd=None,
+        tools=None,
+        timeout_seconds=3,
+        exploration_root=str(root),
+    )
+    assert cli.run_exploration_turn(parser, resume, starting=False) == 0
+    shown = SimpleNamespace(exploration_root=str(root), id="resume")
+    assert cli.show_exploration(parser, shown) == 0
+    capsys.readouterr()
+
+    (manifest_root / "manifest.json").write_text(json.dumps({"id": "resume", "cwd": str(cwd)}))
+    with pytest.raises(SystemExit):
+        cli.run_exploration_turn(parser, resume, starting=False)
+    (manifest_root / "manifest.json").write_text(
+        json.dumps({"id": "resume", "model": "model", "cwd": str(tmp_path / "missing")})
+    )
+    with pytest.raises(SystemExit):
+        cli.run_exploration_turn(parser, resume, starting=False)
+
+    bad_manifest = root / "bad"
+    bad_manifest.mkdir()
+    (bad_manifest / "manifest.json").write_text("not json")
+    with pytest.raises(ValueError, match="could not read"):
+        cli.load_exploration(root, "bad")
+    wrong_manifest = root / "wrong"
+    wrong_manifest.mkdir()
+    (wrong_manifest / "manifest.json").write_text(json.dumps({"id": "other"}))
+    with pytest.raises(ValueError, match="invalid exploration"):
+        cli.load_exploration(root, "wrong")
+
+    with pytest.raises(SystemExit):
+        cli.promote_exploration(
+            parser,
+            SimpleNamespace(exploration_root=str(root), id="missing", output=str(tmp_path / "out")),
+        )
+    for manifest in (
+        {"id": "resume"},
+        {"id": "resume", "lastTurn": str(root / "resume" / "turns" / "002")},
+    ):
+        (manifest_root / "manifest.json").write_text(json.dumps(manifest))
+        if "lastTurn" in manifest:
+            turn = Path(manifest["lastTurn"])
+            turn.mkdir(parents=True, exist_ok=True)
+        with pytest.raises(SystemExit):
+            cli.promote_exploration(
+                parser,
+                SimpleNamespace(
+                    exploration_root=str(root), id="resume", output=str(tmp_path / "out")
+                ),
+            )
+    response_path = manifest_root / "turns" / "002" / "response.md"
+    response_path.write_text("exploratory response")
+    output_file = tmp_path / "output-file"
+    output_file.write_text("file")
+    (manifest_root / "manifest.json").write_text(
+        json.dumps({"id": "resume", "lastTurn": str(response_path.parent)})
+    )
+    with pytest.raises(SystemExit):
+        cli.promote_exploration(
+            parser,
+            SimpleNamespace(exploration_root=str(root), id="resume", output=str(output_file)),
+        )
+    output_dir = tmp_path / "output-dir"
+    output_dir.mkdir()
+    (output_dir / "existing").write_text("x")
+    with pytest.raises(SystemExit):
+        cli.promote_exploration(
+            parser,
+            SimpleNamespace(exploration_root=str(root), id="resume", output=str(output_dir)),
+        )
+    output_dir2 = tmp_path / "output-dir2"
+    assert (
+        cli.promote_exploration(
+            parser,
+            SimpleNamespace(exploration_root=str(root), id="resume", output=str(output_dir2)),
+        )
+        == 0
+    )
+    assert (output_dir2 / "exploration.md").read_text() == "exploratory response"
+    output_dir3 = tmp_path / "output-dir3"
+    output_dir3.mkdir()
+    assert (
+        cli.promote_exploration(
+            parser,
+            SimpleNamespace(exploration_root=str(root), id="resume", output=str(output_dir3)),
+        )
+        == 0
+    )
+
+    monkeypatch.setattr(
+        cli, "read_exploration_prompt", lambda *a: (_ for _ in ()).throw(ValueError("bad prompt"))
+    )
+    with pytest.raises(SystemExit):
+        cli.run_exploration_turn(parser, resume, starting=False)
+    with pytest.raises(SystemExit):
+        cli.show_exploration(parser, SimpleNamespace(exploration_root=str(root), id="missing"))
+
+
+def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    kwargs = {
+        "pi_bin": "pi",
+        "prompt": "review",
+        "model": "model",
+        "files": [source],
+        "max_output_tokens": 1,
+        "response_contract": "findings-json",
+        "timeout_seconds": 1,
+        "request_path": tmp_path / "request.json",
+        "response_path": tmp_path / "response.json",
+        "session_path": tmp_path / "session.json",
+        "diagnostic_path": tmp_path / "stderr.log",
+    }
+    assert "JSON object" in cli.pi_system_prompt("findings-json")
+    assert cli.pi_system_prompt("document")
+    assert cli.pi_system_prompt("unknown")
+    fenced = '```json\n{"verdict": "approved", "findings": []}\n```'
+    assert cli.normalize_pi_response(fenced, "findings-json").startswith("{")
+    assert cli.normalize_pi_response("```json\n[]\n```", "findings-json") == "```json\n[]\n```"
+
+    monkeypatch.setattr(
+        cli.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("pi denied"))
+    )
+    assert cli.invoke_pi(**kwargs)[:2] == (127, "Pi transport could not execute: pi denied")
+
+    event = (
+        json.dumps(
+            {
+                "type": "session",
+                "id": "session",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": fenced}],
+                    "model": "model",
+                    "provider": "provider",
+                    "usage": {"input": 1, "output": 2, "cost": {"total": 0.1}},
+                },
+            }
+        )
+    )
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def communicate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("pi", 1, output=event.encode(), stderr=b"diag")
+            return event.encode(), b"diag"
+
+    monkeypatch.setattr(cli.subprocess, "Popen", Process)
+    monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
+    timed = cli.invoke_pi(
+        **{
+            **kwargs,
+            "request_path": tmp_path / "timeout-request.json",
+            "response_path": tmp_path / "timeout-response.json",
+            "session_path": tmp_path / "timeout-session.json",
+            "diagnostic_path": tmp_path / "timeout-stderr.log",
+        }
+    )
+    assert timed[0] == 124 and timed[1] == "review attempt timed out: diag"
+    assert (tmp_path / "timeout-response.json").is_file()
+
+    class SuccessfulProcess:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, **kwargs):
+            return event.encode(), b""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", SuccessfulProcess)
+    success = cli.invoke_pi(**kwargs)
+    assert success[0] == 0 and success[2].response.startswith("{")
+
+    class EmptyTimeoutProcess:
+        pid = 42
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def communicate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("pi", 1)
+            return b"", b""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", EmptyTimeoutProcess)
+    empty_timeout = cli.invoke_pi(
+        **{
+            **kwargs,
+            "request_path": tmp_path / "empty-timeout-request.json",
+            "response_path": tmp_path / "empty-timeout-response.json",
+            "session_path": tmp_path / "empty-timeout-session.json",
+            "diagnostic_path": tmp_path / "empty-timeout-stderr.log",
+        }
+    )
+    assert empty_timeout[0] == 124
+
+
+def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> None:
+    session_path = tmp_path / "session.jsonl"
+    events_path = tmp_path / "events.jsonl"
+    kwargs = {
+        "pi_bin": "pi",
+        "prompt": "explore",
+        "model": "model",
+        "tools": "read",
+        "cwd": tmp_path,
+        "timeout_seconds": 1,
+        "session_path": session_path,
+        "events_path": events_path,
+    }
+    monkeypatch.setattr(
+        cli.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("denied"))
+    )
+    assert cli.invoke_pi_exploration(**kwargs)[:2] == (
+        127,
+        "Pi exploration could not execute: denied",
+    )
+
+    class Process:
+        pid = 1
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def communicate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("pi", 1)
+            return b"", b""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", Process)
+    monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
+    assert cli.invoke_pi_exploration(**kwargs)[0] == 124
+
+    class Success:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, **kwargs):
+            return b"", b""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", Success)
+    assert cli.invoke_pi_exploration(**kwargs)[0] == 0
+
+
+def test_cli_task8_legacy_receipt_and_config_error_edges(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    assert cli.legacy_receipt_declares_transport({}, "kiro") is False
+    assert cli.legacy_receipt_declares_transport({"attempts": ["bad"]}, "kiro") is False
+    assert cli.legacy_receipt_declares_transport(
+        {"attempts": [{"route": {"transport": "kiro"}}]}, "kiro"
+    )
+    assert cli.legacy_receipt_declares_transport({"attempts": [{"transport": "kiro"}]}, "kiro")
+
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("not json")
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(malformed))) == 1
+    assert json.loads(capsys.readouterr().out)["violations"] == ["json-receipt"]
+    scalar = tmp_path / "scalar.json"
+    scalar.write_text("[]")
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(scalar))) == 1
+    assert json.loads(capsys.readouterr().out)["violations"] == ["receipt-object"]
+    digest_only = {"reviewId": "r", "result": "accepted"}
+    digest_only["sha256"] = cli.sha256_bytes(cli.canonical_json(digest_only))
+    digest_path = tmp_path / "digest.json"
+    digest_path.write_text(json.dumps(digest_only))
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(digest_path))) == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+    digest_only["sha256"] = "wrong"
+    digest_path.write_text(json.dumps(digest_only))
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(digest_path))) == 1
+    assert json.loads(capsys.readouterr().out)["violations"] == ["receipt-digest"]
+
+    class Parser:
+        def parse_args(self, argv):
+            return SimpleNamespace(
+                handler=lambda args: (_ for _ in ()).throw(cli.ReviewctlError("bad config"))
+            )
+
+    monkeypatch.setattr(cli, "build_parser", lambda: Parser())
+    assert cli.run_cli([]) == 2
+    assert "config_invalid" in capsys.readouterr().err
+
+
+def test_cli_task8_remaining_helper_and_receipt_edges(tmp_path: Path, monkeypatch, capsys) -> None:
+    assert cli.pi_resolved_model("provider/model", "provider", "") == ""
+    assert cli.review_validation_error("VERDICT: approved", "verdict") is None
+    unknown = json.dumps({"verdict": "approved", "findings": [], "reviewedFiles": ["source.py"]})
+    assert (
+        cli.review_validation_error(
+            unknown, "other-contract", expected_file_hashes={"source.py": "hash"}
+        )
+        == "other-contract: response does not satisfy the required schema"
+    )
+    assert cli.review_validation_error(unknown, "other-contract") == (
+        "other-contract: response does not satisfy the required schema"
+    )
+    assert (
+        cli.review_validation_error(
+            json.dumps({"verdict": "approved", "findings": [], "reviewedFiles": ["other.py"]}),
+            "findings-json",
+            expected_file_hashes={"source.py": "hash"},
+        )
+        == "findings-json: reviewedFiles proof does not match frozen inputs"
+    )
+
+    request = cli.BackendRequest(
+        prompt="prompt",
+        model="gemini-model",
+        response_contract="findings-json",
+        files=(),
+        attempt_dir=tmp_path / "attempt",
+        timeout_seconds=2,
+        max_output_tokens=3,
+        source_class="synthetic",
+        source_roots=(),
+        provider_preferences=None,
+    )
+    request.attempt_dir.mkdir()
+    response = cli.PersistedResponse("conversation", None, 1, 2, "gemini-model", 3, None, "answer")
+    monkeypatch.setattr(cli, "invoke_gemini", lambda **kwargs: (0, "", response))
+    execution = cli.execute_gemini_backend(request)
+    assert execution.evidence.final_response == request.attempt_dir / "response.md"
+    assert (request.attempt_dir / "response.md").read_text() == "answer"
+    monkeypatch.setattr(
+        cli,
+        "invoke_gemini",
+        lambda **kwargs: (1, "failed", dataclasses.replace(response, response="")),
+    )
+    empty_execution = cli.execute_gemini_backend(
+        dataclasses.replace(request, attempt_dir=tmp_path / "empty-attempt")
+    )
+    assert empty_execution.evidence.final_response is None
+
+    fixture = V1_RECEIPT_FIXTURES / "accepted-findings-v1.json"
+    modern = tmp_path / "modern.json"
+    modern_value = json.loads(fixture.read_text())
+    modern_value["configDigest"] = "config"
+    modern_value.pop("sha256")
+    modern_value["sha256"] = cli.sha256_bytes(cli.canonical_json(modern_value))
+    modern.write_bytes(cli.canonical_json(modern_value) + b"\n")
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(modern))) == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+    modern.write_text(json.dumps({**modern_value, "sha256": "wrong"}))
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(modern))) == 5
+    assert json.loads(capsys.readouterr().out)["violations"] == ["receipt_invalid"]
+
+
+def test_cli_task8_kiro_normalization_and_exploration_fallback_edges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert (
+        cli.normalize_kiro_output(b"> json\nnot-an-object\n", "findings-json")
+        == "json\nnot-an-object"
+    )
+    parser = argparse.ArgumentParser()
+    args = SimpleNamespace(
+        id="thread",
+        model="model",
+        prompt="prompt",
+        prompt_file=None,
+        cwd=str(tmp_path),
+        tools="read",
+        timeout_seconds=1,
+        exploration_root=str(tmp_path / "root"),
+    )
+    monkeypatch.setattr(
+        cli, "read_exploration_prompt", lambda *a: (_ for _ in ()).throw(ValueError("bad"))
+    )
+    monkeypatch.setattr(cli, "fail", lambda *a: None)
+    assert cli.run_exploration_turn(parser, args, starting=True) == 1
+
+
+def test_cli_task8_proprietary_codex_completion_requires_reviewed_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    finding = {
+        "severity": "high",
+        "path": "source.py",
+        "line": 1,
+        "title": "Codex completion",
+        "evidence": "The source contains bounded evidence.",
+        "reproduction": "Inspect source.py line 1.",
+    }
+    responses = [
+        json.dumps({"findings": [finding], "reviewedFiles": ["source.py"]}),
+        json.dumps(
+            {"verdict": "changes-requested", "findings": [finding], "reviewedFiles": ["source.py"]}
+        ),
+    ]
+    captured: list[cli.BackendRequest] = []
+    real_registry = cli.build_backend_registry()
+    registry = cli.BackendRegistry()
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        captured.append(request)
+        response = responses[len(captured) - 1]
+        return cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse("conversation", None, 1, 2, request.model, 3, None, response),
+            cli.BackendEvidence(),
+        )
+
+    registry.register(real_registry.require("codex").descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    policy = tmp_path / "policy.toml"
+    policy.write_text('[models."codex-model"]\nsource_allowed = true\n')
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path),
+            "--transport",
+            "codex",
+            "--model",
+            "codex-model",
+            "--source-class",
+            "proprietary",
+            "--policy",
+            str(policy),
+            "--response-contract",
+            "findings-json",
+            "--max-attempts",
+            "2",
+        ]
+    )
+    assert namespace.handler(namespace) == 0
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    assert len(captured) == 2
+    assert "reviewedFiles" in captured[1].prompt
+    assert receipt["attempts"][1]["result"] == "accepted"
+
+
+def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    registry = cli.BackendRegistry()
+    registry.register(
+        cli.build_backend_registry().require("llm").descriptor,
+        lambda request: cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse(
+                "conversation", None, 1, 2, request.model, 3, None, "VERDICT: approved"
+            ),
+            cli.BackendEvidence(),
+        ),
+    )
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            "run",
+            "--review-id",
+            "prompt-only",
+            "--prompt",
+            "Review this prompt-only request.",
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--model",
+            "model",
+            "--response-contract",
+            "verdict",
+            "--max-attempts",
+            "1",
+        ]
+    )
+    assert namespace.handler(namespace) == 0
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    assert receipt["source"]["files"] == [
+        {"name": "prompt.txt", "sha256": cli.sha256_bytes(b"Review this prompt-only request.")}
+    ]
