@@ -38,9 +38,12 @@ def test_python_tooling_targets_314_consistently() -> None:
     assert project["project"]["requires-python"] == ">=3.14"
     assert project["tool"]["ruff"]["target-version"] == "py314"
     assert lock["requires-python"] == ">=3.14"
-    for workflow_name in ("ci.yml", "release.yml"):
-        workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text()
-        assert 'python-version: "3.14"' in workflow
+    workflows = tuple(
+        (ROOT / ".github" / "workflows" / workflow_name).read_text()
+        for workflow_name in ("ci.yml", "release.yml")
+    )
+    assert all('python-version: "3.14"' in workflow for workflow in workflows)
+    assert 'python-version: "3.12"' not in "\n".join(workflows)
 
 
 def test_public_package_uses_apache_license() -> None:
