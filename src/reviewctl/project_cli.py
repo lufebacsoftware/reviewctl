@@ -141,6 +141,20 @@ def _diagnostic_result(diagnostic: Diagnostic, output_format: str) -> int:
     return exit_code_for(diagnostic.code)
 
 
+def _replace_private_file(path: Path, contents: bytes) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def init_project(args: Any) -> int:
     project = _project_path(args.project)
     if project.exists() and not project.is_dir():
@@ -173,7 +187,6 @@ def init_project(args: Any) -> int:
             return _diagnostic_result(error.diagnostic, "text")
         except (OSError, UnicodeError, ValueError) as error:
             return _diagnostic_result(Diagnostic("invalid_request", str(error)), "text")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     project_id = (
         existing_config.project.project_id
         if existing_config is not None
@@ -186,13 +199,7 @@ def init_project(args: Any) -> int:
         template = template.replace(
             'routes = ["pi:openrouter/stealth/ox-alpha"]', "routes = []"
         ).replace('execution = "remote"', 'execution = "local"')
-    descriptor = os.open(config, flags, 0o600)
-    try:
-        os.fchmod(descriptor, 0o600)
-        os.write(descriptor, template.encode("utf-8"))
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _replace_private_file(config, template.encode("utf-8"))
     if existing_config is None:
         try:
             config_value = load_config(config, user_path=None)

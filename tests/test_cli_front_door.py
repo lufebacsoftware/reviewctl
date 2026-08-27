@@ -238,6 +238,48 @@ def test_init_force_rejects_config_symlink_without_touching_target(tmp_path: Pat
     assert not (project / ".reviewctl").exists()
 
 
+def test_init_force_atomically_replaces_a_racing_symlink(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    project = tmp_path / "project"
+    assert run_cli(["init", "--project", str(project)]) == 0
+    capsys.readouterr()
+    config = project / "reviewctl.toml"
+    external = tmp_path / "external.toml"
+    external.write_bytes(b"must remain untouched\n")
+    before = external.read_bytes()
+    real_open = project_cli.os.open
+    real_replace = project_cli.os.replace
+    swapped = False
+
+    def swap_config_for_symlink() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        swapped = True
+        config.unlink()
+        config.symlink_to(external)
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        if Path(path) == config and flags & os.O_TRUNC:
+            swap_config_for_symlink()
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def racing_replace(source, destination):
+        if Path(destination) == config:
+            swap_config_for_symlink()
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(project_cli.os, "open", racing_open)
+    monkeypatch.setattr(project_cli.os, "replace", racing_replace)
+
+    assert run_cli(["init", "--project", str(project), "--force"]) == 0
+    assert swapped
+    assert external.read_bytes() == before
+    assert config.is_file()
+    assert not config.is_symlink()
+
+
 def test_init_reports_config_write_and_identity_errors(tmp_path: Path, monkeypatch, capsys) -> None:
     args = SimpleNamespace(project=str(tmp_path / "write"), force=False, mode="private")
     monkeypatch.setattr(
