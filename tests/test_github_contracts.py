@@ -282,6 +282,29 @@ def test_github_diff_rename_paths_do_not_strip_repository_directories() -> None:
     )
 
 
+def test_github_diff_parsers_keep_plus_plus_plus_hunk_lines_as_source() -> None:
+    diff = (
+        "diff --git a/src/counter.c b/src/counter.c\n"
+        "--- a/src/counter.c\n"
+        "+++ b/src/counter.c\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+++ counter;\n"
+    )
+
+    assert github_module._diff_files(diff) == (
+        github_module._DiffFile(path="src/counter.c", status="modified", old_path="src/counter.c"),
+    )
+    snapshot = github_module.PullRequestSnapshot(
+        PullRequestRef("owner/name"),
+        "a" * 40,
+        "b" * 40,
+        "private",
+        (github_module.ChangedFileSnapshot("src/counter.c", "modified", "+++ counter;\n"),),
+        diff,
+    )
+    assert github_module._diff_added_lines(snapshot) == {("src/counter.c", 1)}
+
+
 def test_github_command_runner_maps_timeout_oserror_and_success(
     monkeypatch, tmp_path: Path
 ) -> None:

@@ -103,6 +103,91 @@ def test_local_source_requests_diff_media_type(tmp_path: Path) -> None:
     ) in runner.calls
 
 
+@pytest.mark.parametrize(
+    "recheck_metadata",
+    [
+        {
+            "base": {"sha": BASE},
+            "head": {"sha": "c" * 40},
+            "repository": {"visibility": "private"},
+        },
+        {
+            "base": {"sha": "c" * 40},
+            "head": {"sha": HEAD},
+            "repository": {"visibility": "private"},
+        },
+    ],
+)
+def test_local_source_rejects_identity_change_after_diff_before_materialization(
+    tmp_path: Path, recheck_metadata: dict
+) -> None:
+    class HeadRaceRunner(FakeRunner):
+        metadata_calls = 0
+
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if _is_metadata_command(command):
+                self.metadata_calls += 1
+                metadata = {
+                    "base": {"sha": BASE},
+                    "head": {"sha": HEAD},
+                    "repository": {"visibility": "private"},
+                }
+                if self.metadata_calls == 2:
+                    metadata = recheck_metadata
+                self.cwds.append(cwd)
+                self.timeouts.append(timeout_seconds)
+                self.calls.append(tuple(command))
+                return CommandResult(0, json.dumps(metadata).encode(), b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    runner = HeadRaceRunner()
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=runner).resolve(PullRequestRef("example/project", 7))
+
+    assert error.value.diagnostic.code == "github_source_identity_changed"
+    assert "base or head changed" in error.value.diagnostic.message
+    assert runner.metadata_calls == 2
+    assert runner.calls[:3] == [
+        ("gh", "api", "repos/example/project/pulls/7"),
+        ("git", "rev-parse", "HEAD"),
+        ("gh", "api", "repos/example/project/pulls/7", "--header", DIFF_HEADER),
+    ]
+    assert runner.calls[3] == ("gh", "api", "repos/example/project/pulls/7")
+    assert not any(command[:2] == ("git", "show") for command in runner.calls)
+
+
+@pytest.mark.parametrize(
+    "recheck_metadata",
+    [
+        b"not-json",
+        json.dumps({"head": {}}).encode(),
+        json.dumps({"base": {"sha": BASE}, "head": {"sha": 7}}).encode(),
+        json.dumps({"base": {"sha": 7}, "head": {"sha": HEAD}}).encode(),
+    ],
+)
+def test_local_source_rejects_invalid_head_recheck(tmp_path: Path, recheck_metadata: bytes) -> None:
+    class InvalidRecheckRunner(FakeRunner):
+        metadata_calls = 0
+
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if _is_metadata_command(command):
+                self.metadata_calls += 1
+                if self.metadata_calls == 2:
+                    self.cwds.append(cwd)
+                    self.timeouts.append(timeout_seconds)
+                    self.calls.append(tuple(command))
+                    return CommandResult(0, recheck_metadata, b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    runner = InvalidRecheckRunner()
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=runner).resolve(PullRequestRef("example/project", 7))
+
+    assert error.value.diagnostic.code == "github_metadata_invalid"
+    assert runner.metadata_calls == 2
+    assert not any(command[:2] == ("git", "show") for command in runner.calls)
+
+
 def test_source_refuses_stale_checkout(tmp_path: Path) -> None:
     runner = FakeRunner(head="c" * 40)
 
@@ -211,6 +296,9 @@ def test_source_failure_does_not_expose_command_stderr(tmp_path: Path) -> None:
 def test_github_diagnostics_have_documented_exit_classes() -> None:
     assert exit_code_for("github_checkout_stale") == 2
     assert exit_code_for("github_command_failed") == 3
+    assert exit_code_for("github_source_binary") == 2
+    assert exit_code_for("github_source_unsupported") == 2
+    assert exit_code_for("github_source_identity_changed") == 3
     assert exit_code_for("github_visibility_unknown") == 4
 
 

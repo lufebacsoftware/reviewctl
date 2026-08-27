@@ -290,19 +290,26 @@ def _diff_added_lines(snapshot: PullRequestSnapshot) -> set[tuple[str, int]]:
     lines: set[tuple[str, int]] = set()
     current_path: str | None = None
     new_line: int | None = None
+    in_hunk = False
     for raw in snapshot.diff.splitlines():
-        if raw.startswith("+++ "):
+        if raw.startswith("diff --git "):
+            in_hunk = False
+            current_path = None
+            new_line = None
+            continue
+        if not in_hunk and raw.startswith("+++ "):
             current_path = _diff_path(raw[4:])
             new_line = None
             continue
         if raw.startswith("@@ "):
             match = re.search(r"\+(\d+)(?:,(\d+))?", raw)
             new_line = int(match.group(1)) if match else None
+            in_hunk = True
             continue
         if new_line is None:
             continue
         if raw.startswith("+"):
-            if not raw.startswith("+++") and current_path is not None:
+            if current_path is not None:
                 lines.add((current_path, new_line))
             new_line += 1
         elif raw.startswith("-") or raw.startswith("\\"):
@@ -477,9 +484,10 @@ def _diff_files(diff: str) -> tuple[_DiffFile, ...]:
     status = "modified"
     rename_from: str | None = None
     rename_to: str | None = None
+    in_hunk = False
 
     def flush() -> None:
-        nonlocal entry_started, old_path, new_path, status, rename_from, rename_to
+        nonlocal entry_started, old_path, new_path, status, rename_from, rename_to, in_hunk
         path = rename_to or new_path or old_path or rename_from
         if entry_started and path is None:
             raise _UnsupportedDiffError("pull-request diff entry has no materializable path")
@@ -506,11 +514,14 @@ def _diff_files(diff: str) -> tuple[_DiffFile, ...]:
         rename_from = None
         rename_to = None
         entry_started = False
+        in_hunk = False
 
     for raw in diff.splitlines():
         if raw.startswith("diff --git "):
             flush()
             entry_started = True
+        elif raw.startswith("@@ "):
+            in_hunk = True
         elif raw.startswith("Binary files ") or raw == "GIT binary patch":
             raise _BinaryDiffError("binary pull-request diffs are not supported")
         elif raw.startswith("new file mode"):
@@ -523,9 +534,9 @@ def _diff_files(diff: str) -> tuple[_DiffFile, ...]:
         elif raw.startswith("rename to "):
             status = "renamed"
             rename_to = raw.removeprefix("rename to ")
-        elif raw.startswith("--- "):
+        elif not in_hunk and raw.startswith("--- "):
             old_path = raw.removeprefix("--- ")
-        elif raw.startswith("+++ "):
+        elif not in_hunk and raw.startswith("+++ "):
             new_path = raw.removeprefix("+++ ")
     flush()
     unique: dict[str, _DiffFile] = {}
@@ -646,6 +657,35 @@ class LocalGitHubSource:
                 "github_source_too_large", "pull-request diff exceeds the bounded source limit"
             )
         diff = self._decode("GitHub pull-request diff", diff_bytes)
+        metadata_recheck_bytes = self._run(
+            "GitHub pull-request metadata recheck", ["gh", "api", endpoint]
+        )
+        try:
+            metadata_recheck = json.loads(
+                self._decode("GitHub pull-request metadata recheck", metadata_recheck_bytes)
+            )
+            rechecked_base = metadata_recheck["base"]["sha"]
+            rechecked_head = metadata_recheck["head"]["sha"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise _source_diagnostic(
+                "github_metadata_invalid",
+                "GitHub pull-request metadata recheck lacks valid base/head SHAs",
+            ) from error
+        if not isinstance(rechecked_base, str) or not isinstance(rechecked_head, str):
+            raise _source_diagnostic(
+                "github_metadata_invalid",
+                "GitHub pull-request metadata recheck lacks valid base/head SHAs",
+            )
+        if (
+            rechecked_base.lower() != str(base_sha).lower()
+            or rechecked_head.lower() != str(head_sha).lower()
+        ):
+            raise _source_diagnostic(
+                "github_source_identity_changed",
+                "pull-request base or head changed while source was being fetched; "
+                "source materialization is blocked",
+                retryable=True,
+            )
         try:
             diff_files = _diff_files(diff)
         except _BinaryDiffError as error:
