@@ -168,16 +168,17 @@ def _replace_private_file(path: Path, contents: bytes) -> None:
                 except BaseException:
                     pass
         os.replace(temporary, path)
-    finally:
-        primary = sys.exc_info()[1]
-        if temporary.exists():
-            if primary is None:
-                temporary.unlink()
-            else:
-                try:
-                    temporary.unlink()
-                except BaseException:
-                    pass
+    except BaseException:
+        try:
+            temporary.unlink()
+        except BaseException:
+            pass
+        raise
+    else:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def init_project(args: Any) -> int:

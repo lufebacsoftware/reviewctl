@@ -372,6 +372,34 @@ def test_private_file_replace_removes_unmoved_temporary_file(tmp_path: Path, mon
     assert not temporary_paths[0].exists()
 
 
+def test_private_file_replace_reports_cleanup_failure_without_primary_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    temporary_paths: list[Path] = []
+    real_mkstemp = project_cli.tempfile.mkstemp
+    real_unlink = Path.unlink
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        temporary_paths.append(Path(name))
+        return descriptor, name
+
+    monkeypatch.setattr(project_cli.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(project_cli.os, "replace", lambda *args: None)
+    monkeypatch.setattr(
+        Path,
+        "unlink",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup primary")),
+    )
+
+    with pytest.raises(OSError, match="cleanup primary"):
+        project_cli._replace_private_file(tmp_path / "config", b"value")
+
+    monkeypatch.undo()
+    assert len(temporary_paths) == 1
+    real_unlink(temporary_paths[0])
+
+
 def test_private_file_replace_preserves_primary_when_cleanup_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
