@@ -159,8 +159,22 @@ def init_project(args: Any) -> int:
             ),
             "text",
         )
+    existing_config: ReviewConfig | None = None
+    if config.exists():
+        try:
+            existing_config = load_config(config, user_path=None)
+            ProjectIdentityStore(project).ensure(existing_config.project.project_id)
+        except JournalOperationError as error:
+            return _diagnostic_result(error.diagnostic, "text")
+        except (OSError, UnicodeError, ValueError) as error:
+            return _diagnostic_result(Diagnostic("invalid_request", str(error)), "text")
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    template = PROJECT_TEMPLATE.format(project_id="project-" + secrets.token_hex(12)).replace(
+    project_id = (
+        existing_config.project.project_id
+        if existing_config is not None
+        else "project-" + secrets.token_hex(12)
+    )
+    template = PROJECT_TEMPLATE.format(project_id=project_id).replace(
         'privacy_mode = "private"', f'privacy_mode = "{args.mode}"'
     )
     if args.mode == "sensitive":
@@ -174,13 +188,14 @@ def init_project(args: Any) -> int:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    try:
-        config_value = load_config(config, user_path=None)
-        ProjectIdentityStore(project).ensure(config_value.project.project_id)
-    except JournalOperationError as error:
-        return _diagnostic_result(error.diagnostic, "text")
-    except (OSError, UnicodeError, ValueError) as error:
-        return _diagnostic_result(Diagnostic("invalid_request", str(error)), "text")
+    if existing_config is None:
+        try:
+            config_value = load_config(config, user_path=None)
+            ProjectIdentityStore(project).ensure(config_value.project.project_id)
+        except JournalOperationError as error:
+            return _diagnostic_result(error.diagnostic, "text")
+        except (OSError, UnicodeError, ValueError) as error:
+            return _diagnostic_result(Diagnostic("invalid_request", str(error)), "text")
     print(config)
     return 0
 

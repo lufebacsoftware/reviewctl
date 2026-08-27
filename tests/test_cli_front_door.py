@@ -169,8 +169,43 @@ def test_init_rejects_file_path_and_force_overwrites_existing_config(
 
     assert run_cli(["init", "--project", str(tmp_path)]) == 0
     capsys.readouterr()
+    assert run_cli(["init", "--project", str(tmp_path), "--force"]) == 0
+    assert str(tmp_path / "reviewctl.toml") in capsys.readouterr().out
+
+
+def test_init_force_preserves_existing_state_when_identity_validation_fails(
+    tmp_path: Path, capsys
+) -> None:
+    assert run_cli(["init", "--project", str(tmp_path)]) == 0
+    capsys.readouterr()
+    journal = tmp_path / ".reviewctl" / "journal.jsonl"
+    journal.write_bytes(b"existing journal\n")
+    config = tmp_path / "reviewctl.toml"
+    identity = tmp_path / ".reviewctl" / "identity.json"
+    configured_id = load_config(config, user_path=None).project.project_id
+    config.write_bytes(
+        config.read_bytes().replace(f'id = "{configured_id}"'.encode(), b'id = "project-tampered"')
+    )
+    before = {
+        "config": config.read_bytes(),
+        "identity": identity.read_bytes(),
+        "journal": journal.read_bytes(),
+    }
+
     assert run_cli(["init", "--project", str(tmp_path), "--force"]) == 5
     assert "does not match" in capsys.readouterr().err
+    assert config.read_bytes() == before["config"]
+    assert identity.read_bytes() == before["identity"]
+    assert journal.read_bytes() == before["journal"]
+
+
+def test_init_force_preserves_malformed_existing_config(tmp_path: Path, capsys) -> None:
+    config = tmp_path / "reviewctl.toml"
+    config.write_bytes(b"[project\n")
+
+    assert run_cli(["init", "--project", str(tmp_path), "--force"]) == 2
+    assert "could not read configuration" in capsys.readouterr().err
+    assert config.read_bytes() == b"[project\n"
 
 
 def test_init_reports_config_write_and_identity_errors(tmp_path: Path, monkeypatch, capsys) -> None:
