@@ -228,6 +228,20 @@ class ReviewClient:
             return ReviewResult(
                 "privacy_denied", request.review_id or "invalid", Path(), (), diagnostic
             )
+        if (
+            self.config.project.privacy_mode == "private"
+            and profile.execution == "remote"
+            and profile.tools == "read-only"
+            and any(route.transport == "pi" for route in profile.parsed_routes)
+        ):
+            diagnostic = Diagnostic(
+                "privacy_denied",
+                "private remote Pi profiles cannot use read-only tools",
+                next="select tools=none or use a local profile",
+            )
+            return ReviewResult(
+                "privacy_denied", request.review_id or "invalid", Path(), (), diagnostic
+            )
         if not profile.routes:
             diagnostic = Diagnostic(
                 "route_invalid",
@@ -385,6 +399,17 @@ class ReviewClient:
         last_diagnostic: Diagnostic | None = None
         last_usage: Any = None
         saw_partial = False
+
+        def record_attempt(attempt: dict[str, Any]) -> None:
+            attempts.append(attempt)
+            self._journal.append(
+                {
+                    "type": "review_attempt",
+                    "reviewId": review_id,
+                    **attempt,
+                }
+            )
+
         for index, route in enumerate(routes, start=1):
             route_label = f"{route.transport}:{route.model}"
             transport = self.transports.get(route.transport)
@@ -395,16 +420,8 @@ class ReviewClient:
                     f"transport {route.transport!r} is not registered",
                     retryable=True,
                 )
-                attempts.append({"attempt": index, "route": route_label, "status": diagnostic.code})
+                record_attempt({"attempt": index, "route": route_label, "status": diagnostic.code})
                 last_diagnostic = diagnostic
-                self._journal.append(
-                    {
-                        "type": "review_attempt",
-                        "reviewId": review_id,
-                        "route": route_label,
-                        "status": diagnostic.code,
-                    }
-                )
                 if index < len(routes):
                     fallback_relationships.append(
                         {
@@ -445,7 +462,7 @@ class ReviewClient:
                 diagnostic = Diagnostic(
                     "transport_unavailable", "review transport failed", retryable=True
                 )
-                attempts.append(
+                record_attempt(
                     {
                         "attempt": index,
                         "route": route_label,
@@ -468,7 +485,7 @@ class ReviewClient:
                 or not execution.response.response.strip()
             ):
                 diagnostic = _execution_diagnostic(execution)
-                attempts.append({"attempt": index, "route": route_label, "status": diagnostic.code})
+                record_attempt({"attempt": index, "route": route_label, "status": diagnostic.code})
                 last_diagnostic = diagnostic
                 if index < len(routes):
                     fallback_relationships.append(
@@ -489,7 +506,7 @@ class ReviewClient:
                     "review transport returned invalid response identity",
                     retryable=True,
                 )
-                attempts.append({"attempt": index, "route": route_label, "status": diagnostic.code})
+                record_attempt({"attempt": index, "route": route_label, "status": diagnostic.code})
                 last_diagnostic = diagnostic
                 if index < len(routes):
                     fallback_relationships.append(
@@ -529,7 +546,7 @@ class ReviewClient:
                     diagnostic = Diagnostic("contract_failed", str(error))
                 else:
                     findings = self._merge_findings(partial_findings, current_findings)
-                    attempts.append({"attempt": index, "route": route_label, "status": "accepted"})
+                    record_attempt({"attempt": index, "route": route_label, "status": "accepted"})
                     self._record_findings(review_id, findings, dimensions=dimensions)
                     receipt_path = self._write_receipt(
                         artifacts,
@@ -576,7 +593,7 @@ class ReviewClient:
                     status = "partial"
             else:
                 status = "contract_failed"
-            attempts.append(
+            record_attempt(
                 {
                     "attempt": index,
                     "route": route_label,

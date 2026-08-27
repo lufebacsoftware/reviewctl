@@ -95,8 +95,99 @@ def test_client_review_returns_typed_result_and_journal(tmp_path: Path) -> None:
     assert result.receipt_path.is_file()
     assert [event["type"] for event in client.journal().events()] == [
         "review_started",
+        "review_attempt",
         "review_finished",
     ]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [
+        ("exception", "transport_unavailable"),
+        ("failed", "transport_unavailable"),
+        ("empty", "empty_response"),
+        ("identity", "transport_unavailable"),
+        ("partial", "partial"),
+        ("contract", "contract_failed"),
+        ("accepted", "accepted"),
+    ],
+)
+def test_client_journals_each_registered_attempt_outcome(
+    tmp_path: Path, outcome: str, expected_status: str
+) -> None:
+    write_default_config(tmp_path)
+
+    class OutcomeTransport:
+        def execute(self, request):
+            if outcome == "exception":
+                raise ValueError("transport exploded")
+            if outcome == "failed":
+                return BackendExecution(1, "provider failed", None, BackendEvidence())
+            response = {
+                "empty": "",
+                "identity": '{"verdict":"approved","findings":[]}',
+                "partial": (
+                    '{"findings":[{"severity":"high","path":"a.py","line":1,'
+                    '"title":"title","evidence":"e","reproduction":"r"}]}'
+                ),
+                "contract": "not-json",
+                "accepted": '{"verdict":"approved","findings":[]}',
+            }[outcome]
+            conversation_id = "" if outcome == "identity" else "conversation"
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    conversation_id,
+                    0.0,
+                    1,
+                    1,
+                    request.model if outcome != "identity" else "other/model",
+                    1,
+                    "fake",
+                    response,
+                ),
+                BackendEvidence(),
+            )
+
+    client = ReviewClient.from_project(tmp_path, transports={"pi": OutcomeTransport()})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == expected_status
+    assert result.receipt_path.is_file()
+    attempt_events = [
+        event for event in client.journal().events() if event["type"] == "review_attempt"
+    ]
+    assert len(attempt_events) == 1
+    assert attempt_events[0]["attempt"] == 1
+    assert attempt_events[0]["route"] == "pi:fake/model"
+    assert attempt_events[0]["status"] == expected_status
+
+
+def test_client_rejects_private_remote_pi_read_only_profile(tmp_path: Path) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:openrouter/model"]\n'
+        'execution = "remote"\n'
+        'tools = "read-only"\n'
+    )
+    calls = []
+
+    class ForbiddenTransport:
+        def execute(self, request):
+            calls.append(request)
+            raise AssertionError("unsafe private remote read-only transport was invoked")
+
+    client = ReviewClient.from_project(tmp_path, transports={"pi": ForbiddenTransport()})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == "privacy_denied"
+    assert result.diagnostic is not None
+    assert "read-only" in result.diagnostic.message
+    assert calls == []
 
 
 def test_client_injects_contract_instructions_into_transport_prompt(tmp_path: Path) -> None:
