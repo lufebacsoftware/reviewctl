@@ -174,11 +174,6 @@ def _replace_private_file(path: Path, contents: bytes) -> None:
         except BaseException:
             pass
         raise
-    else:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def init_project(args: Any) -> int:

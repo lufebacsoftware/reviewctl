@@ -354,50 +354,31 @@ def test_private_file_replace_preserves_write_failure_when_stream_close_fails(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_private_file_replace_removes_unmoved_temporary_file(tmp_path: Path, monkeypatch) -> None:
-    temporary_paths: list[Path] = []
-    real_mkstemp = project_cli.tempfile.mkstemp
-
-    def tracked_mkstemp(*args, **kwargs):
-        descriptor, name = real_mkstemp(*args, **kwargs)
-        temporary_paths.append(Path(name))
-        return descriptor, name
-
-    monkeypatch.setattr(project_cli.tempfile, "mkstemp", tracked_mkstemp)
-    monkeypatch.setattr(project_cli.os, "replace", lambda *args: None)
-
-    project_cli._replace_private_file(tmp_path / "config", b"value")
-
-    assert len(temporary_paths) == 1
-    assert not temporary_paths[0].exists()
-
-
-def test_private_file_replace_reports_cleanup_failure_without_primary_error(
+def test_private_file_replace_does_not_unlink_reused_temporary_name(
     tmp_path: Path, monkeypatch
 ) -> None:
     temporary_paths: list[Path] = []
     real_mkstemp = project_cli.tempfile.mkstemp
-    real_unlink = Path.unlink
+    real_replace = project_cli.os.replace
 
     def tracked_mkstemp(*args, **kwargs):
         descriptor, name = real_mkstemp(*args, **kwargs)
         temporary_paths.append(Path(name))
         return descriptor, name
 
+    def replace_and_reuse(source, destination):
+        real_replace(source, destination)
+        Path(source).write_bytes(b"unrelated")
+
     monkeypatch.setattr(project_cli.tempfile, "mkstemp", tracked_mkstemp)
-    monkeypatch.setattr(project_cli.os, "replace", lambda *args: None)
-    monkeypatch.setattr(
-        Path,
-        "unlink",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup primary")),
-    )
+    monkeypatch.setattr(project_cli.os, "replace", replace_and_reuse)
 
-    with pytest.raises(OSError, match="cleanup primary"):
-        project_cli._replace_private_file(tmp_path / "config", b"value")
+    destination = tmp_path / "config"
+    project_cli._replace_private_file(destination, b"value")
 
-    monkeypatch.undo()
     assert len(temporary_paths) == 1
-    real_unlink(temporary_paths[0])
+    assert destination.read_bytes() == b"value"
+    assert temporary_paths[0].read_bytes() == b"unrelated"
 
 
 def test_private_file_replace_preserves_primary_when_cleanup_fails(
