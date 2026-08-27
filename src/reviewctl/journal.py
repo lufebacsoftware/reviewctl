@@ -91,7 +91,12 @@ class ProjectJournal:
                 line = json.dumps(
                     normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":")
                 )
-                os.write(descriptor, (line + "\n").encode("utf-8"))
+                remaining = memoryview((line + "\n").encode("utf-8"))
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written == 0:
+                        raise OSError(f"could not finish appending journal {self.path}")
+                    remaining = remaining[written:]
                 os.fsync(descriptor)
         finally:
             os.close(descriptor)

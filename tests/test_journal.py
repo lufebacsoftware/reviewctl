@@ -410,6 +410,33 @@ def test_journal_append_rejects_descriptor_diagnostic(tmp_path: Path, monkeypatc
         journal.append({"type": "review_started"})
 
 
+def test_journal_append_retries_short_writes(tmp_path: Path, monkeypatch) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    real_write = journal_module.os.write
+    write_sizes: list[int] = []
+
+    def short_first_write(descriptor, contents):
+        limit = max(1, len(contents) // 2) if not write_sizes else len(contents)
+        written = real_write(descriptor, contents[:limit])
+        write_sizes.append(written)
+        return written
+
+    monkeypatch.setattr(journal_module.os, "write", short_first_write)
+
+    event = journal.append({"type": "review_started", "reviewId": "r1"})
+
+    assert len(write_sizes) == 2
+    assert journal.events() == [event]
+
+
+def test_journal_append_rejects_zero_length_write(tmp_path: Path, monkeypatch) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    monkeypatch.setattr(journal_module.os, "write", lambda descriptor, contents: 0)
+
+    with pytest.raises(OSError, match="could not finish appending journal"):
+        journal.append({"type": "review_started", "reviewId": "r1"})
+
+
 def test_journal_envelope_identity_and_read_diagnostics(tmp_path: Path, monkeypatch) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl", project_id="p", origin_id="o")
     with pytest.raises(JournalOperationError, match="identity"):
