@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import hashlib
 import json
 import os
 import shlex
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -8983,13 +8985,30 @@ def test_cli_task8_schema_write_defaults_and_account_edges(tmp_path: Path, monke
 
     destination = tmp_path / "raw.txt"
     original_open = cli.os.open
-    original_write = cli.os.write
+    original_close = cli.os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def recording_open(*args: object) -> int:
+        descriptor = original_open(*args)
+        opened.append(descriptor)
+        return descriptor
+
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(cli.os, "open", recording_open)
+    monkeypatch.setattr(cli.os, "close", recording_close)
     monkeypatch.setattr(cli.os, "write", lambda descriptor, contents: 0)
     with pytest.raises(OSError, match="could not finish writing"):
         cli.write_private_exclusive(destination, b"payload")
     assert destination.read_bytes() == b""
-    monkeypatch.setattr(cli.os, "write", original_write)
-    monkeypatch.setattr(cli.os, "open", original_open)
+    assert len(opened) == 1
+    assert closed == opened
+    with pytest.raises(OSError) as error:
+        cli.os.fstat(opened[0])
+    assert error.value.errno == errno.EBADF
 
     parser = argparse.ArgumentParser()
     with monkeypatch.context() as isolated:
@@ -9033,34 +9052,82 @@ def test_cli_task8_process_cleanup_edges(monkeypatch) -> None:
     class Process:
         pid = 123
 
+        def __init__(self) -> None:
+            self.wait_calls: list[dict[str, object]] = []
+
         def wait(self, **kwargs):
+            self.wait_calls.append(kwargs)
             raise OSError("wait")
 
-    cli.reap_process(Process())
-    cli.reap_process_without_blocking(Process())
+    process = Process()
+    cli.reap_process(process)
+    assert process.wait_calls == [{}]
+    nonblocking_process = Process()
+    cli.reap_process_without_blocking(nonblocking_process)
+    assert nonblocking_process.wait_calls == [{"timeout": 0}]
 
     class TimeoutProcess:
         pid = 124
 
+        def __init__(self) -> None:
+            self.wait_calls: list[dict[str, object]] = []
+
         def wait(self, **kwargs):
+            self.wait_calls.append(kwargs)
             if kwargs.get("timeout") == 0:
                 raise subprocess.TimeoutExpired("wait", 0)
             raise ChildProcessError("gone")
+
+    thread_starts: list[dict[str, object]] = []
+    thread_executions: list[tuple[object, tuple[object, ...]]] = []
 
     class Thread:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
         def start(self):
+            thread_starts.append(self.kwargs)
+            thread_executions.append((self.kwargs["target"], self.kwargs["args"]))
             self.kwargs["target"](self.kwargs["args"][0])
 
     monkeypatch.setattr(cli.threading, "Thread", Thread)
-    cli.reap_process_without_blocking(TimeoutProcess())
+    timeout_process = TimeoutProcess()
+    cli.reap_process_without_blocking(timeout_process)
+    assert timeout_process.wait_calls == [{"timeout": 0}, {}]
+    assert thread_starts == [
+        {
+            "target": cli.reap_process,
+            "args": (timeout_process,),
+            "daemon": True,
+            "name": "reviewctl-reap-124",
+        }
+    ]
+    assert thread_executions == [(cli.reap_process, (timeout_process,))]
 
-    process = SimpleNamespace(pid=1, wait=lambda **kwargs: None)
-    monkeypatch.setattr(cli.os, "killpg", lambda *args: (_ for _ in ()).throw(ProcessLookupError()))
-    cli.terminate_process_group(process)
-    cli.terminate_process_group(process, grace_seconds=0)
+    lookup_process = Process()
+    lookup_process.pid = 1
+    lookup_kill_calls: list[tuple[int, int]] = []
+
+    def lookup_killpg(pid: int, signal_number: int) -> None:
+        lookup_kill_calls.append((pid, signal_number))
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(cli.os, "killpg", lookup_killpg)
+    cli.terminate_process_group(lookup_process)
+    assert lookup_kill_calls == [(1, signal.SIGTERM)]
+    assert lookup_process.wait_calls == [{"timeout": 0}]
+
+    zero_process = Process()
+    zero_process.pid = 3
+    zero_kill_calls: list[tuple[int, int]] = []
+
+    def zero_killpg(pid: int, signal_number: int) -> None:
+        zero_kill_calls.append((pid, signal_number))
+
+    monkeypatch.setattr(cli.os, "killpg", zero_killpg)
+    cli.terminate_process_group(zero_process, grace_seconds=0)
+    assert zero_kill_calls == [(3, signal.SIGTERM), (3, signal.SIGKILL)]
+    assert zero_process.wait_calls == [{"timeout": 0}]
 
     calls = []
 
@@ -9073,27 +9140,49 @@ def test_cli_task8_process_cleanup_edges(monkeypatch) -> None:
     class StubbornProcess:
         pid = 2
 
+        def __init__(self) -> None:
+            self.wait_calls: list[dict[str, object]] = []
+
         def wait(self, **kwargs):
+            self.wait_calls.append(kwargs)
             if kwargs.get("timeout") == 0:
-                raise ChildProcessError("gone")
-            raise subprocess.TimeoutExpired("wait", kwargs.get("timeout"))
+                raise subprocess.TimeoutExpired("wait", 0)
+            if kwargs.get("timeout") in (5, 1):
+                raise subprocess.TimeoutExpired("wait", kwargs["timeout"])
 
     timeout_process = StubbornProcess()
     monkeypatch.setattr(cli.os, "killpg", killpg)
     cli.terminate_process_group(timeout_process)
+    assert calls == [(2, signal.SIGTERM), (2, signal.SIGKILL)]
+    assert timeout_process.wait_calls == [
+        {"timeout": 5},
+        {"timeout": 1},
+        {"timeout": 0},
+        {},
+    ]
 
 
 def test_cli_task8_cleanup_wait_error_and_kiro_validation(tmp_path: Path, monkeypatch) -> None:
     class WaitErrorProcess:
         pid = 10
 
+        def __init__(self) -> None:
+            self.wait_calls: list[dict[str, object]] = []
+
         def wait(self, **kwargs):
+            self.wait_calls.append(kwargs)
             if kwargs.get("timeout") == 5:
                 raise subprocess.TimeoutExpired("wait", 5)
             raise OSError("wait failed")
 
-    monkeypatch.setattr(cli.os, "killpg", lambda *args: None)
-    cli.terminate_process_group(WaitErrorProcess())
+    kill_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        cli.os, "killpg", lambda pid, signal_number: kill_calls.append((pid, signal_number))
+    )
+    wait_error_process = WaitErrorProcess()
+    cli.terminate_process_group(wait_error_process)
+    assert kill_calls == [(10, signal.SIGTERM), (10, signal.SIGKILL)]
+    assert wait_error_process.wait_calls == [{"timeout": 5}, {"timeout": 1}]
 
     for payload in (
         b"not-json",
@@ -9269,12 +9358,14 @@ def test_cli_task8_gemini_edge_processes(tmp_path: Path, monkeypatch) -> None:
     )
     assert result[:2] == (127, "Gemini transport could not execute: gemini denied")
 
+    timeout_processes: list[object] = []
+
     class TimeoutProcess:
         returncode = 0
-        calls = 0
 
         def __init__(self, *args, **kwargs):
-            pass
+            self.calls = 0
+            timeout_processes.append(self)
 
         def communicate(self, **kwargs):
             self.calls += 1
@@ -9285,7 +9376,12 @@ def test_cli_task8_gemini_edge_processes(tmp_path: Path, monkeypatch) -> None:
             return b"after", b"more"
 
     monkeypatch.setattr(cli.subprocess, "Popen", TimeoutProcess)
-    monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
+    terminated: list[tuple[object, float]] = []
+
+    def record_termination(process: object, *, grace_seconds: float = 5) -> None:
+        terminated.append((process, grace_seconds))
+
+    monkeypatch.setattr(cli, "terminate_process_group", record_termination)
     timed = cli.invoke_gemini(
         gemini_bin="gemini",
         prompt="review",
@@ -9302,6 +9398,7 @@ def test_cli_task8_gemini_edge_processes(tmp_path: Path, monkeypatch) -> None:
     assert timed[:2] == (124, "review attempt timed out")
     assert (tmp_path / "timeout-response.json").read_bytes() == b"partialafter"
     assert (tmp_path / "timeout-stderr.log").read_bytes() == b"diagnosticmore"
+    assert terminated == [(timeout_processes[0], 5)]
 
     class ResponseProcess:
         returncode = 0
@@ -9604,11 +9701,14 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
         )
     )
 
+    pi_timeout_processes: list[object] = []
+
     class Process:
         returncode = 0
 
         def __init__(self, *args, **kwargs):
             self.calls = 0
+            pi_timeout_processes.append(self)
 
         def communicate(self, **kwargs):
             self.calls += 1
@@ -9617,7 +9717,12 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
             return event.encode(), b"diag"
 
     monkeypatch.setattr(cli.subprocess, "Popen", Process)
-    monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
+    terminated: list[tuple[object, float]] = []
+
+    def record_termination(process: object, *, grace_seconds: float = 5) -> None:
+        terminated.append((process, grace_seconds))
+
+    monkeypatch.setattr(cli, "terminate_process_group", record_termination)
     timed = cli.invoke_pi(
         **{
             **kwargs,
@@ -9629,6 +9734,7 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
     )
     assert timed[0] == 124 and timed[1] == "review attempt timed out: diag"
     assert (tmp_path / "timeout-response.json").is_file()
+    assert terminated == [(pi_timeout_processes[0], 5)]
 
     class SuccessfulProcess:
         returncode = 0
@@ -9649,6 +9755,7 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
 
         def __init__(self, *args, **kwargs):
             self.calls = 0
+            pi_timeout_processes.append(self)
 
         def communicate(self, **kwargs):
             self.calls += 1
@@ -9667,6 +9774,7 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
         }
     )
     assert empty_timeout[0] == 124
+    assert terminated == [(pi_timeout_processes[0], 5), (pi_timeout_processes[1], 5)]
 
 
 def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> None:
@@ -9690,12 +9798,15 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
         "Pi exploration could not execute: denied",
     )
 
+    exploration_timeout_processes: list[object] = []
+
     class Process:
         pid = 1
         returncode = 0
 
         def __init__(self, *args, **kwargs):
             self.calls = 0
+            exploration_timeout_processes.append(self)
 
         def communicate(self, **kwargs):
             self.calls += 1
@@ -9704,8 +9815,14 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
             return b"", b""
 
     monkeypatch.setattr(cli.subprocess, "Popen", Process)
-    monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
+    terminated: list[tuple[object, float]] = []
+
+    def record_termination(process: object, *, grace_seconds: float = 5) -> None:
+        terminated.append((process, grace_seconds))
+
+    monkeypatch.setattr(cli, "terminate_process_group", record_termination)
     assert cli.invoke_pi_exploration(**kwargs)[0] == 124
+    assert terminated == [(exploration_timeout_processes[0], 5)]
 
     class Success:
         returncode = 0
