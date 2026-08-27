@@ -27,9 +27,12 @@ class FakeRunner:
             "repository": {"visibility": "private"},
         }
         self.calls: list[tuple[str, ...]] = []
+        self.cwds: list[Path] = []
+        self.timeouts: list[int] = []
 
     def __call__(self, command, *, cwd: Path, timeout_seconds: int) -> CommandResult:
-        del cwd, timeout_seconds
+        self.cwds.append(cwd)
+        self.timeouts.append(timeout_seconds)
         self.calls.append(tuple(command))
         if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7"):
             return CommandResult(0, json.dumps(self.metadata).encode(), b"")
@@ -53,7 +56,7 @@ class FakeRunner:
 
 def test_local_source_freezes_metadata_diff_and_exact_commit_content(tmp_path: Path) -> None:
     runner = FakeRunner()
-    snapshot = LocalGitHubSource(tmp_path, runner=runner).resolve(
+    snapshot = LocalGitHubSource(tmp_path, runner=runner, timeout_seconds=17).resolve(
         PullRequestRef("example/project", 7)
     )
 
@@ -69,6 +72,8 @@ def test_local_source_freezes_metadata_diff_and_exact_commit_content(tmp_path: P
     assert snapshot.snapshot_sha256
     assert any(command[:2] == ("gh", "api") for command in runner.calls)
     assert ("git", "show", f"{HEAD}:src/app.py") in runner.calls
+    assert runner.cwds and all(cwd == tmp_path.resolve() for cwd in runner.cwds)
+    assert runner.timeouts and set(runner.timeouts) == {17}
 
 
 def test_source_refuses_stale_checkout(tmp_path: Path) -> None:

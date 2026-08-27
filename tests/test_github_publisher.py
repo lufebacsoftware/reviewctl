@@ -79,12 +79,17 @@ class FakeRunner:
         self.comments = comments or {1: []}
         self.reviews = reviews or {1: []}
         self.calls: list[tuple[str, ...]] = []
+        self.cwds: list[Path] = []
+        self.timeouts: list[int] = []
+        self.inputs: list[bytes | None] = []
         self.post_payload = None
 
     def __call__(
         self, command, *, cwd: Path, timeout_seconds: int, input_bytes: bytes | None = None
     ) -> CommandResult:
-        del cwd, timeout_seconds
+        self.cwds.append(cwd)
+        self.timeouts.append(timeout_seconds)
+        self.inputs.append(input_bytes)
         call = tuple(command)
         self.calls.append(call)
         endpoint = command[2]
@@ -119,11 +124,13 @@ def post_calls(runner: FakeRunner) -> list[tuple[str, ...]]:
     ]
 
 
-def test_publisher_reconciles_both_comment_and_review_bodies_and_posts_one_group() -> None:
+def test_publisher_reconciles_both_comment_and_review_bodies_and_posts_one_group(
+    tmp_path: Path,
+) -> None:
     plan = make_plan()
     runner = FakeRunner(comments={1: [{"id": 1, "body": "unrelated"}], 2: []}, reviews={1: []})
 
-    result = GitHubPublisher(Path("."), runner=runner, page_size=2).publish(plan)
+    result = GitHubPublisher(tmp_path, runner=runner, timeout_seconds=19, page_size=2).publish(plan)
 
     assert result.status == "published"
     assert result.summary_comment_id == "9001"
@@ -134,6 +141,9 @@ def test_publisher_reconciles_both_comment_and_review_bodies_and_posts_one_group
     assert runner.post_payload["commit_id"] == HEAD
     assert runner.post_payload["comments"][0]["path"] == "src/app.py"
     assert "finding-summary" in runner.post_payload["body"]
+    assert runner.cwds and all(cwd == tmp_path.resolve() for cwd in runner.cwds)
+    assert runner.timeouts and set(runner.timeouts) == {19}
+    assert any(input_bytes is not None for input_bytes in runner.inputs)
 
 
 def test_publisher_skips_existing_markers_even_on_a_later_head() -> None:
