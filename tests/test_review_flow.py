@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 
+import reviewctl.review_flow as review_flow_module
 from reviewctl.contracts import (
     ContractContext,
     ContractFragment,
@@ -4512,3 +4513,310 @@ def test_validate_v2_receipt_rejects_unhashable_review_values_without_raising(
     _sign_receipt(receipt)
 
     assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+def test_completion_manifest_rejects_optional_bad_packet_and_non_bool_flag() -> None:
+    evaluation = incomplete_evaluation(finding())
+    request = evaluation.completion_request
+    assert request is not None
+    arguments = {
+        "prepared_digest": request.prepared_digest,
+        "packet_digest": request.packet_digest,
+        "missing_fields": request.missing_fields,
+        "invalid_fragment_indexes": request.invalid_fragment_indexes,
+        "violations": request.violations,
+        "sequence_type": tuple,
+        "require_packet_digest": False,
+        "review_declaration_required": False,
+        "require_findings_gap": True,
+    }
+    assert review_flow_module._valid_completion_manifest(**arguments)
+    assert not review_flow_module._valid_completion_manifest(
+        **{**arguments, "packet_digest": "c" * 63}
+    )
+    assert not review_flow_module._valid_completion_manifest(
+        **{**arguments, "review_declaration_required": 1}
+    )
+
+
+def test_ordered_coverage_rejects_wrong_containers_and_non_text_fields() -> None:
+    assert not review_flow_module._valid_ordered_coverage_partition(
+        "verdict", ["verdict"], ["findings"]
+    )
+    assert not review_flow_module._valid_ordered_coverage_partition(
+        ["verdict", 7], ["verdict"], ["findings"]
+    )
+
+
+def test_coverage_matching_rejects_unknown_and_impossible_rules() -> None:
+    assert not review_flow_module._coverage_matches_violation(
+        "unknown",
+        ["verdict", "findings"],
+        ["verdict"],
+        ["findings"],
+        fragment_count=0,
+    )
+    assert not review_flow_module._coverage_matches_violation(
+        "review-declaration",
+        ["verdict", "findings"],
+        ["verdict"],
+        ["findings"],
+        fragment_count=0,
+    )
+
+
+def test_promoted_finding_rejects_prepared_context_exception(monkeypatch) -> None:
+    fragment = promoted(finding())[0]
+
+    def fail_prepare(name: str):
+        raise ValueError(name)
+
+    monkeypatch.setattr(review_flow_module, "get_contract", fail_prepare)
+    assert review_flow_module._validated_promoted_finding(fragment) is None
+
+
+def test_completion_context_rejects_non_fragment_duplicate_and_unsorted_provenance() -> None:
+    evaluation = incomplete_evaluation(finding())
+    request = evaluation.completion_request
+    assert request is not None
+    fragment = promoted(finding(), attempt=1)[0]
+    context = build_completion_context(
+        request,
+        (fragment,),
+        allowed_file_names=("source.py",),
+    )
+    item = context.findings[0]
+    assert not review_flow_module._validate_completion_context(
+        replace(context, findings=(replace(item, sources=(object(),)),))
+    )
+
+    duplicate = replace(item, sources=(fragment, fragment))
+    assert not review_flow_module._validate_completion_context(
+        replace(context, findings=(duplicate,))
+    )
+
+    later = promoted(finding(), attempt=2)[0]
+    unsorted = replace(item, sources=(later, fragment))
+    assert not review_flow_module._validate_completion_context(
+        replace(context, findings=(unsorted,))
+    )
+
+
+def test_promote_contract_fragments_rejects_invalid_duplicate_and_prepared_digest(
+    monkeypatch,
+) -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = ContractContext(file_names=("source.py",))
+    fragment = evaluation.valid_fragments[0]
+    common = {
+        "contract_name": "findings-json",
+        "contract_version": "1",
+        "prepared_digest": evaluation.prepared_digest,
+        "payload_digest": evaluation.payload_digest,
+        "packet_digest": "b" * 64,
+        "contract_context": context,
+        "attempt": 1,
+        "route_index": 0,
+        "raw_response_digest": evaluation.payload_digest,
+    }
+    assert review_flow_module._promote_contract_fragments((fragment,), **common)
+    assert (
+        review_flow_module._promote_contract_fragments(
+            (fragment,), **{**common, "contract_name": "document"}
+        )
+        is None
+    )
+    assert (
+        review_flow_module._promote_contract_fragments(
+            (fragment,), **{**common, "prepared_digest": "c" * 64}
+        )
+        is None
+    )
+
+    monkeypatch.setattr(review_flow_module, "_contract_fragments_are_canonical", lambda _: True)
+    assert review_flow_module._promote_contract_fragments((fragment, fragment), **common) is None
+
+    def fail_prepare(name: str):
+        raise ValueError(name)
+
+    monkeypatch.setattr(review_flow_module, "get_contract", fail_prepare)
+    assert review_flow_module._promote_contract_fragments((fragment,), **common) is None
+
+
+def test_promote_fragments_rejects_contract_validation_exception(monkeypatch) -> None:
+    evaluation = incomplete_evaluation(finding())
+    context = ContractContext(file_names=("source.py",))
+
+    def fail_prepare(name: str):
+        raise ValueError(name)
+
+    monkeypatch.setattr(review_flow_module, "get_contract", fail_prepare)
+    assert (
+        promote_fragments(
+            evaluation,
+            contract_context=context,
+            gate_result="contract-incomplete",
+            attempt=1,
+            route_index=0,
+            raw_response_digest=evaluation.payload_digest,
+        )
+        == ()
+    )
+
+
+def test_build_completion_context_rejects_invalid_built_context(monkeypatch) -> None:
+    evaluation = incomplete_evaluation(finding())
+    request = evaluation.completion_request
+    assert request is not None
+    fragment = promoted(finding())[0]
+    monkeypatch.setattr(review_flow_module, "_validate_completion_context", lambda _: False)
+    with pytest.raises(ValueError, match="invalid completion context"):
+        build_completion_context(request, (fragment,), allowed_file_names=("source.py",))
+
+
+def test_consolidate_rejects_hostile_context_and_prepared_exception(monkeypatch) -> None:
+    class HostileContext(ContractContext):
+        pass
+
+    assert (
+        consolidate(
+            None,
+            (),
+            None,
+            contract_context=HostileContext(file_names=()),
+        ).status
+        == "unavailable"
+    )
+
+    def fail_prepare(name: str):
+        raise ValueError(name)
+
+    monkeypatch.setattr(review_flow_module, "get_contract", fail_prepare)
+    assert (
+        consolidate(
+            None,
+            (),
+            None,
+            contract_context=ContractContext(file_names=("source.py",)),
+        ).status
+        == "unavailable"
+    )
+
+
+def test_receipt_helpers_fail_closed_for_malformed_values() -> None:
+    assert (
+        review_flow_module._receipt_normalized_review(
+            {"verdict": "approved", "findings": [], "reviewedFiles": "source.py"}
+        )
+        is None
+    )
+    assert (
+        review_flow_module._receipt_contract_context(
+            {"fileNames": "source.py", "reviewDeclarationRequired": False}
+        )
+        is None
+    )
+    assert review_flow_module._fallback_reason_for_attempt(object()) is None
+    assert review_flow_module._fallback_reason_for_attempt({"result": "incomplete"}) == "incomplete"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("legacy-output", "contract-evaluation"),
+        ("bad-evaluation", "contract-evaluation"),
+        ("bad-normalized", "contract-evaluation"),
+        ("promoted-type", "promoted-fragments"),
+        ("result-type", "result"),
+        ("later-accepted", "accepted-attempt"),
+        ("unknown-result", "result"),
+        ("kiro-qualification", "backend-qualification"),
+        ("non-kiro-qualification", "backend-qualification"),
+        ("missing-kiro-waiver", "kiro-identity-waiver"),
+        ("unexpected-kiro-waiver", "kiro-identity-waiver"),
+        ("non-product-output", "contract-evaluation"),
+        ("bad-relationship-kind", "fallback-relationships"),
+        ("bad-relationship-shape", "fallback-relationships"),
+    ],
+)
+def test_validate_v2_receipt_rejects_remaining_trust_boundary_mutations(
+    mutation: str, expected: str
+) -> None:
+    receipt = v2_legacy_receipt() if mutation == "legacy-output" else v2_findings_receipt()
+    if mutation == "legacy-output":
+        receipt["attempts"][0]["contractOutput"] = {}
+    elif mutation == "bad-evaluation":
+        receipt["attempts"][0]["contractEvaluation"] = []
+    elif mutation == "bad-normalized":
+        receipt["attempts"][1]["contractEvaluation"]["normalizedValue"] = {
+            "verdict": "approved",
+            "findings": [{}],
+        }
+    elif mutation == "promoted-type":
+        receipt["attempts"][0]["promotedFragments"] = {}
+    elif mutation == "result-type":
+        receipt["result"] = None
+    elif mutation == "later-accepted":
+        later = deepcopy(receipt["attempts"][1])
+        later["number"] = 3
+        receipt["attempts"].append(later)
+    elif mutation == "unknown-result":
+        receipt["result"] = "mystery"
+    elif mutation in {"kiro-qualification", "missing-kiro-waiver"}:
+        receipt["sourceClass"] = "proprietary" if mutation == "missing-kiro-waiver" else "synthetic"
+        receipt["routes"][1]["transport"] = "kiro"
+        receipt["attempts"][1]["route"]["transport"] = "kiro"
+        receipt["attempts"][1]["transport"] = "kiro"
+        if mutation == "kiro-qualification":
+            receipt["extension.backendQualification"] = "qualified"
+    elif mutation == "non-kiro-qualification":
+        receipt["extension.backendQualification"] = "unqualified"
+    elif mutation == "unexpected-kiro-waiver":
+        receipt["extension.kiroUnresolvedIdentityWaiver"] = True
+    elif mutation == "non-product-output":
+        receipt["attempts"][1]["contractOutput"] = {}
+    elif mutation == "bad-relationship-kind":
+        receipt["fallbackRelationships"][0]["kind"] = "retry"
+    elif mutation == "bad-relationship-shape":
+        receipt["fallbackRelationships"] = []
+    _sign_receipt(receipt)
+
+    assert expected in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_rejects_normalized_finding_outside_context() -> None:
+    receipt = v2_findings_receipt()
+    receipt["attempts"][1]["contractEvaluation"]["normalizedValue"] = {
+        "verdict": "changes-requested",
+        "findings": [finding(path="other.py")],
+    }
+    _sign_receipt(receipt)
+
+    assert "contract-evaluation" in validate_v2_receipt(receipt)
+
+
+def test_validate_v2_receipt_rejects_promotion_reproduction_exception(monkeypatch) -> None:
+    receipt = v2_findings_receipt()
+    _sign_receipt(receipt)
+
+    def fail_promotion(*args, **kwargs):
+        raise ValueError("hostile promotion")
+
+    monkeypatch.setattr(review_flow_module, "_promote_contract_fragments", fail_promotion)
+    assert "promoted-fragments" in validate_v2_receipt(receipt)
+
+
+@pytest.mark.parametrize("mode", ["synthetic", "proprietary"])
+def test_validate_v2_receipt_accepts_valid_kiro_qualification(mode: str) -> None:
+    receipt = v2_findings_receipt()
+    receipt["sourceClass"] = mode
+    receipt["routes"][1]["transport"] = "kiro"
+    receipt["attempts"][1]["route"]["transport"] = "kiro"
+    receipt["attempts"][1]["transport"] = "kiro"
+    receipt["extension.backendQualification"] = "unqualified"
+    receipt["extension.mergeGateEligible"] = False
+    if mode == "proprietary":
+        receipt["extension.kiroUnresolvedIdentityWaiver"] = True
+    _sign_receipt(receipt)
+
+    assert validate_v2_receipt(receipt) == ()
