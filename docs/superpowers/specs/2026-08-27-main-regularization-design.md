@@ -34,7 +34,9 @@ remaining outside remote CI.
 
 The same 1,379 tests and build also pass on Python 3.14.6, with the same 89.43% coverage result.
 Python 3.14 is a stable bugfix release line and Ruff supports `py314`, so the migration does not
-depend on a preview runtime or syntax target.
+depend on a preview runtime or syntax target. After changing Ruff's target to `py314`, the exact
+format check reports 15 files: the original 12 plus `cli.py`, `contracts.py`, and
+`review_flow.py`.
 
 ## Python 3.14 Baseline
 
@@ -77,7 +79,7 @@ security and evidence changes. It is not the baseline-repair strategy.
 1. Migrate package metadata, Ruff, uv, CI, release, and current compatibility documentation to
    Python 3.14 in one bounded infrastructure commit. Verify the pre-existing test behavior on
    3.14 before relying on the new default.
-2. Apply Ruff's formatter only to the 12 files reported by the exact CI command. Keep this as a
+2. Apply Ruff's formatter only to the 15 files reported by the exact Python 3.14 CI command. Keep this as a
    mechanical commit with no semantic edits.
 3. Restore coverage module by module using focused tests. Prefer owner-native public behavior
    and existing test seams; test private branches only when they encode observable security or

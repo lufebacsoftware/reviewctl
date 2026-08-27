@@ -118,12 +118,15 @@ git commit -m "chore: require Python 3.14"
 **Files:**
 
 - Modify: `src/reviewctl/api.py`
+- Modify: `src/reviewctl/cli.py`
+- Modify: `src/reviewctl/contracts.py`
 - Modify: `src/reviewctl/github.py`
 - Modify: `src/reviewctl/github_publisher.py`
 - Modify: `src/reviewctl/identity.py`
 - Modify: `src/reviewctl/journal.py`
 - Modify: `src/reviewctl/pi_transport.py`
 - Modify: `src/reviewctl/project_cli.py`
+- Modify: `src/reviewctl/review_flow.py`
 - Modify: `tests/test_api.py`
 - Modify: `tests/test_cli_front_door.py`
 - Modify: `tests/test_config.py`
@@ -136,15 +139,16 @@ git commit -m "chore: require Python 3.14"
 uv run --python 3.14 ruff format --check .
 ```
 
-Expected: exactly the 12 files above are reported.
+Expected: exactly the 15 files above are reported.
 
 - [ ] **Step 2: Format only those files**
 
 ```bash
 uv run --python 3.14 ruff format \
-  src/reviewctl/api.py src/reviewctl/github.py src/reviewctl/github_publisher.py \
+  src/reviewctl/api.py src/reviewctl/cli.py src/reviewctl/contracts.py \
+  src/reviewctl/github.py src/reviewctl/github_publisher.py \
   src/reviewctl/identity.py src/reviewctl/journal.py src/reviewctl/pi_transport.py \
-  src/reviewctl/project_cli.py tests/test_api.py tests/test_cli_front_door.py \
+  src/reviewctl/project_cli.py src/reviewctl/review_flow.py tests/test_api.py tests/test_cli_front_door.py \
   tests/test_config.py tests/test_github_cli.py tests/test_github_source.py
 ```
 
@@ -162,9 +166,10 @@ Expected: all commands pass and no file outside the list changed.
 - [ ] **Step 4: Commit the mechanical delta**
 
 ```bash
-git add src/reviewctl/api.py src/reviewctl/github.py src/reviewctl/github_publisher.py \
+git add src/reviewctl/api.py src/reviewctl/cli.py src/reviewctl/contracts.py \
+  src/reviewctl/github.py src/reviewctl/github_publisher.py \
   src/reviewctl/identity.py src/reviewctl/journal.py src/reviewctl/pi_transport.py \
-  src/reviewctl/project_cli.py tests/test_api.py tests/test_cli_front_door.py \
+  src/reviewctl/project_cli.py src/reviewctl/review_flow.py tests/test_api.py tests/test_cli_front_door.py \
   tests/test_config.py tests/test_github_cli.py tests/test_github_source.py
 git commit -m "style: restore Ruff format baseline"
 ```
