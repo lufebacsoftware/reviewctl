@@ -227,7 +227,7 @@ def test_publisher_fails_closed_on_malformed_reconciliation_page() -> None:
 def test_publisher_does_not_claim_success_for_malformed_post_response() -> None:
     class BadPostRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds, input_bytes=None):
-            if "--method" in command:
+            if "--method" in command and command[command.index("--method") + 1] == "POST":
                 self.calls.append(tuple(command))
                 return CommandResult(0, b"{}", b"")
             return super().__call__(
@@ -313,6 +313,32 @@ def test_publisher_rejects_malformed_reconciliation_page(raw: bytes) -> None:
     )
     with pytest.raises(publisher_module.GitHubPublisherError, match="reconciliation"):
         publisher._page("endpoint", 1)
+
+
+def test_reconciliation_page_explicitly_uses_get_with_query_fields() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command, *, cwd, timeout_seconds, input_bytes=None):
+        del cwd, timeout_seconds, input_bytes
+        calls.append(tuple(command))
+        return CommandResult(0, b"[]", b"")
+
+    publisher = GitHubPublisher(Path("."), runner=runner, page_size=7)
+
+    assert publisher._page("endpoint", 3) == []
+    assert calls == [
+        (
+            "gh",
+            "api",
+            "endpoint",
+            "--method",
+            "GET",
+            "-f",
+            "per_page=7",
+            "-f",
+            "page=3",
+        )
+    ]
 
 
 @pytest.mark.parametrize(

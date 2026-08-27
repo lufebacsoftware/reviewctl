@@ -143,6 +143,8 @@ class GitHubPublisher:
                 "gh",
                 "api",
                 endpoint,
+                "--method",
+                "GET",
                 "-f",
                 f"per_page={self.page_size}",
                 "-f",
