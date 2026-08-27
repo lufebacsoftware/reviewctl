@@ -582,6 +582,36 @@ def test_client_maps_transport_and_empty_response_failures(tmp_path: Path) -> No
     assert result.status == "transport_unavailable"
 
 
+def test_client_rejects_failed_execution_with_parseable_response(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+
+    class FailedExecutionTransport:
+        def execute(self, request):
+            return BackendExecution(
+                exit_code=1,
+                diagnostic="provider failed",
+                response=PersistedResponse(
+                    conversation_id="failed-but-parseable",
+                    cost_usd=0.0,
+                    duration_ms=1,
+                    input_tokens=1,
+                    model=request.model,
+                    output_tokens=1,
+                    provider="fake",
+                    response='{"verdict":"approved","findings":[]}',
+                ),
+                evidence=BackendEvidence(),
+            )
+
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FailedExecutionTransport()})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == "transport_unavailable"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "transport_unavailable"
+
+
 def test_merge_findings_deduplicates_identical_values() -> None:
     value = Finding("high", "source.py", 1, "title", "evidence", "reproduction")
     assert ReviewClient._merge_findings((value,), (value,)) == (value,)

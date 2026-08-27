@@ -455,7 +455,11 @@ class ReviewClient:
                         }
                     )
                 continue
-            if execution.response is None or not execution.response.response.strip():
+            if (
+                execution.exit_code != 0
+                or execution.response is None
+                or not execution.response.response.strip()
+            ):
                 diagnostic = _execution_diagnostic(execution)
                 attempts.append({"attempt": index, "route": route_label, "status": diagnostic.code})
                 last_diagnostic = diagnostic
