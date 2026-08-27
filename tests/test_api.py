@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from reviewctl.api import MAX_SOURCE_BYTES, ReviewClient, ReviewRequest, verify_project_receipt
+import reviewctl.api as api_module
+from reviewctl.api import (
+    MAX_SOURCE_BYTES,
+    Finding,
+    ReviewClient,
+    ReviewRequest,
+    verify_project_receipt,
+)
 from reviewctl.backends import BackendEvidence, BackendExecution, PersistedResponse
+from reviewctl.contracts import ContractFragment, EvaluationStatus, FragmentKind
 from reviewctl.errors import JournalOperationError
 
 
@@ -335,3 +344,293 @@ def test_client_findings_does_not_hide_journal_corruption(tmp_path: Path) -> Non
         client.findings()
 
     assert error.value.diagnostic.code == "journal_corrupt"
+
+
+def test_finding_requires_fields_and_integer_line() -> None:
+    with pytest.raises(ValueError, match="required"):
+        Finding.from_value({"severity": "high"})
+    value = {
+        "severity": "high",
+        "path": "source.py",
+        "line": "3",
+        "title": "Title",
+        "evidence": "Evidence",
+        "reproduction": "Reproduce",
+    }
+    with pytest.raises(ValueError, match="integer"):
+        Finding.from_value(value)
+
+
+def test_private_api_helpers_cover_ids_and_execution_diagnostics() -> None:
+    value = Finding("high", "source.py", None, "Title", "Evidence", "Reproduce")
+    assert api_module.finding_id(value).startswith("finding-")
+    assert api_module._review_id("  explicit ") == "explicit"
+    assert (
+        api_module._execution_diagnostic(BackendExecution(124, "", None, BackendEvidence())).code
+        == "timeout"
+    )
+    assert (
+        api_module._execution_diagnostic(
+            BackendExecution(1, "provider failed", None, BackendEvidence())
+        ).code
+        == "transport_unavailable"
+    )
+    assert (
+        api_module._execution_diagnostic(BackendExecution(0, "", None, BackendEvidence())).code
+        == "empty_response"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[], {"bad": object()}, "not-object"],
+)
+def test_source_context_rejects_nonmapping_unsafe_and_nonobject_values(value: object) -> None:
+    with pytest.raises(ValueError, match="source context"):
+        api_module._normalize_source_context(value)  # type: ignore[arg-type]
+
+
+def test_source_context_rejects_oversized_encoded_value() -> None:
+    with pytest.raises(ValueError, match="limit"):
+        api_module._normalize_source_context({"payload": "x" * 33_000})
+
+
+def test_source_context_rejects_nonobject_decoded_value(monkeypatch) -> None:
+    monkeypatch.setattr(api_module.json, "loads", lambda encoded: [])
+    with pytest.raises(ValueError, match="object"):
+        api_module._normalize_source_context({"value": 1})
+
+
+def test_client_rejects_empty_prompt_unknown_profile_and_bad_dimensions(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    assert client.review(ReviewRequest(prompt=" ")).status == "invalid_request"
+    assert (
+        client.review(ReviewRequest(prompt="review", profile="missing")).status == "config_invalid"
+    )
+    assert (
+        client.review(ReviewRequest(prompt="review", dimensions=("security", "security"))).status
+        == "invalid_request"
+    )
+
+
+def test_client_rejects_sensitive_remote_and_empty_route_profiles(tmp_path: Path) -> None:
+    project = tmp_path / "reviewctl.toml"
+    project.write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        '[profiles.remote]\nroutes = ["pi:model"]\nexecution = "remote"\n'
+        '[profiles.empty]\nroutes = []\nexecution = "local"\n'
+    )
+    config = api_module.load_config(tmp_path, user_path=None)
+    config = replace(config, project=replace(config.project, privacy_mode="sensitive"))
+    client = ReviewClient(tmp_path, config, {"pi": FakeTransport()})
+    assert (
+        client.review(ReviewRequest(prompt="review", profile="remote")).status == "privacy_denied"
+    )
+    assert client.review(ReviewRequest(prompt="review", profile="empty")).status == "route_invalid"
+
+
+def test_from_project_constructs_default_pi_transport(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path)
+    assert "pi" in client.transports
+
+
+def test_client_rejects_explicit_and_duplicate_review_ids(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    first = client.review(ReviewRequest(prompt="review", review_id="explicit"))
+    second = client.review(ReviewRequest(prompt="review", review_id="explicit"))
+    assert first.status == "accepted"
+    assert second.status == "invalid_request"
+
+
+def test_client_rejects_relative_outside_missing_and_invalid_utf8_files(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    (tmp_path / "valid.py").write_text("value = 1\n")
+    assert (
+        client.review(ReviewRequest(prompt="review", files=(Path("valid.py"),))).status
+        == "accepted"
+    )
+    assert (
+        client.review(ReviewRequest(prompt="review", files=(Path("missing.py"),))).status
+        == "invalid_request"
+    )
+    assert (
+        client.review(
+            ReviewRequest(prompt="review", files=(tmp_path.parent / "outside.py",))
+        ).status
+        == "privacy_denied"
+    )
+    invalid = tmp_path / "invalid.py"
+    invalid.write_bytes(b"\xff\xfe")
+    result = client.review(ReviewRequest(prompt="review", files=(invalid,)))
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "UTF-8" in result.diagnostic.message
+
+
+def test_client_rejects_non_json_source_context(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review", source_context=object()))
+    assert result.status == "invalid_request"
+
+
+def test_client_rejects_read_errors_and_post_stat_growth(tmp_path: Path, monkeypatch) -> None:
+    write_default_config(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("value = 1\n")
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    original_read = Path.read_bytes
+
+    def fail_read(path: Path) -> bytes:
+        if path == source:
+            raise OSError("denied")
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read)
+    result = client.review(ReviewRequest(prompt="review", files=(source,)))
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "could not be read" in result.diagnostic.message
+
+    monkeypatch.setattr(Path, "read_bytes", lambda path: b"x" * (MAX_SOURCE_BYTES + 1))
+    result = client.review(ReviewRequest(prompt="review", files=(source,)))
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "exceeds" in result.diagnostic.message
+
+
+def test_client_rejects_unknown_contract_and_unregistered_transport(tmp_path: Path) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[profiles.default]\nroutes = ["llm:model"]\nresponse_contract = "unknown-contract"\n'
+    )
+    client = ReviewClient.from_project(tmp_path, transports={})
+    result = client.review(ReviewRequest(prompt="review"))
+    assert result.status == "contract_failed"
+
+    (tmp_path / "reviewctl.toml").write_text('[profiles.default]\nroutes = ["llm:model"]\n')
+    client = ReviewClient.from_project(tmp_path, transports={})
+    result = client.review(ReviewRequest(prompt="review"))
+    assert result.status == "transport_unavailable"
+
+    (tmp_path / "reviewctl.toml").write_text(
+        '[profiles.default]\nroutes = ["llm:first", "llm:second"]\n'
+    )
+    client = ReviewClient.from_project(tmp_path, transports={})
+    result = client.review(ReviewRequest(prompt="review"))
+    assert result.status == "transport_unavailable"
+
+
+class RaisingTransport:
+    def execute(self, request):
+        raise ValueError("transport exploded")
+
+
+class EmptyTransport:
+    def execute(self, request):
+        return BackendExecution(
+            0, "", PersistedResponse("id", 0, 1, 1, "model", 1, "provider", ""), BackendEvidence()
+        )
+
+
+def test_client_maps_transport_and_empty_response_failures(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    raising = ReviewClient.from_project(tmp_path, transports={"pi": RaisingTransport()})
+    assert raising.review(ReviewRequest(prompt="review")).status == "transport_unavailable"
+    empty = ReviewClient.from_project(tmp_path, transports={"pi": EmptyTransport()})
+    result = empty.review(ReviewRequest(prompt="review"))
+    assert result.status == "empty_response"
+
+    (tmp_path / "reviewctl.toml").write_text(
+        '[profiles.default]\nroutes = ["pi:first", "pi:second"]\n'
+    )
+    raising = ReviewClient.from_project(tmp_path, transports={"pi": RaisingTransport()})
+    result = raising.review(ReviewRequest(prompt="review"))
+    assert result.status == "transport_unavailable"
+
+
+def test_merge_findings_deduplicates_identical_values() -> None:
+    value = Finding("high", "source.py", 1, "title", "evidence", "reproduction")
+    assert ReviewClient._merge_findings((value,), (value,)) == (value,)
+
+
+def test_client_maps_contract_evaluation_exception(tmp_path: Path, monkeypatch) -> None:
+    write_default_config(tmp_path)
+    real_contract = api_module.get_contract("findings-json")
+
+    class RaisingContract:
+        def prepare(self, context):
+            return real_contract.prepare(context)
+
+        def evaluate(self, *args, **kwargs):
+            raise ValueError("evaluation exploded")
+
+    monkeypatch.setattr(api_module, "get_contract", lambda name: RaisingContract())
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review"))
+    assert result.status == "contract_failed"
+
+
+def test_client_handles_malformed_complete_and_incomplete_findings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    write_default_config(tmp_path)
+    real_contract = api_module.get_contract("findings-json")
+    original_evaluate = real_contract.evaluate
+    state = {"status": EvaluationStatus.COMPLETE}
+
+    class MalformedContract:
+        def prepare(self, context):
+            return real_contract.prepare(context)
+
+        def evaluate(self, payload, prepared, context, *, evidence=None):
+            base = original_evaluate('{"verdict":"approved","findings":[]}', prepared, context)
+            if state["status"] is EvaluationStatus.COMPLETE:
+                return base.__class__(**{**base.__dict__, "value": {"findings": [{"bad": True}]}})
+            fragment = ContractFragment(
+                "f", "f", FragmentKind.FINDING, {"bad": True}, base.payload_digest, ()
+            )
+            return base.__class__(
+                **{
+                    **base.__dict__,
+                    "status": EvaluationStatus.INCOMPLETE,
+                    "value": None,
+                    "normalized_digest": None,
+                    "valid_fragments": (fragment,),
+                }
+            )
+
+    monkeypatch.setattr(api_module, "get_contract", lambda name: MalformedContract())
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    assert client.review(ReviewRequest(prompt="review")).status == "contract_failed"
+    state["status"] = EvaluationStatus.INCOMPLETE
+    assert client.review(ReviewRequest(prompt="review")).status == "contract_failed"
+
+
+def test_client_returns_partial_when_all_attempts_are_incomplete(tmp_path: Path) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[profiles.default]\nroutes = ["pi:model"]\nexecution = "local"\n'
+    )
+    partial = (
+        '{"findings":[{"severity":"high","path":"source.py","line":1,'
+        '"title":"t","evidence":"e","reproduction":"r"}]}'
+    )
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport(partial)})
+    result = client.review(ReviewRequest(prompt="review"))
+    assert result.status == "partial"
+    assert len(result.findings) == 1
+
+
+def test_verify_project_receipt_rejects_unreadable_and_missing_digest(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.json"
+    diagnostic = verify_project_receipt(missing)
+    assert diagnostic is not None
+    assert diagnostic.code == "receipt_invalid"
+    no_digest = tmp_path / "no-digest.json"
+    no_digest.write_text("{}")
+    diagnostic = verify_project_receipt(no_digest)
+    assert diagnostic is not None
+    assert diagnostic.code == "receipt_invalid"
