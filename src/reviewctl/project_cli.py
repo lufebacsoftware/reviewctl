@@ -8,12 +8,14 @@ import secrets
 import shutil
 import sys
 import tempfile
+from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 from reviewctl.api import (
+    Finding,
     ReviewClient,
     ReviewRequest,
     ReviewResult,
@@ -245,6 +247,25 @@ def _materialized_github_files(project_dir: Path, snapshot: PullRequestSnapshot)
         yield tuple(paths)
 
 
+def _map_github_finding_paths(
+    snapshot: PullRequestSnapshot, findings: Sequence[Finding]
+) -> tuple[Finding, ...]:
+    paths_by_basename: dict[str, str] = {}
+    duplicate_basenames: set[str] = set()
+    for changed_file in snapshot.changed_files:
+        basename = Path(changed_file.path).name
+        if basename in paths_by_basename:
+            duplicate_basenames.add(basename)
+        else:
+            paths_by_basename[basename] = changed_file.path
+    return tuple(
+        replace(finding, path=paths_by_basename[finding.path])
+        if finding.path in paths_by_basename and finding.path not in duplicate_basenames
+        else finding
+        for finding in findings
+    )
+
+
 def _github_plan_payload(plan: ReviewPublicationPlan) -> dict[str, Any]:
     return {**plan.to_payload(), "planSha256": plan.plan_sha256, "mode": "dry-run"}
 
@@ -350,7 +371,7 @@ def github_review_project(args: Any) -> int:
                 **asdict(finding),
                 "findingId": finding_id(finding),
             }
-            for finding in result.findings
+            for finding in _map_github_finding_paths(snapshot, result.findings)
         )
         if plan_status == "accepted"
         else ()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -181,6 +182,49 @@ def test_github_review_is_dry_run_and_passes_typed_context_to_existing_flow(
     assert FakeClient.request.source_context == snapshot().to_context()
     assert all(str(path).startswith(str(tmp_path)) for path in FakeClient.request.files)
     assert FakeClient.request is not None
+
+
+def test_github_review_maps_unique_basename_to_snapshot_path_for_inline_target(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    write_config(tmp_path)
+
+    class BasenameClient(FakeClient):
+        def review(self, request):
+            result = super().review(request)
+            return replace(
+                result,
+                findings=(replace(result.findings[0], path="app.py"),),
+            )
+
+    monkeypatch.setattr("reviewctl.project_cli.LocalGitHubSource", FakeSource)
+    monkeypatch.setattr("reviewctl.project_cli.ReviewClient", BasenameClient)
+
+    assert project_cli.github_review_project(github_args(tmp_path, publish=False)) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["publicationPlan"]["items"][0]["target"] == {
+        "path": "src/app.py",
+        "line": 1,
+        "side": "RIGHT",
+    }
+
+
+def test_github_finding_path_mapping_leaves_ambiguous_and_unknown_paths_unchanged() -> None:
+    ambiguous_snapshot = replace(
+        snapshot(),
+        changed_files=(
+            ChangedFileSnapshot("src/entry.py", "modified", "first"),
+            ChangedFileSnapshot("tests/entry.py", "modified", "second"),
+        ),
+    )
+    ambiguous = Finding("high", "entry.py", 1, "title", "evidence", "reproduction")
+    unknown = replace(ambiguous, path="missing.py")
+
+    assert project_cli._map_github_finding_paths(ambiguous_snapshot, (ambiguous, unknown)) == (
+        ambiguous,
+        unknown,
+    )
 
 
 def test_github_dry_run_does_not_instantiate_publisher_and_records_plan_event(
