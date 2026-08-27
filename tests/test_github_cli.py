@@ -298,7 +298,36 @@ def test_github_invalid_review_without_receipt_does_not_write_plan_to_cwd(
     assert not (tmp_path / "publication-plan.json").exists()
 
 
-def test_github_publication_event_projection_covers_all_outcomes() -> None:
+@pytest.mark.parametrize(
+    "status,event_type,extra",
+    [
+        ("skipped_duplicate", "github_comment_skipped_duplicate", {"findingId": "f1"}),
+        ("stale_head", "github_publication_stale_head", {"observedHeadSha": "c" * 40}),
+        ("stale_head_race", "github_publication_stale_head_race", {"observedHeadSha": "d" * 40}),
+        ("failed", "github_publication_failed", {"status": "failed", "diagnostic": None}),
+        (
+            "failed",
+            "github_publication_failed",
+            {
+                "status": "failed",
+                "diagnostic": Diagnostic("github_publication_failed", "failed").to_dict(),
+            },
+        ),
+        (
+            "reconciliation_incomplete",
+            "github_publication_failed",
+            {"status": "reconciliation_incomplete", "diagnostic": None},
+        ),
+        (
+            "plan_invalid",
+            "github_publication_failed",
+            {"status": "plan_invalid", "diagnostic": None},
+        ),
+    ],
+)
+def test_github_publication_event_projection_has_exact_payload(
+    status: str, event_type: str, extra: dict[str, object]
+) -> None:
     plan = project_cli.build_publication_plan(
         snapshot(),
         project_id="project-test",
@@ -321,33 +350,47 @@ def test_github_publication_event_projection_covers_all_outcomes() -> None:
         def journal(self):
             return self._journal
 
-    for result in (
-        PublicationResult("key", plan.head_sha, "skipped_duplicate", skipped_finding_ids=("f1",)),
-        PublicationResult("key", plan.head_sha, "stale_head", observed_head_sha="c" * 40),
-        PublicationResult("key", plan.head_sha, "stale_head_race", observed_head_sha="d" * 40),
-        PublicationResult("key", plan.head_sha, "failed"),
-        PublicationResult(
-            "key",
-            plan.head_sha,
-            "failed",
-            diagnostic=Diagnostic("github_publication_failed", "failed"),
-        ),
-    ):
-        client = Client()
-        project_cli._record_github_publication_events(client, plan, result)
-        assert client.journal().events
+    diagnostic = (
+        Diagnostic("github_publication_failed", "failed") if extra.get("diagnostic") else None
+    )
+    result = PublicationResult(
+        "key",
+        plan.head_sha,
+        status,
+        skipped_finding_ids=("f1",) if status == "skipped_duplicate" else (),
+        observed_head_sha=extra.get("observedHeadSha"),
+        diagnostic=diagnostic,
+    )
+    client = Client()
+    project_cli._record_github_publication_events(client, plan, result)
+    common = {
+        "publicationKey": "key",
+        "reviewId": "review-1",
+        "repository": "example/project",
+        "pullNumber": 7,
+        "headSha": plan.head_sha,
+        "type": event_type,
+    }
+    assert client.journal().events == [{**common, **extra}]
 
 
 @pytest.mark.parametrize(
-    "failure,expected",
+    "failure,expected,code,fragment",
     [
-        ("client", 5),
-        ("source", 2),
-        ("value", 2),
+        ("client", 5, "journal_corrupt", "client failed"),
+        ("source", 2, "github_path_invalid", "source failed"),
+        ("value", 2, "invalid_request", "source value failed"),
+        ("os_error", 2, "invalid_request", "source os failed"),
     ],
 )
 def test_github_front_door_setup_errors(
-    tmp_path: Path, monkeypatch, capsys, failure: str, expected: int
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    failure: str,
+    expected: int,
+    code: str,
+    fragment: str,
 ) -> None:
     write_config(tmp_path)
     args = github_args(tmp_path, publish=False)
@@ -369,7 +412,7 @@ def test_github_front_door_setup_errors(
                 raise GitHubSourceError(Diagnostic("github_path_invalid", "source failed"))
 
         monkeypatch.setattr(project_cli, "LocalGitHubSource", FailingSource)
-    else:
+    elif failure == "value":
 
         class ValueSource:
             def __init__(self, project_dir):
@@ -379,8 +422,20 @@ def test_github_front_door_setup_errors(
                 raise ValueError("source value failed")
 
         monkeypatch.setattr(project_cli, "LocalGitHubSource", ValueSource)
+    else:
+
+        class OSErrorSource:
+            def __init__(self, project_dir):
+                pass
+
+            def resolve(self, ref):
+                raise OSError("source os failed")
+
+        monkeypatch.setattr(project_cli, "LocalGitHubSource", OSErrorSource)
     assert project_cli.github_review_project(args) == expected
-    assert capsys.readouterr().out
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["diagnostic"]["code"] == code
+    assert fragment in payload["diagnostic"]["message"]
 
 
 def test_github_front_door_materialization_review_and_plan_errors(
