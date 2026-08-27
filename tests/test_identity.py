@@ -129,3 +129,89 @@ def test_identity_write_cleans_temporary_files_on_every_failure(
         store._write(identity)
     assert [path for path in store.root.glob("identity.*") if path.name != "identity.json"] == []
     monkeypatch.setattr(identity_module.os, operation, original)
+
+
+def test_identity_write_preserves_write_error_when_close_also_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+    close_attempts: list[int] = []
+
+    def fail_write(*args, **kwargs):
+        raise OSError("write failed")
+
+    def fail_close(descriptor: int) -> None:
+        close_attempts.append(descriptor)
+        raise OSError("close failed")
+
+    monkeypatch.setattr(identity_module.os, "write", fail_write)
+    monkeypatch.setattr(identity_module.os, "close", fail_close)
+    with pytest.raises(OSError, match="write failed"):
+        store._write(identity)
+    assert close_attempts
+
+
+def test_identity_write_preserves_replace_error_when_unlink_also_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+    unlink_attempts: list[str] = []
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("replace failed")
+
+    def fail_unlink(path: str) -> None:
+        unlink_attempts.append(path)
+        raise OSError("unlink failed")
+
+    monkeypatch.setattr(identity_module.os, "replace", fail_replace)
+    monkeypatch.setattr(identity_module.os, "unlink", fail_unlink)
+    with pytest.raises(OSError, match="replace failed"):
+        store._write(identity)
+    assert unlink_attempts
+
+
+def test_identity_write_preserves_standalone_unlink_error(tmp_path: Path, monkeypatch) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+
+    monkeypatch.setattr(identity_module.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(
+        identity_module.os,
+        "unlink",
+        lambda path: (_ for _ in ()).throw(OSError("unlink failed")),
+    )
+    with pytest.raises(OSError, match="unlink failed"):
+        store._write(identity)
+
+
+def test_identity_lock_preserves_body_error_when_close_also_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class SuccessfulFcntl:
+        LOCK_EX = 1
+        LOCK_UN = 2
+
+        @staticmethod
+        def flock(descriptor, mode):
+            pass
+
+    monkeypatch.setattr(identity_module, "fcntl", SuccessfulFcntl)
+    monkeypatch.setattr(
+        identity_module.os,
+        "close",
+        lambda descriptor: (_ for _ in ()).throw(OSError("close failed")),
+    )
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="body failed"):
+        with store._identity_lock():
+            raise RuntimeError("body failed")
+    with pytest.raises(OSError, match="close failed"):
+        with store._identity_lock():
+            pass

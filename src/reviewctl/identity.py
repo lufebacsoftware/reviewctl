@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -132,12 +133,26 @@ class ProjectIdentityStore:
                 os.write(descriptor, payload)
                 os.fsync(descriptor)
             finally:
-                os.close(descriptor)
+                primary = sys.exc_info()[1]
+                if primary is None:
+                    os.close(descriptor)
+                else:
+                    try:
+                        os.close(descriptor)
+                    except BaseException:
+                        pass
             os.replace(temporary, self.path)
             os.chmod(self.path, 0o600)
         finally:
+            primary = sys.exc_info()[1]
             if os.path.exists(temporary):
-                os.unlink(temporary)
+                if primary is None:
+                    os.unlink(temporary)
+                else:
+                    try:
+                        os.unlink(temporary)
+                    except BaseException:
+                        pass
 
     @contextmanager
     def _identity_lock(self):
@@ -163,8 +178,15 @@ class ProjectIdentityStore:
             acquired = True
             yield
         finally:
+            primary = sys.exc_info()[1]
             try:
                 if acquired:
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
-                os.close(descriptor)
+                if primary is None:
+                    os.close(descriptor)
+                else:
+                    try:
+                        os.close(descriptor)
+                    except BaseException:
+                        pass
