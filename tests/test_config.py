@@ -280,10 +280,10 @@ def test_config_keeps_stricter_project_privacy_and_checks_all_profiles(tmp_path:
     project.write_text(
         '[project]\nprivacy_mode = "sensitive"\n'
         '[profiles.first]\nroutes = []\nexecution = "local"\n'
-        '[profiles.second]\nroutes = []\nexecution = "local"\n'
+        '[profiles.later]\nroutes = ["pi:model"]\nexecution = "remote"\n'
     )
-    config = load_config(project, user_path=user)
-    assert config.project.privacy_mode == "sensitive"
+    with pytest.raises(ConfigError, match="sensitive"):
+        load_config(project, user_path=user)
 
 
 def test_config_identity_and_string_integer_helpers_cover_defaults() -> None:

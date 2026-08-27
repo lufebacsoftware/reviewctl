@@ -17,6 +17,7 @@ from reviewctl.api import (
 from reviewctl.backends import BackendEvidence, BackendExecution, PersistedResponse
 from reviewctl.contracts import ContractFragment, EvaluationStatus, FragmentKind
 from reviewctl.errors import JournalOperationError
+from reviewctl.pi_transport import PiTransport
 
 
 class FakeTransport:
@@ -433,7 +434,7 @@ def test_client_rejects_sensitive_remote_and_empty_route_profiles(tmp_path: Path
 def test_from_project_constructs_default_pi_transport(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     client = ReviewClient.from_project(tmp_path)
-    assert "pi" in client.transports
+    assert isinstance(client.transports["pi"], PiTransport)
 
 
 def test_client_rejects_explicit_and_duplicate_review_ids(tmp_path: Path) -> None:
