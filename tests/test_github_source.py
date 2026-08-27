@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import reviewctl.github as github_module
 from reviewctl.errors import exit_code_for
 from reviewctl.github import (
     CommandResult,
@@ -176,3 +177,138 @@ def test_github_diagnostics_have_documented_exit_classes() -> None:
     assert exit_code_for("github_checkout_stale") == 2
     assert exit_code_for("github_command_failed") == 3
     assert exit_code_for("github_visibility_unknown") == 4
+
+
+def test_github_source_command_timeout_oserror_and_success(tmp_path: Path) -> None:
+    source = LocalGitHubSource(
+        tmp_path, runner=lambda *args, **kwargs: CommandResult(124, b"", b"")
+    )
+    with pytest.raises(GitHubSourceError, match="timed out"):
+        source._run("operation", ["gh"])
+    source = LocalGitHubSource(tmp_path, runner=lambda *args, **kwargs: CommandResult(1, b"", b""))
+    with pytest.raises(GitHubSourceError, match="failed"):
+        source._run("operation", ["gh"])
+    source = LocalGitHubSource(
+        tmp_path, runner=lambda *args, **kwargs: CommandResult(0, b"ok", b"")
+    )
+    assert source._run("operation", ["gh"]) == b"ok"
+    with pytest.raises(GitHubSourceError, match="non-UTF-8"):
+        source._decode("operation", b"\xff")
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        b"not-json",
+        b"[]",
+        json.dumps({"base": {}, "head": {}}).encode(),
+    ],
+)
+def test_github_source_rejects_malformed_metadata(tmp_path: Path, metadata: bytes) -> None:
+    class MetadataRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7"):
+                return CommandResult(0, metadata, b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    with pytest.raises(GitHubSourceError, match="metadata"):
+        LocalGitHubSource(tmp_path, runner=MetadataRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+
+def test_github_source_accepts_boolean_visibility_fallback(tmp_path: Path) -> None:
+    metadata = {"base": {"sha": BASE}, "head": {"sha": HEAD}, "repository": {"private": False}}
+    snapshot = LocalGitHubSource(tmp_path, runner=FakeRunner(metadata=metadata)).resolve(
+        PullRequestRef("example/project", 7)
+    )
+    assert snapshot.visibility == "public"
+
+
+def test_github_source_rejects_diff_and_file_limits(tmp_path: Path) -> None:
+    class LargeDiffRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7.diff"):
+                return CommandResult(0, b"x" * (github_module.MAX_GITHUB_DIFF_BYTES + 1), b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    with pytest.raises(GitHubSourceError, match="limit"):
+        LocalGitHubSource(tmp_path, runner=LargeDiffRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+    many = b"".join(
+        f"diff --git a/f{i}.py b/f{i}.py\n--- a/f{i}.py\n+++ b/f{i}.py\n".encode()
+        for i in range(github_module.MAX_GITHUB_FILES + 1)
+    )
+
+    class ManyFilesRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7.diff"):
+                return CommandResult(0, many, b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    with pytest.raises(GitHubSourceError, match="file limit"):
+        LocalGitHubSource(tmp_path, runner=ManyFilesRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+
+def test_github_source_rejects_large_changed_file_and_invalid_snapshot(tmp_path: Path) -> None:
+    class LargeFileRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            if command[:2] == ["git", "show"]:
+                return CommandResult(0, b"x" * (github_module.MAX_GITHUB_FILE_BYTES + 1), b"")
+            return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    with pytest.raises(GitHubSourceError, match="changed file"):
+        LocalGitHubSource(tmp_path, runner=LargeFileRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+    class InvalidShaRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds):
+            result = super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
+            if command[:2] == ["gh", "api"] and command[2].endswith("/pulls/7"):
+                metadata = {
+                    "base": {"sha": "bad"},
+                    "head": {"sha": HEAD},
+                    "repository": {"visibility": "private"},
+                }
+                return CommandResult(0, json.dumps(metadata).encode(), b"")
+            return result
+
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=InvalidShaRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+    assert error.value.diagnostic.code == "github_metadata_invalid"
+
+
+def test_github_source_rejects_invalid_timeout_and_boolean_visibility_shape(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="timeout"):
+        LocalGitHubSource(tmp_path, timeout_seconds=0)
+
+    metadata = {
+        "base": {"sha": BASE},
+        "head": {"sha": HEAD},
+        "repository": {"private": "unknown"},
+    }
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=FakeRunner(metadata=metadata)).resolve(
+            PullRequestRef("example/project", 7)
+        )
+    assert error.value.diagnostic.code == "github_visibility_unknown"
+
+
+def test_github_source_rejects_invalid_committed_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        github_module,
+        "_diff_files",
+        lambda diff: (github_module._DiffFile("../bad", "modified"),),
+    )
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=FakeRunner()).resolve(
+            PullRequestRef("example/project", 7)
+        )
+    assert error.value.diagnostic.code == "github_path_invalid"

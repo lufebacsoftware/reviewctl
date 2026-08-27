@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import reviewctl.journal as journal_module
 from reviewctl.errors import JournalOperationError
 from reviewctl.journal import ProjectJournal
 
@@ -347,3 +348,209 @@ def test_two_origins_can_verify_independently_for_one_project(tmp_path: Path) ->
     assert second.verify() == []
     assert first.events()[0]["projectId"] == second.events()[0]["projectId"]
     assert first.events()[0]["originId"] != second.events()[0]["originId"]
+
+
+def test_journal_rejects_partial_identity_and_invalid_events(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="provided together"):
+        ProjectJournal(tmp_path / "journal.jsonl", project_id="project")
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    with pytest.raises(ValueError, match="string type"):
+        journal.append({})
+    with pytest.raises(ValueError, match="string type"):
+        journal.append({"type": 7})
+    with pytest.raises(ValueError, match="status"):
+        journal.append({"type": "finding", "status": "unknown"})
+    with pytest.raises(ValueError, match="findingId"):
+        journal.append({"type": "finding_status_changed", "from": "open", "to": "fixed"})
+    with pytest.raises(ValueError, match="from and to"):
+        journal.append(
+            {"type": "finding_status_changed", "findingId": "f", "from": 1, "to": "fixed"}
+        )
+    with pytest.raises(ValueError, match="unsupported"):
+        journal.append(
+            {"type": "finding_status_changed", "findingId": "f", "from": "bad", "to": "fixed"}
+        )
+    with pytest.raises(ValueError, match="identifiers"):
+        journal.append({"type": "review_started", "eventId": 7})
+    with pytest.raises(ValueError, match="identifiers"):
+        journal.append({"type": "review_started", "reviewId": 7})
+
+
+def test_journal_status_helpers_cover_unknown_missing_and_reason_paths(tmp_path: Path) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    with pytest.raises(JournalOperationError, match="not found"):
+        journal.append_status_change("missing", "fixed")
+    journal.append({"type": "finding", "findingId": "f", "status": "open"})
+    with pytest.raises(JournalOperationError, match="unsupported"):
+        journal.append_status_change("f", "unknown")
+    journal.append_status_change("f", "fixed", reason="  patched  ")
+    journal.append_status_change("f", "open")
+    assert "statusReason" not in journal.finding("f")
+    with pytest.raises(ValueError, match="finding not found"):
+        journal._validate_event(
+            {
+                "type": "finding_status_changed",
+                "findingId": "missing",
+                "from": "open",
+                "to": "fixed",
+            }
+        )
+    with pytest.raises(JournalOperationError, match="invalid finding status transition"):
+        journal.append_status_change("f", "verified")
+
+
+def test_journal_append_rejects_descriptor_diagnostic(tmp_path: Path, monkeypatch) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    monkeypatch.setattr(
+        journal,
+        "_read_descriptor",
+        lambda descriptor: ([], journal_module.Diagnostic("journal_corrupt", "bad descriptor")),
+    )
+    with pytest.raises(JournalOperationError, match="bad descriptor"):
+        journal.append({"type": "review_started"})
+
+
+def test_journal_envelope_identity_and_read_diagnostics(tmp_path: Path, monkeypatch) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl", project_id="p", origin_id="o")
+    with pytest.raises(JournalOperationError, match="identity"):
+        journal._with_envelope(
+            {"type": "review_started"}, [{"projectId": "other", "schemaVersion": 1}]
+        )
+
+    journal.path.write_text(
+        '{"schemaVersion":1,"projectId":"p","originId":"o","sequence":1,"type":"review_started"}\n'
+    )
+    events, diagnostic = journal.read_with_diagnostic()
+    assert events and diagnostic is not None
+    assert journal.findings_with_diagnostic()[1] is not None
+    with pytest.raises(JournalOperationError):
+        journal.head_sequence()
+    monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(OSError("denied")))
+    assert journal.verify()
+
+
+def test_journal_lock_failures_are_typed(tmp_path: Path, monkeypatch) -> None:
+    class LockFailure:
+        LOCK_EX = 1
+        LOCK_UN = 2
+
+        @staticmethod
+        def flock(descriptor, mode):
+            if mode == LockFailure.LOCK_EX:
+                raise OSError("lock failure")
+
+    monkeypatch.setattr(journal_module, "fcntl", LockFailure)
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    with pytest.raises(JournalOperationError, match="could not lock"):
+        journal.append({"type": "review_started"})
+
+    class UnlockFailure:
+        LOCK_EX = 1
+        LOCK_UN = 2
+
+        @staticmethod
+        def flock(descriptor, mode):
+            if mode == UnlockFailure.LOCK_UN:
+                raise OSError("unlock failure")
+
+    monkeypatch.setattr(journal_module, "fcntl", UnlockFailure)
+    with pytest.raises(OSError, match="unlock failure"):
+        with journal._exclusive_lock(-1):
+            pass
+
+
+def test_journal_read_and_verify_diagnostics(tmp_path: Path, monkeypatch) -> None:
+    missing = ProjectJournal(tmp_path / "missing.jsonl")
+    assert missing.read_with_diagnostic() == ([], None)
+    assert missing.verify() == []
+    path = tmp_path / "bad.jsonl"
+    journal = ProjectJournal(path)
+    path.write_bytes(b"\xff")
+    events, diagnostic = journal.read_with_diagnostic()
+    assert events == [] and diagnostic is not None
+    assert journal.verify()
+    monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(OSError("denied")))
+    events, diagnostic = journal.read_with_diagnostic()
+    assert events == [] and diagnostic is not None
+
+
+def test_journal_parse_and_descriptor_fail_closed(tmp_path: Path) -> None:
+    events, diagnostic = ProjectJournal._parse_bytes(b"\n[]\n")
+    assert events == [] and diagnostic is not None
+    events, diagnostic = ProjectJournal._parse_bytes(b"{}\n")
+    assert events == [] and diagnostic is not None
+    events, diagnostic = ProjectJournal._parse_bytes(b"{\n")
+    assert events == [] and diagnostic is not None
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    _events, diagnostic = journal._read_descriptor(-1)
+    assert diagnostic is not None
+
+
+def test_journal_verify_events_covers_legacy_and_versioned_violations(tmp_path: Path) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl", project_id="p", origin_id="o")
+    legacy = {"type": "review_started"}
+    event = {
+        "schemaVersion": 2,
+        "projectId": "wrong",
+        "originId": "wrong",
+        "sequence": 4,
+        "previousEventSha256": "wrong",
+        "eventSha256": "wrong",
+        "type": "review_finished",
+    }
+    assert journal._verify_events([legacy, event, legacy])
+    unconfigured = ProjectJournal(tmp_path / "other.jsonl")
+    assert unconfigured._verify_events(
+        [{"schemaVersion": 1, "projectId": "p", "originId": "o", "sequence": 1, "eventSha256": "x"}]
+    )
+
+
+def test_journal_project_and_status_projection_rejects_malformed_events() -> None:
+    assert ProjectJournal._project([{"type": "review_started"}]) == []
+    assert ProjectJournal._project([{"type": "finding"}]) == []
+    assert (
+        ProjectJournal._project([{"type": "finding", "findingId": "f", "status": "unknown"}]) == []
+    )
+    with pytest.raises(ValueError, match="missing findingId"):
+        ProjectJournal._project([{"type": "finding_status_changed"}])
+    with pytest.raises(ValueError, match="unknown finding"):
+        ProjectJournal._project([{"type": "finding_status_changed", "findingId": "f"}])
+    with pytest.raises(ValueError, match="source"):
+        ProjectJournal._project(
+            [
+                {"type": "finding", "findingId": "f", "status": "open"},
+                {"type": "finding_status_changed", "findingId": "f", "from": "fixed", "to": "open"},
+            ]
+        )
+    with pytest.raises(ValueError, match="transition"):
+        ProjectJournal._project(
+            [
+                {"type": "finding", "findingId": "f", "status": "open"},
+                {
+                    "type": "finding_status_changed",
+                    "findingId": "f",
+                    "from": "open",
+                    "to": "verified",
+                },
+            ]
+        )
+    with pytest.raises(ValueError, match="dimensions"):
+        ProjectJournal._event_dimensions({"dimensions": ["bad"]})
+
+
+def test_journal_compatibility_head_and_dimension_diagnostics(tmp_path: Path) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    assert journal.compatibility() == "empty"
+    journal.append({"type": "review_started"})
+    assert journal.compatibility() == "legacy"
+    assert journal.head_sequence() == 0
+    findings, diagnostic = journal.findings_with_diagnostic(dimension="bad")
+    assert findings == [] and diagnostic is not None
+    path = journal.path
+    path.write_text('{"type":"finding_status_changed","findingId":"unknown"}\n')
+    findings, diagnostic = journal.findings_with_diagnostic()
+    assert findings == [] and diagnostic is not None
+    with pytest.raises(JournalOperationError):
+        journal.findings()
+    journal.path.write_bytes(b"\xff")
+    assert journal.compatibility() == "invalid"

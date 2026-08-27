@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+import reviewctl.github_publisher as publisher_module
 from reviewctl.github import (
     ChangedFileSnapshot,
     CommandResult,
@@ -168,6 +171,15 @@ def test_publisher_refuses_stale_head_before_post() -> None:
     assert post_calls(runner) == []
 
 
+def test_publisher_refuses_head_change_after_reconciliation() -> None:
+    runner = FakeRunner(head_values=[HEAD, OTHER_HEAD])
+    result = GitHubPublisher(Path("."), runner=runner).publish(make_plan())
+    assert result.status == "stale_head"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "github_publication_stale_head"
+    assert post_calls(runner) == []
+
+
 def test_publisher_fails_closed_when_reconciliation_budget_cannot_prove_exhaustion() -> None:
     plan = make_plan()
     runner = FakeRunner(comments={1: [{"id": 1, "body": "x"}], 2: [{"id": 2, "body": "x"}]})
@@ -248,3 +260,82 @@ def test_publisher_redacts_failed_command_details() -> None:
     assert result.diagnostic is not None
     assert result.diagnostic.code == "github_publication_failed"
     assert "super-secret-token" not in result.diagnostic.message
+
+
+def test_publisher_rejects_invalid_bounds() -> None:
+    with pytest.raises(ValueError, match="bounds"):
+        GitHubPublisher(Path("."), timeout_seconds=0)
+    with pytest.raises(ValueError, match="bounds"):
+        GitHubPublisher(Path("."), page_size=0)
+    with pytest.raises(ValueError, match="bounds"):
+        GitHubPublisher(Path("."), max_pages=0)
+
+
+def test_publisher_runner_errors_and_timeouts_are_typed() -> None:
+    def fail(*args, **kwargs):
+        raise ValueError("runner failure")
+
+    publisher = GitHubPublisher(Path("."), runner=fail)
+    with pytest.raises(publisher_module.GitHubPublisherError, match="could not run"):
+        publisher._run("operation", ["gh"])
+
+    publisher = GitHubPublisher(
+        Path("."), runner=lambda *args, **kwargs: CommandResult(124, b"", b"")
+    )
+    with pytest.raises(publisher_module.GitHubPublisherError, match="timed out"):
+        publisher._run("operation", ["gh"], input_bytes=b"payload")
+
+
+@pytest.mark.parametrize("raw", [b"not-json", b"[]", b'{"head": {}}', b'{"head":{"sha":7}}'])
+def test_publisher_rejects_malformed_head(raw: bytes) -> None:
+    publisher = GitHubPublisher(
+        Path("."), runner=lambda *args, **kwargs: CommandResult(0, raw, b"")
+    )
+    plan = make_plan()
+    with pytest.raises(publisher_module.GitHubPublisherError, match="head"):
+        publisher._head(plan)
+
+
+@pytest.mark.parametrize("raw", [b"not-json", b"{}", b"[1]"])
+def test_publisher_rejects_malformed_reconciliation_page(raw: bytes) -> None:
+    publisher = GitHubPublisher(
+        Path("."), runner=lambda *args, **kwargs: CommandResult(0, raw, b"")
+    )
+    with pytest.raises(publisher_module.GitHubPublisherError, match="reconciliation"):
+        publisher._page("endpoint", 1)
+
+
+@pytest.mark.parametrize(
+    "raw", [b"not-json", b"[]", b'{"id": 1, "comments": [1]}', b'{"comments": []}']
+)
+def test_publisher_rejects_malformed_post_bodies(raw: bytes) -> None:
+    publisher = GitHubPublisher(
+        Path("."), runner=lambda *args, **kwargs: CommandResult(0, raw, b"")
+    )
+    with pytest.raises(publisher_module.GitHubPublisherError, match="publication"):
+        publisher._post(make_plan(), make_plan().items)
+
+
+def test_publisher_returns_plan_and_empty_findings_statuses() -> None:
+    plan = build_publication_plan(
+        make_snapshot(), project_id="p", review_id="r", findings=(), review_status="partial"
+    )
+    result = GitHubPublisher(Path("."), runner=FakeRunner()).publish(plan)
+    assert result.status == "plan_invalid"
+    empty = build_publication_plan(
+        make_snapshot(), project_id="p", review_id="r", findings=(), review_status="accepted"
+    )
+    assert GitHubPublisher(Path("."), runner=FakeRunner()).publish(empty).status == "no_findings"
+
+
+def test_publisher_rejects_non_text_reconciliation_body() -> None:
+    runner = FakeRunner(comments={1: [{"body": 7}]})
+    result = GitHubPublisher(Path("."), runner=runner).publish(make_plan())
+    assert result.status == "reconciliation_incomplete"
+
+
+def test_publication_result_payload_and_key_are_stable() -> None:
+    plan = make_plan()
+    result = publisher_module.PublicationResult("key", HEAD, "published")
+    assert result.to_payload()["publicationKey"] == "key"
+    assert publisher_module.publication_key(plan).startswith("github:example/project:7:review-1:")
