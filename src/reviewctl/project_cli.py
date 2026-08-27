@@ -150,6 +150,11 @@ def init_project(args: Any) -> int:
         )
     project.mkdir(parents=True, exist_ok=True)
     config = project / "reviewctl.toml"
+    if config.is_symlink() or (config.exists() and not config.is_file()):
+        return _diagnostic_result(
+            Diagnostic("invalid_request", f"configuration path is not a regular file: {config}"),
+            "text",
+        )
     if config.exists() and not args.force:
         return _diagnostic_result(
             Diagnostic(

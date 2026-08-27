@@ -208,6 +208,36 @@ def test_init_force_preserves_malformed_existing_config(tmp_path: Path, capsys) 
     assert config.read_bytes() == b"[project\n"
 
 
+def test_init_force_rejects_config_directory_without_creating_identity(
+    tmp_path: Path, capsys
+) -> None:
+    config = tmp_path / "reviewctl.toml"
+    config.mkdir()
+
+    assert run_cli(["init", "--project", str(tmp_path), "--force"]) == 2
+    assert "not a regular file" in capsys.readouterr().err
+    assert config.is_dir()
+    assert not (tmp_path / ".reviewctl").exists()
+
+
+def test_init_force_rejects_config_symlink_without_touching_target(tmp_path: Path, capsys) -> None:
+    source_project = tmp_path / "source"
+    assert run_cli(["init", "--project", str(source_project)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "target"
+    project.mkdir()
+    target = project / "actual.toml"
+    target.write_bytes((source_project / "reviewctl.toml").read_bytes())
+    before = target.read_bytes()
+    (project / "reviewctl.toml").symlink_to(target)
+
+    assert run_cli(["init", "--project", str(project), "--force"]) == 2
+    assert "not a regular file" in capsys.readouterr().err
+    assert target.read_bytes() == before
+    assert (project / "reviewctl.toml").is_symlink()
+    assert not (project / ".reviewctl").exists()
+
+
 def test_init_reports_config_write_and_identity_errors(tmp_path: Path, monkeypatch, capsys) -> None:
     args = SimpleNamespace(project=str(tmp_path / "write"), force=False, mode="private")
     monkeypatch.setattr(
