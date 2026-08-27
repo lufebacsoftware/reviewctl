@@ -472,6 +472,35 @@ def test_client_rejects_relative_outside_missing_and_invalid_utf8_files(tmp_path
     assert "UTF-8" in result.diagnostic.message
 
 
+def test_client_rejects_duplicate_source_basenames_before_creating_artifacts(
+    tmp_path: Path,
+) -> None:
+    write_default_config(tmp_path)
+    first = tmp_path / "first" / "entry.py"
+    second = tmp_path / "second" / "entry.py"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text("first = 1\n")
+    second.write_text("second = 2\n")
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    result = client.review(
+        ReviewRequest(
+            prompt="review",
+            review_id="duplicate-basename",
+            files=(first, second),
+        )
+    )
+
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "invalid_request"
+    assert "unique basenames" in result.diagnostic.message
+    assert transport.requests == []
+    assert not client.review_root.exists()
+
+
 def test_client_rejects_non_json_source_context(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})

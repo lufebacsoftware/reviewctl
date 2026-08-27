@@ -261,7 +261,6 @@ class ReviewClient:
         except ValueError as error:
             diagnostic = Diagnostic("invalid_request", str(error))
             return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
-        artifacts = ArtifactStore(attempt_root)
         source_files: list[Path] = []
         source_digests: dict[Path, str] = {}
         for requested_path in request.files:
@@ -317,6 +316,14 @@ class ReviewClient:
                 return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
             source_files.append(path)
             source_digests[path] = _digest(source_bytes)
+        if len({path.name for path in source_files}) != len(source_files):
+            diagnostic = Diagnostic(
+                "invalid_request",
+                "review files must have unique basenames",
+                next="select files with distinct names",
+            )
+            return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
+        artifacts = ArtifactStore(attempt_root)
         source_files_tuple = tuple(source_files)
         try:
             contract = get_contract(profile.response_contract)
