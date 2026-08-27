@@ -1,8 +1,8 @@
 # reviewctl GitHub review — Phase 0–1 implementation plan
 
-**Date:** 2026-08-24  
-**Roadmap:** `docs/superpowers/specs/2026-08-24-github-pi-review-roadmap.md`  
-**Scope:** provider-neutral contracts, deterministic dry-run publication plan, and local-first GitHub PR source  
+**Date:** 2026-08-24\
+**Roadmap:** `docs/superpowers/specs/2026-08-24-github-pi-review-roadmap.md`\
+**Scope:** provider-neutral contracts, deterministic dry-run publication plan, and local-first GitHub PR source\
 **Out of scope:** GitHub writes, review approvals, request-changes, GitHub Actions, remote checkout materialization, and a second Pi orchestration path.
 
 ## Objective

@@ -1,9 +1,9 @@
 # reviewctl GitHub comment publisher — Phase 2 implementation plan
 
-**Date:** 2026-08-24  
-**Roadmap:** `docs/superpowers/specs/2026-08-24-github-pi-review-roadmap.md`  
-**Prerequisite:** Phase 0–1 commit `0bdf813`  
-**Scope:** explicit, comment-only GitHub publication from a verified dry-run plan  
+**Date:** 2026-08-24\
+**Roadmap:** `docs/superpowers/specs/2026-08-24-github-pi-review-roadmap.md`\
+**Prerequisite:** Phase 0–1 commit `0bdf813`\
+**Scope:** explicit, comment-only GitHub publication from a verified dry-run plan\
 **Out of scope:** approvals, request-changes, checks, Actions, GitHub Apps, and automatic republishing/re-anchoring.
 
 ## Objective

@@ -1,8 +1,8 @@
 # reviewctl Open Source Tool, CLI, API, and Pi Transport Design
 
-**Status:** Draft for user review  
-**Date:** 2026-08-23  
-**Scope:** Product direction and first implementation boundary  
+**Status:** Draft for user review\
+**Date:** 2026-08-23\
+**Scope:** Product direction and first implementation boundary\
 **License:** Keep the repository's existing Apache-2.0 license
 
 ## 1. Product decision
