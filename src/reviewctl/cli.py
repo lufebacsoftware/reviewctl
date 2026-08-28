@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -503,17 +503,37 @@ def parse_route(value: str) -> ReviewRoute:
     return ReviewRoute(transport=transport, model=model.strip())
 
 
+def load_execution_config(
+    parser: argparse.ArgumentParser,
+    config_value: str | None,
+    *,
+    required: bool,
+) -> tuple[Path, dict[str, Any], bytes] | None:
+    """Read one execution config once for parsing and receipt identity."""
+    config_path = Path(
+        os.path.abspath(Path(config_value or "~/.config/reviewctl/config.toml").expanduser())
+    )
+    try:
+        raw = read_confined_bytes(config_path)
+    except FileNotFoundError:
+        if required:
+            parser.error(f"reviewctl config does not exist: {config_path}")
+        return None
+    except OSError as error:
+        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    try:
+        config = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    return config_path, config, raw
+
+
 def load_route_profile(
     parser: argparse.ArgumentParser, config_value: str | None, profile: str
 ) -> tuple[tuple[ReviewRoute, ...], dict[str, object]]:
     """Load one ordered route profile from a user-owned TOML config file."""
-    config_path = Path(config_value or "~/.config/reviewctl/config.toml").expanduser().resolve()
-    if not config_path.is_file():
-        parser.error(f"reviewctl config does not exist: {config_path}")
-    try:
-        config = tomllib.loads(config_path.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    loaded = load_execution_config(parser, config_value, required=True)
+    config_path, config, raw = cast(tuple[Path, dict[str, Any], bytes], loaded)
     profiles = config.get("profiles")
     profile_config = profiles.get(profile) if isinstance(profiles, dict) else None
     route_specs = profile_config.get("routes") if isinstance(profile_config, dict) else None
@@ -543,7 +563,7 @@ def load_route_profile(
     return routes, {
         "name": profile,
         "path": str(config_path),
-        "sha256": sha256_bytes(config_path.read_bytes()),
+        "sha256": sha256_bytes(raw),
         "settings": settings,
     }
 
@@ -552,21 +572,16 @@ def load_transport_defaults(
     parser: argparse.ArgumentParser, config_value: str | None, transport: str
 ) -> tuple[dict[str, int], dict[str, str] | None]:
     """Load optional execution defaults for direct transport invocations."""
-    config_path = Path(config_value or "~/.config/reviewctl/config.toml").expanduser().resolve()
-    if not config_path.is_file():
-        if config_value:
-            parser.error(f"reviewctl config does not exist: {config_path}")
+    loaded = load_execution_config(parser, config_value, required=bool(config_value))
+    if loaded is None:
         return {}, None
-    try:
-        config = tomllib.loads(config_path.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    config_path, config, raw = loaded
     defaults = config.get("defaults")
     transport_defaults = defaults.get(transport) if isinstance(defaults, dict) else None
     if transport_defaults is None:
         return {}, {
             "path": str(config_path),
-            "sha256": sha256_bytes(config_path.read_bytes()),
+            "sha256": sha256_bytes(raw),
         }
     if not isinstance(transport_defaults, dict):
         parser.error(f"defaults.{transport} must be a TOML table")
@@ -585,7 +600,7 @@ def load_transport_defaults(
         settings[key] = value
     return settings, {
         "path": str(config_path),
-        "sha256": sha256_bytes(config_path.read_bytes()),
+        "sha256": sha256_bytes(raw),
     }
 
 

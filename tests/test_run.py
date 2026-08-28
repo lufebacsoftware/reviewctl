@@ -2981,6 +2981,63 @@ def test_direct_transport_applies_configured_transport_defaults(tmp_path: Path) 
     assert receipt["executionConfig"]["path"] == str(config.resolve())
 
 
+def test_transport_defaults_hash_the_exact_parsed_config_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "reviewctl.toml"
+    parsed = b"[defaults.llm]\ntimeout_seconds = 111\n"
+    replacement = b"[defaults.llm]\ntimeout_seconds = 222\n"
+    config.write_bytes(parsed)
+    real_read_confined_bytes = cli.read_confined_bytes
+    replacement_occurred = False
+
+    def read_then_replace(path: Path, *args: object, **kwargs: object) -> bytes:
+        nonlocal replacement_occurred
+        raw = real_read_confined_bytes(path, *args, **kwargs)
+        if path == config:
+            config.write_bytes(replacement)
+            replacement_occurred = True
+        return raw
+
+    monkeypatch.setattr(cli, "read_confined_bytes", read_then_replace)
+
+    settings, metadata = cli.load_transport_defaults(argparse.ArgumentParser(), str(config), "llm")
+
+    assert replacement_occurred is True
+    assert settings == {"timeout_seconds": 111}
+    assert metadata == {
+        "path": str(config.resolve()),
+        "sha256": hashlib.sha256(parsed).hexdigest(),
+    }
+
+
+def test_route_profile_hashes_the_exact_parsed_config_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "reviewctl.toml"
+    parsed = b'[profiles.code]\nroutes = ["llm:accepted"]\n'
+    replacement = b'[profiles.code]\nroutes = ["llm:empty"]\n'
+    config.write_bytes(parsed)
+    real_read_confined_bytes = cli.read_confined_bytes
+    replacement_occurred = False
+
+    def read_then_replace(path: Path, *args: object, **kwargs: object) -> bytes:
+        nonlocal replacement_occurred
+        raw = real_read_confined_bytes(path, *args, **kwargs)
+        if path == config:
+            config.write_bytes(replacement)
+            replacement_occurred = True
+        return raw
+
+    monkeypatch.setattr(cli, "read_confined_bytes", read_then_replace)
+
+    routes, metadata = cli.load_route_profile(argparse.ArgumentParser(), str(config), "code")
+
+    assert replacement_occurred is True
+    assert routes == (cli.ReviewRoute("llm", "accepted"),)
+    assert metadata["sha256"] == hashlib.sha256(parsed).hexdigest()
+
+
 def test_mixed_routes_do_not_apply_the_first_transports_defaults(tmp_path: Path) -> None:
     fake_agy = write_fake_agy(tmp_path)
     fake_pi = write_fake_pi(tmp_path)
@@ -10218,8 +10275,20 @@ def test_cli_task8_schema_write_defaults_and_account_edges(tmp_path: Path, monke
 
     parser = argparse.ArgumentParser()
     with monkeypatch.context() as isolated:
-        isolated.setattr(cli.Path, "is_file", lambda self: False)
+        isolated.setattr(
+            cli,
+            "read_confined_bytes",
+            lambda path: (_ for _ in ()).throw(FileNotFoundError(path)),
+        )
         assert cli.load_transport_defaults(parser, None, "pi") == ({}, None)
+    with monkeypatch.context() as isolated:
+        isolated.setattr(
+            cli,
+            "read_confined_bytes",
+            lambda path: (_ for _ in ()).throw(OSError(f"unsafe config: {path}")),
+        )
+        with pytest.raises(SystemExit):
+            cli.load_transport_defaults(parser, str(tmp_path / "unsafe.toml"), "pi")
     with pytest.raises(SystemExit):
         cli.load_transport_defaults(parser, str(tmp_path / "missing.toml"), "pi")
     malformed = tmp_path / "malformed.toml"
