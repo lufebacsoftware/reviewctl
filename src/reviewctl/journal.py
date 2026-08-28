@@ -427,19 +427,28 @@ class ProjectJournal:
                 previous_event = event
                 continue
             legacy_prefix = False
-            if expected_project is None:
-                expected_project = event.get("projectId")
-            if expected_origin is None:
-                expected_origin = event.get("originId")
-            if event.get("schemaVersion") != 1:
+            schema_version = event.get("schemaVersion")
+            project_id = event.get("projectId")
+            origin_id = event.get("originId")
+            valid_project = isinstance(project_id, str) and bool(project_id)
+            valid_origin = isinstance(origin_id, str) and bool(origin_id)
+            if type(schema_version) is not int or schema_version != 1:
                 violations.append(f"unsupported schema version at line {index}")
-            if event.get("projectId") != expected_project:
+            if not valid_project:
+                violations.append(f"invalid project identity at line {index}")
+            elif expected_project is None:
+                expected_project = project_id
+            elif project_id != expected_project:
                 violations.append(f"project identity mismatch at line {index}")
-            if event.get("originId") != expected_origin:
+            if not valid_origin:
+                violations.append(f"invalid origin identity at line {index}")
+            elif expected_origin is None:
+                expected_origin = origin_id
+            elif origin_id != expected_origin:
                 violations.append(f"origin identity mismatch at line {index}")
             sequence = event.get("sequence")
             expected_sequence = versioned_count + 1
-            if sequence != expected_sequence:
+            if type(sequence) is not int or sequence != expected_sequence:
                 violations.append(
                     "sequence mismatch at line "
                     f"{index}: expected {expected_sequence}, got {sequence}"
@@ -476,7 +485,7 @@ class ProjectJournal:
 
     def compatibility(self) -> str:
         events, diagnostic = self.read_with_diagnostic()
-        if diagnostic is not None and not events:
+        if diagnostic is not None:
             return "invalid"
         if any(event.get("schemaVersion") == 1 for event in events):
             return (
@@ -616,7 +625,9 @@ class ProjectJournal:
         return findings, diagnostic
 
     def finding(self, finding_id: str) -> dict[str, Any] | None:
-        findings, _diagnostic = self.findings_with_diagnostic()
+        findings, diagnostic = self.findings_with_diagnostic()
+        if diagnostic is not None:
+            raise JournalOperationError(diagnostic)
         return next(
             (finding for finding in findings if finding.get("findingId") == finding_id),
             None,

@@ -317,6 +317,44 @@ def test_journal_verify_reports_tamper_gap_and_identity_mismatch(tmp_path: Path)
     assert any("event digest" in violation for violation in violations)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("schemaVersion", True, "schema version"),
+        ("schemaVersion", 1.0, "schema version"),
+        ("sequence", True, "sequence"),
+        ("projectId", None, "project identity"),
+        ("projectId", "", "project identity"),
+        ("originId", None, "origin identity"),
+        ("originId", "", "origin identity"),
+    ],
+)
+def test_journal_rejects_malformed_versioned_envelope_scalars(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    event = {
+        "schemaVersion": 1,
+        "projectId": "project-1",
+        "originId": "origin-1",
+        "sequence": 1,
+        "previousEventSha256": None,
+        "type": "review_started",
+    }
+    event[field] = value
+    event["eventSha256"] = journal_module._event_digest(event)
+    path = tmp_path / "journal.jsonl"
+    path.write_text(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+    journal = ProjectJournal(path)
+
+    violations = journal.verify()
+    _events, diagnostic = journal.read_with_diagnostic()
+
+    assert any(message in violation for violation in violations)
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_corrupt"
+    assert journal.compatibility() == "invalid"
+
+
 def test_versioned_event_extends_a_legacy_prefix_with_canonical_digest(tmp_path: Path) -> None:
     path = tmp_path / "journal.jsonl"
     legacy = {"type": "review_started", "reviewId": "legacy"}
@@ -430,6 +468,21 @@ def test_journal_status_helpers_cover_unknown_missing_and_reason_paths(tmp_path:
         )
     with pytest.raises(JournalOperationError, match="invalid finding status transition"):
         journal.append_status_change("f", "verified")
+
+
+def test_singular_finding_and_status_change_propagate_journal_corruption(tmp_path: Path) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.append({"type": "finding", "findingId": "f", "status": "open"})
+    with journal.path.open("a") as stream:
+        stream.write('{"type":')
+
+    with pytest.raises(JournalOperationError) as finding_error:
+        journal.finding("f")
+    with pytest.raises(JournalOperationError) as status_error:
+        journal.append_status_change("f", "fixed")
+
+    assert finding_error.value.diagnostic.code == "journal_corrupt"
+    assert status_error.value.diagnostic.code == "journal_corrupt"
 
 
 def test_journal_append_rejects_descriptor_diagnostic(tmp_path: Path, monkeypatch) -> None:
