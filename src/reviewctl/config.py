@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import tomllib
 from collections.abc import Mapping
@@ -12,7 +13,11 @@ from typing import Any
 
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import ConfigError
-from reviewctl.filesystem import read_confined_bytes
+from reviewctl.filesystem import (
+    confined_directory_descriptor,
+    confined_relative_regular_descriptor,
+    read_confined_bytes,
+)
 
 SUPPORTED_TRANSPORTS = frozenset({"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"})
 PRIVACY_RANK = {"personal": 0, "private": 1, "sensitive": 2}
@@ -88,25 +93,53 @@ def parse_route(value: str) -> Route:
 
 
 def _config_path(path: Path) -> Path:
-    candidate = path.expanduser()
-    if candidate.is_dir():
-        return candidate.resolve() / "reviewctl.toml"
-    return candidate.parent.resolve() / candidate.name
+    candidate = Path(os.path.abspath(path.expanduser()))
+    try:
+        with confined_directory_descriptor(candidate):
+            return candidate / "reviewctl.toml"
+    except OSError:
+        return candidate
+
+
+def _descriptor_bytes(descriptor: int) -> bytes:
+    with os.fdopen(os.dup(descriptor), "rb") as stream:
+        return stream.read()
 
 
 def _read(path: Path | None) -> tuple[dict[str, Any], bytes, Path | None]:
     if path is None:
         return {}, b"", None
-    resolved = _config_path(path)
+    candidate = Path(os.path.abspath(path.expanduser()))
     try:
-        raw = read_confined_bytes(resolved)
+        with confined_directory_descriptor(candidate) as directory_descriptor:
+            resolved = candidate / "reviewctl.toml"
+            try:
+                with confined_relative_regular_descriptor(
+                    directory_descriptor, Path("reviewctl.toml"), os.O_RDONLY
+                ) as descriptor:
+                    raw = _descriptor_bytes(descriptor)
+            except FileNotFoundError:
+                return {}, b"", None
+            except OSError as error:
+                raise ConfigError(
+                    f"could not read configuration {resolved}; it must be a regular file: {error}"
+                ) from error
+    except ConfigError:
+        raise
+    except OSError:
+        resolved = candidate
+        try:
+            raw = read_confined_bytes(resolved)
+        except FileNotFoundError:
+            return {}, b"", None
+        except OSError as error:
+            raise ConfigError(
+                f"could not read configuration {resolved}; it must be a regular file: {error}"
+            ) from error
+    try:
         value = tomllib.loads(raw.decode("utf-8"))
-    except FileNotFoundError:
-        return {}, b"", None
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise ConfigError(
-            f"could not read configuration {resolved}; it must be a regular file: {error}"
-        ) from error
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ConfigError(f"could not read configuration {resolved}: {error}") from error
     if not isinstance(value, dict):
         raise ConfigError(f"configuration {resolved} must contain a TOML table")
     return value, raw, resolved

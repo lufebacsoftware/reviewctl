@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ import pytest
 import reviewctl.config as config_module
 from reviewctl.cli import run_cli
 from reviewctl.config import ConfigError, load_config, parse_route
-from reviewctl.filesystem import read_confined_bytes
+from reviewctl.filesystem import confined_relative_regular_descriptor, read_confined_bytes
 
 
 def test_project_config_wins_over_user_profile(tmp_path: Path) -> None:
@@ -132,6 +133,17 @@ def test_missing_project_config_uses_safe_defaults(tmp_path: Path) -> None:
     assert config.profile("default").routes == ()
 
 
+def test_project_directory_without_config_uses_safe_defaults(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    config = load_config(project, user_path=None)
+
+    assert config.project.privacy_mode == "private"
+    assert config.profile("default").routes == ()
+    assert config.path is None
+
+
 def test_dangling_project_config_symlink_is_not_treated_as_missing(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -161,6 +173,62 @@ def test_project_config_swap_to_symlink_fails_at_confined_open(
 
     with pytest.raises(ConfigError, match="could not read configuration"):
         load_config(project, user_path=None)
+
+
+def test_project_directory_swap_cannot_redirect_config_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    displaced = tmp_path / "displaced"
+    external = tmp_path / "external"
+    project.mkdir()
+    external.mkdir()
+    (project / "reviewctl.toml").write_text(
+        '[project]\nid = "project-one"\nprivacy_mode = "sensitive"\n'
+    )
+    (external / "reviewctl.toml").write_text(
+        '[project]\nid = "project-one"\nprivacy_mode = "personal"\n'
+    )
+
+    def swap_during_lookup(path: Path) -> Path:
+        candidate = path.expanduser()
+        assert candidate.is_dir()
+        candidate.rename(displaced)
+        candidate.symlink_to(external, target_is_directory=True)
+        return candidate.resolve() / "reviewctl.toml"
+
+    monkeypatch.setattr(config_module, "_config_path", swap_during_lookup)
+
+    assert load_config(project, user_path=None).project.privacy_mode == "sensitive"
+
+
+def test_project_config_open_remains_bound_to_the_directory_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    displaced = tmp_path / "displaced"
+    external = tmp_path / "external"
+    project.mkdir()
+    external.mkdir()
+    (project / "reviewctl.toml").write_text(
+        '[project]\nid = "project-one"\nprivacy_mode = "sensitive"\n'
+    )
+    (external / "reviewctl.toml").write_text(
+        '[project]\nid = "project-one"\nprivacy_mode = "personal"\n'
+    )
+
+    @contextmanager
+    def swap_then_open(parent_descriptor: int, path: Path, flags: int, mode: int = 0o600):
+        project.rename(displaced)
+        project.symlink_to(external, target_is_directory=True)
+        with confined_relative_regular_descriptor(
+            parent_descriptor, path, flags, mode
+        ) as descriptor:
+            yield descriptor
+
+    monkeypatch.setattr(config_module, "confined_relative_regular_descriptor", swap_then_open)
+
+    assert load_config(project, user_path=None).project.privacy_mode == "sensitive"
 
 
 def test_config_digest_changes_when_project_bytes_change(tmp_path: Path) -> None:
