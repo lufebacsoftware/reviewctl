@@ -7,12 +7,19 @@ import os
 import posixpath
 import re
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 
 from reviewctl.backends import BackendDescriptor, BackendRegistry, DiscoveryKind
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    resource = None
+
 _MAX_OUTPUT_LENGTH = 500
+_MAX_CAPTURE_BYTES = 4096
 _WINDOWS_EXECUTABLE_EXTENSIONS = (".COM", ".EXE", ".BAT", ".CMD")
 _CREDENTIAL_SUFFIX = (
     r"(?:access[-_]token|auth[-_]token|refresh[-_]token|id[-_]token|"
@@ -75,27 +82,56 @@ def _combined_output(stdout: object, stderr: object) -> str:
 
 def probe_version(executable: str, environ: Mapping[str, str]) -> tuple[str | None, str | None]:
     child_environment = {key: environ[key] for key in ("PATH", "SYSTEMROOT") if key in environ}
-    try:
-        completed = subprocess.run(
-            [executable, "--version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-            check=False,
-            env=child_environment,
+    if resource is None:
+        return None, "bounded version probe unsupported on this platform"
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (_MAX_CAPTURE_BYTES + 1, _MAX_CAPTURE_BYTES + 1),
         )
-    except subprocess.TimeoutExpired as error:
-        output = _combined_output(error.stdout, error.stderr)
-        diagnostic = "version probe timed out after 5 seconds"
-        if output:
-            diagnostic = f"{diagnostic}: {output}"
-        return None, _bounded_output(diagnostic)
+
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            try:
+                completed = subprocess.run(
+                    [executable, "--version"],
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=5,
+                    check=False,
+                    env=child_environment,
+                    preexec_fn=limit_output_files,
+                )
+                completed_stdout = completed.stdout
+                completed_stderr = completed.stderr
+                timed_out = False
+            except subprocess.TimeoutExpired as error:
+                completed_stdout = error.stdout
+                completed_stderr = error.stderr
+                timed_out = True
+
+            def bounded_output(value: object, stream) -> tuple[bytes | str, bool]:
+                if not isinstance(value, bytes | str):
+                    stream.seek(0)
+                    value = stream.read(_MAX_CAPTURE_BYTES + 1)
+                return value[:_MAX_CAPTURE_BYTES], len(value) > _MAX_CAPTURE_BYTES
+
+            stdout, stdout_truncated = bounded_output(completed_stdout, stdout_file)
+            stderr, stderr_truncated = bounded_output(completed_stderr, stderr_file)
+        if stdout_truncated or stderr_truncated:
+            return None, "version probe output exceeded bounded capture"
+        output = _combined_output(stdout, stderr)
+        if timed_out:
+            diagnostic = "version probe timed out after 5 seconds"
+            if output:
+                diagnostic = f"{diagnostic}: {output}"
+            return None, _bounded_output(diagnostic)
+    except subprocess.SubprocessError as error:
+        return None, _bounded_output(f"bounded version probe failed: {error}")
     except OSError as error:
         return None, _bounded_output(f"version probe failed: {error}")
 
-    output = _combined_output(completed.stdout, completed.stderr)
     if completed.returncode == 0:
         if output:
             return _bounded_output(output), None

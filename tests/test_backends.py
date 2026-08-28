@@ -341,7 +341,7 @@ def test_execute_llm_backend_invokes_legacy_transport_and_maps_database_evidence
         Path(kwargs["database"]).write_bytes(b"database evidence")
         return 17, "diagnostic"
 
-    def fake_load_response(database: Path) -> PersistedResponse:
+    def fake_load_response(database: Path | bytes) -> PersistedResponse:
         calls["load"] = database
         return expected_response
 
@@ -352,7 +352,9 @@ def test_execute_llm_backend_invokes_legacy_transport_and_maps_database_evidence
 
     execution = cli.execute_llm_backend(request)
     database = request.attempt_dir / "transport.sqlite3"
-    scratch_database = calls["load"]
+    loaded_database = calls["load"]
+    assert loaded_database == b"database evidence"
+    scratch_database = calls["invoke"]["database"]
     assert isinstance(scratch_database, Path)
 
     assert calls == {
@@ -366,7 +368,7 @@ def test_execute_llm_backend_invokes_legacy_transport_and_maps_database_evidence
             "response_contract": request.response_contract,
             "timeout_seconds": request.timeout_seconds,
         },
-        "load": scratch_database,
+        "load": b"database evidence",
     }
     assert scratch_database != database
     assert database.read_bytes() == b"database evidence"

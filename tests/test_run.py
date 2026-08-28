@@ -5985,6 +5985,7 @@ def test_validate_request_rejects_blank_missing_and_oversized_fragments(tmp_path
 def test_load_response_handles_missing_invalid_empty_and_optional_token_columns(
     tmp_path: Path,
 ) -> None:
+    assert cli.load_response(b"") is None
     assert cli.load_response(tmp_path / "missing.sqlite3") is None
     invalid = tmp_path / "invalid.sqlite3"
     invalid.write_text("not a database")
@@ -9798,6 +9799,76 @@ def test_run_rejects_a_response_from_an_unpinned_openrouter_provider(
     }
 
 
+def test_write_private_exclusive_detects_parent_replacement_after_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "attempt"
+    parent.mkdir()
+    metadata = parent.stat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    displaced = tmp_path / "displaced-attempt"
+    real_write = cli.os.write
+    swapped = False
+
+    def raced_write(descriptor: int, value: memoryview) -> int:
+        nonlocal swapped
+        written = real_write(descriptor, value)
+        if not swapped:
+            swapped = True
+            parent.rename(displaced)
+            parent.mkdir()
+        return written
+
+    monkeypatch.setattr(cli.os, "write", raced_write)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        cli.write_private_exclusive(
+            parent / "receipt.json",
+            b"proof",
+            label="review receipt evidence",
+            expected_parent_identity=identity,
+        )
+
+    assert swapped
+    assert list(parent.iterdir()) == []
+    assert (displaced / "receipt.json").read_bytes() == b"proof"
+
+
+def test_write_private_exclusive_detects_file_replacement_after_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "attempt"
+    parent.mkdir()
+    metadata = parent.stat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    target = parent / "receipt.json"
+    displaced = parent / "displaced-receipt.json"
+    real_write = cli.os.write
+    swapped = False
+
+    def raced_write(descriptor: int, value: memoryview) -> int:
+        nonlocal swapped
+        written = real_write(descriptor, value)
+        if not swapped:
+            swapped = True
+            target.rename(displaced)
+            target.touch()
+        return written
+
+    monkeypatch.setattr(cli.os, "write", raced_write)
+
+    with pytest.raises(RuntimeError, match="evidence identity changed"):
+        cli.write_private_exclusive(
+            target,
+            b"proof",
+            label="review receipt evidence",
+            expected_parent_identity=identity,
+        )
+
+    assert target.read_bytes() == b""
+    assert displaced.read_bytes() == b"proof"
+
+
 def test_cli_task8_schema_write_defaults_and_account_edges(tmp_path: Path, monkeypatch) -> None:
     schema = {"required": ["verdict"], "properties": {"verdict": {"type": "string"}}}
     codex_schema = cli.codex_schema(schema)
@@ -10782,6 +10853,7 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
         stdout: object,
         stderr: object,
         start_new_session: bool,
+        preexec_fn: Callable[[], None],
     ) -> None:
         assert command == [
             "pi",
@@ -10798,9 +10870,10 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
             "explore",
         ]
         assert cwd == tmp_path
-        assert stdout is subprocess.PIPE
-        assert stderr is subprocess.PIPE
+        assert hasattr(stdout, "write")
+        assert hasattr(stderr, "write")
         assert start_new_session is True
+        assert callable(preexec_fn)
 
     def strict_popen(process_factory: Callable[[], object]) -> Callable[..., object]:
         def launch(
@@ -10810,8 +10883,11 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
             stdout: object,
             stderr: object,
             start_new_session: bool,
+            preexec_fn: Callable[[], None],
         ) -> object:
-            assert_pi_exploration_launch(command, cwd, stdout, stderr, start_new_session)
+            assert_pi_exploration_launch(
+                command, cwd, stdout, stderr, start_new_session, preexec_fn
+            )
             return process_factory()
 
         return launch
@@ -10862,6 +10938,28 @@ def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> 
 
     monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(Success))
     assert cli.invoke_pi_exploration(**kwargs)[0] == 0
+
+    with monkeypatch.context() as isolated:
+        isolated.setattr(cli, "resource", None)
+        assert cli.invoke_pi_exploration(**kwargs)[0] == 126
+
+    def preexec_failure() -> object:
+        raise subprocess.SubprocessError("preexec failed")
+
+    monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(preexec_failure))
+    assert cli.invoke_pi_exploration(**kwargs)[0] == 126
+
+    class Oversized:
+        returncode = 0
+
+        def communicate(self, **kwargs):
+            return b"12345", b""
+
+    monkeypatch.setattr(cli, "MAX_PI_EXPLORATION_STDOUT_BYTES", 4)
+    monkeypatch.setattr(cli.subprocess, "Popen", strict_popen(Oversized))
+    oversized = cli.invoke_pi_exploration(**kwargs)
+    assert oversized[0:2] == (502, "Pi exploration output exceeded bounded capture")
+    assert events_path.read_bytes() == b"1234"
 
 
 def test_cli_task8_legacy_receipt_and_config_error_edges(

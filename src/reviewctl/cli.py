@@ -93,6 +93,8 @@ MAX_KIRO_STDERR_BYTES = 100_000
 MAX_OPENROUTER_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_OPENROUTER_STDERR_BYTES = 100_000
 MAX_OPENROUTER_STATUS_BYTES = 32
+MAX_PI_EXPLORATION_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_PI_EXPLORATION_STDERR_BYTES = 100_000
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
@@ -403,6 +405,22 @@ def write_private_exclusive(
             if written == 0:
                 raise OSError(f"could not finish writing raw response evidence at {path}")
             remaining = remaining[written:]
+        if expected_parent_identity is not None:
+            try:
+                with confined_regular_descriptor(
+                    path,
+                    os.O_RDONLY,
+                    expected_parent_identity=expected_parent_identity,
+                ) as persisted_descriptor:
+                    written_metadata = os.fstat(descriptor)
+                    persisted_metadata = os.fstat(persisted_descriptor)
+                    if (written_metadata.st_dev, written_metadata.st_ino) != (
+                        persisted_metadata.st_dev,
+                        persisted_metadata.st_ino,
+                    ):
+                        raise OSError("filesystem evidence identity changed")
+            except OSError as error:
+                raise RuntimeError(f"{label} path is unsafe at {path}: {error}") from error
 
 
 def canonical_json(value: object) -> bytes:
@@ -2995,23 +3013,53 @@ def invoke_pi_exploration(
     started = time.monotonic()
     stdout = b""
     stderr = b""
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+    if resource is None:
+        return 126, "Pi exploration bounded output capture unsupported", "", blank
+    capture_file_limit = max(MAX_PI_EXPLORATION_STDOUT_BYTES, MAX_PI_EXPLORATION_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
         )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            terminate_process_group(process)
-            # Drain bytes emitted while Pi handles termination so exploration
-            # diagnostics and observed metadata remain complete.
-            stdout, stderr = process.communicate()
-            if stdout:
-                events_path.write_bytes(stdout)
+
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+                preexec_fn=limit_output_files,
+            )
+            timed_out = False
+            try:
+                communicated_stdout, communicated_stderr = process.communicate(
+                    timeout=timeout_seconds
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                terminate_process_group(process)
+                communicated_stdout, communicated_stderr = process.communicate()
+
+            def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                if not isinstance(value, bytes):
+                    stream.seek(0)
+                    value = stream.read(limit + 1)
+                return value[:limit], len(value) > limit
+
+            stdout, stdout_truncated = bounded_output(
+                communicated_stdout, stdout_file, MAX_PI_EXPLORATION_STDOUT_BYTES
+            )
+            stderr, stderr_truncated = bounded_output(
+                communicated_stderr, stderr_file, MAX_PI_EXPLORATION_STDERR_BYTES
+            )
+        if stdout:
+            events_path.write_bytes(stdout)
+        if stdout_truncated or stderr_truncated:
+            return 502, "Pi exploration output exceeded bounded capture", "", blank
+        if timed_out:
             return (
                 124,
                 pi_timeout_diagnostic(stderr).replace("review attempt", "exploration turn", 1),
@@ -3025,11 +3073,11 @@ def invoke_pi_exploration(
             )
     except FileNotFoundError:
         return 127, f"Pi exploration executable not found: {pi_bin}", "", blank
+    except subprocess.SubprocessError as error:
+        return 126, f"Pi exploration bounded output capture failed: {error}", "", blank
     except OSError as error:
         return 127, f"Pi exploration could not execute: {error}", "", blank
 
-    if stdout:
-        events_path.write_bytes(stdout)
     return (
         process.returncode,
         stderr.decode(errors="replace"),
@@ -3379,11 +3427,19 @@ def invoke_codex(
             isolation_context.__exit__(None, None, None)
 
 
-def load_response(database: Path) -> PersistedResponse | None:
-    if not database.is_file():
+def load_response(database: Path | bytes) -> PersistedResponse | None:
+    if isinstance(database, Path):
+        try:
+            database_bytes = read_confined_bytes(database)
+        except OSError:
+            return None
+    else:
+        database_bytes = database
+    if not database_bytes:
         return None
     try:
-        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(":memory:")) as connection:
+            connection.deserialize(database_bytes)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(responses)")}
             required = {"response", "conversation_id", "model"}
             if not required <= columns:
@@ -3438,7 +3494,7 @@ def execute_llm_backend(request: BackendRequest) -> BackendExecution:
         if os.path.lexists(scratch_database):
             try:
                 scratch_bytes = read_confined_bytes(scratch_database)
-                response = load_response(scratch_database)
+                response = load_response(scratch_bytes)
                 write_private_exclusive(
                     database,
                     scratch_bytes,

@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import reviewctl.setup as reviewctl_setup
 from reviewctl import cli
 from reviewctl.backends import (
     BackendCapabilities,
@@ -198,20 +199,15 @@ def test_probe_version_uses_exact_safe_subprocess_options(monkeypatch: pytest.Mo
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert probe_version("/safe/tool", {"PATH": "/safe/bin"}) == ("tool 1.2.3", None)
-    assert calls == [
-        (
-            ["/safe/tool", "--version"],
-            {
-                "capture_output": True,
-                "text": True,
-                "encoding": "utf-8",
-                "errors": "replace",
-                "timeout": 5,
-                "check": False,
-                "env": {"PATH": "/safe/bin"},
-            },
-        )
-    ]
+    assert len(calls) == 1
+    command, options = calls[0]
+    assert command == ["/safe/tool", "--version"]
+    assert options["timeout"] == 5
+    assert options["check"] is False
+    assert options["env"] == {"PATH": "/safe/bin"}
+    assert hasattr(options["stdout"], "write")
+    assert hasattr(options["stderr"], "write")
+    assert callable(options["preexec_fn"])
 
 
 def test_topology_is_stably_sorted_and_serializes_with_asdict() -> None:
@@ -384,6 +380,36 @@ def test_probe_version_bounds_timeout_and_os_error_diagnostics(
     assert expected_text in diagnostic
     assert len(diagnostic) <= 500
     assert "super-secret" not in diagnostic
+
+
+def test_probe_version_fails_closed_for_unbounded_or_oversized_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as isolated:
+        isolated.setattr(reviewctl_setup, "resource", None)
+        assert probe_version("tool", {}) == (
+            None,
+            "bounded version probe unsupported on this platform",
+        )
+
+    def preexec_failure(*args: object, **kwargs: object) -> None:
+        raise subprocess.SubprocessError("preexec failed")
+
+    monkeypatch.setattr(subprocess, "run", preexec_failure)
+    version, diagnostic = probe_version("tool", {})
+    assert version is None
+    assert diagnostic == "bounded version probe failed: preexec failed"
+
+    def oversized(command: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        options["stdout"].write(b"x" * (reviewctl_setup._MAX_CAPTURE_BYTES + 1))
+        options["stdout"].flush()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", oversized)
+    assert probe_version("tool", {}) == (
+        None,
+        "version probe output exceeded bounded capture",
+    )
 
 
 def _write_python_executable(directory: Path, name: str, source: str) -> Path:
