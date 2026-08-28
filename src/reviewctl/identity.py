@@ -153,7 +153,7 @@ class ProjectIdentityStore:
         except BaseException:
             try:
                 candidate = os.stat(temporary, follow_symlinks=False)
-                if staged_identity is None or (candidate.st_dev, candidate.st_ino) == (
+                if staged_identity is not None and (candidate.st_dev, candidate.st_ino) == (
                     staged_identity.st_dev,
                     staged_identity.st_ino,
                 ):
