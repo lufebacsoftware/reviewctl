@@ -12,6 +12,7 @@ from reviewctl.api import (
     Finding,
     ReviewClient,
     ReviewRequest,
+    finding_id,
     verify_project_receipt,
 )
 from reviewctl.backends import BackendEvidence, BackendExecution, PersistedResponse
@@ -79,7 +80,7 @@ def write_default_config(project: Path) -> None:
         '[project]\nprivacy_mode = "private"\n'
         "[profiles.default]\n"
         'routes = ["pi:fake/model"]\n'
-        'execution = "local"\n'
+        'execution = "remote"\n'
     )
 
 
@@ -843,6 +844,14 @@ def test_merge_findings_deduplicates_identical_values() -> None:
     assert ReviewClient._merge_findings((value,), (value,)) == (value,)
 
 
+def test_merge_findings_uses_latest_variant_for_one_stable_identity() -> None:
+    partial = Finding("medium", "source.py", 1, "title", "old evidence", "reproduction")
+    completed = Finding("high", "source.py", 1, "title", "new evidence", "reproduction")
+
+    assert finding_id(partial) == finding_id(completed)
+    assert ReviewClient._merge_findings((partial,), (completed,)) == (completed,)
+
+
 def test_client_maps_contract_evaluation_exception(tmp_path: Path, monkeypatch) -> None:
     write_default_config(tmp_path)
     real_contract = api_module.get_contract("findings-json")
@@ -898,7 +907,7 @@ def test_client_handles_malformed_complete_and_incomplete_findings(
 
 def test_client_returns_partial_when_all_attempts_are_incomplete(tmp_path: Path) -> None:
     (tmp_path / "reviewctl.toml").write_text(
-        '[profiles.default]\nroutes = ["pi:model"]\nexecution = "local"\n'
+        '[profiles.default]\nroutes = ["pi:model"]\nexecution = "remote"\n'
     )
     partial = (
         '{"findings":[{"severity":"high","path":"source.py","line":1,'

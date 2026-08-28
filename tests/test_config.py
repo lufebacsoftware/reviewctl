@@ -55,12 +55,20 @@ def test_sensitive_remote_profile_is_rejected_at_load(tmp_path: Path) -> None:
         load_config(project, user_path=None)
 
 
-def test_local_profile_rejects_explicit_openrouter_route(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "route",
+    [
+        "pi:openrouter/stealth/ox-alpha",
+        "pi:google/gemini-2.5-flash",
+        "pi:anthropic/claude-sonnet-4",
+    ],
+)
+def test_local_profile_rejects_provider_backed_pi_route(tmp_path: Path, route: str) -> None:
     project = tmp_path / "reviewctl.toml"
     project.write_text(
         '[project]\nprivacy_mode = "sensitive"\n'
         "[profiles.default]\n"
-        'routes = ["pi:openrouter/stealth/ox-alpha"]\n'
+        f'routes = ["{route}"]\n'
         'execution = "local"\n'
     )
 
@@ -233,7 +241,7 @@ def test_profile_accepts_null_output_tokens_and_rejects_non_table_and_openrouter
     )
     with pytest.raises(ConfigError, match="TOML table"):
         config_module._profile("default", [], "private", ())
-    with pytest.raises(ConfigError, match="OpenRouter"):
+    with pytest.raises(ConfigError, match="remote"):
         config_module._profile(
             "local",
             {"routes": ["pi:openrouter/model"], "execution": "local"},

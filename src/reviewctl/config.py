@@ -194,10 +194,10 @@ def _profile(
     if tools not in TOOL_MODES:
         raise ConfigError(f"profiles.{name}.tools must be none or read-only")
     if execution == "local" and any(
-        route.transport == "openrouter" or route.model.startswith("openrouter/")
+        route.transport in {"openrouter", "pi"} or route.model.startswith("openrouter/")
         for route in parsed_routes
     ):
-        raise ConfigError(f"local profile {name!r} cannot use a remote OpenRouter route")
+        raise ConfigError(f"local profile {name!r} cannot use a remote provider-backed route")
     try:
         dimensions = normalize_dimensions(
             value.get("dimensions"),

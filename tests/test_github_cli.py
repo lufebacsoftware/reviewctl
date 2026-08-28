@@ -26,7 +26,7 @@ def write_config(project: Path) -> None:
         '[project]\nprivacy_mode = "private"\n'
         "[profiles.default]\n"
         'routes = ["pi:fake/model"]\n'
-        'execution = "local"\n'
+        'execution = "remote"\n'
     )
 
 
