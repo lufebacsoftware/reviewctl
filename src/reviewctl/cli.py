@@ -990,15 +990,20 @@ def source_git_metadata(files: list[Path]) -> dict[str, str | None]:
     return git_metadata(roots.pop())
 
 
-def load_policy(path: str) -> dict[str, Any]:
+def load_policy_evidence(path: str) -> tuple[dict[str, Any], bytes]:
     import tomllib
 
-    return tomllib.loads(Path(path).read_text())
+    raw = read_confined_bytes(Path(os.path.abspath(Path(path).expanduser())))
+    return tomllib.loads(raw.decode("utf-8")), raw
+
+
+def load_policy(path: str) -> dict[str, Any]:
+    return load_policy_evidence(path)[0]
 
 
 def policy_sha256(path: str) -> str:
     """Return the digest of the policy bytes applied to a review."""
-    return sha256_bytes(Path(path).read_bytes())
+    return sha256_bytes(read_confined_bytes(Path(os.path.abspath(Path(path).expanduser()))))
 
 
 def normalize_provider_preferences(value: object) -> dict[str, object] | None:
@@ -4404,8 +4409,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     policy_digest: str | None = None
     loaded_policy: dict[str, Any] | None = None
     if args.policy:
-        loaded_policy = load_policy(args.policy)
-        policy_digest = policy_sha256(args.policy)
+        loaded_policy, policy_bytes = load_policy_evidence(args.policy)
+        policy_digest = sha256_bytes(policy_bytes)
     local_policy_routes = [route for route in routes if route.transport in LOCAL_POLICY_TRANSPORTS]
     kiro_routes = [route for route in local_policy_routes if route.transport == "kiro"]
     if args.source_class == "proprietary":

@@ -870,6 +870,56 @@ def test_proprietary_local_cli_transports_require_policy_and_honor_exact_denials
     assert "does not allow gemini model gemini-3.6-flash" in denied.stderr.lower()
 
 
+def test_run_hashes_the_exact_policy_bytes_used_for_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    registry = cli.BackendRegistry()
+    registry.register(
+        cli.build_backend_registry().require("codex").descriptor,
+        lambda request: cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse(
+                "conversation", None, 1, 2, request.model, 3, "openai", "VERDICT: approved"
+            ),
+            cli.BackendEvidence(),
+        ),
+    )
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    policy = tmp_path / "policy.toml"
+    authorized = b'[models."codex-model"]\nsource_allowed = true\n'
+    replacement = b'[models."codex-model"]\nsource_allowed = false\n'
+    policy.write_bytes(authorized)
+    assert cli.policy_sha256(str(policy)) == hashlib.sha256(authorized).hexdigest()
+    real_load_policy = cli.load_policy
+
+    def load_then_replace(path: str) -> dict[str, Any]:
+        loaded = real_load_policy(path)
+        policy.write_bytes(replacement)
+        return loaded
+
+    monkeypatch.setattr(cli, "load_policy", load_then_replace)
+    namespace = cli.build_parser().parse_args(
+        [
+            *review_arguments(tmp_path),
+            "--transport",
+            "codex",
+            "--model",
+            "codex-model",
+            "--source-class",
+            "proprietary",
+            "--policy",
+            str(policy),
+            "--response-contract",
+            "verdict",
+        ]
+    )
+
+    assert namespace.handler(namespace) == 0
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    assert receipt["policy"]["sha256"] == hashlib.sha256(authorized).hexdigest()
+
+
 def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_identity(
     tmp_path: Path,
 ) -> None:
