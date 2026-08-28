@@ -173,6 +173,39 @@ def test_identity_write_preserves_write_error_when_close_also_fails(
     assert close_attempts
 
 
+def test_identity_write_closes_and_cleans_when_fstat_fails(tmp_path: Path, monkeypatch) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+    real_mkstemp = identity_module.tempfile.mkstemp
+    real_fstat = identity_module.os.fstat
+    descriptors: list[int] = []
+    temporary_paths: list[Path] = []
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, temporary = real_mkstemp(*args, **kwargs)
+        descriptors.append(descriptor)
+        temporary_paths.append(Path(temporary))
+        return descriptor, temporary
+
+    monkeypatch.setattr(identity_module.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(
+        identity_module.os,
+        "fstat",
+        lambda descriptor: (_ for _ in ()).throw(OSError("fstat failed")),
+    )
+
+    with pytest.raises(OSError, match="fstat failed"):
+        store._write(identity)
+
+    monkeypatch.undo()
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        real_fstat(descriptors[0])
+    assert len(temporary_paths) == 1
+    assert not temporary_paths[0].exists()
+
+
 def test_identity_write_preserves_write_error_when_cleanup_also_fails(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -127,9 +127,10 @@ class ProjectIdentityStore:
             + b"\n"
         )
         descriptor, temporary = tempfile.mkstemp(prefix="identity.", dir=self.root)
-        staged_identity = os.fstat(descriptor)
+        staged_identity = None
         try:
             try:
+                staged_identity = os.fstat(descriptor)
                 os.fchmod(descriptor, 0o600)
                 remaining = memoryview(payload)
                 while remaining:
@@ -152,7 +153,7 @@ class ProjectIdentityStore:
         except BaseException:
             try:
                 candidate = os.stat(temporary, follow_symlinks=False)
-                if (candidate.st_dev, candidate.st_ino) == (
+                if staged_identity is None or (candidate.st_dev, candidate.st_ino) == (
                     staged_identity.st_dev,
                     staged_identity.st_ino,
                 ):
