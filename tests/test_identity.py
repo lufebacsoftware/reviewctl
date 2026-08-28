@@ -101,7 +101,7 @@ def test_identity_store_lock_failure_and_unlock_failure(tmp_path: Path, monkeypa
     assert closed
 
 
-def test_identity_store_replace_cleanup(tmp_path: Path, monkeypatch) -> None:
+def test_identity_store_retains_source_after_replace_failure(tmp_path: Path, monkeypatch) -> None:
     store = ProjectIdentityStore(tmp_path)
     original_replace = identity_module.os.replace
     temporary_paths: list[str] = []
@@ -114,11 +114,11 @@ def test_identity_store_replace_cleanup(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(OSError, match="replace failed"):
         store.ensure("project-one")
     assert temporary_paths
-    assert not Path(temporary_paths[0]).exists()
+    assert Path(temporary_paths[0]).is_file()
     monkeypatch.setattr(identity_module.os, "replace", original_replace)
 
 
-@pytest.mark.parametrize("operation", ["fchmod", "write", "fsync", "close", "replace", "chmod"])
+@pytest.mark.parametrize("operation", ["fchmod", "write", "fsync", "close", "chmod"])
 def test_identity_write_cleans_temporary_files_on_every_failure(
     tmp_path: Path, monkeypatch, operation: str
 ) -> None:
@@ -171,6 +171,27 @@ def test_identity_write_preserves_write_error_when_close_also_fails(
     with pytest.raises(OSError, match="write failed"):
         store._write(identity)
     assert close_attempts
+
+
+def test_identity_write_preserves_write_error_when_cleanup_also_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+    monkeypatch.setattr(
+        identity_module.os,
+        "write",
+        lambda descriptor, contents: (_ for _ in ()).throw(RuntimeError("write primary")),
+    )
+    monkeypatch.setattr(
+        identity_module.os,
+        "unlink",
+        lambda path: (_ for _ in ()).throw(OSError("cleanup secondary")),
+    )
+
+    with pytest.raises(RuntimeError, match="write primary"):
+        store._write(identity)
 
 
 def test_identity_write_retries_short_writes(tmp_path: Path, monkeypatch) -> None:
@@ -228,26 +249,27 @@ def test_identity_write_does_not_unlink_reused_temporary_name(tmp_path: Path, mo
     assert temporary_paths[0].read_bytes() == b"unrelated"
 
 
-def test_identity_write_preserves_replace_error_when_unlink_also_fails(
+def test_identity_write_does_not_unlink_reused_name_after_replace_failure(
     tmp_path: Path, monkeypatch
 ) -> None:
     store = ProjectIdentityStore(tmp_path)
     store.root.mkdir(parents=True, exist_ok=True)
     identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
-    unlink_attempts: list[str] = []
+    temporary_paths: list[Path] = []
 
-    def fail_replace(*args, **kwargs):
+    def fail_replace(source, destination):
+        del destination
+        temporary = Path(source)
+        temporary.unlink()
+        temporary.write_bytes(b"unrelated")
+        temporary_paths.append(temporary)
         raise OSError("replace failed")
 
-    def fail_unlink(path: str) -> None:
-        unlink_attempts.append(path)
-        raise OSError("unlink failed")
-
     monkeypatch.setattr(identity_module.os, "replace", fail_replace)
-    monkeypatch.setattr(identity_module.os, "unlink", fail_unlink)
     with pytest.raises(OSError, match="replace failed"):
         store._write(identity)
-    assert unlink_attempts
+    assert len(temporary_paths) == 1
+    assert temporary_paths[0].read_bytes() == b"unrelated"
 
 
 def test_identity_lock_preserves_body_error_when_close_also_fails(

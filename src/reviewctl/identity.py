@@ -128,6 +128,7 @@ class ProjectIdentityStore:
         )
         descriptor, temporary = tempfile.mkstemp(prefix="identity.", dir=self.root)
         installed = False
+        replace_attempted = False
         try:
             try:
                 os.fchmod(descriptor, 0o600)
@@ -147,11 +148,12 @@ class ProjectIdentityStore:
                         os.close(descriptor)
                     except BaseException:
                         pass
+            replace_attempted = True
             os.replace(temporary, self.path)
             installed = True
             os.chmod(self.path, 0o600)
         except BaseException:
-            if not installed:
+            if not installed and not replace_attempted:
                 try:
                     os.unlink(temporary)
                 except BaseException:
