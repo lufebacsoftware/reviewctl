@@ -173,6 +173,61 @@ def test_identity_write_preserves_write_error_when_close_also_fails(
     assert close_attempts
 
 
+def test_identity_write_retries_short_writes(tmp_path: Path, monkeypatch) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+    real_write = identity_module.os.write
+    write_sizes: list[int] = []
+
+    def short_first_write(descriptor, contents):
+        limit = max(1, len(contents) // 2) if not write_sizes else len(contents)
+        written = real_write(descriptor, contents[:limit])
+        write_sizes.append(written)
+        return written
+
+    monkeypatch.setattr(identity_module.os, "write", short_first_write)
+
+    store._write(identity)
+
+    assert len(write_sizes) == 2
+    assert store._read() == identity
+
+
+def test_identity_write_rejects_zero_length_write(tmp_path: Path, monkeypatch) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+    monkeypatch.setattr(identity_module.os, "write", lambda descriptor, contents: 0)
+
+    with pytest.raises(OSError, match="could not finish writing project identity"):
+        store._write(identity)
+
+    assert not store.path.exists()
+
+
+def test_identity_write_does_not_unlink_reused_temporary_name(tmp_path: Path, monkeypatch) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+    real_replace = identity_module.os.replace
+    temporary_paths: list[Path] = []
+
+    def replace_and_reuse(source, destination):
+        real_replace(source, destination)
+        temporary = Path(source)
+        temporary.write_bytes(b"unrelated")
+        temporary_paths.append(temporary)
+
+    monkeypatch.setattr(identity_module.os, "replace", replace_and_reuse)
+
+    store._write(identity)
+
+    assert len(temporary_paths) == 1
+    assert store._read() == identity
+    assert temporary_paths[0].read_bytes() == b"unrelated"
+
+
 def test_identity_write_preserves_replace_error_when_unlink_also_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -193,21 +248,6 @@ def test_identity_write_preserves_replace_error_when_unlink_also_fails(
     with pytest.raises(OSError, match="replace failed"):
         store._write(identity)
     assert unlink_attempts
-
-
-def test_identity_write_preserves_standalone_unlink_error(tmp_path: Path, monkeypatch) -> None:
-    store = ProjectIdentityStore(tmp_path)
-    store.root.mkdir(parents=True, exist_ok=True)
-    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
-
-    monkeypatch.setattr(identity_module.os.path, "exists", lambda path: True)
-    monkeypatch.setattr(
-        identity_module.os,
-        "unlink",
-        lambda path: (_ for _ in ()).throw(OSError("unlink failed")),
-    )
-    with pytest.raises(OSError, match="unlink failed"):
-        store._write(identity)
 
 
 def test_identity_lock_preserves_body_error_when_close_also_fails(

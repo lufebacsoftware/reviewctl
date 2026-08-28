@@ -127,10 +127,16 @@ class ProjectIdentityStore:
             + b"\n"
         )
         descriptor, temporary = tempfile.mkstemp(prefix="identity.", dir=self.root)
+        installed = False
         try:
             try:
                 os.fchmod(descriptor, 0o600)
-                os.write(descriptor, payload)
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written == 0:
+                        raise OSError(f"could not finish writing project identity {self.path}")
+                    remaining = remaining[written:]
                 os.fsync(descriptor)
             finally:
                 primary = sys.exc_info()[1]
@@ -142,17 +148,15 @@ class ProjectIdentityStore:
                     except BaseException:
                         pass
             os.replace(temporary, self.path)
+            installed = True
             os.chmod(self.path, 0o600)
-        finally:
-            primary = sys.exc_info()[1]
-            if os.path.exists(temporary):
-                if primary is None:
+        except BaseException:
+            if not installed:
+                try:
                     os.unlink(temporary)
-                else:
-                    try:
-                        os.unlink(temporary)
-                    except BaseException:
-                        pass
+                except BaseException:
+                    pass
+            raise
 
     @contextmanager
     def _identity_lock(self):

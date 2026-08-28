@@ -299,6 +299,37 @@ def test_publisher_classifies_post_head_race_without_retry() -> None:
     assert result.summary_comment_id == "9001"
 
 
+def test_publisher_preserves_posted_ids_when_final_head_lookup_fails() -> None:
+    class FinalHeadTimeoutRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.head_lookups = 0
+
+        def __call__(self, command, *, cwd, timeout_seconds, input_bytes=None):
+            if command[2] == "repos/example/project/pulls/7":
+                self.head_lookups += 1
+                if self.head_lookups == 3:
+                    self.calls.append(tuple(command))
+                    return CommandResult(124, b"", b"")
+            return super().__call__(
+                command,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                input_bytes=input_bytes,
+            )
+
+    runner = FinalHeadTimeoutRunner()
+
+    result = GitHubPublisher(Path("."), runner=runner).publish(make_plan())
+
+    assert result.status == "failed"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "github_publication_timeout"
+    assert result.summary_comment_id == "9001"
+    assert result.published_comment_ids == ("9002", "9003")
+    assert len(post_calls(runner)) == 1
+
+
 def test_publisher_redacts_failed_command_details() -> None:
     class FailedRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds, input_bytes=None):

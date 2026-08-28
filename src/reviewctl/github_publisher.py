@@ -278,6 +278,8 @@ class GitHubPublisher:
 
     def publish(self, plan: ReviewPublicationPlan) -> PublicationResult:
         key = publication_key(plan)
+        posted: dict[str, Any] | None = None
+        skipped: tuple[str, ...] = ()
         if not plan.executable:
             diagnostic = Diagnostic(
                 "github_publication_plan_invalid",
@@ -362,7 +364,15 @@ class GitHubPublisher:
                 if error.diagnostic.code == "publication_reconciliation_incomplete"
                 else "failed"
             )
-            return PublicationResult(key, plan.head_sha, status, diagnostic=error.diagnostic)
+            return PublicationResult(
+                key,
+                plan.head_sha,
+                status,
+                published_comment_ids=posted["commentIds"] if posted is not None else (),
+                skipped_finding_ids=skipped,
+                summary_comment_id=posted["summaryCommentId"] if posted is not None else None,
+                diagnostic=error.diagnostic,
+            )
 
 
 __all__ = ["GitHubPublisher", "GitHubPublisherError", "PublicationResult", "publication_key"]
