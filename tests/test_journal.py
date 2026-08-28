@@ -494,6 +494,31 @@ def test_journal_descriptor_read_rejects_early_eof(tmp_path: Path, monkeypatch) 
     assert "complete journal" in diagnostic.message
 
 
+def test_journal_append_rejects_growth_during_descriptor_read(tmp_path: Path, monkeypatch) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl", project_id="p", origin_id="o")
+    journal.append({"type": "review_started", "reviewId": "r1"})
+    journal.append({"type": "review_attempt", "reviewId": "r1", "attempt": 1})
+    first, second = journal.path.read_bytes().splitlines(keepends=True)
+    journal.path.write_bytes(first)
+    real_read = journal_module.os.read
+    injected = False
+
+    def grow_before_read(descriptor: int, size: int) -> bytes:
+        nonlocal injected
+        if not injected:
+            injected = True
+            with journal.path.open("ab") as intruder:
+                intruder.write(second)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(journal_module.os, "read", grow_before_read)
+
+    with pytest.raises(JournalOperationError, match="changed while reading"):
+        journal.append({"type": "review_finished", "reviewId": "r1"})
+
+    assert journal.path.read_bytes() == first + second
+
+
 def test_journal_append_rejects_zero_length_write(tmp_path: Path, monkeypatch) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     monkeypatch.setattr(journal_module.os, "write", lambda descriptor, contents: 0)

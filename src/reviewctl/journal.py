@@ -308,7 +308,8 @@ class ProjectJournal:
     def _read_descriptor(self, descriptor: int) -> tuple[list[dict[str, Any]], Diagnostic | None]:
         try:
             os.lseek(descriptor, 0, os.SEEK_SET)
-            remaining = os.fstat(descriptor).st_size
+            expected_size = os.fstat(descriptor).st_size
+            remaining = expected_size
             chunks: list[bytes] = []
             while remaining:
                 chunk = os.read(descriptor, remaining)
@@ -316,6 +317,8 @@ class ProjectJournal:
                     return [], Diagnostic("journal_corrupt", "could not read the complete journal")
                 chunks.append(chunk)
                 remaining -= len(chunk)
+            if os.fstat(descriptor).st_size != expected_size:
+                return [], Diagnostic("journal_corrupt", "journal changed while reading")
             raw = b"".join(chunks)
         except OSError as error:
             return [], Diagnostic("journal_corrupt", f"could not read journal: {error}")
