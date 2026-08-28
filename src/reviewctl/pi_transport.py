@@ -79,18 +79,30 @@ def _run_process(
             timed_out = True
             stdout = error.stdout if isinstance(error.stdout, bytes) else None
             stderr = error.stderr if isinstance(error.stderr, bytes) else None
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+
+            def signal_process(sig: signal.Signals) -> None:
+                try:
+                    os.killpg(process.pid, sig)
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    fallback = process.terminate if sig == signal.SIGTERM else process.kill
+                    try:
+                        fallback()
+                    except OSError:
+                        pass
+
+            signal_process(signal.SIGTERM)
             try:
                 trailing_stdout, trailing_stderr = process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
+                signal_process(signal.SIGKILL)
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                trailing_stdout, trailing_stderr = process.communicate()
+                    trailing_stdout, trailing_stderr = process.communicate(timeout=2)
+                except OSError, subprocess.TimeoutExpired:
+                    trailing_stdout, trailing_stderr = None, None
+            except OSError:
+                trailing_stdout, trailing_stderr = None, None
             if isinstance(trailing_stdout, bytes) and trailing_stdout:
                 stdout = trailing_stdout
             if isinstance(trailing_stderr, bytes) and trailing_stderr:

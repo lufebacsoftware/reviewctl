@@ -387,6 +387,94 @@ def test_run_process_ignores_process_gone_before_timeout_sigkill(
     assert process.communicate_calls == 3
 
 
+@pytest.mark.parametrize("denied_signal", [signal.SIGTERM, signal.SIGKILL])
+def test_run_process_preserves_timeout_when_group_signal_is_denied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, denied_signal: signal.Signals
+) -> None:
+    class PermissionProcess:
+        pid = 791
+        returncode = -signal.SIGKILL
+
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+            self.terminated = False
+            self.killed = False
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            self.communicate_calls += 1
+            required_timeouts = 1 if denied_signal == signal.SIGTERM else 2
+            if self.communicate_calls <= required_timeouts:
+                raise subprocess.TimeoutExpired("pi", kwargs.get("timeout", 4))
+            return b"", b""
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = PermissionProcess()
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "Popen",
+        popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
+    )
+
+    def deny_signal(pid: int, sig: signal.Signals) -> None:
+        if sig == denied_signal:
+            raise PermissionError("permission denied")
+
+    monkeypatch.setattr(pi_module.os, "killpg", deny_signal)
+
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(124, b"", b"", True)
+    assert process.terminated is (denied_signal == signal.SIGTERM)
+    assert process.killed is (denied_signal == signal.SIGKILL)
+
+
+@pytest.mark.parametrize("recovery", ["after-term", "after-kill"])
+def test_run_process_preserves_timeout_when_termination_and_drain_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, recovery: str
+) -> None:
+    class UnstoppableProcess:
+        pid = 792
+        returncode = 1
+
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            self.communicate_calls += 1
+            if self.communicate_calls == 1 or (
+                recovery == "after-kill" and self.communicate_calls == 2
+            ):
+                raise subprocess.TimeoutExpired("pi", kwargs.get("timeout", 4))
+            raise OSError("drain failed")
+
+        def terminate(self) -> None:
+            raise PermissionError("terminate denied")
+
+        def kill(self) -> None:
+            raise PermissionError("kill denied")
+
+    process = UnstoppableProcess()
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "Popen",
+        popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
+    )
+    monkeypatch.setattr(
+        pi_module.os,
+        "killpg",
+        lambda pid, sig: (_ for _ in ()).throw(PermissionError("group signal denied")),
+    )
+
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(124, b"", b"", True)
+
+
 def test_run_process_reports_communication_oserror(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
