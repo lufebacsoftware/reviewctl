@@ -31,6 +31,33 @@ REPOSITORY = Path(__file__).parents[1]
 V1_RECEIPT_FIXTURES = REPOSITORY / "tests" / "fixtures" / "receipts"
 
 
+def test_review_root_does_not_create_through_replaced_artifact_ancestor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    displaced = tmp_path / "displaced-artifacts"
+    real_mkdir = Path.mkdir
+    swapped = False
+
+    def raced_mkdir(path: Path, *args, **kwargs) -> None:
+        nonlocal swapped
+        if artifact_root in path.parents and not swapped:
+            swapped = True
+            artifact_root.rename(displaced)
+            artifact_root.symlink_to(external, target_is_directory=True)
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", raced_mkdir)
+
+    directory = cli.review_root(artifact_root, "review-id")
+
+    assert directory.is_dir()
+    assert not (external / "review-id").exists()
+
+
 def run_cli(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "reviewctl", *arguments],
@@ -161,8 +188,9 @@ def mock_openrouter_curl(
     returncode: int = 0,
     status: int | str = 200,
     stderr: bytes = b"",
+    include_separator: bool = True,
 ) -> dict[str, object]:
-    """Replace curl while preserving the request and response-file contract."""
+    """Replace curl while preserving the response-body and status contract."""
     captured: dict[str, object] = {}
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
@@ -171,13 +199,10 @@ def mock_openrouter_curl(
         captured["timeout"] = kwargs["timeout"]
         config = command[command.index("--config") + 1]
         captured["config"] = kwargs["input"].decode() if config == "-" else Path(config).read_text()
-        response_path = Path(command[command.index("--output") + 1])
-        if body:
-            response_path.write_bytes(body)
         return subprocess.CompletedProcess(
             command,
             returncode=returncode,
-            stdout=str(status).encode(),
+            stdout=(body + b"\n" if include_separator else body) + str(status).encode(),
             stderr=stderr,
         )
 
@@ -295,8 +320,7 @@ if os.environ.get('AGE_FAIL'):
 if '-d' in sys.argv:
     sys.stdout.buffer.write(Path(sys.argv[-1]).read_bytes())
 else:
-    target = Path(sys.argv[sys.argv.index('-o') + 1])
-    target.write_bytes(sys.stdin.buffer.read())
+    sys.stdout.buffer.write(sys.stdin.buffer.read())
 """,
     )
 
@@ -7999,7 +8023,7 @@ def test_invoke_openrouter_rejects_missing_or_error_http_status(
 ) -> None:
     source = tmp_path / "source.py"
     source.write_text("pass\n")
-    mock_openrouter_curl(monkeypatch, status="not-a-status")
+    mock_openrouter_curl(monkeypatch, status="not-a-status", include_separator=False)
 
     no_status = cli.invoke_openrouter(
         api_key="test",
@@ -8297,6 +8321,31 @@ def test_invoke_agy_persists_a_sandboxed_structured_response(tmp_path: Path) -> 
     assert json.loads(response_path.read_text())["conversation_id"] == "agy-conversation"
 
 
+def test_invoke_agy_does_not_write_evidence_through_a_symlinked_parent(tmp_path: Path) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    external = tmp_path / "external"
+    external.mkdir()
+    attempt = tmp_path / "attempt"
+    attempt.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="unsafe"):
+        cli.invoke_agy(
+            agy_bin=str(fake_agy),
+            prompt="Review synthetic source.",
+            model="gemini-3.6-flash-low",
+            files=[source],
+            max_output_tokens=1,
+            response_contract="verdict",
+            timeout_seconds=7,
+            request_path=attempt / "request.json",
+            response_path=attempt / "response.json",
+        )
+
+    assert list(external.iterdir()) == []
+
+
 def test_invoke_agy_prefers_schema_validated_structured_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -8338,6 +8387,36 @@ def test_invoke_agy_rejects_duplicate_keys_in_structured_output(
         "AGY_RAW_PAYLOAD",
         '{"status":"SUCCESS","structured_output":'
         '{"verdict":"changes-requested","verdict":"approved","findings":[]}}',
+    )
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin=str(fake_agy),
+        prompt="Review synthetic source.",
+        model="gemini-3.7-flash-high",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert exit_code == 502
+    assert error == "agy returned invalid JSON"
+    assert response.response == ""
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_invoke_agy_rejects_non_finite_structured_output(
+    number: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setenv(
+        "AGY_RAW_PAYLOAD",
+        '{"status":"SUCCESS","structured_output":'
+        f'{{"verdict":"approved","findings":[],"score":{number}}}}}',
     )
 
     exit_code, error, response = cli.invoke_agy(
@@ -8789,6 +8868,40 @@ def test_invoke_kiro_uses_one_deadline_across_all_processes(
         ["chat", "--list-models"],
         ["chat", "--no-interactive"],
     ]
+
+
+@pytest.mark.parametrize("limited_stream", ["stdout", "stderr"])
+def test_invoke_kiro_bounds_captured_process_output(
+    limited_stream: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if limited_stream == "stdout":
+        monkeypatch.setattr(cli, "MAX_KIRO_STDOUT_BYTES", 1)
+        inventory_mode = "valid"
+    else:
+        monkeypatch.setattr(cli, "MAX_KIRO_STDERR_BYTES", 1)
+        inventory_mode = "quota-warning"
+
+    exit_code, error, response = invoke_fake_kiro(
+        tmp_path,
+        monkeypatch,
+        inventory_mode=inventory_mode,
+    )
+
+    assert exit_code == 502
+    assert error == "Kiro transport output exceeded bounded capture"
+    assert response.response == ""
+
+
+def test_invoke_kiro_fails_closed_without_bounded_capture_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "resource", None)
+
+    exit_code, error, response = invoke_fake_kiro(tmp_path, monkeypatch)
+
+    assert exit_code == 126
+    assert error == "Kiro bounded output capture unsupported on this platform"
+    assert response.response == ""
 
 
 def test_kiro_inventory_receives_the_full_remaining_deadline(
@@ -10282,7 +10395,13 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         cli.subprocess, "Popen", strict_popen(SuccessfulProcess, kwargs["session_path"])
     )
-    success = cli.invoke_pi(**kwargs)
+    success = cli.invoke_pi(
+        **{
+            **kwargs,
+            "request_path": tmp_path / "success-request.json",
+            "response_path": tmp_path / "success-response.json",
+        }
+    )
     assert success[0] == 0 and success[2].response.startswith("{")
 
     class EmptyTimeoutProcess:
@@ -10446,6 +10565,16 @@ def test_cli_task8_legacy_receipt_and_config_error_edges(
     digest_path.write_text(json.dumps(digest_only))
     assert cli.verify_receipt(SimpleNamespace(receipt=str(digest_path))) == 1
     assert json.loads(capsys.readouterr().out)["violations"] == ["receipt-digest"]
+
+    external_receipt = tmp_path / "external-receipt.json"
+    external_receipt.write_text(json.dumps({**digest_only, "sha256": "wrong"}))
+    external_value = {"reviewId": "r", "result": "accepted"}
+    external_value["sha256"] = cli.sha256_bytes(cli.canonical_json(external_value))
+    external_receipt.write_text(json.dumps(external_value))
+    symlinked_receipt = tmp_path / "symlinked-receipt.json"
+    symlinked_receipt.symlink_to(external_receipt)
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(symlinked_receipt))) == 1
+    assert json.loads(capsys.readouterr().out)["violations"] == ["json-receipt"]
 
     class Parser:
         def parse_args(self, argv):

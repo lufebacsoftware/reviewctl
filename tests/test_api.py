@@ -946,6 +946,37 @@ def test_source_reader_rejects_project_parent_replaced_before_open(
     assert external_source.read_text() == "secret = True\n"
 
 
+def test_source_reader_rejects_project_replaced_by_a_real_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "source.py"
+    source.write_text("safe = True\n")
+    displaced = tmp_path / "project-displaced"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / source.name).write_text("secret = True\n")
+    real_open = api_module.os.open
+    swapped = False
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == Path(project.anchor) and not swapped:
+            swapped = True
+            project.rename(displaced)
+            replacement.rename(project)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(api_module.os, "open", raced_open)
+
+    with pytest.raises(OSError, match="identity changed"):
+        api_module._read_source_bytes(source, project_dir=project)
+
+    assert swapped
+    assert (project / source.name).read_text() == "secret = True\n"
+
+
 def test_client_rejects_unknown_contract_and_unregistered_transport(tmp_path: Path) -> None:
     (tmp_path / "reviewctl.toml").write_text(
         '[profiles.default]\nroutes = ["llm:model"]\nresponse_contract = "unknown-contract"\n'

@@ -26,7 +26,11 @@ from reviewctl.contracts import (
 )
 from reviewctl.dimensions import DIMENSION_SCHEMA_VERSION, merge_dimensions, normalize_dimensions
 from reviewctl.errors import ConfigError, Diagnostic
-from reviewctl.filesystem import confined_regular_descriptor, read_confined_text
+from reviewctl.filesystem import (
+    confined_directory_descriptor,
+    confined_relative_regular_descriptor,
+    read_confined_text,
+)
 from reviewctl.identity import ProjectIdentityStore
 from reviewctl.journal import ProjectJournal
 
@@ -41,18 +45,32 @@ MAX_SOURCE_CONTEXT_BYTES = 32 * 1024
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
 
-def _read_source_bytes(path: Path, *, project_dir: Path | None = None) -> bytes | None:
+def _read_source_bytes(
+    path: Path,
+    *,
+    project_dir: Path | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> bytes | None:
     root = project_dir or path.parent
-    path.relative_to(root)
+    relative = path.relative_to(root)
     if not _OPEN_SUPPORTS_DIR_FD:
         raise OSError("this platform cannot open review sources without following symlinks")
     try:
-        with confined_regular_descriptor(path, os.O_RDONLY) as descriptor:
-            source = os.fstat(descriptor)
-            if source.st_size > MAX_SOURCE_BYTES:
-                return None
-            with os.fdopen(os.dup(descriptor), "rb") as stream:
-                return stream.read(MAX_SOURCE_BYTES + 1)
+        if expected_root_identity is None:
+            root_metadata = os.stat(root, follow_symlinks=False)
+            expected_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+        with confined_directory_descriptor(root) as root_descriptor:
+            root_metadata = os.fstat(root_descriptor)
+            if (root_metadata.st_dev, root_metadata.st_ino) != expected_root_identity:
+                raise OSError("review source root identity changed")
+            with confined_relative_regular_descriptor(
+                root_descriptor, relative, os.O_RDONLY
+            ) as descriptor:
+                source = os.fstat(descriptor)
+                if source.st_size > MAX_SOURCE_BYTES:
+                    return None
+                with os.fdopen(os.dup(descriptor), "rb") as stream:
+                    return stream.read(MAX_SOURCE_BYTES + 1)
     except OSError as error:
         if "platform cannot confine" in str(error):
             raise OSError(
@@ -222,6 +240,8 @@ class ReviewClient:
         origin_id: str | None = None,
     ) -> None:
         self.project_dir = project_dir.expanduser().resolve()
+        project_metadata = os.stat(self.project_dir, follow_symlinks=False)
+        self._project_identity = (project_metadata.st_dev, project_metadata.st_ino)
         self.config = config
         self.transports = transports
         self.review_root = self.project_dir / ".reviewctl" / "reviews"
@@ -365,7 +385,11 @@ class ReviewClient:
                 )
                 return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
             try:
-                source_bytes = _read_source_bytes(path, project_dir=self.project_dir)
+                source_bytes = _read_source_bytes(
+                    path,
+                    project_dir=self.project_dir,
+                    expected_root_identity=self._project_identity,
+                )
                 if source_bytes is None or len(source_bytes) > MAX_SOURCE_BYTES:
                     diagnostic = Diagnostic(
                         "invalid_request",

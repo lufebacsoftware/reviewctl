@@ -30,6 +30,11 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    resource = None
+
 from reviewctl import __version__
 from reviewctl.backends import (
     BackendCapabilities,
@@ -61,7 +66,12 @@ from reviewctl.contracts import (
     canonical_json as contract_canonical_json,
 )
 from reviewctl.errors import Diagnostic, ReviewctlError, exit_code_for
-from reviewctl.filesystem import confined_regular_descriptor, read_confined_text
+from reviewctl.filesystem import (
+    confined_directory_descriptor,
+    confined_regular_descriptor,
+    read_confined_bytes,
+    read_confined_text,
+)
 from reviewctl.project_cli import add_project_commands
 from reviewctl.review_flow import (
     FallbackRelationship,
@@ -77,6 +87,8 @@ from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discove
 
 MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
+MAX_KIRO_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_KIRO_STDERR_BYTES = 100_000
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
@@ -888,8 +900,10 @@ def validate_request(
 
 def review_root(artifact_root: Path, review_id: str) -> Path:
     turn_name = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}.{secrets.token_hex(3)}"
-    directory = artifact_root.expanduser().resolve() / review_id / turn_name
-    directory.mkdir(parents=True, exist_ok=False)
+    review_directory = artifact_root.expanduser().resolve() / review_id
+    directory = review_directory / turn_name
+    with confined_directory_descriptor(review_directory, create=True) as parent_descriptor:
+        os.mkdir(turn_name, mode=0o700, dir_fd=parent_descriptor)
     return directory
 
 
@@ -1355,7 +1369,7 @@ def build_blind_product_package(
         receipt_path = run.get("receipt")
         if not all(isinstance(item, str) and item for item in (candidate, case, receipt_path)):
             raise ValueError("accepted product run requires candidate, case, and receipt")
-        receipt = json.loads(Path(receipt_path).read_text())
+        receipt = json.loads(read_confined_text(Path(receipt_path)))
         if receipt.get("result") != "accepted" or not valid_receipt(receipt):
             raise ValueError("accepted product run requires a verified accepted receipt")
         response = receipt.get("review")
@@ -1881,24 +1895,56 @@ def invoke_kiro(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return 124, b"", b"", "review attempt timed out"
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=environment,
-                stdin=subprocess.PIPE if input_bytes is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
+        if resource is None:
+            return 126, b"", b"", "Kiro bounded output capture unsupported on this platform"
+        capture_file_limit = max(MAX_KIRO_STDOUT_BYTES, MAX_KIRO_STDERR_BYTES) + 1
+
+        def limit_output_files() -> None:
+            resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+                resource.RLIMIT_FSIZE,
+                (capture_file_limit, capture_file_limit),
             )
-            try:
-                stdout, stderr = process.communicate(input=input_bytes, timeout=remaining)
-                return process.returncode, stdout, stderr, ""
-            except subprocess.TimeoutExpired as error:
-                terminate_process_group(process, grace_seconds=0)
-                stdout = error.output if isinstance(error.output, bytes) else b""
-                stderr = error.stderr if isinstance(error.stderr, bytes) else b""
-                return 124, stdout, stderr, "review attempt timed out"
+
+        try:
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=environment,
+                    stdin=subprocess.PIPE if input_bytes is not None else None,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                    preexec_fn=limit_output_files,
+                )
+                try:
+                    communicated_stdout, communicated_stderr = process.communicate(
+                        input=input_bytes, timeout=remaining
+                    )
+                    code = process.returncode
+                    transport_error = ""
+                except subprocess.TimeoutExpired as error:
+                    terminate_process_group(process, grace_seconds=0)
+                    communicated_stdout = error.output
+                    communicated_stderr = error.stderr
+                    code = 124
+                    transport_error = "review attempt timed out"
+
+                def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                    if not isinstance(value, bytes):
+                        stream.seek(0)
+                        value = stream.read(limit + 1)
+                    return value[:limit], len(value) > limit
+
+                stdout, stdout_truncated = bounded_output(
+                    communicated_stdout, stdout_file, MAX_KIRO_STDOUT_BYTES
+                )
+                stderr, stderr_truncated = bounded_output(
+                    communicated_stderr, stderr_file, MAX_KIRO_STDERR_BYTES
+                )
+                if stdout_truncated or stderr_truncated:
+                    return 502, stdout, stderr, "Kiro transport output exceeded bounded capture"
+                return code, stdout, stderr, transport_error
         except FileNotFoundError:
             return 127, b"", b"", f"Kiro transport executable not found: {kiro_bin}"
         except OSError as error:
@@ -2116,7 +2162,8 @@ def invoke_gemini(
         "--sandbox",
         "--skip-trust",
     ]
-    request_path.write_bytes(
+    write_private_exclusive(
+        request_path,
         canonical_json(
             {
                 "command": command,
@@ -2131,7 +2178,8 @@ def invoke_gemini(
                 "session": str(session_path),
             }
         )
-        + b"\n"
+        + b"\n",
+        label="Gemini request evidence",
     )
     started = time.monotonic()
     environment = gemini_process_environment(os.environ)
@@ -2190,7 +2238,8 @@ def invoke_gemini(
     if not isinstance(response_text, str):
         return 502, "Gemini returned no response", blank
     response_text = normalize_pi_response(response_text, response_contract)
-    session_path.write_bytes(
+    write_private_exclusive(
+        session_path,
         canonical_json(
             {
                 "session_id": conversation_id,
@@ -2199,7 +2248,8 @@ def invoke_gemini(
                 else {},
             }
         )
-        + b"\n"
+        + b"\n",
+        label="Gemini session evidence",
     )
     input_tokens, output_tokens = gemini_usage(payload)
     return (
@@ -2268,7 +2318,11 @@ def invoke_openrouter(
         }
     if provider_preferences:
         payload["provider"] = provider_preferences
-    request_path.write_bytes(canonical_json(payload) + b"\n")
+    write_private_exclusive(
+        request_path,
+        canonical_json(payload) + b"\n",
+        label="OpenRouter request evidence",
+    )
     started = time.monotonic()
     curl_bin = os.environ.get("CURL_BIN", "curl")
     curl_config = (
@@ -2288,10 +2342,8 @@ def invoke_openrouter(
         "POST",
         "--data-binary",
         f"@{request_path}",
-        "--output",
-        str(response_path),
         "--write-out",
-        "%{http_code}",
+        "\n%{http_code}",
         "https://openrouter.ai/api/v1/chat/completions",
     ]
     try:
@@ -2308,10 +2360,19 @@ def invoke_openrouter(
         return 127, f"OpenRouter transport could not execute: {error}", blank
     except subprocess.TimeoutExpired:
         return 124, "review attempt timed out", blank
-    raw_response = response_path.read_bytes() if response_path.is_file() else b""
+    raw_response, separator, http_status_bytes = completed.stdout.rpartition(b"\n")
+    if not separator:
+        raw_response = b""
+        http_status_bytes = completed.stdout
+    if raw_response:
+        write_private_exclusive(
+            response_path,
+            raw_response,
+            label="OpenRouter response evidence",
+        )
     if completed.returncode == 28:
         return 124, "review attempt timed out", blank
-    http_status_text = completed.stdout.decode(errors="replace").strip()
+    http_status_text = http_status_bytes.decode(errors="replace").strip()
     http_status = int(http_status_text) if http_status_text.isdigit() else None
     if completed.returncode != 0:
         message = raw_response.decode(errors="replace") or completed.stderr.decode(errors="replace")
@@ -2386,7 +2447,11 @@ def invoke_agy(
         "responseContract": response_contract,
         "sandbox": True,
     }
-    request_path.write_bytes(canonical_json(request_payload) + b"\n")
+    write_private_exclusive(
+        request_path,
+        canonical_json(request_payload) + b"\n",
+        label="AGY request evidence",
+    )
     command = [
         agy_bin,
         "--model",
@@ -2417,7 +2482,7 @@ def invoke_agy(
                 return 124, "review attempt timed out", blank
     except OSError as error:
         return 127, str(error), blank
-    response_path.write_bytes(stdout)
+    write_private_exclusive(response_path, stdout, label="AGY response evidence")
     stderr_text = stderr.decode(errors="replace")
     if process.returncode != 0:
         return process.returncode, stderr_text, blank
@@ -2426,6 +2491,7 @@ def invoke_agy(
             stdout,
             object_pairs_hook=exact_json_object,
             parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
         )
     except json.JSONDecodeError, ValueError:
         return 502, "agy returned invalid JSON", blank
@@ -2579,6 +2645,14 @@ def reject_nonstandard_json_constant(constant: str) -> None:
     raise ValueError(f"non-standard JSON constant: {constant}")
 
 
+def parse_finite_json_float(value: str) -> float:
+    """Reject finite-parser overflow while decoding strict JSON evidence."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
+
+
 def normalize_pi_response(response: str, response_contract: str) -> str:
     """Remove only one outer JSON fence that Pi may add despite the contract."""
     if response_contract not in {"findings-json", "product-review-json", "product-judge-json"}:
@@ -2633,7 +2707,8 @@ def invoke_pi(
         f"{prompt}\n\nReturn only the requested {response_contract} response. "
         "Do not edit files, run commands, or use information outside the supplied files."
     )
-    request_path.write_bytes(
+    write_private_exclusive(
+        request_path,
         canonical_json(
             {
                 "command": "pi",
@@ -2647,7 +2722,8 @@ def invoke_pi(
                 "session": str(session_path),
             }
         )
-        + b"\n"
+        + b"\n",
+        label="Pi request evidence",
     )
     started = time.monotonic()
     stdout = b""
@@ -2668,10 +2744,16 @@ def invoke_pi(
             # including bytes emitted while the process handled termination.
             stdout, stderr = process.communicate()
             if stdout:
-                response_path.write_bytes(stdout)
+                write_private_exclusive(
+                    response_path,
+                    stdout,
+                    label="Pi response evidence",
+                )
             if stderr:
-                diagnostic_path.write_text(
-                    redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
+                write_private_exclusive(
+                    diagnostic_path,
+                    redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
+                    label="Pi diagnostic evidence",
                 )
             return (
                 124,
@@ -2689,10 +2771,12 @@ def invoke_pi(
         return 127, f"Pi transport could not execute: {error}", blank
 
     if stdout:
-        response_path.write_bytes(stdout)
+        write_private_exclusive(response_path, stdout, label="Pi response evidence")
     if stderr:
-        diagnostic_path.write_text(
-            redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
+        write_private_exclusive(
+            diagnostic_path,
+            redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
+            label="Pi diagnostic evidence",
         )
     persisted = pi_persisted_response(stdout, model, round((time.monotonic() - started) * 1000))
     if not persisted.response:
@@ -3197,20 +3281,29 @@ def load_response(database: Path) -> PersistedResponse | None:
 
 def execute_llm_backend(request: BackendRequest) -> BackendExecution:
     database = request.attempt_dir / "transport.sqlite3"
-    exit_code, diagnostic = invoke_llm(
-        llm_bin=os.environ.get("LLM_BIN", "llm"),
-        prompt=request.prompt,
-        model=request.model,
-        database=database,
-        files=list(request.files),
-        max_output_tokens=request.max_output_tokens,
-        response_contract=request.response_contract,
-        timeout_seconds=request.timeout_seconds,
-    )
+    with tempfile.TemporaryDirectory(prefix="reviewctl-llm-") as scratch_directory:
+        scratch_database = Path(scratch_directory).resolve() / "transport.sqlite3"
+        exit_code, diagnostic = invoke_llm(
+            llm_bin=os.environ.get("LLM_BIN", "llm"),
+            prompt=request.prompt,
+            model=request.model,
+            database=scratch_database,
+            files=list(request.files),
+            max_output_tokens=request.max_output_tokens,
+            response_contract=request.response_contract,
+            timeout_seconds=request.timeout_seconds,
+        )
+        response = load_response(scratch_database)
+        if scratch_database.exists():
+            write_private_exclusive(
+                database,
+                read_confined_bytes(scratch_database),
+                label="LLM database evidence",
+            )
     return BackendExecution(
         exit_code,
         diagnostic,
-        load_response(database),
+        response,
         BackendEvidence(database=database),
     )
 
@@ -3226,7 +3319,11 @@ def execute_codex_backend(request: BackendRequest) -> BackendExecution:
         timeout_seconds=request.timeout_seconds,
         workspace=request.files[0].parent,
     )
-    response_path.write_text(response.response)
+    write_private_exclusive(
+        response_path,
+        response.response.encode(),
+        label="Codex response evidence",
+    )
     return BackendExecution(
         exit_code,
         diagnostic,
@@ -3360,21 +3457,33 @@ def execute_pi_backend(request: BackendRequest) -> BackendExecution:
     session_path = request.attempt_dir / "session.jsonl"
     final_response_path = request.attempt_dir / "response.md"
     stderr_path = request.attempt_dir / "stderr.log"
-    exit_code, diagnostic, response = invoke_pi(
-        pi_bin=os.environ.get("PI_BIN", "pi"),
-        prompt=request.prompt,
-        model=request.model,
-        files=list(request.files),
-        max_output_tokens=request.max_output_tokens,
-        response_contract=request.response_contract,
-        timeout_seconds=request.timeout_seconds,
-        request_path=request_path,
-        response_path=events_path,
-        session_path=session_path,
-        diagnostic_path=stderr_path,
-    )
+    with tempfile.TemporaryDirectory(prefix="reviewctl-pi-") as scratch_directory:
+        scratch_session = Path(scratch_directory).resolve() / "session.jsonl"
+        exit_code, diagnostic, response = invoke_pi(
+            pi_bin=os.environ.get("PI_BIN", "pi"),
+            prompt=request.prompt,
+            model=request.model,
+            files=list(request.files),
+            max_output_tokens=request.max_output_tokens,
+            response_contract=request.response_contract,
+            timeout_seconds=request.timeout_seconds,
+            request_path=request_path,
+            response_path=events_path,
+            session_path=scratch_session,
+            diagnostic_path=stderr_path,
+        )
+        if scratch_session.exists():
+            write_private_exclusive(
+                session_path,
+                read_confined_bytes(scratch_session),
+                label="Pi session evidence",
+            )
     if response.response:
-        final_response_path.write_text(response.response)
+        write_private_exclusive(
+            final_response_path,
+            response.response.encode(),
+            label="Pi final response evidence",
+        )
     return BackendExecution(
         exit_code,
         diagnostic,
@@ -3843,7 +3952,7 @@ def persisted_receipt_valid(path: Path, *, expected_sha256: str | None = None) -
 def seal(path: Path, contents: bytes, recipient: str) -> str:
     target = path.with_suffix(path.suffix + ".age")
     result = subprocess.run(
-        ["age", "-r", recipient, "-o", str(target)],
+        ["age", "-r", recipient],
         input=contents,
         text=False,
         capture_output=True,
@@ -3851,6 +3960,7 @@ def seal(path: Path, contents: bytes, recipient: str) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors="replace").strip() or "age failed")
+    write_private_exclusive(target, result.stdout, label="sealed review evidence")
     return target.name
 
 
@@ -3923,7 +4033,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     logger = configure_runtime_logger(log_path)
     turn_dir = review_root(artifact_root, args.review_id)
     attempts_dir = turn_dir / "attempts"
-    attempts_dir.mkdir()
+    with confined_directory_descriptor(attempts_dir, create=True):
+        pass
     codex_source_roots = (
         review_source_roots(files)
         if any(route.transport == "codex" for route in routes)
@@ -4088,7 +4199,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     review_id=args.review_id,
                 )
             attempt_dir = attempts_dir / f"{number:02d}"
-            attempt_dir.mkdir()
+            with confined_directory_descriptor(attempts_dir) as attempts_descriptor:
+                os.mkdir(attempt_dir.name, mode=0o700, dir_fd=attempts_descriptor)
             database: Path | None = None
             request_path: Path | None = None
             response_path: Path | None = None
@@ -4379,7 +4491,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             if evaluation_error is not None:
                 attempt["evaluationError"] = evaluation_error
             attempts.append(attempt)
-            (attempt_dir / "attempt.json").write_bytes(canonical_json(attempt) + b"\n")
+            write_private_exclusive(
+                attempt_dir / "attempt.json",
+                canonical_json(attempt) + b"\n",
+                label="attempt metadata evidence",
+            )
             log_event(
                 logger,
                 "attempt_finished",
@@ -4600,7 +4716,7 @@ def verify_receipt(args: argparse.Namespace) -> int:
 
     try:
         receipt = json.loads(
-            receipt_path.read_text(),
+            read_confined_text(receipt_path),
             object_pairs_hook=exact_json_object,
             parse_constant=reject_nonstandard_constant,
         )
@@ -4902,7 +5018,7 @@ def run_candidate_tournament(
             exit_code = run_review(parser, namespace)
             receipt_paths = sorted(set(case_root.glob("**/receipt.json")) - before)
             receipt_path = receipt_paths[0]
-            receipt = json.loads(receipt_path.read_text())
+            receipt = json.loads(read_confined_text(receipt_path))
             actual_cost = receipt_attempt_cost(receipt)
             if candidate.cost_mode == "metered" and actual_cost is not None:
                 actual_spend += actual_cost
@@ -5086,7 +5202,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             after = set(case_root.glob("**/receipt.json"))
             receipt_paths = sorted(after - before)
             receipt_path = receipt_paths[0]
-            receipt = json.loads(receipt_path.read_text())
+            receipt = json.loads(read_confined_text(receipt_path))
             receipt_result = str(receipt["result"])
             actual_cost = receipt_attempt_cost(receipt)
             if actual_cost is None:

@@ -273,6 +273,18 @@ def test_identity_root_descriptor_rejects_missing_root_and_unsupported_platform(
     assert error.value.diagnostic.code == "journal_unavailable"
 
 
+def test_state_root_helper_rejects_unsupported_platform_without_attribute_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delattr(identity_module.os, "O_DIRECTORY")
+    monkeypatch.delattr(identity_module.os, "O_NOFOLLOW")
+
+    with pytest.raises(JournalOperationError) as error:
+        ensure_project_state_root(tmp_path / "project")
+
+    assert error.value.diagnostic.code == "journal_unavailable"
+
+
 def test_identity_root_helpers_reject_non_directory_descriptors(
     tmp_path: Path, monkeypatch
 ) -> None:

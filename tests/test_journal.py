@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,47 @@ import pytest
 import reviewctl.journal as journal_module
 from reviewctl.errors import JournalOperationError
 from reviewctl.journal import ProjectJournal
+
+
+def test_journal_constructor_does_not_chmod_through_replaced_project_ancestor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "project"
+    state = project / ".reviewctl"
+    state.mkdir(parents=True)
+    external_workspace = tmp_path / "external-workspace"
+    external_state = external_workspace / "project" / ".reviewctl"
+    external_state.mkdir(parents=True)
+    external_state.chmod(0o755)
+    displaced = tmp_path / "displaced-workspace"
+    real_mkdir = Path.mkdir
+
+    def raced_mkdir(path: Path, *args, **kwargs) -> None:
+        if path == state:
+            workspace.rename(displaced)
+            workspace.symlink_to(external_workspace, target_is_directory=True)
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", raced_mkdir)
+
+    ProjectJournal(state / "journal.jsonl")
+
+    assert external_state.stat().st_mode & 0o777 == 0o755
+
+
+def test_journal_constructor_wraps_directory_confinement_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    @contextmanager
+    def failed_confinement(path: Path, *, create: bool = False):
+        raise OSError("confinement failed")
+        yield
+
+    monkeypatch.setattr(journal_module, "confined_directory_descriptor", failed_confinement)
+
+    with pytest.raises(JournalOperationError, match="could not confine journal directory"):
+        ProjectJournal(tmp_path / "journal.jsonl")
 
 
 def test_journal_rejects_symlinked_project_state_root(tmp_path: Path) -> None:
@@ -25,6 +67,20 @@ def test_journal_rejects_symlinked_project_state_root(tmp_path: Path) -> None:
         ProjectJournal(project / ".reviewctl" / "journal.jsonl")
 
     assert list(external.iterdir()) == []
+
+
+def test_journal_rejects_duplicate_event_keys(tmp_path: Path) -> None:
+    path = tmp_path / "journal.jsonl"
+    path.write_text('{"type":"finding","type":"review_started"}\n')
+    journal = ProjectJournal(path)
+
+    events, diagnostic = journal.read_with_diagnostic()
+
+    assert events == []
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_corrupt"
+    assert diagnostic.message == "invalid journal event at line 1: type"
+    assert journal.verify() == [diagnostic.message]
 
 
 def test_journal_rejects_symlinked_state_file(tmp_path: Path) -> None:

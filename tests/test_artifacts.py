@@ -242,3 +242,19 @@ def test_artifact_write_rejects_project_parent_replaced_before_anchor_open(
 
     assert swapped
     assert list(external_root.iterdir()) == []
+
+
+def test_artifact_write_rejects_root_replaced_by_a_real_directory(tmp_path: Path) -> None:
+    root = tmp_path / "review"
+    store = ArtifactStore(root)
+    displaced = tmp_path / "review-displaced"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+
+    root.rename(displaced)
+    replacement.rename(root)
+
+    with pytest.raises(OSError, match="identity changed"):
+        store.write_text("packet.json", "private prompt")
+
+    assert list(root.iterdir()) == []

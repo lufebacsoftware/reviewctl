@@ -49,11 +49,25 @@ def _unsafe_state_path(path: Path) -> JournalOperationError:
     )
 
 
+def _unsupported_identity_confinement() -> JournalOperationError:
+    return JournalOperationError(
+        Diagnostic(
+            "journal_unavailable",
+            "this platform cannot confine project identity files",
+            retryable=False,
+        )
+    )
+
+
 def ensure_project_state_root(project_dir: Path, *, create: bool = True) -> Path | None:
     """Return a literal private .reviewctl directory without following a root symlink."""
     project = project_dir.expanduser().resolve()
     root = project / ".reviewctl"
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_flag is None or not _OPEN_SUPPORTS_DIR_FD:
+        raise _unsupported_identity_confinement()
+    flags = os.O_RDONLY | directory_flag | no_follow
     descriptor: int | None = None
     try:
         with confined_directory_descriptor(project, create=create) as project_descriptor:
@@ -181,13 +195,7 @@ class ProjectIdentityStore:
         no_follow = getattr(os, "O_NOFOLLOW", None)
         directory_flag = getattr(os, "O_DIRECTORY", None)
         if no_follow is None or directory_flag is None or not _OPEN_SUPPORTS_DIR_FD:
-            raise JournalOperationError(
-                Diagnostic(
-                    "journal_unavailable",
-                    "this platform cannot confine project identity files",
-                    retryable=False,
-                )
-            )
+            raise _unsupported_identity_confinement()
         with ExitStack() as descriptors:
             try:
                 project_descriptor = descriptors.enter_context(

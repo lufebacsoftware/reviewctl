@@ -7,7 +7,10 @@ import stat
 from contextlib import contextmanager
 from pathlib import Path
 
-from reviewctl.filesystem import confined_directory_descriptor
+from reviewctl.filesystem import (
+    confined_directory_descriptor,
+    confined_relative_directory_descriptor,
+)
 from reviewctl.identity import confine_project_state_path
 
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
@@ -18,8 +21,10 @@ class ArtifactStore:
 
     def __init__(self, root: Path) -> None:
         self.root = confine_project_state_path(root)
-        with self._directory_descriptor(()):
-            pass
+        self._root_identity: tuple[int, int] | None = None
+        with self._directory_descriptor(()) as descriptor:
+            metadata = os.fstat(descriptor)
+            self._root_identity = (metadata.st_dev, metadata.st_ino)
 
     @staticmethod
     def _artifact_parts(name: str) -> tuple[str, ...]:
@@ -35,9 +40,14 @@ class ArtifactStore:
     def _directory_descriptor(self, parts: tuple[str, ...]):
         if not _OPEN_SUPPORTS_DIR_FD:
             raise OSError("this platform cannot confine review artifacts")
-        with confined_directory_descriptor(self.root.joinpath(*parts), create=True) as current:
-            os.fchmod(current, 0o700)
-            yield current
+        with confined_directory_descriptor(self.root, create=True) as root:
+            metadata = os.fstat(root)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if self._root_identity is not None and identity != self._root_identity:
+                raise OSError("artifact root identity changed")
+            with confined_relative_directory_descriptor(root, parts, create=True) as current:
+                os.fchmod(current, 0o700)
+                yield current
 
     def write_bytes(self, name: str, contents: bytes) -> Path:
         parts = self._artifact_parts(name)

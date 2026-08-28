@@ -338,6 +338,7 @@ def test_execute_llm_backend_invokes_legacy_transport_and_maps_database_evidence
 
     def fake_invoke_llm(**kwargs: object) -> tuple[int, str]:
         calls["invoke"] = kwargs
+        Path(kwargs["database"]).write_bytes(b"database evidence")
         return 17, "diagnostic"
 
     def fake_load_response(database: Path) -> PersistedResponse:
@@ -347,23 +348,28 @@ def test_execute_llm_backend_invokes_legacy_transport_and_maps_database_evidence
     monkeypatch.delenv("LLM_BIN", raising=False)
     monkeypatch.setattr(cli, "invoke_llm", fake_invoke_llm)
     monkeypatch.setattr(cli, "load_response", fake_load_response)
+    request.attempt_dir.mkdir()
 
     execution = cli.execute_llm_backend(request)
     database = request.attempt_dir / "transport.sqlite3"
+    scratch_database = calls["load"]
+    assert isinstance(scratch_database, Path)
 
     assert calls == {
         "invoke": {
             "llm_bin": "llm",
             "prompt": request.prompt,
             "model": request.model,
-            "database": database,
+            "database": scratch_database,
             "files": list(request.files),
             "max_output_tokens": request.max_output_tokens,
             "response_contract": request.response_contract,
             "timeout_seconds": request.timeout_seconds,
         },
-        "load": database,
+        "load": scratch_database,
     }
+    assert scratch_database != database
+    assert database.read_bytes() == b"database evidence"
     assert execution == BackendExecution(
         17, "diagnostic", expected_response, BackendEvidence(database=database)
     )
@@ -670,6 +676,7 @@ def test_execute_pi_backend_invokes_legacy_transport_and_maps_all_evidence(
 
     def fake_invoke_pi(**kwargs: object) -> tuple[int, str, PersistedResponse]:
         calls.update(kwargs)
+        Path(kwargs["session_path"]).write_text("session evidence")
         return 0, "", expected_response
 
     request.attempt_dir.mkdir()
@@ -682,6 +689,8 @@ def test_execute_pi_backend_invokes_legacy_transport_and_maps_all_evidence(
     session_path = request.attempt_dir / "session.jsonl"
     final_response_path = request.attempt_dir / "response.md"
     stderr_path = request.attempt_dir / "stderr.log"
+    scratch_session = calls["session_path"]
+    assert isinstance(scratch_session, Path)
 
     assert calls == {
         "pi_bin": "pi",
@@ -693,9 +702,11 @@ def test_execute_pi_backend_invokes_legacy_transport_and_maps_all_evidence(
         "timeout_seconds": request.timeout_seconds,
         "request_path": request_path,
         "response_path": events_path,
-        "session_path": session_path,
+        "session_path": scratch_session,
         "diagnostic_path": stderr_path,
     }
+    assert scratch_session != session_path
+    assert session_path.read_text() == "session evidence"
     assert final_response_path.is_file() is bool(response_text)
     if response_text:
         assert final_response_path.read_text() == response_text

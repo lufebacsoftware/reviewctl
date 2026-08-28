@@ -19,6 +19,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
     fcntl = None
 
+from reviewctl.contracts import exact_json_object
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError
 from reviewctl.filesystem import confined_directory_descriptor
@@ -80,8 +81,13 @@ class ProjectJournal:
         self.path = confine_project_state_path(path)
         self.project_id = project_id
         self.origin_id = origin_id
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
+        try:
+            with confined_directory_descriptor(self.path.parent, create=True) as descriptor:
+                os.fchmod(descriptor, 0o700)
+        except OSError as error:
+            raise JournalOperationError(
+                Diagnostic("journal_corrupt", f"could not confine journal directory: {error}")
+            ) from error
 
     def append(self, event: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
@@ -462,6 +468,7 @@ class ProjectJournal:
             try:
                 event = json.loads(
                     line,
+                    object_pairs_hook=exact_json_object,
                     parse_constant=_reject_nonstandard_json_number,
                     parse_float=_parse_finite_json_float,
                 )
