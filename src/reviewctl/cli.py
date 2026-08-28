@@ -88,6 +88,8 @@ from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discove
 
 MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
+MAX_AGY_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_AGY_STDERR_BYTES = 100_000
 MAX_KIRO_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_KIRO_STDERR_BYTES = 100_000
 MAX_LLM_DATABASE_BYTES = 4 * 1024 * 1024
@@ -98,6 +100,8 @@ MAX_OPENROUTER_STDERR_BYTES = 100_000
 MAX_OPENROUTER_STATUS_BYTES = 32
 MAX_PI_EXPLORATION_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_PI_EXPLORATION_STDERR_BYTES = 100_000
+MAX_PI_LEGACY_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_PI_LEGACY_STDERR_BYTES = 100_000
 MAX_CODEX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDERR_BYTES = 100_000
@@ -2617,6 +2621,8 @@ def invoke_agy(
 ) -> tuple[int, str, PersistedResponse]:
     """Run a native Antigravity model in an empty sandbox with durable JSON evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
+    if resource is None:
+        return 126, "Antigravity bounded output capture unsupported on this platform", blank
     packet = openrouter_packet(prompt, files, response_contract)
     request_payload: dict[str, object] = {
         "command": "agy",
@@ -2646,23 +2652,52 @@ def invoke_agy(
     if schema := response_schema(response_contract):
         command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
     command.append("--print")
+    capture_file_limit = max(MAX_AGY_STDOUT_BYTES, MAX_AGY_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
     try:
         with tempfile.TemporaryDirectory(prefix="reviewctl-agy-") as sandbox:
-            process = subprocess.Popen(
-                command,
-                cwd=sandbox,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-            try:
-                stdout, stderr = process.communicate(input=packet.encode(), timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                terminate_process_group(process)
-                return 124, "review attempt timed out", blank
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=sandbox,
+                    stdin=subprocess.PIPE,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                    preexec_fn=limit_output_files,
+                )
+                try:
+                    communicated_stdout, communicated_stderr = process.communicate(
+                        input=packet.encode(), timeout=timeout_seconds
+                    )
+                except subprocess.TimeoutExpired:
+                    terminate_process_group(process)
+                    return 124, "review attempt timed out", blank
+
+                def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                    if not isinstance(value, bytes):
+                        stream.seek(0)
+                        value = stream.read(limit + 1)
+                    return value[:limit], len(value) > limit
+
+                stdout, stdout_truncated = bounded_output(
+                    communicated_stdout, stdout_file, MAX_AGY_STDOUT_BYTES
+                )
+                stderr, stderr_truncated = bounded_output(
+                    communicated_stderr, stderr_file, MAX_AGY_STDERR_BYTES
+                )
+            if stdout_truncated or stderr_truncated:
+                return 502, "Antigravity transport output exceeded bounded capture", blank
     except OSError as error:
         return 127, str(error), blank
+    except subprocess.SubprocessError as error:
+        return 126, f"Antigravity bounded output capture failed: {error}", blank
     write_private_exclusive(
         response_path,
         stdout,
@@ -2871,6 +2906,8 @@ def invoke_pi(
 ) -> tuple[int, str, PersistedResponse]:
     """Run Pi in JSON mode and retain its complete event stream and session."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
+    if resource is None:
+        return 126, "Pi bounded output capture unsupported on this platform", blank
     command = [
         pi_bin,
         "--mode",
@@ -2916,21 +2953,49 @@ def invoke_pi(
     started = time.monotonic()
     stdout = b""
     stderr = b""
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=files[0].parent if files else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+    capture_file_limit = max(MAX_PI_LEGACY_STDOUT_BYTES, MAX_PI_LEGACY_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
         )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            terminate_process_group(process)
-            # A second communicate returns the complete buffered streams,
-            # including bytes emitted while the process handled termination.
-            stdout, stderr = process.communicate()
+
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=files[0].parent if files else None,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+                preexec_fn=limit_output_files,
+            )
+            timed_out = False
+            try:
+                communicated_stdout, communicated_stderr = process.communicate(
+                    timeout=timeout_seconds
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                terminate_process_group(process)
+                communicated_stdout, communicated_stderr = process.communicate()
+
+            def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                if not isinstance(value, bytes):
+                    stream.seek(0)
+                    value = stream.read(limit + 1)
+                return value[:limit], len(value) > limit
+
+            stdout, stdout_truncated = bounded_output(
+                communicated_stdout, stdout_file, MAX_PI_LEGACY_STDOUT_BYTES
+            )
+            stderr, stderr_truncated = bounded_output(
+                communicated_stderr, stderr_file, MAX_PI_LEGACY_STDERR_BYTES
+            )
+        if stdout_truncated or stderr_truncated:
+            return 502, "Pi transport output exceeded bounded capture", blank
+        if timed_out:
             if stdout:
                 write_private_exclusive(
                     response_path,
@@ -2957,6 +3022,8 @@ def invoke_pi(
             )
     except FileNotFoundError:
         return 127, f"Pi transport executable not found: {pi_bin}", blank
+    except subprocess.SubprocessError as error:
+        return 126, f"Pi bounded output capture failed: {error}", blank
     except OSError as error:
         return 127, f"Pi transport could not execute: {error}", blank
 

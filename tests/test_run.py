@@ -8758,6 +8758,103 @@ def test_invoke_agy_sends_the_review_packet_over_standard_input(
     assert len(stdin_log.read_bytes()) > cli.MAX_FRAGMENT_BYTES
 
 
+@pytest.mark.parametrize(("stdout", "stderr"), [(b"12345", b""), (b"", b"12345")])
+def test_invoke_agy_rejects_oversized_subprocess_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: bytes, stderr: bytes
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            return stdout, stderr
+
+    monkeypatch.setattr(cli, "MAX_AGY_STDOUT_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli, "MAX_AGY_STDERR_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Process())
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin="agy",
+        prompt="Review.",
+        model="gemini-test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert (exit_code, error, response.response) == (
+        502,
+        "Antigravity transport output exceeded bounded capture",
+        "",
+    )
+
+
+def test_invoke_agy_fails_closed_without_bounded_capture_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setattr(cli, "resource", None)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin="agy",
+        prompt="Review.",
+        model="gemini-test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert (exit_code, error, response.response) == (
+        126,
+        "Antigravity bounded output capture unsupported on this platform",
+        "",
+    )
+
+
+def test_invoke_agy_reports_bounded_capture_setup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.SubprocessError("limit failed")),
+    )
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin="agy",
+        prompt="Review.",
+        model="gemini-test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert (exit_code, error, response.response) == (
+        126,
+        "Antigravity bounded output capture failed: limit failed",
+        "",
+    )
+
+
 def test_invoke_agy_does_not_write_evidence_through_a_symlinked_parent(tmp_path: Path) -> None:
     fake_agy = write_fake_agy(tmp_path)
     source = tmp_path / "source.py"
@@ -10833,6 +10930,7 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
         stdout: object,
         stderr: object,
         start_new_session: bool,
+        preexec_fn: Callable[[], None],
         session_path: Path,
     ) -> None:
         assert command == [
@@ -10857,9 +10955,10 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
             "Do not edit files, run commands, or use information outside the supplied files.",
         ]
         assert cwd == source.parent
-        assert stdout is subprocess.PIPE
-        assert stderr is subprocess.PIPE
+        assert hasattr(stdout, "write")
+        assert hasattr(stderr, "write")
         assert start_new_session is True
+        assert callable(preexec_fn)
 
     def strict_popen(
         process_factory: Callable[[], object], session_path: Path
@@ -10871,8 +10970,11 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
             stdout: object,
             stderr: object,
             start_new_session: bool,
+            preexec_fn: Callable[[], None],
         ) -> object:
-            assert_pi_launch(command, cwd, stdout, stderr, start_new_session, session_path)
+            assert_pi_launch(
+                command, cwd, stdout, stderr, start_new_session, preexec_fn, session_path
+            )
             return process_factory()
 
         return launch
@@ -10993,6 +11095,109 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
     )
     assert empty_timeout[0] == 124
     assert terminated == [(pi_timeout_processes[0], 5), (pi_timeout_processes[1], 5)]
+
+
+@pytest.mark.parametrize(("stdout", "stderr"), [(b"12345", b""), (b"", b"12345")])
+def test_invoke_pi_rejects_oversized_subprocess_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: bytes, stderr: bytes
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            return stdout, stderr
+
+    monkeypatch.setattr(cli, "MAX_PI_LEGACY_STDOUT_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli, "MAX_PI_LEGACY_STDERR_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Process())
+
+    exit_code, error, response = cli.invoke_pi(
+        pi_bin="pi",
+        prompt="Review.",
+        model="openrouter/test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+        session_path=tmp_path / "session.json",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert (exit_code, error, response.response) == (
+        502,
+        "Pi transport output exceeded bounded capture",
+        "",
+    )
+
+
+def test_invoke_pi_fails_closed_without_bounded_capture_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setattr(cli, "resource", None)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+
+    exit_code, error, response = cli.invoke_pi(
+        pi_bin="pi",
+        prompt="Review.",
+        model="openrouter/test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+        session_path=tmp_path / "session.json",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert (exit_code, error, response.response) == (
+        126,
+        "Pi bounded output capture unsupported on this platform",
+        "",
+    )
+
+
+def test_invoke_pi_reports_bounded_capture_setup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.SubprocessError("limit failed")),
+    )
+
+    exit_code, error, response = cli.invoke_pi(
+        pi_bin="pi",
+        prompt="Review.",
+        model="openrouter/test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+        session_path=tmp_path / "session.json",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert (exit_code, error, response.response) == (
+        126,
+        "Pi bounded output capture failed: limit failed",
+        "",
+    )
 
 
 def test_cli_task8_pi_exploration_process_edges(tmp_path: Path, monkeypatch) -> None:

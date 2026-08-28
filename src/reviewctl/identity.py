@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - journal support is POSIX-only
     fcntl = None
 
 from reviewctl.config import PROJECT_ID
+from reviewctl.contracts import exact_json_object
 from reviewctl.errors import Diagnostic, JournalOperationError
 from reviewctl.filesystem import confined_directory_descriptor
 
@@ -265,7 +266,7 @@ class ProjectIdentityStore:
                 raise OSError("project identity is not a regular file")
             with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
                 descriptor = None
-                value = json.load(stream)
+                value = json.load(stream, object_pairs_hook=exact_json_object)
         except FileNotFoundError:
             raise
         except (OSError, UnicodeError, ValueError) as error:

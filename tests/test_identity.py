@@ -34,6 +34,18 @@ def test_identity_store_rejects_project_mismatch(tmp_path: Path) -> None:
         store.ensure("project-two")
 
 
+def test_identity_store_rejects_duplicate_json_fields(tmp_path: Path) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    created = store.ensure("project-one")
+    store.path.write_text(
+        '{"schemaVersion":1,"projectId":"other","projectId":"project-one",'
+        f'"originId":"{created.origin_id}","createdAt":"{created.created_at}"}}'
+    )
+
+    with pytest.raises(JournalOperationError, match="projectId"):
+        store.read_existing()
+
+
 @pytest.mark.parametrize("target_exists", [False, True])
 def test_identity_store_rejects_symlinked_state_root_without_mutating_target(
     tmp_path: Path, target_exists: bool
