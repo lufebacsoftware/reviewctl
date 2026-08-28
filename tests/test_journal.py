@@ -369,6 +369,35 @@ def test_journal_rejects_malformed_versioned_envelope_scalars(
     assert journal.compatibility() == "invalid"
 
 
+@pytest.mark.parametrize("status", ["unknown", ["open"]])
+def test_journal_verify_rejects_persisted_unsupported_finding_status(
+    tmp_path: Path, status: object
+) -> None:
+    event = {
+        "schemaVersion": 1,
+        "projectId": "project-1",
+        "originId": "origin-1",
+        "sequence": 1,
+        "previousEventSha256": None,
+        "type": "finding_observed",
+        "findingId": "finding-1",
+        "reviewId": "review-1",
+        "status": status,
+    }
+    event["eventSha256"] = journal_module._event_digest(event)
+    path = tmp_path / "journal.jsonl"
+    path.write_text(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+    journal = ProjectJournal(path, project_id="project-1", origin_id="origin-1")
+
+    violations = journal.verify()
+    findings, diagnostic = journal.findings_with_diagnostic()
+
+    assert any("finding status" in violation for violation in violations)
+    assert findings == []
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_corrupt"
+
+
 def test_versioned_event_extends_a_legacy_prefix_with_canonical_digest(tmp_path: Path) -> None:
     path = tmp_path / "journal.jsonl"
     legacy = {"type": "review_started", "reviewId": "legacy"}

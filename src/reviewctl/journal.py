@@ -276,7 +276,7 @@ class ProjectJournal:
         event_type = event["type"]
         if event_type in {"finding", "finding_observed"}:
             status = event.get("status", "open")
-            if status not in FINDING_STATUSES:
+            if not isinstance(status, str) or status not in FINDING_STATUSES:
                 raise ValueError(f"unsupported finding status: {status}")
             return
         if event_type != "finding_status_changed":
@@ -428,6 +428,10 @@ class ProjectJournal:
                 self._event_dimensions(event)
             except ValueError as error:
                 violations.append(f"{error} at line {index}")
+            if event.get("type") in {"finding", "finding_observed"}:
+                status = event.get("status", "open")
+                if not isinstance(status, str) or status not in FINDING_STATUSES:
+                    violations.append(f"unsupported finding status at line {index}")
             if "schemaVersion" not in event:
                 if not legacy_prefix:
                     violations.append(f"legacy event after versioned event at line {index}")
