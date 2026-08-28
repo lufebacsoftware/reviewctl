@@ -891,14 +891,17 @@ def test_run_hashes_the_exact_policy_bytes_used_for_authorization(
     replacement = b'[models."codex-model"]\nsource_allowed = false\n'
     policy.write_bytes(authorized)
     assert cli.policy_sha256(str(policy)) == hashlib.sha256(authorized).hexdigest()
-    real_load_policy = cli.load_policy
+    real_load_policy_evidence = cli.load_policy_evidence
+    replacement_occurred = False
 
-    def load_then_replace(path: str) -> dict[str, Any]:
-        loaded = real_load_policy(path)
+    def load_then_replace(path: str) -> tuple[dict[str, Any], bytes]:
+        nonlocal replacement_occurred
+        loaded = real_load_policy_evidence(path)
         policy.write_bytes(replacement)
+        replacement_occurred = True
         return loaded
 
-    monkeypatch.setattr(cli, "load_policy", load_then_replace)
+    monkeypatch.setattr(cli, "load_policy_evidence", load_then_replace)
     namespace = cli.build_parser().parse_args(
         [
             *review_arguments(tmp_path),
@@ -917,6 +920,7 @@ def test_run_hashes_the_exact_policy_bytes_used_for_authorization(
 
     assert namespace.handler(namespace) == 0
     receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    assert replacement_occurred is True
     assert receipt["policy"]["sha256"] == hashlib.sha256(authorized).hexdigest()
 
 
