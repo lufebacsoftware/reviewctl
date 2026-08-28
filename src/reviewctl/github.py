@@ -517,6 +517,16 @@ def _diff_path(value: str, *, side_prefixed: bool = True) -> str | None:
     return _validate_relative_path(path)
 
 
+_DIFF_HEADER = re.compile(r'diff --git ("(?:\\.|[^"\\])*"|[^ ]+) ("(?:\\.|[^"\\])*"|[^ ]+)')
+
+
+def _diff_header_paths(value: str) -> tuple[str, str]:
+    match = _DIFF_HEADER.fullmatch(value)
+    if match is None:
+        raise _UnsupportedDiffError("pull-request diff has a malformed diff --git header")
+    return match.group(1), match.group(2)
+
+
 def _diff_files(diff: str) -> tuple[_DiffFile, ...]:
     if diff and not diff.startswith("diff --git "):
         raise _UnsupportedDiffError("non-empty pull-request diff must begin with diff --git")
@@ -531,16 +541,12 @@ def _diff_files(diff: str) -> tuple[_DiffFile, ...]:
 
     def flush() -> None:
         nonlocal entry_started, old_path, new_path, status, rename_from, rename_to, in_hunk
-        path = rename_to or new_path or old_path or rename_from
-        if entry_started and path is None:
-            raise _UnsupportedDiffError("pull-request diff entry has no materializable path")
-        if path is not None:
+        if entry_started:
+            path = rename_to or new_path or old_path or rename_from or ""
             resolved_status = status
             if path == "/dev/null":
-                path = old_path or rename_from
+                path = old_path or rename_from or ""
                 resolved_status = "deleted"
-            if path is None:
-                raise _UnsupportedDiffError("pull-request diff entry has no materializable path")
             entries.append(
                 _DiffFile(
                     path=_diff_path(path, side_prefixed=rename_to is None) or path,
@@ -562,6 +568,7 @@ def _diff_files(diff: str) -> tuple[_DiffFile, ...]:
     for raw in diff.splitlines():
         if raw.startswith("diff --git "):
             flush()
+            old_path, new_path = _diff_header_paths(raw)
             entry_started = True
         elif raw.startswith("@@ "):
             in_hunk = True

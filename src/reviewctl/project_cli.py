@@ -553,9 +553,11 @@ def _status_payload(
         except ValueError as error:
             diagnostic = Diagnostic("invalid_request", str(error))
             selected_dimension = None
-        if selected_dimension is not None:
+        if selected_dimension is not None and diagnostic is None:
             events = [
-                event for event in events if selected_dimension in event.get("dimensions", [])
+                event
+                for event in events
+                if selected_dimension in ProjectJournal._event_dimensions(event)
             ]
     review_ids = {event.get("reviewId") for event in events if event.get("reviewId")}
     payload: dict[str, Any] = {

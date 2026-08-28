@@ -898,6 +898,33 @@ def test_findings_and_status_filter_by_dimension(tmp_path: Path, capsys) -> None
     assert json.loads(capsys.readouterr().out)["journal"]["reviews"] == 1
 
 
+@pytest.mark.parametrize("dimensions", [None, 1])
+def test_status_dimension_filter_reports_malformed_journal_dimensions(
+    tmp_path: Path, capsys, dimensions: object
+) -> None:
+    journal = ProjectJournal(tmp_path / ".reviewctl/journal.jsonl")
+    journal.path.write_text(
+        json.dumps(
+            {
+                "type": "review_started",
+                "reviewId": "review-security",
+                "dimensions": dimensions,
+            }
+        )
+        + "\n"
+    )
+
+    assert (
+        run_cli(
+            ["status", "--project", str(tmp_path), "--dimension", "security", "--format", "json"]
+        )
+        == 5
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["diagnostic"]["code"] == "journal_corrupt"
+    assert "dimensions" in payload["diagnostic"]["message"]
+
+
 def test_doctor_reports_route_and_capability_without_credentials(tmp_path: Path, capsys) -> None:
     (tmp_path / "reviewctl.toml").write_text(
         '[project]\nprivacy_mode = "private"\n'

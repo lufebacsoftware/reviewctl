@@ -905,6 +905,16 @@ def test_journal_project_and_status_projection_rejects_malformed_events() -> Non
         ProjectJournal._event_dimensions({"dimensions": ["bad"]})
 
 
+@pytest.mark.parametrize("dimensions", [None, 1])
+def test_journal_append_rejects_malformed_dimensions(tmp_path: Path, dimensions: object) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+
+    with pytest.raises(ValueError, match="dimensions"):
+        journal.append({"type": "review_started", "dimensions": dimensions})
+
+    assert not journal.path.exists()
+
+
 def test_journal_compatibility_head_and_dimension_diagnostics(tmp_path: Path) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     assert journal.compatibility() == "empty"

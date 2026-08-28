@@ -438,18 +438,18 @@ def test_github_source_rejects_binary_diff_blocks(tmp_path: Path, binary_block: 
 
 
 @pytest.mark.parametrize(
-    "diff_body",
+    ("diff_body", "expected_status", "source_sha"),
     [
-        b"old mode 100644\nnew mode 100755\n",
-        b"new file mode 100644\n",
-        b"+++ /dev/null\n",
+        (b"old mode 100644\nnew mode 100755\n", "modified", HEAD),
+        (b"new file mode 100644\n", "added", HEAD),
+        (b"deleted file mode 100644\n", "deleted", BASE),
     ],
-    ids=["mode-only", "empty-added-file", "dev-null-without-old-path"],
+    ids=["mode-only", "empty-added-file", "empty-deleted-file"],
 )
-def test_github_source_rejects_diff_entries_without_materializable_paths(
-    tmp_path: Path, diff_body: bytes
+def test_github_source_materializes_paths_from_metadata_only_diff_headers(
+    tmp_path: Path, diff_body: bytes, expected_status: str, source_sha: str
 ) -> None:
-    class UnsupportedDiffRunner(FakeRunner):
+    class MetadataOnlyDiffRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds):
             if _is_diff_command(command):
                 return CommandResult(
@@ -459,13 +459,15 @@ def test_github_source_rejects_diff_entries_without_materializable_paths(
                 )
             return super().__call__(command, cwd=cwd, timeout_seconds=timeout_seconds)
 
-    with pytest.raises(GitHubSourceError) as error:
-        LocalGitHubSource(tmp_path, runner=UnsupportedDiffRunner()).resolve(
-            PullRequestRef("example/project", 7)
-        )
+    runner = MetadataOnlyDiffRunner()
+    snapshot = LocalGitHubSource(tmp_path, runner=runner).resolve(
+        PullRequestRef("example/project", 7)
+    )
 
-    assert error.value.diagnostic.code == "github_source_unsupported"
-    assert "materializable path" in error.value.diagnostic.message
+    assert [(item.path, item.status) for item in snapshot.changed_files] == [
+        ("script.sh", expected_status)
+    ]
+    assert ("git", "show", f"{source_sha}:script.sh") in runner.calls
 
 
 @pytest.mark.parametrize(

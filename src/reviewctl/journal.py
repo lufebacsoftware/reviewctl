@@ -272,6 +272,7 @@ class ProjectJournal:
     def _validate_event(
         self, event: dict[str, Any], *, events: list[dict[str, Any]] | None = None
     ) -> None:
+        self._event_dimensions(event)
         event_type = event["type"]
         if event_type in {"finding", "finding_observed"}:
             status = event.get("status", "open")
@@ -421,6 +422,10 @@ class ProjectJournal:
         previous_versioned: dict[str, Any] | None = None
         previous_event: dict[str, Any] | None = None
         for index, event in enumerate(events, start=1):
+            try:
+                self._event_dimensions(event)
+            except ValueError as error:
+                violations.append(f"{error} at line {index}")
             if "schemaVersion" not in event:
                 if not legacy_prefix:
                     violations.append(f"legacy event after versioned event at line {index}")
@@ -591,10 +596,11 @@ class ProjectJournal:
 
     @staticmethod
     def _event_dimensions(event: dict[str, Any]) -> list[str]:
+        dimensions = event.get("dimensions", [])
+        if "dimensions" in event and dimensions is None:
+            raise ValueError("journal dimensions must be an array of strings")
         try:
-            return list(
-                normalize_dimensions(event.get("dimensions", []), label="journal dimensions")
-            )
+            return list(normalize_dimensions(dimensions, label="journal dimensions"))
         except ValueError as error:
             raise ValueError(str(error)) from error
 

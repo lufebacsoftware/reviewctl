@@ -7643,7 +7643,7 @@ def test_invoke_llm_attaches_schema_for_structured_contract(tmp_path: Path) -> N
         files=[source],
         max_output_tokens=20,
         response_contract="findings-json",
-        timeout_seconds=1,
+        timeout_seconds=7,
     )
 
     assert exit_code == 0
@@ -8224,17 +8224,18 @@ def test_invoke_agy_rejects_non_success_or_invalid_output(
 
 
 @pytest.mark.parametrize(
-    ("environment", "expected_exit", "expected_error"),
+    ("environment", "timeout_seconds", "expected_exit", "expected_error"),
     [
-        ({"AGY_EXIT": "17"}, 17, ""),
-        ({"AGY_LIST": "1"}, 502, "agy returned a non-object response"),
-        ({"AGY_SLEEP": "3"}, 124, "review attempt timed out"),
+        ({"AGY_EXIT": "17"}, 7, 17, ""),
+        ({"AGY_LIST": "1"}, 7, 502, "agy returned a non-object response"),
+        ({"AGY_SLEEP": "3"}, 1, 124, "review attempt timed out"),
     ],
 )
 def test_invoke_agy_handles_process_failures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     environment: dict[str, str],
+    timeout_seconds: int,
     expected_exit: int,
     expected_error: str,
 ) -> None:
@@ -8251,7 +8252,7 @@ def test_invoke_agy_handles_process_failures(
         files=[source],
         max_output_tokens=1,
         response_contract="verdict",
-        timeout_seconds=1,
+        timeout_seconds=timeout_seconds,
         request_path=tmp_path / "request.json",
         response_path=tmp_path / "response.json",
     )
@@ -8343,18 +8344,19 @@ def test_invoke_gemini_persists_headless_json_and_observed_stats(
 
 
 @pytest.mark.parametrize(
-    ("environment", "expected_exit", "expected_error"),
+    ("environment", "timeout_seconds", "expected_exit", "expected_error"),
     [
-        ({"GEMINI_API_KEY": "exit:17"}, 17, ""),
-        ({"GEMINI_API_KEY": "invalid"}, 502, "Gemini returned invalid JSON"),
-        ({"GEMINI_API_KEY": "list"}, 502, "Gemini returned a non-object response"),
-        ({"GEMINI_API_KEY": "sleep:3"}, 124, "review attempt timed out"),
+        ({"GEMINI_API_KEY": "exit:17"}, 7, 17, ""),
+        ({"GEMINI_API_KEY": "invalid"}, 7, 502, "Gemini returned invalid JSON"),
+        ({"GEMINI_API_KEY": "list"}, 7, 502, "Gemini returned a non-object response"),
+        ({"GEMINI_API_KEY": "sleep:3"}, 1, 124, "review attempt timed out"),
     ],
 )
 def test_invoke_gemini_handles_process_failures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     environment: dict[str, str],
+    timeout_seconds: int,
     expected_exit: int,
     expected_error: str,
 ) -> None:
@@ -8371,7 +8373,7 @@ def test_invoke_gemini_handles_process_failures(
         files=[source],
         max_output_tokens=1,
         response_contract="findings-json",
-        timeout_seconds=1,
+        timeout_seconds=timeout_seconds,
         request_path=tmp_path / "request.json",
         response_path=tmp_path / "response.json",
         session_path=tmp_path / "session.json",

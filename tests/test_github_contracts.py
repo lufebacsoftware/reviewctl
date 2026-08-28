@@ -238,6 +238,27 @@ def test_github_diff_parsing_covers_added_deleted_renamed_and_dev_null() -> None
     ) == {("new.py", 1)}
 
 
+def test_github_diff_parsing_retains_quoted_metadata_only_header_paths() -> None:
+    diff = 'diff --git "a/caf\\303\\251 file.py" "b/caf\\303\\251 file.py"\nnew file mode 100644\n'
+
+    assert github_module._diff_files(diff) == (
+        github_module._DiffFile(path="café file.py", status="added", old_path="café file.py"),
+    )
+
+
+@pytest.mark.parametrize(
+    "diff",
+    [
+        "diff --git only-one-path\n",
+        'diff --git "" ""\n',
+        'diff --git "" /dev/null\n',
+    ],
+)
+def test_github_diff_parsing_rejects_headers_without_materializable_paths(diff: str) -> None:
+    with pytest.raises(ValueError):
+        github_module._diff_files(diff)
+
+
 def test_github_added_lines_decode_c_quoted_utf8_paths() -> None:
     snapshot = github_module.PullRequestSnapshot(
         PullRequestRef("owner/name"),
