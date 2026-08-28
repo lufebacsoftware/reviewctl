@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import stat
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -23,6 +24,61 @@ from reviewctl.errors import Diagnostic, JournalOperationError
 
 def _now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _unsafe_state_root(root: Path) -> JournalOperationError:
+    return JournalOperationError(
+        Diagnostic(
+            "journal_corrupt",
+            f"project state root is unsafe: {root}",
+            next="replace .reviewctl with a private directory inside the project",
+        )
+    )
+
+
+def ensure_project_state_root(project_dir: Path, *, create: bool = True) -> Path | None:
+    """Return a literal private .reviewctl directory without following a root symlink."""
+    project = project_dir.expanduser().resolve()
+    root = project / ".reviewctl"
+    if root.is_symlink():
+        raise _unsafe_state_root(root)
+    if not root.exists():
+        if not create:
+            return None
+        root.mkdir(mode=0o700)
+    if not root.is_dir():
+        raise _unsafe_state_root(root)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as error:
+        raise _unsafe_state_root(root) from error
+    try:
+        if create:
+            os.fchmod(descriptor, 0o700)
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise _unsafe_state_root(root)
+    finally:
+        primary = sys.exc_info()[1]
+        if primary is None:
+            os.close(descriptor)
+        else:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+    return root
+
+
+def confine_project_state_path(path: Path) -> Path:
+    """Validate a literal .reviewctl ancestor before resolving a state path."""
+    absolute = Path(os.path.abspath(path.expanduser()))
+    for candidate in (absolute, *absolute.parents):
+        if candidate.name == ".reviewctl":
+            root = ensure_project_state_root(candidate.parent)
+            assert root is not None
+            return root / absolute.relative_to(candidate)
+    return absolute.resolve()
 
 
 @dataclass(frozen=True)
@@ -50,8 +106,7 @@ class ProjectIdentityStore:
         self.path = self.root / "identity.json"
 
     def ensure(self, project_id: str) -> ProjectIdentity:
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
+        ensure_project_state_root(self.project_dir)
         with self._identity_lock():
             if self.path.exists():
                 identity = self._read()
@@ -86,6 +141,8 @@ class ProjectIdentityStore:
 
     def read_existing(self) -> ProjectIdentity | None:
         """Read an existing identity without creating or modifying local state."""
+        if ensure_project_state_root(self.project_dir, create=False) is None:
+            return None
         if not self.path.exists():
             return None
         return self._read()

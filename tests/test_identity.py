@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import reviewctl.identity as identity_module
 from reviewctl.errors import JournalOperationError
-from reviewctl.identity import ProjectIdentity, ProjectIdentityStore
+from reviewctl.identity import ProjectIdentity, ProjectIdentityStore, confine_project_state_path
 
 
 def test_identity_store_creates_reuses_and_serializes_identity(tmp_path: Path) -> None:
@@ -24,6 +26,81 @@ def test_identity_store_rejects_project_mismatch(tmp_path: Path) -> None:
     store.ensure("project-one")
     with pytest.raises(JournalOperationError, match="does not match"):
         store.ensure("project-two")
+
+
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_identity_store_rejects_symlinked_state_root_without_mutating_target(
+    tmp_path: Path, target_exists: bool
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    external = tmp_path / "external"
+    if target_exists:
+        external.mkdir(mode=0o755)
+        before_mode = stat.S_IMODE(external.stat().st_mode)
+    (project / ".reviewctl").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(JournalOperationError, match="state root"):
+        ProjectIdentityStore(project).ensure("project-one")
+
+    if target_exists:
+        assert list(external.iterdir()) == []
+        assert stat.S_IMODE(external.stat().st_mode) == before_mode
+    else:
+        assert not external.exists()
+
+
+def test_identity_store_rejects_non_directory_and_unopenable_state_roots(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    root = project / ".reviewctl"
+    root.write_text("not a directory")
+    with pytest.raises(JournalOperationError, match="state root"):
+        ProjectIdentityStore(project).ensure("project-one")
+
+    root.unlink()
+    root.mkdir()
+    monkeypatch.setattr(
+        identity_module.os,
+        "open",
+        lambda *args: (_ for _ in ()).throw(OSError("open failed")),
+    )
+    with pytest.raises(JournalOperationError, match="state root"):
+        ProjectIdentityStore(project).ensure("project-one")
+
+
+def test_identity_store_rejects_non_directory_descriptor_and_preserves_primary_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ProjectIdentityStore(tmp_path)
+    store.root.mkdir()
+    real_close = identity_module.os.close
+    close_attempts: list[int] = []
+
+    monkeypatch.setattr(identity_module.os, "fstat", lambda descriptor: SimpleNamespace(st_mode=0))
+
+    def fail_close(descriptor: int) -> None:
+        close_attempts.append(descriptor)
+        try:
+            raise OSError("close failed")
+        finally:
+            real_close(descriptor)
+
+    monkeypatch.setattr(identity_module.os, "close", fail_close)
+    with pytest.raises(JournalOperationError, match="state root"):
+        store.ensure("project-one")
+    assert close_attempts
+
+
+def test_confine_project_state_path_validates_state_ancestor_and_resolves_other_paths(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / ".reviewctl" / "reviews" / "receipt.json"
+    assert confine_project_state_path(state_path) == state_path
+    assert (tmp_path / ".reviewctl").is_dir()
+    assert confine_project_state_path(tmp_path / "other") == (tmp_path / "other").resolve()
 
 
 @pytest.mark.parametrize(
@@ -47,6 +124,7 @@ def test_identity_store_rejects_malformed_json_and_absent_is_none(tmp_path: Path
     store = ProjectIdentityStore(tmp_path)
     assert store.read_existing() is None
     store.root.mkdir(parents=True)
+    assert store.read_existing() is None
     store.path.write_text("not-json")
     with pytest.raises(JournalOperationError, match="read project identity"):
         store.read_existing()

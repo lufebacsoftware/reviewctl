@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
 
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError
+from reviewctl.identity import confine_project_state_path
 
 FINDING_STATUSES = frozenset({"open", "disputed", "fixed", "verified", "dismissed"})
 FINDING_TRANSITIONS = {
@@ -57,7 +58,7 @@ class ProjectJournal:
     ) -> None:
         if (project_id is None) != (origin_id is None):
             raise ValueError("project_id and origin_id must be provided together")
-        self.path = path.expanduser().resolve()
+        self.path = confine_project_state_path(path)
         self.project_id = project_id
         self.origin_id = origin_id
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

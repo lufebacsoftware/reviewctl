@@ -7,6 +7,7 @@ import pytest
 
 import reviewctl.artifacts as artifacts_module
 from reviewctl.artifacts import ArtifactStore
+from reviewctl.errors import JournalOperationError
 
 
 def test_sensitive_artifact_is_private(tmp_path: Path) -> None:
@@ -46,3 +47,16 @@ def test_artifact_rejects_zero_progress_write(tmp_path: Path, monkeypatch) -> No
 
     with pytest.raises(OSError, match="finish"):
         artifact.write_bytes("packet.json", b"payload")
+
+
+def test_artifact_store_rejects_symlinked_project_state_root(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (project / ".reviewctl").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(JournalOperationError, match="state root"):
+        ArtifactStore(project / ".reviewctl" / "reviews")
+
+    assert list(external.iterdir()) == []

@@ -149,6 +149,36 @@ def test_init_creates_private_project_config_and_refuses_accidental_overwrite(
     assert "already exists" in capsys.readouterr().err
 
 
+def test_init_rejects_symlinked_state_root_before_writing_config(tmp_path: Path, capsys) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    external = tmp_path / "external"
+    external.mkdir(mode=0o755)
+    before_mode = os.stat(external).st_mode & 0o777
+    (project / ".reviewctl").symlink_to(external, target_is_directory=True)
+
+    assert run_cli(["init", "--project", str(project)]) == 5
+    assert "state root" in capsys.readouterr().err
+    assert not (project / "reviewctl.toml").exists()
+    assert list(external.iterdir()) == []
+    assert os.stat(external).st_mode & 0o777 == before_mode
+
+
+def test_init_reports_state_root_that_becomes_unsafe_before_config_write(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    def fail_when_creating(project: Path, *, create: bool = True):
+        if not create:
+            return None
+        raise JournalOperationError(Diagnostic("journal_corrupt", "state root raced"))
+
+    monkeypatch.setattr(project_cli, "ensure_project_state_root", fail_when_creating)
+
+    assert run_cli(["init", "--project", str(tmp_path / "project")]) == 5
+    assert "state root raced" in capsys.readouterr().err
+    assert not (tmp_path / "project" / "reviewctl.toml").exists()
+
+
 def test_init_sensitive_mode_creates_a_loadable_local_only_profile(tmp_path: Path) -> None:
     assert run_cli(["init", "--project", str(tmp_path), "--mode", "sensitive"]) == 0
 
@@ -415,7 +445,9 @@ def test_private_file_replace_preserves_primary_when_cleanup_fails(
 def test_init_reports_config_write_and_identity_errors(tmp_path: Path, monkeypatch, capsys) -> None:
     args = SimpleNamespace(project=str(tmp_path / "write"), force=False, mode="private")
     monkeypatch.setattr(
-        project_cli.os, "open", lambda *args: (_ for _ in ()).throw(OSError("open failed"))
+        project_cli,
+        "_replace_private_file",
+        lambda *args: (_ for _ in ()).throw(OSError("open failed")),
     )
     with pytest.raises(OSError, match="open failed"):
         project_cli.init_project(args)

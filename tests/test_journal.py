@@ -11,6 +11,19 @@ from reviewctl.errors import JournalOperationError
 from reviewctl.journal import ProjectJournal
 
 
+def test_journal_rejects_symlinked_project_state_root(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (project / ".reviewctl").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(JournalOperationError, match="state root"):
+        ProjectJournal(project / ".reviewctl" / "journal.jsonl")
+
+    assert list(external.iterdir()) == []
+
+
 def test_journal_appends_and_reads_events(tmp_path: Path) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     journal.append({"type": "review_started", "reviewId": "r1"})

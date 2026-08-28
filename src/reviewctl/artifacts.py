@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from reviewctl.identity import confine_project_state_path
+
 
 class ArtifactStore:
     """Write raw review artifacts below one private directory."""
 
     def __init__(self, root: Path) -> None:
-        self.root = root.expanduser().resolve()
+        self.root = confine_project_state_path(root)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
 

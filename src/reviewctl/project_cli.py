@@ -35,7 +35,7 @@ from reviewctl.github import (
     build_publication_plan,
 )
 from reviewctl.github_publisher import GitHubPublisher, PublicationResult, publication_key
-from reviewctl.identity import ProjectIdentityStore
+from reviewctl.identity import ProjectIdentityStore, ensure_project_state_root
 from reviewctl.journal import ProjectJournal
 from reviewctl.pi_transport import PiTransport
 
@@ -184,6 +184,10 @@ def init_project(args: Any) -> int:
             "text",
         )
     project.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_project_state_root(project, create=False)
+    except JournalOperationError as error:
+        return _diagnostic_result(error.diagnostic, "text")
     config = project / "reviewctl.toml"
     if config.is_symlink() or (config.exists() and not config.is_file()):
         return _diagnostic_result(
@@ -220,6 +224,10 @@ def init_project(args: Any) -> int:
         template = template.replace(
             'routes = ["pi:openrouter/stealth/ox-alpha"]', "routes = []"
         ).replace('execution = "remote"', 'execution = "local"')
+    try:
+        ensure_project_state_root(project)
+    except JournalOperationError as error:
+        return _diagnostic_result(error.diagnostic, "text")
     _replace_private_file(config, template.encode("utf-8"))
     if existing_config is None:
         try:
@@ -282,8 +290,8 @@ def _github_prompt(snapshot: PullRequestSnapshot) -> str:
 
 @contextmanager
 def _materialized_github_files(project_dir: Path, snapshot: PullRequestSnapshot) -> Any:
-    staging_root = project_dir / ".reviewctl"
-    staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    staging_root = ensure_project_state_root(project_dir)
+    assert staging_root is not None
     with tempfile.TemporaryDirectory(prefix="github-source-", dir=staging_root) as directory:
         paths: list[Path] = []
         root = Path(directory)
