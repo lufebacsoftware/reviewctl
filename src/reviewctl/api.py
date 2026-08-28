@@ -404,6 +404,7 @@ class ReviewClient:
         partial_findings: list[Finding] = []
         last_diagnostic: Diagnostic | None = None
         last_usage: Any = None
+        last_usage_route: str | None = None
         saw_partial = False
 
         def record_attempt(attempt: dict[str, Any]) -> None:
@@ -524,6 +525,7 @@ class ReviewClient:
                     )
                 continue
             last_usage = execution.response
+            last_usage_route = route_label
             attempt_artifacts.write_text("response.md", execution.response.response)
             try:
                 evaluation = contract.evaluate(
@@ -634,7 +636,7 @@ class ReviewClient:
         receipt_path = self._write_receipt(
             artifacts,
             review_id=review_id,
-            route=attempts[-1]["route"] if attempts else "",
+            route=last_usage_route or (attempts[-1]["route"] if attempts else ""),
             status=status,
             packet_digest=packet_digest,
             diagnostic=diagnostic,

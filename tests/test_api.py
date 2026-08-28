@@ -257,6 +257,32 @@ def test_client_falls_back_and_keeps_valid_findings_from_partial_attempt(tmp_pat
     assert receipt["fallbackRelationships"][0]["from"] == "pi:first/model"
 
 
+def test_partial_receipt_binds_usage_to_the_attempt_that_produced_it(tmp_path: Path) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:first/model", "pi:second/model"]\n'
+        'execution = "remote"\n'
+    )
+    partial = (
+        '{"findings":[{"severity":"high","path":"app.py","line":1,'
+        '"title":"Handle failure","evidence":"e","reproduction":"r"}]}'
+    )
+    transport = QueueTransport([partial, None])
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == "partial"
+    receipt = json.loads(result.receipt_path.read_text())
+    assert [attempt["route"] for attempt in receipt["attempts"]] == [
+        "pi:first/model",
+        "pi:second/model",
+    ]
+    assert receipt["route"] == "pi:first/model"
+    assert receipt["usage"]["model"] == "first/model"
+
+
 def test_project_receipt_verification_detects_tampering(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
