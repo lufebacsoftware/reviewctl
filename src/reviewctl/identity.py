@@ -181,7 +181,8 @@ class ProjectIdentityStore:
         origin_id = value.get("originId")
         created_at = value.get("createdAt")
         if (
-            schema_version != 1
+            type(schema_version) is not int
+            or schema_version != 1
             or not isinstance(project_id, str)
             or not project_id
             or not isinstance(origin_id, str)

@@ -129,6 +129,8 @@ def test_identity_store_rejects_symlinked_state_files_without_mutating_target(
     [
         [],
         {"schemaVersion": 2},
+        {"schemaVersion": True, "projectId": "p", "originId": "o", "createdAt": "t"},
+        {"schemaVersion": 1.0, "projectId": "p", "originId": "o", "createdAt": "t"},
         {"schemaVersion": 1, "projectId": "", "originId": "o", "createdAt": "t"},
         {"schemaVersion": 1, "projectId": "p", "originId": "", "createdAt": "t"},
     ],
