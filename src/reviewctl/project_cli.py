@@ -823,7 +823,7 @@ def add_project_commands(commands: Any) -> None:
     set_status.set_defaults(handler=set_finding_status)
 
     journal = commands.add_parser("journal", help="inspect the project journal")
-    journal_commands = journal.add_subparsers(dest="journal_command")
+    journal_commands = journal.add_subparsers(dest="journal_command", required=True)
     verify = journal_commands.add_parser("verify", help="verify journal continuity read-only")
     verify.add_argument("--project", default=".")
     verify.add_argument("--format", choices=("text", "json"), default="text")

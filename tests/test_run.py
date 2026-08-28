@@ -7315,6 +7315,81 @@ def test_tournament_rejects_invalid_budget_or_empty_plan(tmp_path: Path, content
     assert result.returncode == 2
 
 
+@pytest.mark.parametrize("budget", ["nan", "+inf", "-inf"])
+def test_tournament_rejects_nonfinite_budget_before_running(tmp_path: Path, budget: str) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    source = tmp_path / "synthetic.py"
+    source.write_text("pass\n")
+    artifact_root = tmp_path / "tournament-artifacts"
+    tournament = tmp_path / "invalid-budget.toml"
+    tournament.write_text(
+        f'''budget_usd = {budget}
+max_output_tokens = 8
+artifact_root = "{artifact_root}"
+
+[models.accepted]
+input_per_million_usd = 0
+output_per_million_usd = 0
+
+[[cases]]
+id = "synthetic-case"
+prompt = "Review."
+files = ["{source}"]
+'''
+    )
+
+    result = run_cli("tournament", "--plan", str(tournament), env={"LLM_BIN": str(fake_llm)})
+
+    assert result.returncode == 2
+    assert "positive budget_usd" in result.stderr
+    assert not artifact_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "price"),
+    [
+        ("input_per_million_usd", "-1"),
+        ("output_per_million_usd", "-1"),
+        ("input_per_million_usd", "nan"),
+        ("output_per_million_usd", "+inf"),
+    ],
+)
+def test_legacy_tournament_rejects_invalid_pricing_before_running(
+    tmp_path: Path, field: str, price: str
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    source = tmp_path / "synthetic.py"
+    source.write_text("pass\n")
+    artifact_root = tmp_path / "tournament-artifacts"
+    prices = {
+        "input_per_million_usd": "0",
+        "output_per_million_usd": "0",
+    }
+    prices[field] = price
+    tournament = tmp_path / "invalid-pricing.toml"
+    tournament.write_text(
+        f'''budget_usd = 1
+max_output_tokens = 8
+artifact_root = "{artifact_root}"
+
+[models.accepted]
+input_per_million_usd = {prices["input_per_million_usd"]}
+output_per_million_usd = {prices["output_per_million_usd"]}
+
+[[cases]]
+id = "synthetic-case"
+prompt = "Review."
+files = ["{source}"]
+'''
+    )
+
+    result = run_cli("tournament", "--plan", str(tournament), env={"LLM_BIN": str(fake_llm)})
+
+    assert result.returncode == 2
+    assert "finite nonnegative pricing" in result.stderr
+    assert list(artifact_root.iterdir()) == []
+
+
 def test_tournament_resolves_case_and_artifact_paths_relative_to_its_plan(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     plan_directory = tmp_path / "plan"

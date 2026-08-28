@@ -4881,10 +4881,10 @@ def run_candidate_tournament(
 def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     plan_path = Path(args.plan)
     plan = load_policy(str(plan_path))
-    budget = float(plan.get("budget_usd", 0))
+    budget = numeric_value(plan.get("budget_usd", 0))
     max_output_tokens = int(plan.get("max_output_tokens", 4096))
     timeout_seconds = plan.get("timeout_seconds", 90)
-    if budget <= 0 or max_output_tokens <= 0:
+    if budget is None or budget <= 0 or max_output_tokens <= 0:
         parser.error("tournament plan requires positive budget_usd and max_output_tokens")
     if (
         not isinstance(timeout_seconds, int)
@@ -4940,6 +4940,10 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         for model, pricing in models.items():
             if not isinstance(pricing, dict):
                 parser.error("tournament model pricing must be an object")
+            input_price = numeric_value(pricing.get("input_per_million_usd"))
+            output_price = numeric_value(pricing.get("output_per_million_usd"))
+            if input_price is None or output_price is None or input_price < 0 or output_price < 0:
+                parser.error("tournament model requires finite nonnegative pricing")
             raw_candidate_max_output_tokens = pricing.get("max_output_tokens")
             if raw_candidate_max_output_tokens is not None and (
                 not isinstance(raw_candidate_max_output_tokens, int)
@@ -4949,8 +4953,8 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                 parser.error("tournament model max_output_tokens must be a positive integer")
             candidate_max_output_tokens = raw_candidate_max_output_tokens or max_output_tokens
             estimate = (
-                input_tokens * float(pricing["input_per_million_usd"]) / 1_000_000
-                + candidate_max_output_tokens * float(pricing["output_per_million_usd"]) / 1_000_000
+                input_tokens * input_price / 1_000_000
+                + candidate_max_output_tokens * output_price / 1_000_000
             ) * legacy_max_attempts
             if estimated_spend + estimate > budget:
                 write_tournament_report(

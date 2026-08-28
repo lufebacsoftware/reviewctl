@@ -1064,3 +1064,11 @@ def test_journal_verify_reports_validity_without_rewriting_bytes(tmp_path: Path,
     assert payload["sequence"] == 1
     assert payload["compatibility"] == "versioned"
     assert journal.path.read_bytes() == before
+
+
+def test_journal_requires_a_subcommand(capsys) -> None:
+    with pytest.raises(SystemExit) as error:
+        run_cli(["journal"])
+
+    assert error.value.code == 2
+    assert "journal_command" in capsys.readouterr().err
