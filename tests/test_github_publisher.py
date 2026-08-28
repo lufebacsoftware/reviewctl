@@ -410,6 +410,12 @@ def test_publisher_runner_errors_and_timeouts_are_typed() -> None:
     with pytest.raises(publisher_module.GitHubPublisherError, match="timed out"):
         publisher._run("operation", ["gh"], input_bytes=b"payload")
 
+    publisher = GitHubPublisher(
+        Path("."), runner=lambda *args, **kwargs: CommandResult(1, b"bounded", b"", True)
+    )
+    with pytest.raises(publisher_module.GitHubPublisherError, match="bounded output"):
+        publisher._run("operation", ["gh"])
+
 
 @pytest.mark.parametrize("raw", [b"not-json", b"[]", b'{"head": {}}', b'{"head":{"sha":7}}'])
 def test_publisher_rejects_malformed_head(raw: bytes) -> None:

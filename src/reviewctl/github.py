@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import resource
 import subprocess
 import tempfile
 import time
@@ -50,6 +51,7 @@ class CommandResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+    output_truncated: bool = False
 
 
 class CommandRunner(Protocol):
@@ -70,6 +72,13 @@ def _run_command(
     timeout_seconds: float,
     input_bytes: bytes | None = None,
 ) -> CommandResult:
+    capture_limit = MAX_GITHUB_DIFF_BYTES + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE, (capture_limit, capture_limit)
+        )
+
     try:
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
             completed = subprocess.run(
@@ -80,24 +89,30 @@ def _run_command(
                 check=False,
                 input=input_bytes,
                 timeout=timeout_seconds,
+                preexec_fn=limit_output_files,
             )
             stdout_file.seek(0)
             stderr_file.seek(0)
             stdout = (
                 completed.stdout
                 if isinstance(completed.stdout, bytes)
-                else stdout_file.read(MAX_GITHUB_DIFF_BYTES + 1)
+                else stdout_file.read(capture_limit)
             )
             stderr = (
                 completed.stderr
                 if isinstance(completed.stderr, bytes)
-                else stderr_file.read(MAX_GITHUB_DIFF_BYTES + 1)
+                else stderr_file.read(capture_limit)
             )
     except subprocess.TimeoutExpired:
         return CommandResult(124, b"", b"timeout")
     except OSError:
         return CommandResult(127, b"", b"command unavailable")
-    return CommandResult(completed.returncode, stdout, stderr)
+    return CommandResult(
+        completed.returncode,
+        stdout,
+        stderr,
+        output_truncated=len(stdout) == capture_limit or len(stderr) == capture_limit,
+    )
 
 
 class GitHubSourceError(ReviewctlError):
@@ -606,6 +621,10 @@ class LocalGitHubSource:
             cwd=self.project_dir,
             timeout_seconds=timeout_seconds,
         )
+        if result.output_truncated:
+            raise _source_diagnostic(
+                "github_source_too_large", f"{operation} exceeded the bounded output limit"
+            )
         if result.returncode == 124:
             raise _source_diagnostic(
                 "github_source_timeout", f"{operation} timed out", retryable=True

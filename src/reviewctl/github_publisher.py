@@ -117,6 +117,11 @@ class GitHubPublisher:
                 )
         except (OSError, UnicodeError, ValueError) as error:
             raise _failure("github_publication_failed", f"{operation} could not run") from error
+        if result.output_truncated:
+            raise _failure(
+                "github_publication_response_invalid",
+                f"{operation} exceeded the bounded output limit",
+            )
         if result.returncode == 124:
             raise _failure("github_publication_timeout", f"{operation} timed out", retryable=True)
         if result.returncode != 0:

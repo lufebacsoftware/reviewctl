@@ -123,6 +123,18 @@ def test_local_source_enforces_one_deadline_across_all_commands(
     assert len(runner.calls) == 3
 
 
+def test_local_source_rejects_truncated_runner_output(tmp_path: Path) -> None:
+    source = LocalGitHubSource(
+        tmp_path,
+        runner=lambda *args, **kwargs: CommandResult(1, b"bounded", b"", True),
+    )
+
+    with pytest.raises(GitHubSourceError) as error:
+        source._run("operation", ["gh"])
+
+    assert error.value.diagnostic.code == "github_source_too_large"
+
+
 @pytest.mark.parametrize(
     "recheck_metadata",
     [

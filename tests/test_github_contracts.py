@@ -371,8 +371,8 @@ def test_github_command_runner_bounds_captured_stdout(tmp_path: Path) -> None:
         timeout_seconds=10,
     )
 
-    assert result.returncode == 0
     assert len(result.stdout) == github_module.MAX_GITHUB_DIFF_BYTES + 1
+    assert result.output_truncated
 
 
 def test_snapshot_context_and_added_line_fallback_branches() -> None:
