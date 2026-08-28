@@ -22,7 +22,10 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
 from reviewctl.contracts import exact_json_object
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError
-from reviewctl.filesystem import confined_directory_descriptor
+from reviewctl.filesystem import (
+    confined_directory_descriptor,
+    confined_relative_directory_descriptor,
+)
 from reviewctl.identity import confine_project_state_path
 
 FINDING_STATUSES = frozenset({"open", "disputed", "fixed", "verified", "dismissed"})
@@ -76,24 +79,44 @@ class ProjectJournal:
         project_id: str | None = None,
         origin_id: str | None = None,
         prepare_for_writes: bool = True,
+        expected_project_identity: tuple[int, int] | None = None,
     ) -> None:
         if (project_id is None) != (origin_id is None):
             raise ValueError("project_id and origin_id must be provided together")
-        self.path = confine_project_state_path(path, create_root=prepare_for_writes)
+        absolute_path = Path(os.path.abspath(path.expanduser()))
+        self.path = absolute_path
+        if expected_project_identity is None:
+            self.path = confine_project_state_path(path, create_root=prepare_for_writes)
         self.project_id = project_id
         self.origin_id = origin_id
         try:
-            with confined_directory_descriptor(
-                self.path.parent, create=prepare_for_writes
-            ) as descriptor:
-                if prepare_for_writes:
-                    os.fchmod(descriptor, 0o700)
-                metadata = os.fstat(descriptor)
-                self._parent_identity = (metadata.st_dev, metadata.st_ino)
+            if expected_project_identity is None:
+                with confined_directory_descriptor(
+                    self.path.parent, create=prepare_for_writes
+                ) as descriptor:
+                    self._capture_parent_identity(descriptor, prepare_for_writes)
+            else:
+                project_dir = self.path.parent.parent
+                relative_parent = self.path.parent.relative_to(project_dir)
+                with confined_directory_descriptor(
+                    project_dir, expected_identity=expected_project_identity
+                ) as project_descriptor:
+                    with confined_relative_directory_descriptor(
+                        project_descriptor,
+                        relative_parent.parts,
+                        create=prepare_for_writes,
+                    ) as descriptor:
+                        self._capture_parent_identity(descriptor, prepare_for_writes)
         except OSError as error:
             raise JournalOperationError(
                 Diagnostic("journal_corrupt", f"could not confine journal directory: {error}")
             ) from error
+
+    def _capture_parent_identity(self, descriptor: int, prepare_for_writes: bool) -> None:
+        if prepare_for_writes:
+            os.fchmod(descriptor, 0o700)
+        metadata = os.fstat(descriptor)
+        self._parent_identity = (metadata.st_dev, metadata.st_ino)
 
     def append(self, event: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):

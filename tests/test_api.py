@@ -149,6 +149,28 @@ def test_client_from_project_rejects_project_directory_replacement(
     assert not (project / ".reviewctl").exists()
 
 
+def test_client_from_project_rejects_replacement_before_journal_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    displaced = tmp_path / "displaced"
+    project.mkdir()
+    write_default_config(project)
+    real_project_journal = api_module.ProjectJournal
+
+    def replace_then_construct(path: Path, *args: object, **kwargs: object):
+        project.rename(displaced)
+        project.mkdir()
+        return real_project_journal(path, *args, **kwargs)
+
+    monkeypatch.setattr(api_module, "ProjectJournal", replace_then_construct)
+
+    with pytest.raises(JournalOperationError, match="journal"):
+        ReviewClient.from_project(project, transports={"pi": FakeTransport()})
+
+    assert not (project / ".reviewctl").exists()
+
+
 def test_client_review_returns_typed_result_and_journal(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     (tmp_path / "a.py").write_text("value = 1\n")

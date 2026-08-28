@@ -292,6 +292,7 @@ class ReviewClient:
             self.project_dir / ".reviewctl" / "journal.jsonl",
             project_id=project_id,
             origin_id=origin_id,
+            expected_project_identity=self._project_identity,
         )
 
     @classmethod
