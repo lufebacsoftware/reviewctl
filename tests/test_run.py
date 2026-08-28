@@ -324,6 +324,8 @@ payload = {
     'duration_seconds': 1.25,
     'usage': {'input_tokens': 10, 'output_tokens': 20},
 }
+if structured := os.environ.get('AGY_STRUCTURED_OUTPUT'):
+    payload['structured_output'] = json.loads(structured)
 if delay := os.environ.get('AGY_SLEEP'):
     time.sleep(float(delay))
 if exit_code := os.environ.get('AGY_EXIT'):
@@ -478,6 +480,8 @@ with Path({str(observations)!r}).open("a") as stream:
 if arguments == ["chat", "--list-models", "--format", "json"]:
     time.sleep({stage_delays[0]!r})
     mode = {inventory_mode!r}
+    if mode == "quota-warning":
+        print("Monthly request limit reached", file=sys.stderr)
     if mode == "malformed":
         print("{{")
     elif mode == "nonzero":
@@ -510,6 +514,7 @@ if arguments == ["chat", "--list-models", "--format", "json"]:
                 {{"model_id": "timeout-session"}},
                 {{"model_id": "invalid-utf8"}},
                 {{"model_id": "styled"}},
+                {{"model_id": "quota"}},
             ],
             "default_model": "claude-sonnet-5",
         }}))
@@ -519,7 +524,9 @@ if arguments == ["chat", "--list-sessions", "--format", "json"]:
     time.sleep({stage_delays[2]!r})
     marker = Path.cwd() / ".selected-model"
     model = marker.read_text() if marker.is_file() else ""
-    if model == "malformed-session":
+    if model == "quota":
+        print(json.dumps([{{"cwd": str(Path.cwd().resolve()), "sessions": []}}]))
+    elif model == "malformed-session":
         print("{{")
     elif model == "absent-session":
         print("[]")
@@ -543,6 +550,9 @@ if model == "timeout":
 if model == "nonzero":
     print("token=super-secret-token-value", file=sys.stderr)
     raise SystemExit(17)
+if model == "quota":
+    print("Monthly request limit reached", file=sys.stderr)
+    raise SystemExit(0)
 if model == "empty":
     raise SystemExit(0)
 if model == "invalid-utf8":
@@ -8211,6 +8221,37 @@ def test_invoke_agy_persists_a_sandboxed_structured_response(tmp_path: Path) -> 
     assert json.loads(response_path.read_text())["conversation_id"] == "agy-conversation"
 
 
+def test_invoke_agy_prefers_schema_validated_structured_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    structured = {"verdict": "approved", "findings": []}
+    monkeypatch.setenv("AGY_STRUCTURED_OUTPUT", json.dumps(structured))
+    monkeypatch.setenv(
+        "AGY_RESPONSE",
+        '{"verdict":"approved","findings":[]}\n'
+        '{"toolAction":"Finishing review","verdict":"approved","findings":[]}',
+    )
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin=str(fake_agy),
+        prompt="Review synthetic source.",
+        model="gemini-3.7-flash-high",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert exit_code == 0
+    assert error == ""
+    assert response.response == json.dumps(structured, separators=(",", ":"), sort_keys=True)
+
+
 def test_invoke_agy_rejects_non_success_or_invalid_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -8797,6 +8838,31 @@ def test_invoke_kiro_fails_closed_without_a_coherent_session(
     assert "session" in error.lower()
     assert response.response == ""
     assert (tmp_path / "response.log").is_file()
+
+
+def test_invoke_kiro_reports_account_quota_instead_of_session_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(tmp_path, monkeypatch, model="quota")
+
+    assert exit_code == 429
+    assert error == "Kiro monthly request limit reached"
+    assert response.response == ""
+
+
+def test_invoke_kiro_does_not_misclassify_inventory_warning_as_account_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(
+        tmp_path,
+        monkeypatch,
+        model="absent-session",
+        inventory_mode="quota-warning",
+    )
+
+    assert exit_code == 502
+    assert error == "Kiro returned no coherent session for the review directory"
+    assert response.response == ""
 
 
 @pytest.mark.parametrize(

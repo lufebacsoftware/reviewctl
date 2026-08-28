@@ -1981,6 +1981,8 @@ def invoke_kiro(
             return code, transport_error or stderr or "Kiro session inventory failed", blank
         session = kiro_session_id(session_stdout, cwd)
         if not session:
+            if b"Monthly request limit reached" in invocation_stderr:
+                return 429, "Kiro monthly request limit reached", blank
             return 502, "Kiro returned no coherent session for the review directory", blank
         try:
             normalized_response = normalize_kiro_output(stdout, response_contract)
@@ -2423,7 +2425,12 @@ def invoke_agy(
     usage_values = usage if isinstance(usage, dict) else {}
     duration_seconds = numeric_value(payload.get("duration_seconds"))
     conversation_id = payload.get("conversation_id")
-    response = payload.get("response")
+    structured_output = payload.get("structured_output")
+    response = (
+        canonical_json(structured_output).decode()
+        if isinstance(structured_output, dict)
+        else payload.get("response")
+    )
     return (
         0,
         "",
