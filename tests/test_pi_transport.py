@@ -352,6 +352,41 @@ def test_run_process_preserves_partial_output_when_timeout_process_is_gone(
     assert result == PiProcessResult(124, b"partial", b"error", True)
 
 
+def test_run_process_ignores_process_gone_before_timeout_sigkill(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class GoneBeforeKillProcess:
+        pid = 790
+        returncode = -signal.SIGTERM
+
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            self.communicate_calls += 1
+            if self.communicate_calls <= 2:
+                raise subprocess.TimeoutExpired("pi", kwargs.get("timeout", 4))
+            return b"", b""
+
+    process = GoneBeforeKillProcess()
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "Popen",
+        popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
+    )
+
+    def disappear_before_kill(pid: int, sig: signal.Signals) -> None:
+        if sig == signal.SIGKILL:
+            raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(pi_module.os, "killpg", disappear_before_kill)
+
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(124, b"", b"", True)
+    assert process.communicate_calls == 3
+
+
 def test_run_process_reports_communication_oserror(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -86,7 +86,10 @@ def _run_process(
             try:
                 trailing_stdout, trailing_stderr = process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 trailing_stdout, trailing_stderr = process.communicate()
             if isinstance(trailing_stdout, bytes) and trailing_stdout:
                 stdout = trailing_stdout
