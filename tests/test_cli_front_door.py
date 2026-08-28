@@ -149,6 +149,32 @@ def test_init_creates_private_project_config_and_refuses_accidental_overwrite(
     assert "already exists" in capsys.readouterr().err
 
 
+def test_init_reuses_retained_identity_when_project_config_is_missing(tmp_path: Path) -> None:
+    project_cli.ProjectIdentityStore(tmp_path).ensure("project-existing")
+
+    assert run_cli(["init", "--project", str(tmp_path)]) == 0
+
+    config = load_config(tmp_path / "reviewctl.toml", user_path=None)
+    identity = project_cli.ProjectIdentityStore(tmp_path).read_existing()
+    assert config.project.project_id == "project-existing"
+    assert identity is not None
+    assert identity.project_id == "project-existing"
+
+
+def test_init_rejects_corrupt_retained_identity_before_writing_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    class BrokenIdentityStore:
+        def read_existing(self):
+            raise JournalOperationError(Diagnostic("journal_corrupt", "identity malformed"))
+
+    monkeypatch.setattr(project_cli, "ProjectIdentityStore", lambda project: BrokenIdentityStore())
+
+    assert run_cli(["init", "--project", str(tmp_path)]) == 5
+    assert "identity malformed" in capsys.readouterr().err
+    assert not (tmp_path / "reviewctl.toml").exists()
+
+
 def test_init_rejects_symlinked_state_root_before_writing_config(tmp_path: Path, capsys) -> None:
     project = tmp_path / "project"
     project.mkdir()

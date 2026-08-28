@@ -87,14 +87,18 @@ def parse_route(value: str) -> Route:
 
 
 def _config_path(path: Path) -> Path:
-    candidate = path.expanduser().resolve()
-    return candidate / "reviewctl.toml" if candidate.is_dir() else candidate
+    candidate = path.expanduser()
+    if candidate.is_dir():
+        return candidate.resolve() / "reviewctl.toml"
+    return candidate.parent.resolve() / candidate.name
 
 
 def _read(path: Path | None) -> tuple[dict[str, Any], bytes, Path | None]:
     if path is None:
         return {}, b"", None
     resolved = _config_path(path)
+    if resolved.is_symlink():
+        raise ConfigError(f"configuration {resolved} must be a regular file")
     if not resolved.exists():
         return {}, b"", None
     if not resolved.is_file():

@@ -7295,8 +7295,9 @@ def test_fetch_openrouter_model_endpoints_handles_missing_and_invalid_transport_
         def __exit__(self, *unused: object) -> None:
             return None
 
-        def read(self) -> bytes:
+        def read(self, limit: int) -> bytes:
             assert isinstance(outcome, bytes)
+            assert limit == cli.MAX_OPENROUTER_RESPONSE_BYTES + 1
             return outcome
 
     def fake_urlopen(*unused: object, **ignored: object) -> FakeResponse:
@@ -7317,6 +7318,43 @@ def test_fetch_openrouter_model_endpoints_handles_missing_and_invalid_transport_
     )
 
 
+@pytest.mark.parametrize("http_error", [False, True])
+def test_fetch_openrouter_model_endpoints_rejects_oversized_response_bodies(
+    monkeypatch: pytest.MonkeyPatch, http_error: bool
+) -> None:
+    monkeypatch.setattr(cli, "MAX_OPENROUTER_RESPONSE_BYTES", 4)
+
+    class FakeResponse:
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *unused: object) -> None:
+            return None
+
+        def read(self, limit: int) -> bytes:
+            assert limit == 5
+            return b"12345"
+
+    def fake_urlopen(*unused: object, **ignored: object) -> FakeResponse:
+        if http_error:
+            raise cli.urlerror.HTTPError(
+                "https://example.test",
+                429,
+                "rate",
+                {},
+                BytesIO(b"12345"),
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr(cli.urlrequest, "urlopen", fake_urlopen)
+
+    assert cli.fetch_openrouter_model_endpoints(
+        api_key="test-key",
+        model="deepseek/test",
+        timeout_seconds=1,
+    ) == (502, "OpenRouter provider preflight response exceeded bounded capture", None)
+
+
 def test_fetch_openrouter_model_endpoints_reads_a_wrapped_endpoint_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7329,7 +7367,8 @@ def test_fetch_openrouter_model_endpoints_reads_a_wrapped_endpoint_payload(
         def __exit__(self, *unused: object) -> None:
             return None
 
-        def read(self) -> bytes:
+        def read(self, limit: int) -> bytes:
+            assert limit == cli.MAX_OPENROUTER_RESPONSE_BYTES + 1
             return b'{"data":{"endpoints":[]}}'
 
     def fake_urlopen(request: object, *, timeout: int) -> FakeResponse:

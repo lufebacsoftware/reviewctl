@@ -1149,9 +1149,15 @@ def fetch_openrouter_model_endpoints(
     )
     try:
         with urlrequest.urlopen(request, timeout=timeout_seconds) as response:
-            payload = json.loads(response.read())
+            raw_payload = response.read(MAX_OPENROUTER_RESPONSE_BYTES + 1)
+            if len(raw_payload) > MAX_OPENROUTER_RESPONSE_BYTES:
+                return 502, "OpenRouter provider preflight response exceeded bounded capture", None
+            payload = json.loads(raw_payload)
     except urlerror.HTTPError as error:
-        return error.code, error.read().decode(errors="replace"), None
+        error_body = error.read(MAX_OPENROUTER_RESPONSE_BYTES + 1)
+        if len(error_body) > MAX_OPENROUTER_RESPONSE_BYTES:
+            return 502, "OpenRouter provider preflight response exceeded bounded capture", None
+        return error.code, error_body.decode(errors="replace"), None
     except urlerror.URLError as error:
         return 502, str(error.reason), None
     except TimeoutError:

@@ -131,6 +131,15 @@ def test_missing_project_config_uses_safe_defaults(tmp_path: Path) -> None:
     assert config.profile("default").routes == ()
 
 
+def test_dangling_project_config_symlink_is_not_treated_as_missing(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "reviewctl.toml").symlink_to(tmp_path / "missing.toml")
+
+    with pytest.raises(ConfigError, match="regular file"):
+        load_config(project, user_path=None)
+
+
 def test_config_digest_changes_when_project_bytes_change(tmp_path: Path) -> None:
     path = tmp_path / "reviewctl.toml"
     path.write_text('[project]\nprivacy_mode = "private"\n')

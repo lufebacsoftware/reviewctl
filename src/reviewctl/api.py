@@ -150,6 +150,7 @@ def _logical_source_name(value: str) -> str:
     candidate = PurePosixPath(value)
     if (
         candidate.is_absolute()
+        or not candidate.parts
         or candidate.as_posix() != value
         or any(part in {".", ".."} for part in candidate.parts)
     ):

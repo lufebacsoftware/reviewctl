@@ -210,19 +210,30 @@ def init_project(args: Any) -> int:
             ),
             "text",
         )
+    identity_store = ProjectIdentityStore(project)
     existing_config: ReviewConfig | None = None
+    existing_identity = None
     if config.exists():
         try:
             existing_config = load_config(config, user_path=None)
-            ProjectIdentityStore(project).ensure(existing_config.project.project_id)
+            identity_store.ensure(existing_config.project.project_id)
         except JournalOperationError as error:
             return _diagnostic_result(error.diagnostic, "text")
         except (OSError, UnicodeError, ValueError) as error:
             return _diagnostic_result(Diagnostic("invalid_request", str(error)), "text")
+    else:
+        try:
+            existing_identity = identity_store.read_existing()
+        except JournalOperationError as error:
+            return _diagnostic_result(error.diagnostic, "text")
     project_id = (
         existing_config.project.project_id
         if existing_config is not None
-        else "project-" + secrets.token_hex(12)
+        else (
+            existing_identity.project_id
+            if existing_identity is not None
+            else "project-" + secrets.token_hex(12)
+        )
     )
     template = PROJECT_TEMPLATE.format(project_id=project_id).replace(
         'privacy_mode = "private"', f'privacy_mode = "{args.mode}"'
@@ -239,7 +250,7 @@ def init_project(args: Any) -> int:
     if existing_config is None:
         try:
             config_value = load_config(config, user_path=None)
-            ProjectIdentityStore(project).ensure(config_value.project.project_id)
+            identity_store.ensure(config_value.project.project_id)
         except JournalOperationError as error:
             return _diagnostic_result(error.diagnostic, "text")
         except (OSError, UnicodeError, ValueError) as error:
@@ -313,11 +324,9 @@ def _materialized_github_files(project_dir: Path, snapshot: PullRequestSnapshot)
     with tempfile.TemporaryDirectory(prefix="github-source-", dir=staging_root) as directory:
         paths: list[Path] = []
         root = Path(directory)
+        artifacts = ArtifactStore(root)
         for changed_file in snapshot.changed_files:
-            path = root / changed_file.path
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(changed_file.content, encoding="utf-8")
-            paths.append(path)
+            paths.append(artifacts.write_text(changed_file.path, changed_file.content))
         yield tuple(paths)
 
 

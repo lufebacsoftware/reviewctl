@@ -835,6 +835,7 @@ def test_client_rejects_the_same_project_relative_source_twice(tmp_path: Path) -
         "source.py\x00",
         "src\\source.py",
         "/source.py",
+        ".",
         "src//x.py",
         "../x.py",
     ],

@@ -52,6 +52,37 @@ def snapshot() -> PullRequestSnapshot:
     )
 
 
+def test_materialized_github_files_do_not_follow_a_racing_parent_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "app.py"
+    victim.write_text("outside\n")
+    changed = replace(
+        snapshot(),
+        changed_files=(
+            ChangedFileSnapshot(path="src/app.py", status="modified", content="reviewed\n"),
+        ),
+    )
+    original_write_text = Path.write_text
+
+    def redirect_path_write(path: Path, contents: str, *args, **kwargs) -> int:
+        if "github-source-" in str(path):
+            path.parent.rmdir()
+            path.parent.symlink_to(outside, target_is_directory=True)
+        return original_write_text(path, contents, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", redirect_path_write)
+
+    with project_cli._materialized_github_files(project, changed) as paths:
+        assert paths[0].read_text() == "reviewed\n"
+
+    assert victim.read_text() == "outside\n"
+
+
 class FakeSource:
     def __init__(self, project_dir: Path) -> None:
         self.project_dir = project_dir
