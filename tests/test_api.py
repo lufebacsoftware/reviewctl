@@ -826,6 +826,57 @@ def test_client_rejects_the_same_project_relative_source_twice(tmp_path: Path) -
     assert transport.requests == []
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        " source.py",
+        "source.py\x00",
+        "src\\source.py",
+        "/source.py",
+        "src//x.py",
+        "../x.py",
+    ],
+)
+def test_logical_source_name_rejects_unsafe_or_noncanonical_values(value: object) -> None:
+    with pytest.raises(ValueError, match="project-relative paths"):
+        api_module._logical_source_name(value)
+
+
+def test_client_rejects_source_names_that_do_not_align_with_files(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("value = 1\n")
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    result = client.review(
+        ReviewRequest(
+            prompt="review",
+            files=(source,),
+            source_names=("src/source.py", "tests/source.py"),
+        )
+    )
+
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "one-to-one" in result.diagnostic.message
+    assert transport.requests == []
+
+    result = client.review(
+        ReviewRequest(
+            prompt="review",
+            files=(source,),
+            source_names=("../source.py",),
+        )
+    )
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "project-relative paths" in result.diagnostic.message
+    assert transport.requests == []
+
+
 def test_client_rejects_non_json_source_context(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})

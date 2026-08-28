@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 import reviewctl.project_cli as project_cli
-from reviewctl.api import Finding, ReviewResult, finding_id
+from reviewctl.api import Finding, ReviewClient, ReviewResult, finding_id
+from reviewctl.backends import BackendEvidence, BackendExecution, PersistedResponse
 from reviewctl.cli import run_cli
 from reviewctl.errors import Diagnostic, JournalOperationError
 from reviewctl.github import (
@@ -220,6 +221,70 @@ def test_github_review_maps_unique_basename_to_snapshot_path_for_inline_target(
             reproduction="private reproduction",
         )
     )
+
+
+def test_github_review_preserves_repository_path_through_real_review_client(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    write_config(tmp_path)
+
+    class FindingTransport:
+        requests = []
+
+        def execute(self, request):
+            self.requests.append(request)
+            model_path = request.files[0].name
+            response = json.dumps(
+                {
+                    "verdict": "changes-requested",
+                    "findings": [
+                        {
+                            "severity": "high",
+                            "path": model_path,
+                            "line": 1,
+                            "title": "Handle failure",
+                            "evidence": "private evidence",
+                            "reproduction": "private reproduction",
+                        }
+                    ],
+                }
+            )
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    "conversation",
+                    0.0,
+                    1,
+                    1,
+                    request.model,
+                    1,
+                    "fake",
+                    response,
+                ),
+                BackendEvidence(),
+            )
+
+    transport = FindingTransport()
+
+    class RealClientFactory:
+        @classmethod
+        def from_project(cls, project_dir: Path):
+            return ReviewClient.from_project(project_dir, transports={"pi": transport})
+
+    monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
+    monkeypatch.setattr(project_cli, "ReviewClient", RealClientFactory)
+
+    assert project_cli.github_review_project(github_args(tmp_path, publish=False)) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert transport.requests[0].files[0].name == "src%2Fapp.py"
+    assert payload["review"]["findings"][0]["path"] == "src/app.py"
+    assert payload["publicationPlan"]["items"][0]["target"] == {
+        "path": "src/app.py",
+        "line": 1,
+        "side": "RIGHT",
+    }
 
 
 def test_github_finding_path_mapping_leaves_ambiguous_and_unknown_paths_unchanged() -> None:

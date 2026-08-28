@@ -427,6 +427,7 @@ def github_review_project(args: Any) -> int:
                 ReviewRequest(
                     prompt=_github_prompt(snapshot),
                     files=files,
+                    source_names=tuple(item.path for item in snapshot.changed_files),
                     profile=args.profile,
                     review_id=args.review_id,
                     dimensions=tuple(args.dimensions),

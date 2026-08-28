@@ -11,7 +11,7 @@ import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -117,6 +117,7 @@ class ReviewRequest:
     review_id: str | None = None
     dimensions: tuple[str, ...] = ()
     source_context: Mapping[str, Any] | None = None
+    source_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -137,8 +138,27 @@ def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _model_file_name(path: Path, project_dir: Path) -> str:
-    return quote(path.relative_to(project_dir).as_posix(), safe="")
+def _logical_source_name(value: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or not value.isprintable()
+        or "\\" in value
+    ):
+        raise ValueError("review source names must be printable project-relative paths")
+    candidate = PurePosixPath(value)
+    if (
+        candidate.is_absolute()
+        or candidate.as_posix() != value
+        or any(part in {".", ".."} for part in candidate.parts)
+    ):
+        raise ValueError("review source names must be normalized project-relative paths")
+    return value
+
+
+def _model_file_name(source_name: str) -> str:
+    return quote(source_name, safe="")
 
 
 def _restore_source_paths(
@@ -384,6 +404,20 @@ class ReviewClient:
                 next="select a smaller bounded source set or split the review",
             )
             return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
+        if request.source_names and len(request.source_names) != len(request.files):
+            diagnostic = Diagnostic(
+                "invalid_request",
+                "review source names must align one-to-one with review files",
+                next="supply one project-relative source name for every file",
+            )
+            return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
+        try:
+            requested_source_names = tuple(
+                _logical_source_name(value) for value in request.source_names
+            )
+        except ValueError as error:
+            diagnostic = Diagnostic("invalid_request", str(error))
+            return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
         source_files: list[Path] = []
         source_contents: list[bytes] = []
         source_names: list[str] = []
@@ -448,7 +482,12 @@ class ReviewClient:
                 return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
             source_files.append(path)
             source_contents.append(source_bytes)
-            source_names.append(_model_file_name(path, self.project_dir))
+            source_name = (
+                requested_source_names[len(source_files) - 1]
+                if requested_source_names
+                else _logical_source_name(path.relative_to(self.project_dir).as_posix())
+            )
+            source_names.append(_model_file_name(source_name))
             source_digests[path] = _digest(source_bytes)
         if len(set(source_names)) != len(source_names):
             diagnostic = Diagnostic(
@@ -460,8 +499,12 @@ class ReviewClient:
         artifacts = ArtifactStore(attempt_root)
         source_files_tuple = tuple(source_files)
         source_paths_by_name = {
-            name: path.relative_to(self.project_dir).as_posix()
-            for name, path in zip(source_names, source_files_tuple, strict=True)
+            name: (
+                requested_source_names[index]
+                if requested_source_names
+                else path.relative_to(self.project_dir).as_posix()
+            )
+            for index, (name, path) in enumerate(zip(source_names, source_files_tuple, strict=True))
         }
         try:
             contract = get_contract(profile.response_contract)
@@ -495,7 +538,11 @@ class ReviewClient:
             "dimensionSchemaVersion": DIMENSION_SCHEMA_VERSION,
             "dimensions": list(dimensions),
             "files": [
-                {"name": name, "path": str(path), "sha256": source_digests[path]}
+                {
+                    "name": name,
+                    "path": source_paths_by_name[name],
+                    "sha256": source_digests[path],
+                }
                 for name, path in zip(source_names, source_files_tuple, strict=True)
             ],
         }
