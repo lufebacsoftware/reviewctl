@@ -10,6 +10,7 @@ import re
 import secrets
 import stat
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,23 +38,52 @@ class ReviewTransport(Protocol):
 _REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_CONTEXT_BYTES = 32 * 1024
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
 
-def _source_opener(path: str, flags: int) -> int:
+def _source_opener(path: str, flags: int, *, directory: int | None = None) -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
+    if no_follow is None or (directory is not None and not _OPEN_SUPPORTS_DIR_FD):
         raise OSError("this platform cannot open review sources without following symlinks")
-    return os.open(path, flags | no_follow | getattr(os, "O_NONBLOCK", 0))
+    return os.open(
+        path,
+        flags | no_follow | getattr(os, "O_NONBLOCK", 0),
+        dir_fd=directory,
+    )
 
 
-def _read_source_bytes(path: Path) -> bytes | None:
-    with open(path, "rb", opener=_source_opener) as stream:
-        source = os.fstat(stream.fileno())
-        if not stat.S_ISREG(source.st_mode):
-            raise OSError("review source is not a regular file")
-        if source.st_size > MAX_SOURCE_BYTES:
-            return None
-        return stream.read(MAX_SOURCE_BYTES + 1)
+def _read_source_bytes(path: Path, *, project_dir: Path | None = None) -> bytes | None:
+    root = project_dir or path.parent
+    relative = path.relative_to(root)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_flag is None or not _OPEN_SUPPORTS_DIR_FD:
+        raise OSError("this platform cannot open review sources without following symlinks")
+    with ExitStack() as descriptors:
+        current = os.open(root, os.O_RDONLY | directory_flag | no_follow)
+        descriptors.callback(os.close, current)
+        if not stat.S_ISDIR(os.fstat(current).st_mode):
+            raise OSError("review source root is not a directory")
+        for component in relative.parts[:-1]:
+            current = os.open(
+                component,
+                os.O_RDONLY | directory_flag | no_follow,
+                dir_fd=current,
+            )
+            descriptors.callback(os.close, current)
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise OSError("review source ancestor is not a directory")
+
+        def opener(name: str, flags: int) -> int:
+            return _source_opener(name, flags, directory=current)
+
+        with open(relative.name, "rb", opener=opener) as stream:
+            source = os.fstat(stream.fileno())
+            if not stat.S_ISREG(source.st_mode):
+                raise OSError("review source is not a regular file")
+            if source.st_size > MAX_SOURCE_BYTES:
+                return None
+            return stream.read(MAX_SOURCE_BYTES + 1)
 
 
 @dataclass(frozen=True)
@@ -359,7 +389,7 @@ class ReviewClient:
                 )
                 return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
             try:
-                source_bytes = _read_source_bytes(path)
+                source_bytes = _read_source_bytes(path, project_dir=self.project_dir)
                 if source_bytes is None or len(source_bytes) > MAX_SOURCE_BYTES:
                     diagnostic = Diagnostic(
                         "invalid_request",

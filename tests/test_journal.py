@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,35 @@ def test_journal_rejects_symlinked_state_file(tmp_path: Path) -> None:
     assert external.read_text() == "outside\n"
 
 
+def test_journal_append_rejects_state_file_replaced_by_symlink_before_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "project" / ".reviewctl" / "journal.jsonl"
+    path.parent.parent.mkdir()
+    journal = ProjectJournal(path)
+    external = tmp_path / "external.jsonl"
+    external.write_bytes(b"")
+    external.chmod(0o644)
+    real_open = journal_module.os.open
+    swapped = False
+
+    def raced_open(open_path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(open_path) in {path, Path(path.name)} and not swapped:
+            swapped = True
+            path.symlink_to(external)
+        return real_open(open_path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(journal_module.os, "open", raced_open)
+
+    with pytest.raises(JournalOperationError, match="journal"):
+        journal.append({"type": "review_started", "reviewId": "r1"})
+
+    assert swapped
+    assert external.read_bytes() == b""
+    assert external.stat().st_mode & 0o777 == 0o644
+
+
 def test_journal_reports_existing_non_regular_path_as_corrupt(tmp_path: Path) -> None:
     path = tmp_path / ".reviewctl" / "journal.jsonl"
     path.mkdir(parents=True)
@@ -51,6 +81,110 @@ def test_journal_reports_existing_non_regular_path_as_corrupt(tmp_path: Path) ->
     assert diagnostic.code == "journal_corrupt"
     assert "regular file" in diagnostic.message
     assert journal.verify() == [diagnostic.message]
+
+
+def test_journal_descriptor_open_fails_closed_for_platform_and_path_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    monkeypatch.setattr(journal_module, "_OPEN_SUPPORTS_DIR_FD", False)
+    with pytest.raises(JournalOperationError) as unsupported:
+        journal.append({"type": "review_started"})
+    assert unsupported.value.diagnostic.code == "journal_unavailable"
+
+    monkeypatch.setattr(journal_module, "_OPEN_SUPPORTS_DIR_FD", True)
+    real_open = journal_module.os.open
+
+    def fail_parent(path, flags, *args, **kwargs):
+        if Path(path) == journal.path.parent:
+            raise OSError("parent failed")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(journal_module.os, "open", fail_parent)
+    with pytest.raises(JournalOperationError, match="directory"):
+        journal.append({"type": "review_started"})
+
+
+def test_journal_descriptor_open_rejects_non_directory_and_missing_create(
+    tmp_path: Path, monkeypatch
+) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    real_open = journal_module.os.open
+    real_fstat = journal_module.os.fstat
+    parent_descriptor: int | None = None
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal parent_descriptor
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == journal.path.parent:
+            parent_descriptor = descriptor
+        return descriptor
+
+    def non_directory_parent(descriptor: int):
+        if descriptor == parent_descriptor:
+            return SimpleNamespace(st_mode=0)
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(journal_module.os, "open", tracked_open)
+    monkeypatch.setattr(journal_module.os, "fstat", non_directory_parent)
+    with pytest.raises(JournalOperationError, match="not a directory"):
+        journal.append({"type": "review_started"})
+
+    monkeypatch.setattr(journal_module.os, "fstat", real_fstat)
+
+    def missing_journal(path, flags, *args, **kwargs):
+        if Path(path) == Path(journal.path.name):
+            raise FileNotFoundError("raced away")
+        return tracked_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(journal_module.os, "open", missing_journal)
+    with pytest.raises(JournalOperationError, match="raced away"):
+        journal.append({"type": "review_started"})
+
+
+def test_journal_descriptor_open_preserves_error_when_parent_close_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    real_open = journal_module.os.open
+    real_close = journal_module.os.close
+
+    def fail_file(path, flags, *args, **kwargs):
+        if Path(path) == Path(journal.path.name):
+            raise RuntimeError("file failed")
+        return real_open(path, flags, *args, **kwargs)
+
+    def fail_close(descriptor: int) -> None:
+        try:
+            raise OSError("close failed")
+        finally:
+            real_close(descriptor)
+
+    monkeypatch.setattr(journal_module.os, "open", fail_file)
+    monkeypatch.setattr(journal_module.os, "close", fail_close)
+    with pytest.raises(JournalOperationError, match="file failed"):
+        journal.append({"type": "review_started"})
+
+
+def test_journal_close_failure_is_reported_for_append_and_read(tmp_path: Path, monkeypatch) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.append({"type": "review_started"})
+    real_close = journal_module.os.close
+
+    def fail_close(descriptor: int) -> None:
+        try:
+            raise OSError("close failed")
+        finally:
+            real_close(descriptor)
+
+    monkeypatch.setattr(journal_module.os, "close", fail_close)
+    with pytest.raises(OSError, match="close failed"):
+        journal.append({"type": "review_finished"})
+
+    events, diagnostic = journal.read_with_diagnostic()
+    assert events == []
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_corrupt"
 
 
 def test_journal_appends_and_reads_events(tmp_path: Path) -> None:
@@ -393,6 +527,67 @@ def test_journal_verify_rejects_persisted_unsupported_finding_status(
     findings, diagnostic = journal.findings_with_diagnostic()
 
     assert any("finding status" in violation for violation in violations)
+    assert findings == []
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_corrupt"
+
+
+def test_journal_verify_rejects_persisted_invalid_dimensions(tmp_path: Path) -> None:
+    event = {
+        "schemaVersion": 1,
+        "projectId": "project-1",
+        "originId": "origin-1",
+        "sequence": 1,
+        "previousEventSha256": None,
+        "type": "review_started",
+        "reviewId": "review-1",
+        "dimensions": None,
+    }
+    event["eventSha256"] = journal_module._event_digest(event)
+    path = tmp_path / "journal.jsonl"
+    path.write_text(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+    journal = ProjectJournal(path, project_id="project-1", origin_id="origin-1")
+
+    violations = journal.verify()
+
+    assert any("dimensions" in violation for violation in violations)
+
+
+@pytest.mark.parametrize("target", ["verified", ["fixed"]])
+def test_journal_verify_rejects_persisted_invalid_status_transition(
+    tmp_path: Path, target: object
+) -> None:
+    journal = ProjectJournal(
+        tmp_path / "journal.jsonl", project_id="project-1", origin_id="origin-1"
+    )
+    finding = journal.append(
+        {
+            "type": "finding_observed",
+            "findingId": "finding-1",
+            "reviewId": "review-1",
+            "status": "open",
+        }
+    )
+    transition = {
+        "schemaVersion": 1,
+        "projectId": "project-1",
+        "originId": "origin-1",
+        "sequence": 2,
+        "previousEventSha256": finding["eventSha256"],
+        "type": "finding_status_changed",
+        "findingId": "finding-1",
+        "reviewId": "review-1",
+        "from": "open",
+        "to": target,
+    }
+    transition["eventSha256"] = journal_module._event_digest(transition)
+    with journal.path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(transition, sort_keys=True, separators=(",", ":")) + "\n")
+
+    violations = journal.verify()
+    findings, diagnostic = journal.findings_with_diagnostic()
+
+    assert violations
     assert findings == []
     assert diagnostic is not None
     assert diagnostic.code == "journal_corrupt"
@@ -747,9 +942,10 @@ def test_journal_append_preserves_primary_when_rollback_and_close_fail(
         journal.append({"type": "review_started", "reviewId": "r1"})
 
     monkeypatch.undo()
-    assert len(descriptors) == 1
-    assert rollback_attempts == [(descriptors[0], 0)]
-    real_close(descriptors[0])
+    assert len(descriptors) == 2
+    assert rollback_attempts == [(descriptors[1], 0)]
+    for descriptor in descriptors:
+        real_close(descriptor)
 
 
 def test_journal_envelope_identity_and_read_diagnostics(tmp_path: Path, monkeypatch) -> None:

@@ -9,7 +9,12 @@ import pytest
 
 import reviewctl.identity as identity_module
 from reviewctl.errors import JournalOperationError
-from reviewctl.identity import ProjectIdentity, ProjectIdentityStore, confine_project_state_path
+from reviewctl.identity import (
+    ProjectIdentity,
+    ProjectIdentityStore,
+    confine_project_state_path,
+    ensure_project_state_root,
+)
 
 
 def test_identity_store_creates_reuses_and_serializes_identity(tmp_path: Path) -> None:
@@ -65,10 +70,61 @@ def test_identity_store_rejects_non_directory_and_unopenable_state_roots(
     monkeypatch.setattr(
         identity_module.os,
         "open",
-        lambda *args: (_ for _ in ()).throw(OSError("open failed")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("open failed")),
     )
     with pytest.raises(JournalOperationError, match="state root"):
         ProjectIdentityStore(project).ensure("project-one")
+
+
+def test_state_root_helper_rejects_invalid_open_and_descriptor_failures(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    root = project / ".reviewctl"
+    root.write_text("not a directory")
+    with pytest.raises(JournalOperationError, match="state root"):
+        ensure_project_state_root(project)
+
+    root.unlink()
+    root.mkdir()
+    real_open = identity_module.os.open
+    monkeypatch.setattr(
+        identity_module.os,
+        "open",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("open failed")),
+    )
+    with pytest.raises(JournalOperationError, match="state root"):
+        ensure_project_state_root(project)
+
+    monkeypatch.setattr(identity_module.os, "open", real_open)
+    monkeypatch.setattr(identity_module.os, "fstat", lambda descriptor: SimpleNamespace(st_mode=0))
+    with pytest.raises(JournalOperationError, match="state root"):
+        ensure_project_state_root(project)
+
+
+def test_state_root_helper_preserves_descriptor_error_when_close_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    (project / ".reviewctl").mkdir(parents=True)
+    real_close = identity_module.os.close
+
+    def fail_close(descriptor: int) -> None:
+        try:
+            raise OSError("close failed")
+        finally:
+            real_close(descriptor)
+
+    monkeypatch.setattr(
+        identity_module.os,
+        "fstat",
+        lambda descriptor: (_ for _ in ()).throw(RuntimeError("fstat failed")),
+    )
+    monkeypatch.setattr(identity_module.os, "close", fail_close)
+
+    with pytest.raises(RuntimeError, match="fstat failed"):
+        ensure_project_state_root(project)
 
 
 def test_identity_store_rejects_non_directory_descriptor_and_preserves_primary_error(
@@ -122,6 +178,70 @@ def test_identity_store_rejects_symlinked_state_files_without_mutating_target(
 
     assert external.read_text() == "outside\n"
     assert stat.S_IMODE(external.stat().st_mode) == 0o644
+
+
+def test_identity_store_rejects_state_root_replaced_before_lock_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    store = ProjectIdentityStore(project)
+    store.root.mkdir(parents=True)
+    displaced_root = project / ".reviewctl-displaced"
+    external = tmp_path / "external"
+    external.mkdir(mode=0o755)
+    real_open = identity_module.os.open
+    swapped = False
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) in {store.root / "identity.lock", Path("identity.lock")} and not swapped:
+            swapped = True
+            store.root.rename(displaced_root)
+            store.root.symlink_to(external, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(identity_module.os, "open", raced_open)
+
+    with pytest.raises(JournalOperationError, match="state"):
+        store.ensure("project-one")
+
+    assert swapped
+    assert list(external.iterdir()) == []
+
+
+def test_identity_root_descriptor_rejects_missing_root_and_unsupported_platform(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ProjectIdentityStore(tmp_path / "project")
+    with pytest.raises(JournalOperationError, match="state root"):
+        with store._root_descriptor(create=False):
+            pass
+
+    store.root.mkdir(parents=True)
+    monkeypatch.setattr(identity_module, "_OPEN_SUPPORTS_DIR_FD", False)
+    with pytest.raises(JournalOperationError) as error:
+        with store._root_descriptor():
+            pass
+    assert error.value.diagnostic.code == "journal_unavailable"
+
+
+def test_identity_rejects_non_regular_identity_temporary_and_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ProjectIdentityStore(tmp_path / "project")
+    store.root.mkdir(parents=True)
+    store.path.mkdir()
+    with pytest.raises(JournalOperationError, match="regular file"):
+        store.ensure("project-one")
+
+    store.path.rmdir()
+    identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
+    monkeypatch.setattr(identity_module.stat, "S_ISREG", lambda mode: False)
+    with pytest.raises(OSError, match="temporary identity"):
+        store._write(identity)
+    with pytest.raises(JournalOperationError, match="state path"):
+        with store._identity_lock():
+            pass
 
 
 @pytest.mark.parametrize(
@@ -207,7 +327,8 @@ def test_identity_store_cleans_source_after_replace_failure(tmp_path: Path, monk
     original_replace = identity_module.os.replace
     temporary_paths: list[str] = []
 
-    def fail_replace(temporary, target):
+    def fail_replace(temporary, target, **kwargs):
+        del target, kwargs
         temporary_paths.append(temporary)
         raise OSError("replace failed")
 
@@ -215,11 +336,11 @@ def test_identity_store_cleans_source_after_replace_failure(tmp_path: Path, monk
     with pytest.raises(OSError, match="replace failed"):
         store.ensure("project-one")
     assert temporary_paths
-    assert not Path(temporary_paths[0]).exists()
+    assert not (store.root / temporary_paths[0]).exists()
     monkeypatch.setattr(identity_module.os, "replace", original_replace)
 
 
-@pytest.mark.parametrize("operation", ["fchmod", "write", "fsync", "close", "replace", "chmod"])
+@pytest.mark.parametrize("operation", ["fchmod", "write", "fsync", "close", "replace"])
 def test_identity_write_cleans_temporary_files_on_every_failure(
     tmp_path: Path, monkeypatch, operation: str
 ) -> None:
@@ -280,24 +401,29 @@ def test_identity_write_closes_and_preserves_unverified_path_when_fstat_fails(
     store = ProjectIdentityStore(tmp_path)
     store.root.mkdir(parents=True, exist_ok=True)
     identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
-    real_mkstemp = identity_module.tempfile.mkstemp
+    real_open = identity_module.os.open
     real_fstat = identity_module.os.fstat
     descriptors: list[int] = []
     temporary_paths: list[Path] = []
+    temporary_descriptor: int | None = None
 
-    def tracked_mkstemp(*args, **kwargs):
-        descriptor, temporary = real_mkstemp(*args, **kwargs)
-        descriptors.append(descriptor)
-        temporary_paths.append(Path(temporary))
-        return descriptor, temporary
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal temporary_descriptor
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if str(path).startswith("identity."):
+            temporary_descriptor = descriptor
+            descriptors.append(descriptor)
+            temporary_paths.append(store.root / str(path))
+        return descriptor
 
     def replace_path_then_fail_fstat(descriptor):
-        del descriptor
-        temporary_paths[0].unlink()
-        temporary_paths[0].write_bytes(b"unrelated")
-        raise OSError("fstat failed")
+        if descriptor == temporary_descriptor:
+            temporary_paths[0].unlink()
+            temporary_paths[0].write_bytes(b"unrelated")
+            raise OSError("fstat failed")
+        return real_fstat(descriptor)
 
-    monkeypatch.setattr(identity_module.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(identity_module.os, "open", tracked_open)
     monkeypatch.setattr(identity_module.os, "fstat", replace_path_then_fail_fstat)
 
     with pytest.raises(OSError, match="fstat failed"):
@@ -372,9 +498,9 @@ def test_identity_write_does_not_unlink_reused_temporary_name(tmp_path: Path, mo
     real_replace = identity_module.os.replace
     temporary_paths: list[Path] = []
 
-    def replace_and_reuse(source, destination):
-        real_replace(source, destination)
-        temporary = Path(source)
+    def replace_and_reuse(source, destination, **kwargs):
+        real_replace(source, destination, **kwargs)
+        temporary = store.root / source
         temporary.write_bytes(b"unrelated")
         temporary_paths.append(temporary)
 
@@ -395,9 +521,9 @@ def test_identity_write_does_not_unlink_reused_name_after_replace_failure(
     identity = ProjectIdentity("project-one", "origin-one", "2026-08-27T00:00:00Z")
     temporary_paths: list[Path] = []
 
-    def fail_replace(source, destination):
-        del destination
-        temporary = Path(source)
+    def fail_replace(source, destination, **kwargs):
+        del destination, kwargs
+        temporary = store.root / source
         temporary.unlink()
         temporary.write_bytes(b"unrelated")
         temporary_paths.append(temporary)
@@ -445,7 +571,7 @@ def test_identity_lock_preserves_body_error_when_close_also_fails(
     with pytest.raises(OSError, match="close failed"):
         with store._identity_lock():
             pass
-    assert len(close_attempts) == 2
+    assert len(close_attempts) == 4
 
 
 def test_identity_lock_preserves_body_error_when_unlock_also_fails(

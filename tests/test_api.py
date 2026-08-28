@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -711,10 +712,10 @@ def test_client_rejects_read_errors_and_post_stat_growth(tmp_path: Path, monkeyp
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
     original_read = api_module._read_source_bytes
 
-    def fail_read(path: Path) -> bytes:
+    def fail_read(path: Path, **kwargs) -> bytes:
         if path == source:
             raise OSError("denied")
-        return original_read(path)
+        return original_read(path, **kwargs)
 
     monkeypatch.setattr(api_module, "_read_source_bytes", fail_read)
     result = client.review(ReviewRequest(prompt="review", files=(source,)))
@@ -723,7 +724,9 @@ def test_client_rejects_read_errors_and_post_stat_growth(tmp_path: Path, monkeyp
     assert "could not be read" in result.diagnostic.message
 
     monkeypatch.setattr(
-        api_module, "_read_source_bytes", lambda path: b"x" * (MAX_SOURCE_BYTES + 1)
+        api_module,
+        "_read_source_bytes",
+        lambda path, **kwargs: b"x" * (MAX_SOURCE_BYTES + 1),
     )
     result = client.review(ReviewRequest(prompt="review", files=(source,)))
     assert result.status == "invalid_request"
@@ -744,6 +747,44 @@ def test_source_reader_fails_closed_without_nofollow_or_for_non_regular_files(
     monkeypatch.setattr(api_module.os, "O_NOFOLLOW", None)
     with pytest.raises(OSError, match="without following symlinks"):
         api_module._read_source_bytes(source)
+
+
+def test_source_reader_fails_closed_without_dirfd_support(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("safe = True\n")
+    monkeypatch.setattr(api_module, "_OPEN_SUPPORTS_DIR_FD", False)
+
+    with pytest.raises(OSError, match="without following symlinks"):
+        api_module._read_source_bytes(source)
+    with pytest.raises(OSError, match="without following symlinks"):
+        api_module._source_opener(source.name, os.O_RDONLY, directory=0)
+
+
+@pytest.mark.parametrize("invalid_component", ["root", "ancestor"])
+def test_source_reader_rejects_non_directory_descriptors(
+    tmp_path: Path, monkeypatch, invalid_component: str
+) -> None:
+    root = tmp_path / "project"
+    package = root / "package"
+    package.mkdir(parents=True)
+    source = package / "source.py"
+    source.write_text("safe = True\n")
+    real_fstat = api_module.os.fstat
+    calls = 0
+
+    def fake_fstat(descriptor: int):
+        nonlocal calls
+        calls += 1
+        if invalid_component == "root" and calls == 1:
+            return SimpleNamespace(st_mode=0)
+        if invalid_component == "ancestor" and calls == 2:
+            return SimpleNamespace(st_mode=0)
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(api_module.os, "fstat", fake_fstat)
+
+    with pytest.raises(OSError, match="not a directory"):
+        api_module._read_source_bytes(source, project_dir=root)
 
 
 def test_client_rejects_source_replaced_by_external_symlink_before_open(
@@ -771,16 +812,56 @@ def test_client_rejects_source_replaced_by_external_symlink_before_open(
             swap_source()
         return real_read(path)
 
-    def raced_open(path, flags, *args):
-        if Path(path) == source:
+    def raced_open(path, flags, *args, **kwargs):
+        if Path(path) in {source, Path(source.name)}:
             swap_source()
-        return real_open(path, flags, *args)
+        return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_bytes", raced_read)
     monkeypatch.setattr(os, "open", raced_open)
 
     result = client.review(ReviewRequest(prompt="review", files=(source,)))
 
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "could not be read" in result.diagnostic.message
+    assert transport.requests == []
+
+
+def test_client_rejects_source_with_ancestor_replaced_by_external_symlink_before_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    package = project / "package"
+    package.mkdir(parents=True)
+    write_default_config(project)
+    source = package / "source.py"
+    source.write_text("safe = True\n")
+    external_package = tmp_path / "external-package"
+    external_package.mkdir()
+    (external_package / source.name).write_text("secret = True\n")
+    displaced_package = project / "displaced-package"
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    client = ReviewClient.from_project(project, transports={"pi": transport})
+    real_open = os.open
+    swapped = False
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if (
+            Path(path) == source
+            or (Path(path) == Path("package") and kwargs.get("dir_fd") is not None)
+        ) and not swapped:
+            swapped = True
+            package.rename(displaced_package)
+            package.symlink_to(external_package, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", raced_open)
+
+    result = client.review(ReviewRequest(prompt="review", files=(source,)))
+
+    assert swapped
     assert result.status == "invalid_request"
     assert result.diagnostic is not None
     assert "could not be read" in result.diagnostic.message

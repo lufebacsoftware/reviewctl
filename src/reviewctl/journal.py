@@ -7,6 +7,7 @@ import json
 import math
 import os
 import secrets
+import stat
 import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -30,6 +31,7 @@ FINDING_TRANSITIONS = {
     "verified": frozenset({"open", "dismissed"}),
     "dismissed": frozenset({"open"}),
 }
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
 
 def _now() -> str:
@@ -92,7 +94,8 @@ class ProjectJournal:
             normalized["reviewId"], str
         ):
             raise ValueError("journal event identifiers must be strings")
-        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+        parent_descriptor, descriptor = self._open_descriptors(create=True)
+        assert descriptor is not None
         try:
             os.fchmod(descriptor, 0o600)
             with self._exclusive_lock(descriptor):
@@ -130,15 +133,71 @@ class ProjectJournal:
                         pass
                     raise
         finally:
-            primary = sys.exc_info()[1]
-            if primary is None:
-                os.close(descriptor)
-            else:
-                try:
-                    os.close(descriptor)
-                except BaseException:
-                    pass
+            self._close_descriptors(descriptor, parent_descriptor)
         return normalized
+
+    def _open_descriptors(self, *, create: bool) -> tuple[int, int | None]:
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        directory_flag = getattr(os, "O_DIRECTORY", None)
+        if no_follow is None or directory_flag is None or not _OPEN_SUPPORTS_DIR_FD:
+            raise JournalOperationError(
+                Diagnostic(
+                    "journal_unavailable",
+                    "this platform cannot open the project journal without following symlinks",
+                    retryable=False,
+                )
+            )
+        try:
+            parent = os.open(
+                self.path.parent,
+                os.O_RDONLY | directory_flag | no_follow,
+            )
+        except OSError as error:
+            raise JournalOperationError(
+                Diagnostic("journal_corrupt", f"could not open journal directory: {error}")
+            ) from error
+        try:
+            if not stat.S_ISDIR(os.fstat(parent).st_mode):
+                raise OSError("journal directory is not a directory")
+            flags = os.O_RDONLY
+            if create:
+                flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+            try:
+                descriptor = os.open(
+                    self.path.name,
+                    flags | no_follow | getattr(os, "O_NONBLOCK", 0),
+                    0o600,
+                    dir_fd=parent,
+                )
+            except FileNotFoundError:
+                if not create:
+                    return parent, None
+                raise
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                os.close(descriptor)
+                raise OSError("journal path is not a regular file")
+            return parent, descriptor
+        except BaseException as error:
+            try:
+                os.close(parent)
+            except BaseException:
+                pass
+            raise JournalOperationError(
+                Diagnostic("journal_corrupt", f"could not open journal: {error}")
+            ) from error
+
+    @staticmethod
+    def _close_descriptors(*descriptors: int) -> None:
+        primary = sys.exc_info()[1]
+        close_error: BaseException | None = None
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if primary is None and close_error is not None:
+            raise close_error
 
     @contextmanager
     def _exclusive_lock(self, descriptor: int):
@@ -355,14 +414,18 @@ class ProjectJournal:
         return events, None
 
     def _read_locked(self) -> tuple[list[dict[str, Any]], Diagnostic | None]:
-        if not self.path.exists():
-            return [], None
-        if not self.path.is_file():
-            return [], Diagnostic("journal_corrupt", "journal path must be a regular file")
         try:
-            with self.path.open("rb") as stream:
-                with self._shared_lock(stream.fileno()):
-                    return self._read_descriptor(stream.fileno())
+            parent_descriptor, descriptor = self._open_descriptors(create=False)
+            try:
+                if descriptor is None:
+                    return [], None
+                with self._shared_lock(descriptor):
+                    return self._read_descriptor(descriptor)
+            finally:
+                targets = (
+                    (parent_descriptor,) if descriptor is None else (descriptor, parent_descriptor)
+                )
+                self._close_descriptors(*targets)
         except JournalOperationError as error:
             return [], error.diagnostic
         except OSError as error:
@@ -477,6 +540,10 @@ class ProjectJournal:
             versioned_count += 1
             previous_versioned = event
             previous_event = event
+        try:
+            self._project(events)
+        except (TypeError, ValueError) as error:
+            violations.append(str(error))
         return violations
 
     def verify(self) -> list[str]:
@@ -622,10 +689,7 @@ class ProjectJournal:
                 selected_dimension = normalize_dimensions([dimension], label="finding dimension")[0]
             except ValueError as error:
                 return [], Diagnostic("invalid_request", str(error))
-        try:
-            findings = self._project(events)
-        except ValueError as error:
-            return [], Diagnostic("journal_corrupt", str(error))
+        findings = self._project(events)
         if status is not None:
             findings = [finding for finding in findings if finding.get("status") == status]
         if selected_dimension is not None:

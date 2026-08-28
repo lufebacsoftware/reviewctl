@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import secrets
 import stat
 import sys
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +20,8 @@ except ImportError:  # pragma: no cover - journal support is POSIX-only
     fcntl = None
 
 from reviewctl.errors import Diagnostic, JournalOperationError
+
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
 
 def _now() -> str:
@@ -122,56 +124,123 @@ class ProjectIdentityStore:
         self.path = self.root / "identity.json"
 
     def ensure(self, project_id: str) -> ProjectIdentity:
-        ensure_project_state_root(self.project_dir)
-        confine_project_state_path(self.path)
-        with self._identity_lock():
-            if self.path.exists():
-                identity = self._read()
-            else:
-                identity = ProjectIdentity(
-                    project_id=project_id,
-                    origin_id="origin-" + secrets.token_hex(12),
-                    created_at=_now(),
-                )
-                if fcntl is None:
+        with self._root_descriptor() as root_descriptor:
+            with self._identity_lock(root_descriptor):
+                try:
+                    identity = self._read(root_descriptor)
+                except FileNotFoundError:
+                    identity = ProjectIdentity(
+                        project_id=project_id,
+                        origin_id="origin-" + secrets.token_hex(12),
+                        created_at=_now(),
+                    )
+                    if fcntl is None:
+                        raise JournalOperationError(
+                            Diagnostic(
+                                "journal_unavailable",
+                                "this platform has no supported project identity lock primitive",
+                                retryable=True,
+                                next="run reviewctl on a POSIX filesystem with advisory locking",
+                            )
+                        ) from None
+                    self._write(identity, root_descriptor)
+                if identity.project_id != project_id:
                     raise JournalOperationError(
                         Diagnostic(
-                            "journal_unavailable",
-                            "this platform has no supported project identity lock primitive",
-                            retryable=True,
-                            next="run reviewctl on a POSIX filesystem with advisory locking",
+                            "journal_corrupt",
+                            "project identity does not match the configured project id",
+                            next=(
+                                "restore the original project.id or migrate the journal "
+                                "explicitly before changing its portable identity"
+                            ),
                         )
                     )
-                self._write(identity)
-            if identity.project_id != project_id:
-                raise JournalOperationError(
-                    Diagnostic(
-                        "journal_corrupt",
-                        "project identity does not match the configured project id",
-                        next=(
-                            "restore the original project.id or migrate the journal "
-                            "explicitly before changing its portable identity"
-                        ),
-                    )
-                )
-            return identity
+                return identity
 
     def read_existing(self) -> ProjectIdentity | None:
         """Read an existing identity without creating or modifying local state."""
         if ensure_project_state_root(self.project_dir, create=False) is None:
             return None
-        confine_project_state_path(self.path, create_root=False)
-        if not self.path.exists():
-            return None
-        return self._read()
+        with self._root_descriptor(create=False) as root_descriptor:
+            try:
+                return self._read(root_descriptor)
+            except FileNotFoundError:
+                return None
 
-    def _read(self) -> ProjectIdentity:
+    @contextmanager
+    def _root_descriptor(self, *, create: bool = True):
+        root = self.root
+        if root.is_symlink():
+            raise _unsafe_state_root(root)
+        if not root.exists():
+            if not create:
+                raise _unsafe_state_root(root)
+            root.mkdir(mode=0o700)
+        if not root.is_dir():
+            raise _unsafe_state_root(root)
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        directory_flag = getattr(os, "O_DIRECTORY", None)
+        if no_follow is None or directory_flag is None or not _OPEN_SUPPORTS_DIR_FD:
+            raise JournalOperationError(
+                Diagnostic(
+                    "journal_unavailable",
+                    "this platform cannot confine project identity files",
+                    retryable=False,
+                )
+            )
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
+            descriptor = os.open(root, os.O_RDONLY | directory_flag | no_follow)
+        except OSError as error:
+            raise _unsafe_state_root(root) from error
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise _unsafe_state_root(root)
+            yield descriptor
+            current = os.stat(root, follow_symlinks=False)
+            if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise _unsafe_state_root(root)
+        finally:
+            primary = sys.exc_info()[1]
+            if primary is None:
+                os.close(descriptor)
+            else:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+
+    def _read(self, root_descriptor: int | None = None) -> ProjectIdentity:
+        if root_descriptor is None:
+            with self._root_descriptor() as owned_descriptor:
+                return self._read(owned_descriptor)
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                self.path.name,
+                os.O_RDONLY | no_follow | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=root_descriptor,
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("project identity is not a regular file")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                descriptor = None
+                value = json.load(stream)
+        except FileNotFoundError:
+            raise
         except (OSError, UnicodeError, ValueError) as error:
+            if isinstance(error, OSError) and error.errno == errno.ELOOP:
+                raise _unsafe_state_path(self.path) from error
             raise JournalOperationError(
                 Diagnostic("journal_corrupt", f"could not read project identity: {error}")
             ) from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         if not isinstance(value, dict):
             raise JournalOperationError(
                 Diagnostic("journal_corrupt", "project identity must be a JSON object")
@@ -195,17 +264,29 @@ class ProjectIdentityStore:
             )
         return ProjectIdentity(project_id, origin_id, created_at, schema_version)
 
-    def _write(self, identity: ProjectIdentity) -> None:
+    def _write(self, identity: ProjectIdentity, root_descriptor: int | None = None) -> None:
+        if root_descriptor is None:
+            with self._root_descriptor() as owned_descriptor:
+                self._write(identity, owned_descriptor)
+            return
         payload = (
             json.dumps(identity.to_dict(), ensure_ascii=True, sort_keys=True, indent=2).encode(
                 "utf-8"
             )
             + b"\n"
         )
-        descriptor, temporary = tempfile.mkstemp(prefix="identity.", dir=self.root)
+        temporary = f"identity.{secrets.token_hex(16)}"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=root_descriptor,
+        )
         staged_identity = None
         try:
             staged_identity = os.fstat(descriptor)
+            if not stat.S_ISREG(staged_identity.st_mode):
+                raise OSError("temporary identity is not a regular file")
             os.fchmod(descriptor, 0o600)
             remaining = memoryview(payload)
             while remaining:
@@ -214,16 +295,24 @@ class ProjectIdentityStore:
                     raise OSError(f"could not finish writing project identity {self.path}")
                 remaining = remaining[written:]
             os.fsync(descriptor)
-            os.replace(temporary, self.path)
-            os.chmod(self.path, 0o600)
+            os.replace(
+                temporary,
+                self.path.name,
+                src_dir_fd=root_descriptor,
+                dst_dir_fd=root_descriptor,
+            )
         except BaseException:
             try:
-                candidate = os.stat(temporary, follow_symlinks=False)
+                candidate = os.stat(
+                    temporary,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
                 if staged_identity is not None and (candidate.st_dev, candidate.st_ino) == (
                     staged_identity.st_dev,
                     staged_identity.st_ino,
                 ):
-                    os.unlink(temporary)
+                    os.unlink(temporary, dir_fd=root_descriptor)
             except BaseException:
                 pass
             raise
@@ -238,14 +327,27 @@ class ProjectIdentityStore:
                     pass
 
     @contextmanager
-    def _identity_lock(self):
+    def _identity_lock(self, root_descriptor: int | None = None):
+        if root_descriptor is None:
+            with self._root_descriptor() as owned_descriptor:
+                with self._identity_lock(owned_descriptor):
+                    yield
+            return
         if fcntl is None:
             yield
             return
         lock_path = self.root / "identity.lock"
-        if lock_path.is_symlink():
-            raise _unsafe_state_path(lock_path)
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            descriptor = os.open(
+                lock_path.name,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=root_descriptor,
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("project identity lock is not a regular file")
+        except OSError as error:
+            raise _unsafe_state_path(lock_path) from error
         acquired = False
         primary: BaseException | None = None
         unlock_error: BaseException | None = None
