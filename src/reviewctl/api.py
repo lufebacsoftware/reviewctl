@@ -661,12 +661,14 @@ class ReviewClient:
     @staticmethod
     def _merge_findings(*groups: Sequence[Finding]) -> tuple[Finding, ...]:
         merged: list[Finding] = []
-        seen: set[str] = set()
+        positions: dict[str, int] = {}
         for group in groups:
             for finding in group:
-                identity = json.dumps(asdict(finding), ensure_ascii=True, sort_keys=True)
-                if identity not in seen:
-                    seen.add(identity)
+                identity = _finding_id(finding)
+                if identity in positions:
+                    merged[positions[identity]] = finding
+                else:
+                    positions[identity] = len(merged)
                     merged.append(finding)
         return tuple(merged)
 
