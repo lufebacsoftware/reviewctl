@@ -41,3 +41,75 @@ def test_pi_transcript_is_not_review_evidence() -> None:
     assert "approval" in document
     assert "transcript" in document
     assert "artifact root" in document
+
+
+def test_help_llm_carries_setup_and_nonqualification_invariants() -> None:
+    document = " ".join((REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower().split())
+
+    for command in (
+        "reviewctl setup discover --format json",
+        "reviewctl setup show --format json",
+        "reviewctl setup check --backend name --format json",
+    ):
+        assert command in document
+    for invariant in (
+        "setup diagnostics are local, read-only, and non-qualifying.",
+        (
+            "setup diagnostics observe only executable presence and version for registered "
+            "executable backends."
+        ),
+        ("setup diagnostics never authenticate, call a model or provider, or write configuration."),
+        "availability is not qualification.",
+        (
+            "remote api backends may execute providers or models remotely, but setup never "
+            "credential-probes them."
+        ),
+    ):
+        assert invariant in document
+
+    for forbidden_reversal in (
+        "setup diagnostics may write configuration",
+        "setup diagnostics may authenticate",
+        "setup diagnostics may call a model",
+        "availability is qualification",
+        "provider or model execution is always local",
+    ):
+        assert forbidden_reversal not in document
+
+    for product in ("cursor", "claude"):
+        unsupported_claim = " ".join((product, "is", "supported"))
+        assert unsupported_claim not in document
+
+
+def test_help_llm_gives_machine_readable_next_actions_for_every_result() -> None:
+    document = " ".join((REPOSITORY / "docs" / "HELP-LLM.md").read_text().lower().split())
+
+    for instruction in (
+        "incomplete: inspect `completionrequest`, `fallbackrelationships`, and `rawresponse`",
+        "invalid: inspect `violations`, `evaluationerror`, and `rawresponse`",
+        "accepted: inspect both the legacy and consolidated views, then run `reviewctl verify`",
+        "errors are actionable for llms",
+    ):
+        assert instruction in document
+
+
+def test_evidence_contract_documents_raw_and_structural_receipt_evidence() -> None:
+    document = " ".join((REPOSITORY / "docs" / "EVIDENCE.md").read_text().lower().split())
+
+    for invariant in (
+        "`rawresponse` records its durable absolute path, sha-256, and character count",
+        "a non-null response is retained even when it is empty or rejected",
+        "v1 verification is digest-only",
+        "v2 verification is structural and offline",
+        "acceptedattempt must identify a real complete accepted attempt",
+        "unconfirmed findings remain visible in the consolidated view",
+    ):
+        assert invariant in document
+
+
+def test_raw_response_docs_describe_the_current_absolute_path_contract() -> None:
+    for name in ("EVIDENCE.md", "HELP-LLM.md"):
+        document = " ".join((REPOSITORY / "docs" / name).read_text().lower().split())
+
+        assert "durable absolute path" in document
+        assert "relative path" not in document

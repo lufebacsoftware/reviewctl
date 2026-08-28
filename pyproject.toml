@@ -7,7 +7,7 @@ name = "reviewctl"
 version = "0.3.2"
 description = "Portable, evidence-backed LLM code review control plane"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Lufebac Software" }]
@@ -28,7 +28,7 @@ packages = ["src/reviewctl"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

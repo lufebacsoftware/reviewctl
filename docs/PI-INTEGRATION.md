@@ -2,52 +2,154 @@
 
 Use `pi` as the interactive workbench and `reviewctl` as the formal review and
 evidence archive. They can use the same provider, but they have different
-contracts.
+contracts. `reviewctl` also exposes a `pi` transport for bounded, headless
+runs; that transport is the only way a Pi response can enter the formal
+receipt flow.
 
 ## Division of responsibility
 
-`pi` is for short exploratory conversations and resumable threads. Use it to
-understand a design, inspect a checkout, run a REPL, try a report, or shape a
-review question. Keep each thread in a dedicated session directory outside the
-`reviewctl` artifact root.
+`pi` is for exploratory conversations and resumable threads. Use the integrated
+`reviewctl explore` commands to understand a design, inspect a checkout, run a
+REPL, try a report, or shape a review question. Keep these sessions in the
+exploration root, outside the formal `reviewctl` artifact root.
 
 `reviewctl` is for a bounded review. It freezes the selected source files,
 applies the source and provider policy, invokes the selected transport, stores
 the request and response evidence, and writes a verifiable receipt. Its
 artifact root is the archive for formal reviews; use `--seal-to` when the
-request and response must also be encrypted with Age.
+request and response must also be encrypted with Age. The `pi` transport runs
+with tools, extensions, skills, prompt templates, and context-file discovery
+disabled. For each attempt, it records only the Pi artifacts actually observed:
+the JSON event stream when Pi emits stdout, the session file when Pi creates it,
+stderr when Pi emits diagnostics, and an extracted final response when one is
+non-empty. Missing executables, silent processes, and empty responses therefore
+leave any unproduced evidence locator as `null`. A failed process still retains
+the non-empty event, session, or stderr artifacts it actually produced;
+reviewctl does not manufacture empty files as evidence.
+
+## Project-local quick path
+
+For a new local project, the short path is:
+
+```bash
+reviewctl init --project .
+reviewctl doctor --project . --format json
+reviewctl review --project . --profile default \
+  --prompt "Review the selected change and return actionable findings." \
+  --file src/example.py --format json
+reviewctl status --project . --format json
+reviewctl findings --project . --status open --format json
+```
+
+`init` creates a private `reviewctl.toml` with a Pi profile and refuses to
+overwrite an existing file unless `--force` is supplied. Credentials remain in
+Pi or the environment. `doctor` is read-only: it reports route, privacy,
+contract, executable, and capability metadata without authenticating or
+calling a model.
+
+The project API tries profile routes in order. A timeout, empty response,
+transport failure, or incomplete contract may move to the next route. Valid
+findings from an incomplete response are retained and supplied as bounded
+completion context; they remain marked as partial until a later attempt
+completes the contract. The receipt records `attempts` and
+`fallbackRelationships`, so a fallback is inspectable rather than an implicit
+retry.
+
+`max_attempts` is a per-route retry allowance, capped at three. A profile with
+two routes and `max_attempts = 2` can therefore make at most four bounded
+attempts; each attempt and transition is recorded in the receipt.
+
+The project journal is append-only. Its current findings view collapses
+repeated `finding_observed` events by stable `findingId` and applies later
+`finding_status_changed` events. To record a decision:
+
+```bash
+reviewctl findings set-status --project . \
+  --id finding-<stable-id> --status fixed \
+  --reason "patched in commit abc123" --format json
+```
+
+The lifecycle is `open`, `disputed`, `fixed`, `verified`, or `dismissed`.
+Re-observation does not reset an existing status. Invalid transitions and
+unknown IDs are safe `invalid_request` diagnostics rather than silent writes.
+
+Project receipts have a local SHA-256 envelope for detecting accidental
+corruption and can be checked offline:
+
+```bash
+reviewctl verify .reviewctl/reviews/<review-id>/receipt.json
+```
+
+The SHA-256 is not a cryptographic signature or shared trust root; anyone who
+can rewrite a local receipt can also recompute it. Federation and signed
+exchange bundles are separate future work. The stable project exit meanings
+are: `0` accepted review (findings may
+exist), `1` caller-selected `--fail-on` threshold, `2` invalid input or
+configuration, `3` unavailable/timeout/empty/contract failure, `4` privacy
+denial, and `5` receipt or journal verification failure. Diagnostic messages
+are bounded and do not include prompts, source, credentials, or raw provider
+responses.
 
 An interactive `pi` transcript is never an approval, a merge decision, or a
 formal review receipt. The transcript may inform the prompt, but the formal
-question must be promoted through `reviewctl`.
+question must be promoted through `reviewctl`. A `reviewctl --route pi:...`
+attempt is formal only because `reviewctl` freezes the inputs, validates the
+response contract, persists the attempt, and produces a receipt that still
+requires `reviewctl verify`.
 
 ## Promotion workflow
 
-### 1. Explore with pi
+### 1. Explore with reviewctl and pi
 
-Start a named, isolated thread. Limit tools to the smallest set needed for the
-question, and do not point the session directory at a review artifact root.
+Start a named, resumable thread. The default tool set is read-only repository
+inspection. Add `bash`, `edit`, or `write` only as a deliberate local execution
+decision; the session is not a merge gate.
 
 ```bash
-pi \
-  --name accounting-design \
-  --session-dir "$TMPDIR/pi-accounting-design" \
-  --tools read,grep,find,ls,bash \
-  --no-approve \
-  "Explore the proposed accounting change. Do not edit files or create commits.
-   Separate observations from recommendations and suggest a bounded review question."
+reviewctl explore start \
+  --id accounting-design \
+  --model openai-codex/gpt-5.6-sol \
+  --cwd ~/Code/workspaces/ledger \
+  --prompt "Explore the proposed accounting change. Do not edit files or create commits. \
+Separate observations from recommendations and suggest a bounded review question."
 ```
 
-For a later turn, resume the same thread with `pi --continue` or select it
-with `--session`. Treat the conversation as working notes, not evidence.
+Continue the same conversation:
 
-### 2. Freeze the formal request
+```bash
+reviewctl explore resume \
+  --id accounting-design \
+  --prompt "Inspect the relevant tests and refine the bounded review question."
+```
 
-Write the agreed question to a prompt file outside the interactive session
-directory. Attach only the source and focused tests needed for that question.
-Do not attach the entire `pi` transcript as a substitute for source files.
+A resume inherits the prior tool set when `--tools` is omitted. Passing
+`--tools` explicitly replaces it for that turn and subsequent resumes, so an
+explicit `--tools read,grep,find,ls` revokes previously enabled write or shell
+capabilities.
 
-### 3. Run and archive the review
+`reviewctl explore show` prints the manifest, and each turn is retained under
+`~/.cache/reviewctl/explorations/<id>/turns/`. The session JSONL is the Pi
+conversation state; the per-turn event stream and response are diagnostic
+working material. A turn always retains its request and `turn.json`; event,
+response, stderr, and session files exist only when Pi produced the corresponding
+content. Transport-independent failures such as a missing executable are recorded
+in `turn.json:diagnostic`, not manufactured as Pi stderr.
+
+### 2. Promote the formal request
+
+When the exploratory question is ready, create a handoff package:
+
+```bash
+reviewctl explore promote \
+  --id accounting-design \
+  --output review-handoffs/accounting-design
+```
+
+This creates `prompt.md`, the latest exploratory response as `exploration.md`,
+and a manifest. Attach only the source and focused tests needed for the formal
+question; do not treat the exploratory response as a source of truth.
+
+### 3. Run and archive the formal review
 
 ```bash
 reviewctl run \
@@ -64,10 +166,43 @@ reviewctl run \
   --seal-to age1auditrecipient...
 ```
 
+For a headless Pi attempt or an ordered Pi fallback, select the transport
+explicitly. Formal Pi model identifiers must include their provider so an
+observed provider change cannot be hidden by an unqualified model name:
+
+```bash
+reviewctl run \
+  --review-id bounded-accounting-change-pi \
+  --route pi:openrouter/google/gemini-2.5-flash \
+  --prompt-file review-request.md \
+  --file src/accounting.clj \
+  --file test/accounting_test.clj \
+  --source-class proprietary \
+  --response-contract findings-json
+```
+
+Pi's interactive session directory is not reused. Each attempt gets an
+isolated session inside its review artifact directory, and an empty or failed
+Pi process is recorded as unavailable rather than discarded or treated as an
+approval.
+
+Pi's current CLI has no output-token limit option. The request artifact records
+`requestedMaxOutputTokens` together with `outputTokenLimitEnforced: false` so
+automation cannot mistake the requested value for an enforced budget cap.
+
 The same flow may use `--transport agy` for a bounded synthetic product
 review, or the approved Codex transport for proprietary source. Do not infer
 authorization from the model selected in `pi`; the formal transport and
 policy are recorded by `reviewctl`.
+
+## GitHub pull requests
+
+For a local-first pull-request review, use `reviewctl github review`. It reads
+PR metadata and the diff through `gh`, verifies the local checkout at the exact
+head SHA, and sends only the bounded snapshot through the existing project
+profile. The command is dry-run only: it creates a verified local receipt and
+publication plan without writing to GitHub. See `docs/GITHUB-REVIEWS.md` for
+the source boundary and fail-closed diagnostics.
 
 ### 4. Verify before using the result
 

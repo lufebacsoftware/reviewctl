@@ -15,20 +15,42 @@ provenance invalidates the prior receipt and requires a fresh review. The policy
 policy bytes used for that historical decision: changing the policy later does not alter an existing
 receipt, but a new review records the new policy digest.
 
+Every attempt distinguishes an absent backend response from a present response. A non-null response is
+retained even when it is empty or rejected, under the attempt directory. `rawResponse` records its
+durable absolute path, SHA-256, and character count. This durable raw evidence supports diagnosis; it is never
+copied into a completion prompt and never qualifies a rejected response for fragment promotion.
+
+Receipt schema versions have deliberately different verification guarantees. V1 verification is
+digest-only: it preserves the historical integrity check without retroactively imposing new structure.
+V2 verification is structural and offline: after checking the digest, it validates attempt numbering,
+contract identity, gates and evaluation state, fallback relationships, promoted-fragment identity, the
+accepted attempt, and consolidation without calling a provider or model.
+
+The receipt SHA-256 is tamper detection, not a digital signature and not a trust root. Structural
+verification detects internally incompatible facts, including mixing native findings state into a legacy
+contract receipt. It does not prove who authored the receipt or defend against an actor authorized to
+rewrite every fact and recompute the digest; signatures and organizational trust policy remain separate
+concerns.
+
 ## Sealed audit payload
 
 The runner never copies source files into its artifact directory. It writes private temporary snapshots
-only for the lifetime of the model process; receipt provenance hashes those exact bytes. Passing
-`--seal-to` stores the exact assembled request and raw model response only as Age-encrypted payloads.
+only for the lifetime of the model process; `snapshotIntegrity` receipt provenance hashes those exact
+bytes locally. Passing
+`--seal-to` stores the exact assembled request and a sealed copy of the raw model response as
+Age-encrypted payloads.
 SQLite transport databases are deleted after extraction, including when Age sealing fails, because they
 contain raw prompt and response data. The Codex transport similarly deletes its `--output-last-message`
 file and any temporary JSON schema after extraction; the receipt keeps the Codex session identifier,
 response hash, and validated structured findings.
 
 For proprietary Codex reviews on macOS, the runner also creates a temporary `CODEX_HOME` with only the
-authentication file required by Codex and applies a `sandbox-exec` deny rule to every original review
-source root. This proves that Codex cannot reopen the reviewed checkout after snapshotting. It is not a
-whole-host sandbox claim: system paths outside the source roots are outside this narrow boundary.
+authentication file required by Codex and applies `sandbox-exec` rules that deny reads and writes to
+every original review source root and deny writes throughout the invoking user's real home. This proves
+that Codex cannot reopen the reviewed checkout after snapshotting or write into the user's home. It is
+not a whole-host sandbox claim: paths outside the source roots and real home remain outside this boundary.
+Codex's internal seatbelt is bypassed only for this externally sandboxed path, because macOS does not
+permit nested seatbelt application; synthetic and non-isolated Codex runs retain `--sandbox read-only`.
 
 On timeout, `reviewctl` discards any partially written Codex final message before validation. A timeout
 can record duration and transport failure, but it can never contribute a partial verdict or finding to a
@@ -39,10 +61,30 @@ The structured findings contract accepts exactly two outcomes: `approved` with n
 read the files, or returns an ambiguous natural-language verdict produces an unavailable receipt rather
 than an approval.
 
-Every structured response must also return a SHA-256 for every frozen review file. `reviewctl` compares
-that set exactly with the locally snapshotted bytes. This is not a proof of model reasoning, but it is a
-machine-checkable proof that the response could not have been accepted without correctly reading each
-bounded file.
+For typed findings, contract evaluation is `complete`, `incomplete`, or `invalid`. Promotion is allowed
+only from an eligible incomplete attempt and only for findings that independently pass the full finding
+validator. Invalid responses and responses rejected by a pre-gate promote nothing. Completion receives
+validated fragments and a target-bound gap manifest, not the raw response. It cannot inherit a prior
+verdict or approval, and absence of a finding in a later response is not a dispute.
+
+acceptedAttempt must identify a real complete accepted attempt. The legacy verdict and findings are
+bound to that attempt. Unconfirmed findings remain visible in the consolidated view with provenance;
+they are not silently discarded merely because a later response is complete. Consequently the
+consolidated approval invariant is stricter than the legacy accepted-attempt view.
+
+For transport contexts that require a `reviewDeclaration`, the structured response lists every frozen
+basename it declares it reviewed. `reviewctl` compares that set exactly with the frozen packet. The
+model never supplies the authoritative source hashes; the runner records them from local bytes.
+
+The receipt also distinguishes the `invocationManifest` assembled by reviewctl from a
+`providerRequestObserved` request. Direct transports can persist a sanitized provider-native request.
+An opaque intermediary CLI can expose only the invocation reviewctl controlled unless it returns
+stronger observation evidence. The packet digest identifies reviewctl's intermediate assembled prompt;
+it does not by itself attest what a remote provider received.
+
+Snapshot integrity, a matching declaration, and an observed request are useful but narrower claims.
+None proves cognition, attention, semantic understanding, correct reasoning, or correctness of a
+finding. Model findings remain proposals until independently reproduced or otherwise verified.
 
 Evidence repositories retain the visible receipt and sealed payloads. Their commits must be signed by
 the owning organization. Release signing and reproducible-build provenance apply to the `reviewctl`

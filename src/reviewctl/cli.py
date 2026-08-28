@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -15,28 +16,97 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
-from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    resource = None
+
 from reviewctl import __version__
+from reviewctl.backends import (
+    BackendCapabilities,
+    BackendDescriptor,
+    BackendEvidence,
+    BackendExecution,
+    BackendFamily,
+    BackendRegistry,
+    BackendRequest,
+    DiscoveryKind,
+    PersistedResponse,
+    ReadOnlyCapability,
+    SourceIsolation,
+)
+from reviewctl.contracts import (
+    FINDINGS_SCHEMA,
+    REVIEWED_FILES_SCHEMA,
+    ContractCompletionRequest,
+    ContractContext,
+    ContractEvaluation,
+    EvaluationContext,
+    EvaluationStatus,
+    exact_json_object,
+    get_contract,
+    require_string_json_object_keys,
+    valid_review_basename,
+)
+from reviewctl.contracts import (
+    canonical_json as contract_canonical_json,
+)
+from reviewctl.errors import Diagnostic, ReviewctlError, exit_code_for
+from reviewctl.filesystem import (
+    confined_directory_descriptor,
+    confined_regular_descriptor,
+    confined_relative_directory_descriptor,
+    read_confined_bytes,
+    read_confined_text,
+)
+from reviewctl.project_cli import add_project_commands
+from reviewctl.review_flow import (
+    FallbackRelationship,
+    PromotedFragment,
+    build_completion_context,
+    consolidate,
+    promote_fragments,
+    receipt_contract_identity,
+    render_completion_prompt,
+    validate_v2_receipt,
+)
+from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discover_topology
 
 MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
+MAX_AGY_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_AGY_STDERR_BYTES = 100_000
+MAX_KIRO_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_KIRO_STDERR_BYTES = 100_000
+MAX_LLM_DATABASE_BYTES = 4 * 1024 * 1024
+MAX_LLM_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_LLM_STDERR_BYTES = 100_000
+MAX_OPENROUTER_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_OPENROUTER_STDERR_BYTES = 100_000
+MAX_OPENROUTER_STATUS_BYTES = 32
+MAX_PI_EXPLORATION_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_PI_EXPLORATION_STDERR_BYTES = 100_000
+MAX_PI_LEGACY_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_PI_LEGACY_STDERR_BYTES = 100_000
+MAX_CODEX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_CODEX_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_CODEX_STDERR_BYTES = 100_000
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
-FINDING_FIELDS = {"severity", "path", "line", "title", "evidence", "reproduction"}
-FINDING_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-REVIEW_VERDICTS = {"approved", "changes-requested"}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
 PRODUCT_SCORE_FIELDS = {
     "delivery",
@@ -52,9 +122,13 @@ RESPONSE_CONTRACTS = {
     "product-review-json",
     "product-judge-json",
 }
-TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy"}
+DEFAULT_REVIEW_TIMEOUT_SECONDS = 90
+DEFAULT_REVIEW_MAX_ATTEMPTS = 1
+TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
-ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy"}
+ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"}
+LOCAL_POLICY_TRANSPORTS = frozenset({"codex", "gemini", "kiro", "pi"})
+REQUIRED_LOCAL_POLICY_TRANSPORTS = frozenset({"gemini", "kiro", "pi"})
 RETRIABLE_REVIEW_RESULTS = {
     "timeout",
     "transport-failed",
@@ -71,41 +145,43 @@ PROVIDER_PREFERENCE_KEYS = {
     "order",
     "sort",
 }
-FINDINGS_SCHEMA = {
-    "type": "object",
-    "required": ["verdict", "findings"],
-    "additionalProperties": False,
-    "properties": {
-        "verdict": {"type": "string", "enum": sorted(REVIEW_VERDICTS)},
-        "findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": sorted(FINDING_FIELDS),
-                "additionalProperties": False,
-                "properties": {
-                    "severity": {"type": "string", "enum": sorted(FINDING_SEVERITIES)},
-                    "path": {"type": "string"},
-                    "line": {"type": "integer", "minimum": 1},
-                    "title": {"type": "string"},
-                    "evidence": {"type": "string"},
-                    "reproduction": {"type": "string"},
-                },
-            },
-        },
-    },
-}
 CODEX_FINDINGS_SCHEMA = {
     **FINDINGS_SCHEMA,
     "required": ["verdict", "findings", "reviewedFiles"],
     "properties": {
         **FINDINGS_SCHEMA["properties"],
-        "reviewedFiles": {
-            "type": "array",
-            "minItems": 1,
-            "items": {"type": "string", "minLength": 1},
-        },
+        "reviewedFiles": REVIEWED_FILES_SCHEMA,
     },
+}
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ANSI_ESCAPE_BYTES = rb"\x1b\[[0-?]*[ -/]*[@-~]"
+KIRO_RESPONSE_PREFIX = re.compile(
+    rb"^(?:" + ANSI_ESCAPE_BYTES + rb")*> (?:" + ANSI_ESCAPE_BYTES + rb")*"
+)
+KIRO_LEADING_UI = re.compile(rb"^(?:" + ANSI_ESCAPE_BYTES + rb")*")
+KIRO_TRAILING_UI = re.compile(rb"(?:" + ANSI_ESCAPE_BYTES + rb")+[\r\n]*$")
+KIRO_RAW_CREDITS_FOOTER = re.compile(
+    rb"\n(?:" + ANSI_ESCAPE_BYTES + rb"|[ \t\r\n])*"
+    rb"\xe2\x96\xb8 Credits: [0-9]+(?:\.[0-9]+)?"
+    rb"(?: \xe2\x80\xa2 Time: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h)"
+    rb"(?: [0-9]+(?:\.[0-9]+)?(?:ms|s|m|h))*)?"
+    rb"(?:" + ANSI_ESCAPE_BYTES + rb"|[ \t\r\n])*$"
+)
+KIRO_SESSION_ID = re.compile(
+    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+)
+KIRO_REVIEW_AGENT = {
+    "name": "reviewctl_readonly",
+    "description": "Ephemeral no-tools review agent managed by reviewctl.",
+    "prompt": None,
+    "mcpServers": {},
+    "tools": [],
+    "toolAliases": {},
+    "allowedTools": [],
+    "resources": [],
+    "toolsSettings": {},
+    "includeMcpJson": False,
+    "model": None,
 }
 
 _STRING_SCHEMA = {"type": "string", "minLength": 1}
@@ -254,28 +330,19 @@ def codex_schema(schema: dict[str, object]) -> dict[str, object]:
 
 def response_schema(contract: str, *, codex: bool = False) -> dict[str, object] | None:
     """Return the strict JSON schema for one supported response contract."""
+    if contract == "findings-json":
+        return (
+            get_contract(contract)
+            .prepare(ContractContext(review_declaration_required=codex))
+            .schema
+        )
     schema = {
-        "findings-json": FINDINGS_SCHEMA,
         "product-review-json": PRODUCT_REVIEW_SCHEMA,
         "product-judge-json": PRODUCT_JUDGE_SCHEMA,
     }.get(contract)
     if schema is None:
         return None
     return codex_schema(schema) if codex else schema
-
-
-@dataclass(frozen=True)
-class PersistedResponse:
-    """The response persisted by one isolated `llm` invocation."""
-
-    conversation_id: str
-    cost_usd: float | None
-    duration_ms: int | None
-    input_tokens: int | None
-    model: str
-    output_tokens: int | None
-    provider: str | None
-    response: str
 
 
 @dataclass(frozen=True)
@@ -314,8 +381,67 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def write_private_exclusive(
+    path: Path,
+    contents: bytes,
+    *,
+    label: str = "raw response evidence",
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> None:
+    with ExitStack() as descriptors:
+        try:
+            descriptor = descriptors.enter_context(
+                confined_regular_descriptor(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    expected_parent_identity=expected_parent_identity,
+                )
+            )
+        except FileExistsError as error:
+            if label == "raw response evidence":
+                message = (
+                    f"{label} collision at {path}: "
+                    "the adapter already created the reserved raw-response.txt path; "
+                    "configure the adapter to use a different evidence path"
+                )
+            else:
+                message = f"{label} collision at {path}: the reserved path already exists"
+            raise RuntimeError(message) from error
+        except OSError as error:
+            raise RuntimeError(f"{label} path is unsafe at {path}: {error}") from error
+        remaining = memoryview(contents)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written == 0:
+                raise OSError(f"could not finish writing raw response evidence at {path}")
+            remaining = remaining[written:]
+        if expected_parent_identity is not None:
+            try:
+                with confined_regular_descriptor(
+                    path,
+                    os.O_RDONLY,
+                    expected_parent_identity=expected_parent_identity,
+                ) as persisted_descriptor:
+                    written_metadata = os.fstat(descriptor)
+                    persisted_metadata = os.fstat(persisted_descriptor)
+                    if (written_metadata.st_dev, written_metadata.st_ino) != (
+                        persisted_metadata.st_dev,
+                        persisted_metadata.st_ino,
+                    ):
+                        raise OSError("filesystem evidence identity changed")
+            except OSError as error:
+                raise RuntimeError(f"{label} path is unsafe at {path}: {error}") from error
+
+
 def canonical_json(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    require_string_json_object_keys(value)
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
 
 
 def utc_now() -> str:
@@ -371,22 +497,69 @@ def parse_route(value: str) -> ReviewRoute:
     transport, separator, model = value.partition(":")
     if not separator or transport not in ROUTE_TRANSPORTS or not model.strip():
         raise ValueError(
-            "routes must use transport:model with transport in llm, codex, openrouter, agy"
+            "routes must use transport:model with transport in "
+            "llm, codex, openrouter, agy, gemini, kiro, pi"
         )
     return ReviewRoute(transport=transport, model=model.strip())
 
 
+def load_execution_config(
+    parser: argparse.ArgumentParser,
+    config_value: str | None,
+    *,
+    required: bool,
+) -> tuple[Path, dict[str, Any], bytes] | None:
+    """Read one execution config once for parsing and receipt identity."""
+    config_path = Path(
+        os.path.abspath(Path(config_value or "~/.config/reviewctl/config.toml").expanduser())
+    )
+    try:
+        raw = read_confined_bytes(config_path)
+    except FileNotFoundError:
+        if required:
+            parser.error(f"reviewctl config does not exist: {config_path}")
+        return None
+    except OSError as error:
+        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    try:
+        config = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    return config_path, config, raw
+
+
+def execution_default_settings(
+    parser: argparse.ArgumentParser, config: dict[str, Any], transport: str
+) -> dict[str, int]:
+    """Validate defaults for one transport from an already loaded config snapshot."""
+    defaults = config.get("defaults")
+    transport_defaults = defaults.get(transport) if isinstance(defaults, dict) else None
+    if transport_defaults is None:
+        return {}
+    if not isinstance(transport_defaults, dict):
+        parser.error(f"defaults.{transport} must be a TOML table")
+    settings: dict[str, int] = {}
+    for key, minimum, maximum in (
+        ("timeout_seconds", 1, None),
+        ("max_attempts", 1, 3),
+    ):
+        value = transport_defaults.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            parser.error(f"defaults.{transport}.{key} must be a positive integer")
+        if maximum is not None and value > maximum:
+            parser.error(f"defaults.{transport}.{key} must be from {minimum} to {maximum}")
+        settings[key] = value
+    return settings
+
+
 def load_route_profile(
     parser: argparse.ArgumentParser, config_value: str | None, profile: str
-) -> tuple[tuple[ReviewRoute, ...], dict[str, str]]:
+) -> tuple[tuple[ReviewRoute, ...], dict[str, object]]:
     """Load one ordered route profile from a user-owned TOML config file."""
-    config_path = Path(config_value or "~/.config/reviewctl/config.toml").expanduser().resolve()
-    if not config_path.is_file():
-        parser.error(f"reviewctl config does not exist: {config_path}")
-    try:
-        config = tomllib.loads(config_path.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        parser.error(f"could not read reviewctl config {config_path}: {error}")
+    loaded = load_execution_config(parser, config_value, required=True)
+    config_path, config, raw = cast(tuple[Path, dict[str, Any], bytes], loaded)
     profiles = config.get("profiles")
     profile_config = profiles.get(profile) if isinstance(profiles, dict) else None
     route_specs = profile_config.get("routes") if isinstance(profile_config, dict) else None
@@ -400,16 +573,48 @@ def load_route_profile(
         routes = tuple(parse_route(value) for value in route_specs)
     except ValueError as error:
         parser.error(f"profile {profile!r}: {error}")
+    route_transports = {route.transport for route in routes}
+    transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
+    default_settings = execution_default_settings(parser, config, transport_default_key)
+    settings: dict[str, int] = {}
+    for key, minimum, maximum in (
+        ("timeout_seconds", 1, None),
+        ("max_attempts", 1, 3),
+    ):
+        value = profile_config.get(key) if isinstance(profile_config, dict) else None
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            parser.error(f"profile {profile!r}: {key} must be a positive integer")
+        if maximum is not None and value > maximum:
+            parser.error(f"profile {profile!r}: {key} must be from {minimum} to {maximum}")
+        settings[key] = value
     return routes, {
         "name": profile,
         "path": str(config_path),
-        "sha256": sha256_bytes(config_path.read_bytes()),
+        "sha256": sha256_bytes(raw),
+        "settings": settings,
+        "defaultSettings": default_settings,
+    }
+
+
+def load_transport_defaults(
+    parser: argparse.ArgumentParser, config_value: str | None, transport: str
+) -> tuple[dict[str, int], dict[str, str] | None]:
+    """Load optional execution defaults for direct transport invocations."""
+    loaded = load_execution_config(parser, config_value, required=bool(config_value))
+    if loaded is None:
+        return {}, None
+    config_path, config, raw = loaded
+    return execution_default_settings(parser, config, transport), {
+        "path": str(config_path),
+        "sha256": sha256_bytes(raw),
     }
 
 
 def review_routes(
     parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> tuple[tuple[ReviewRoute, ...], dict[str, str] | None]:
+) -> tuple[tuple[ReviewRoute, ...], dict[str, object] | None]:
     """Resolve explicit routes or preserve the legacy single-transport CLI."""
     route_specs = getattr(args, "routes", [])
     profile = getattr(args, "profile", None)
@@ -431,6 +636,292 @@ def review_routes(
 
 def fail(parser: argparse.ArgumentParser, message: str) -> None:
     parser.error(message)
+
+
+def llm_help_payload() -> dict[str, object]:
+    """Return stable machine-readable usage guidance for coding agents."""
+    return {
+        "tool": "reviewctl",
+        "purpose": (
+            "Explore ideas with Pi, then promote bounded questions to formal review receipts."
+        ),
+        "commands": {
+            "explore": {
+                "start": "reviewctl explore start --id ID --model MODEL --cwd PATH --prompt TEXT",
+                "resume": "reviewctl explore resume --id ID --prompt TEXT",
+                "show": "reviewctl explore show --id ID",
+                "promote": {
+                    "usage": "reviewctl explore promote --id ID --output PATH",
+                    "approval": "never",
+                },
+            },
+            "run": {
+                "usage": (
+                    "reviewctl run --review-id ID --transport TRANSPORT --model MODEL "
+                    "--prompt-file FILE --file SOURCE"
+                ),
+                "verification": "reviewctl verify RECEIPT.json",
+                "approval": (
+                    "only when receipt.result is accepted, acceptedAttempt names the accepted "
+                    "attempt, receipt verification succeeds, and material findings are "
+                    "independently checked"
+                ),
+            },
+            "setup": {
+                "discover": "reviewctl setup discover --format json",
+                "show": "reviewctl setup show --format json",
+                "check": "reviewctl setup check --backend NAME --format json",
+            },
+            "help-llm": "reviewctl help-llm --format json",
+        },
+        "backendSemantics": {
+            "availabilityIsNotQualification": True,
+            "setupIsLocalOnly": True,
+            "setupCallsModels": False,
+        },
+        "defaults": {
+            "explorationRoot": "~/.cache/reviewctl/explorations",
+            "explorationTools": "read,grep,find,ls",
+            "explorationIsResumable": True,
+            "piOutputTokenLimitEnforced": False,
+        },
+        "errors": {
+            "exitCodes": {
+                "0": {
+                    "meaning": "completed",
+                    "next": "follow the selected command's next step; only run creates a receipt",
+                },
+                "1": {
+                    "meaning": "unavailable-or-invalid",
+                    "next": "inspect the persisted attempt before changing inputs or routes",
+                },
+                "2": {
+                    "meaning": "invocation-error",
+                    "next": "correct the named CLI argument, file, config, or policy error",
+                },
+            },
+            "attemptResults": {
+                "accepted": {"meaning": "all gates passed", "inspect": ["receipt.json"]},
+                "timeout": {
+                    "meaning": "transport exceeded the effective timeout",
+                    "inspect": ["attempt.json:diagnostic", "receipt.json:executionSettings"],
+                },
+                "transport-failed": {
+                    "meaning": "transport exited unsuccessfully",
+                    "inspect": [
+                        "attempt.json:exitCode",
+                        "attempt.json:diagnostic",
+                        "attempt.json:evidence.stderr when non-null",
+                    ],
+                },
+                "missing-response": {
+                    "meaning": "transport produced no persisted response record",
+                    "inspect": ["attempt.json:evidence", "attempt.json:diagnostic"],
+                },
+                "model-mismatch": {
+                    "meaning": "resolved model differs from the requested model",
+                    "inspect": ["attempt.json:model"],
+                },
+                "provider-mismatch": {
+                    "meaning": "observed provider violates the requested provider policy",
+                    "inspect": ["attempt.json:provider", "attempt.json:providerPreferences"],
+                },
+                "empty": {
+                    "meaning": "transport persisted an empty response",
+                    "inspect": ["attempt.json:evidence", "attempt.json:diagnostic"],
+                },
+                "missing-conversation": {
+                    "meaning": "transport response has no durable conversation identifier",
+                    "inspect": ["attempt.json:conversationId", "attempt.json:evidence"],
+                },
+                "incomplete": {
+                    "meaning": "response failed the selected response contract",
+                    "inspect": [
+                        "attempt.json:contractEvaluation.completionRequest",
+                        "attempt.json:promotedFragments",
+                        "receipt.json:fallbackRelationships",
+                        "attempt.json:rawResponse",
+                    ],
+                },
+            },
+            "contractViolations": {
+                "prepared-contract": (
+                    "prepared contract identity or packet context did not authenticate"
+                ),
+                "invalid-json": "payload is not exact JSON or contains duplicate object keys",
+                "top-level-not-object": "structured payload is not a JSON object",
+                "response-fields": "top-level fields differ from the prepared schema",
+                "review-declaration": "reviewedFiles does not match the frozen packet",
+                "verdict": "verdict is missing, mistyped, or outside the allowed vocabulary",
+                "findings-shape": "findings is not an array",
+                "finding-fields": "a finding has missing or additional fields",
+                "finding-value": "a finding has an invalid severity, line, or blank string",
+                "finding-path": "a finding path is outside the frozen packet",
+                "verdict-invariant": "verdict and finding count disagree",
+            },
+            "redaction": "diagnostics are bounded and credential-shaped values are redacted",
+        },
+        "nextActions": {
+            "incomplete": {
+                "inspect": [
+                    "attempt.json:contractEvaluation.completionRequest",
+                    "attempt.json:promotedFragments",
+                    "receipt.json:fallbackRelationships",
+                    "attempt.json:rawResponse",
+                ]
+            },
+            "invalid": {
+                "inspect": [
+                    "attempt.json:contractEvaluation.violations",
+                    "attempt.json:evaluationError",
+                    "attempt.json:rawResponse",
+                ]
+            },
+            "accepted": {
+                "inspect": [
+                    "receipt.json:verdict",
+                    "receipt.json:findings",
+                    "receipt.json:consolidatedReview",
+                ],
+                "run": "reviewctl verify RECEIPT.json",
+            },
+        },
+        "rules": [
+            "Exploration responses are working material, not approvals.",
+            "Promote only the bounded question and selected source files to formal review.",
+            "Do not attach a full conversation as a substitute for source files.",
+            "A missing, empty, unavailable, or unverified receipt is not an approval.",
+        ],
+    }
+
+
+def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Print concise Markdown or JSON guidance intended for LLM tool discovery."""
+    payload = llm_help_payload()
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+        return 0
+    print(
+        "# reviewctl\n\n"
+        "Use `reviewctl explore` for resumable Pi conversations and product or architecture "
+        "exploration. Use `reviewctl run` for a bounded formal review.\n\n"
+        "## Exploration\n\n"
+        "```bash\n"
+        'reviewctl explore start --id ID --model MODEL --cwd PATH --prompt "QUESTION"\n'
+        'reviewctl explore resume --id ID --prompt "NEXT QUESTION"\n'
+        "reviewctl explore show --id ID\n"
+        "reviewctl explore promote --id ID --output PATH\n"
+        "```\n\n"
+        "Exploration sessions are resumable. Every turn retains its request and manifest; "
+        "Pi event, response, stderr, and session artifacts exist only when Pi produces "
+        "them. Runner failures are recorded in turn.json:diagnostic. A response is "
+        "exploratory working material, not an approval.\n\n"
+        "## Formal review\n\n"
+        "```bash\n"
+        "reviewctl run --review-id ID --transport TRANSPORT --model MODEL "
+        "--prompt-file FILE --file SOURCE\n"
+        "reviewctl verify RECEIPT.json\n"
+        "```\n\n"
+        "A formal result requires receipt.result=accepted, a non-null acceptedAttempt, "
+        "successful receipt verification, and independent checking of material findings. "
+        "Hash verification alone proves integrity, not acceptance.\n\n"
+        "## Diagnose failures\n\n"
+        "Do not retry blindly. A run that exits 1 still persists a receipt and attempt evidence. "
+        "Read `attempt.json` fields `result`, `diagnostic`, `validationError`, and "
+        "`contractEvaluation.violations`; then inspect only the referenced request, response, "
+        "session, or stderr artifact. Exit 2 means the CLI rejected an argument or local input "
+        "before a review could run. Diagnostics are bounded and credential-shaped values are "
+        "redacted. After any correction, run `reviewctl verify RECEIPT.json` on the new receipt.\n"
+    )
+    return 0
+
+
+def setup_installation_payload(installation: BackendInstallation) -> dict[str, object]:
+    """Serialize one observed backend installation with stable public field names."""
+    return {
+        "name": installation.name,
+        "requestedExecutable": installation.requested_executable,
+        "resolvedExecutable": installation.resolved_executable,
+        "version": installation.version,
+        "availability": installation.availability,
+        "qualification": installation.qualification,
+        "diagnostics": list(installation.diagnostics),
+        "probePerformed": installation.probe_performed,
+    }
+
+
+def setup_topology_payload(topology: LocalExecutionTopology) -> dict[str, object]:
+    """Serialize local setup observations without exposing process environment data."""
+    return {
+        "schemaVersion": topology.schema_version,
+        "localOnly": topology.local_only,
+        "modelProbePerformed": topology.model_probe_performed,
+        "backends": [setup_installation_payload(backend) for backend in topology.backends],
+    }
+
+
+def sanitize_setup_human_text(value: str) -> str:
+    """Render terminal controls as inert, single-line escaped text."""
+    escaped_controls = {"\r": r"\r", "\n": r"\n", "\t": r"\t"}
+    rendered = []
+    for character in value:
+        code_point = ord(character)
+        if code_point <= 0x1F or 0x7F <= code_point <= 0x9F:
+            rendered.append(escaped_controls.get(character, f"\\x{code_point:02x}"))
+        elif 0xD800 <= code_point <= 0xDFFF:
+            rendered.append(f"\\u{code_point:04x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
+
+
+def print_setup_topology(topology: LocalExecutionTopology, output_format: str) -> None:
+    """Print stable JSON or concise human-readable local setup observations."""
+    if output_format == "json":
+        print(
+            json.dumps(
+                setup_topology_payload(topology), ensure_ascii=True, indent=2, sort_keys=True
+            )
+        )
+        return
+    print(f"local-only: {'yes' if topology.local_only else 'no'}")
+    print(f"model probes: {'yes' if topology.model_probe_performed else 'no'}")
+    for backend in topology.backends:
+        details = (
+            f"{backend.name}: availability={backend.availability} "
+            f"qualification={backend.qualification}"
+        )
+        if backend.version:
+            details = f"{details} version={backend.version}"
+        print(sanitize_setup_human_text(details))
+        for diagnostic in backend.diagnostics:
+            print(f"  diagnostic: {sanitize_setup_human_text(diagnostic)}")
+
+
+def run_setup(args: argparse.Namespace) -> int:
+    """Discover local backend executables and report non-qualifying setup state."""
+    topology = discover_topology(build_backend_registry(), environ=os.environ)
+    selected_names = set(args.backends)
+    selected = tuple(
+        backend
+        for backend in topology.backends
+        if not selected_names or backend.name in selected_names
+    )
+    selected_topology = LocalExecutionTopology(
+        topology.schema_version,
+        topology.local_only,
+        topology.model_probe_performed,
+        selected,
+    )
+    print_setup_topology(selected_topology, args.format)
+    if args.setup_command != "check":
+        return 0
+    checked = (
+        selected
+        if selected_names
+        else tuple(backend for backend in selected if backend.availability != "not-applicable")
+    )
+    return 0 if all(backend.availability == "available" for backend in checked) else 1
 
 
 def validate_request(
@@ -463,16 +954,31 @@ def validate_request(
             fail(parser, f"review file does not exist: {file}")
         if file.stat().st_size > MAX_FRAGMENT_BYTES:
             fail(parser, f"review file exceeds {MAX_FRAGMENT_BYTES} bytes: {file}")
+    if not all(valid_review_basename(file.name) for file in files):
+        fail(parser, "review files must have safe printable basenames")
     if len({file.name for file in files}) != len(files):
         fail(parser, "review files must have unique basenames")
     return prompt, files
 
 
-def review_root(artifact_root: Path, review_id: str) -> Path:
+def review_root(artifact_root: Path, review_id: str) -> tuple[Path, tuple[int, int]]:
     turn_name = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}.{secrets.token_hex(3)}"
-    directory = artifact_root.expanduser().resolve() / review_id / turn_name
-    directory.mkdir(parents=True, exist_ok=False)
-    return directory
+    root = Path(os.path.abspath(artifact_root.expanduser()))
+    review_directory = root / review_id
+    directory = review_directory / turn_name
+    with confined_directory_descriptor(root, create=True) as root_descriptor:
+        with confined_relative_directory_descriptor(
+            root_descriptor, (review_id,), create=True
+        ) as review_descriptor:
+            os.mkdir(turn_name, mode=0o700, dir_fd=review_descriptor)
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            turn_descriptor = os.open(turn_name, flags, dir_fd=review_descriptor)
+            try:
+                metadata = os.fstat(turn_descriptor)
+                identity = (metadata.st_dev, metadata.st_ino)
+            finally:
+                os.close(turn_descriptor)
+    return directory, identity
 
 
 def git_metadata(cwd: Path) -> dict[str, str | None]:
@@ -507,15 +1013,20 @@ def source_git_metadata(files: list[Path]) -> dict[str, str | None]:
     return git_metadata(roots.pop())
 
 
-def load_policy(path: str) -> dict[str, Any]:
+def load_policy_evidence(path: str) -> tuple[dict[str, Any], bytes]:
     import tomllib
 
-    return tomllib.loads(Path(path).read_text())
+    raw = read_confined_bytes(Path(os.path.abspath(Path(path).expanduser())))
+    return tomllib.loads(raw.decode("utf-8")), raw
+
+
+def load_policy(path: str) -> dict[str, Any]:
+    return load_policy_evidence(path)[0]
 
 
 def policy_sha256(path: str) -> str:
     """Return the digest of the policy bytes applied to a review."""
-    return sha256_bytes(Path(path).read_bytes())
+    return sha256_bytes(read_confined_bytes(Path(os.path.abspath(Path(path).expanduser()))))
 
 
 def normalize_provider_preferences(value: object) -> dict[str, object] | None:
@@ -603,7 +1114,7 @@ def endpoint_price_per_million(endpoint: dict[str, object], field: str) -> float
     value = pricing.get(field) if isinstance(pricing, dict) else None
     try:
         return float(value) * 1_000_000
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -676,9 +1187,15 @@ def fetch_openrouter_model_endpoints(
     )
     try:
         with urlrequest.urlopen(request, timeout=timeout_seconds) as response:
-            payload = json.loads(response.read())
+            raw_payload = response.read(MAX_OPENROUTER_RESPONSE_BYTES + 1)
+            if len(raw_payload) > MAX_OPENROUTER_RESPONSE_BYTES:
+                return 502, "OpenRouter provider preflight response exceeded bounded capture", None
+            payload = json.loads(raw_payload)
     except urlerror.HTTPError as error:
-        return error.code, error.read().decode(errors="replace"), None
+        error_body = error.read(MAX_OPENROUTER_RESPONSE_BYTES + 1)
+        if len(error_body) > MAX_OPENROUTER_RESPONSE_BYTES:
+            return 502, "OpenRouter provider preflight response exceeded bounded capture", None
+        return error.code, error_body.decode(errors="replace"), None
     except urlerror.URLError as error:
         return 502, str(error.reason), None
     except TimeoutError:
@@ -937,7 +1454,12 @@ def build_blind_product_package(
         receipt_path = run.get("receipt")
         if not all(isinstance(item, str) and item for item in (candidate, case, receipt_path)):
             raise ValueError("accepted product run requires candidate, case, and receipt")
-        receipt = json.loads(Path(receipt_path).read_text())
+        receipt = json.loads(
+            read_confined_text(Path(receipt_path)),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
         if receipt.get("result") != "accepted" or not valid_receipt(receipt):
             raise ValueError("accepted product run requires a verified accepted receipt")
         response = receipt.get("review")
@@ -1023,11 +1545,17 @@ def frozen_review_files(files: list[Path]) -> Iterator[tuple[list[dict[str, str]
         root = Path(directory)
         source: list[dict[str, str]] = []
         snapshots: list[Path] = []
-        for file in files:
+        for file in sorted(files, key=lambda item: item.name):
             contents = file.read_bytes()
             snapshot = root / file.name
             snapshot.write_bytes(contents)
-            source.append({"path": str(file), "sha256": sha256_bytes(contents)})
+            source.append(
+                {
+                    "name": file.name,
+                    "path": str(file),
+                    "sha256": sha256_bytes(contents),
+                }
+            )
             snapshots.append(snapshot)
         yield source, snapshots
 
@@ -1054,6 +1582,48 @@ def sandbox_profile_path(path: Path) -> str:
     return json.dumps(str(path.resolve()))
 
 
+def account_home() -> Path:
+    """Return the login account home without trusting the HOME environment variable."""
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except (ImportError, KeyError, OSError) as error:
+        raise RuntimeError("Codex isolation could not resolve the login account home") from error
+
+
+def codex_process_environment(
+    source_environ: Mapping[str, str], overrides: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Build a Codex child environment from an explicit non-secret operational allowlist.
+
+    Credentials remain file-based through CODEX_AUTH_FILE; API keys, cloud credentials,
+    tokens, proxy URLs, and arbitrary ambient variables are intentionally excluded.
+    """
+    allowed_keys = (
+        "PATH",
+        "SYSTEMROOT",
+        "HOME",
+        "CODEX_HOME",
+        "CODEX_AUTH_FILE",
+        "CODEX_CA_CERTIFICATES",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+    configured = overrides or {}
+    return {
+        key: configured[key] if key in configured else source_environ[key]
+        for key in allowed_keys
+        if key in configured or key in source_environ
+    }
+
+
 @contextmanager
 def codex_isolation(
     source_roots: list[Path], *, auth_path: Path | None = None
@@ -1068,8 +1638,9 @@ def codex_isolation(
     sandbox = shutil.which("sandbox-exec")
     if sandbox is None:
         raise RuntimeError("proprietary Codex reviews require macOS sandbox-exec")
-    source_auth = (
-        auth_path or Path(os.environ.get("CODEX_AUTH_FILE", "~/.codex/auth.json")).expanduser()
+    configured_auth = os.environ.get("CODEX_AUTH_FILE")
+    source_auth = auth_path or (
+        Path(configured_auth) if configured_auth else account_home() / ".codex" / "auth.json"
     )
     if not source_auth.is_file():
         raise RuntimeError(f"Codex isolation requires auth file: {source_auth}")
@@ -1080,29 +1651,98 @@ def codex_isolation(
         shutil.copyfile(source_auth, copied_auth)
         copied_auth.chmod(0o600)
         profile = home / "source-root-deny.sb"
-        denies = "\n".join(
-            f"(deny file-read* (subpath {sandbox_profile_path(root)}))" for root in source_roots
+        source_denies = "\n".join(
+            "\n".join(
+                [
+                    f"(deny file-read* (subpath {sandbox_profile_path(root)}))",
+                    f"(deny file-write* (subpath {sandbox_profile_path(root)}))",
+                ]
+            )
+            for root in source_roots
         )
+        home_write_deny = f"(deny file-write* (subpath {sandbox_profile_path(account_home())}))"
+        denies = f"{source_denies}\n{home_write_deny}"
         profile.write_text(f"(version 1)\n(allow default)\n{denies}\n")
-        environment = dict(os.environ)
-        environment.update({"CODEX_HOME": str(home), "HOME": str(home), "TMPDIR": str(home)})
+        environment = codex_process_environment(
+            os.environ,
+            {"CODEX_HOME": str(home), "HOME": str(home), "TMPDIR": str(home)},
+        )
         environment.pop("CODEX_AUTH_FILE", None)
         yield CodexIsolation(environment=environment, home=home, profile=profile)
 
 
-def source_allowed(policy: dict[str, Any], model: str) -> bool:
-    return bool(policy.get("models", {}).get(model, {}).get("source_allowed", False))
+def policy_entry(
+    policy: dict[str, Any], model: str, *, transport: str | None = None
+) -> dict[str, Any]:
+    models = policy.get("models")
+    if type(models) is dict and model in models:
+        entry = models[model]
+        return entry if type(entry) is dict else {}
+    if transport in LOCAL_POLICY_TRANSPORTS:
+        transports = policy.get("transports")
+        if type(transports) is dict and transport in transports:
+            entry = transports[transport]
+            return entry if type(entry) is dict else {}
+    return {}
 
 
-def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+def source_allowed(policy: dict[str, Any], model: str, *, transport: str | None = None) -> bool:
+    return policy_entry(policy, model, transport=transport).get("source_allowed") is True
+
+
+def unresolved_identity_waived(
+    policy: dict[str, Any], model: str, *, transport: str | None = None
+) -> bool:
+    return policy_entry(policy, model, transport=transport).get("allow_unresolved_identity") is True
+
+
+def reap_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.wait()
+    except ChildProcessError, OSError:
+        pass
+
+
+def reap_process_without_blocking(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.wait(timeout=0)
+    except subprocess.TimeoutExpired:
+        threading.Thread(
+            target=reap_process,
+            args=(process,),
+            daemon=True,
+            name=f"reviewctl-reap-{process.pid}",
+        ).start()
+    except ChildProcessError, OSError:
+        pass
+
+
+def terminate_process_group(process: subprocess.Popen[bytes], *, grace_seconds: float = 5) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=5)
     except ProcessLookupError:
+        reap_process_without_blocking(process)
         return
+    if grace_seconds <= 0:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        reap_process_without_blocking(process)
+        return
+    try:
+        process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            reap_process_without_blocking(process)
+        except ChildProcessError, OSError:
+            pass
 
 
 def packet_prompt(prompt: str, files: list[Path], response_contract: str = "verdict") -> str:
@@ -1148,6 +1788,8 @@ def invoke_llm(
     response_contract: str,
     timeout_seconds: int,
 ) -> tuple[int, str]:
+    if resource is None:
+        return 126, "LLM bounded output capture unsupported on this platform"
     command = [
         llm_bin,
         "prompt",
@@ -1168,18 +1810,41 @@ def invoke_llm(
     if schema := response_schema(response_contract):
         command.extend(["--schema", json.dumps(schema, separators=(",", ":"))])
 
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    capture_file_limit = max(MAX_LLM_DATABASE_BYTES, MAX_LLM_STDOUT_BYTES, MAX_LLM_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+            preexec_fn=limit_output_files,
+        )
+        try:
+            communicated_stdout, communicated_stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(process)
+            return 124, "review attempt timed out"
+
+        def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+            if not isinstance(value, bytes):
+                stream.seek(0)
+                value = stream.read(limit + 1)
+            return value[:limit], len(value) > limit
+
+        _, stdout_truncated = bounded_output(communicated_stdout, stdout_file, MAX_LLM_STDOUT_BYTES)
+        stderr, stderr_truncated = bounded_output(
+            communicated_stderr, stderr_file, MAX_LLM_STDERR_BYTES
+        )
+        if stdout_truncated or stderr_truncated:
+            return 502, "LLM transport output exceeded bounded capture"
         return process.returncode, stderr.decode(errors="replace")
-    except subprocess.TimeoutExpired:
-        terminate_process_group(process)
-        return 124, "review attempt timed out"
 
 
 def openrouter_packet(
@@ -1191,10 +1856,9 @@ def openrouter_packet(
     )
     if response_contract == "findings-json":
         contract = (
-            "Return only JSON matching the supplied schema. The top-level object has exactly "
-            "`verdict` and `findings`. Each finding has exactly six fields: `severity`, `path`, "
-            "`line`, `title`, `evidence`, and `reproduction`. Use `changes-requested` if and only "
-            "if `findings` is non-empty; use `approved` if and only if `findings` is empty."
+            get_contract(response_contract)
+            .prepare(ContractContext(file_names=tuple(file.name for file in files)))
+            .output_instructions
         )
     elif response_contract == "product-review-json":
         contract = (
@@ -1213,12 +1877,551 @@ def openrouter_packet(
     return f"{prompt}\n\n{contract}\n\n{fragments}"
 
 
+def kiro_process_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Retain local Kiro login paths while excluding ambient provider credentials."""
+    allowed = (
+        "PATH",
+        "SYSTEMROOT",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+    environment = {key: source[key] for key in allowed if key in source}
+    environment["KIRO_LOG_NO_COLOR"] = "1"
+    environment["NO_COLOR"] = "1"
+    environment["CLICOLOR"] = "0"
+    environment["TERM"] = "dumb"
+    return environment
+
+
+def normalize_kiro_output(stdout: bytes, response_contract: str) -> str:
+    """Decode known Kiro UI framing for the JSON-only review contract."""
+    if response_contract != "findings-json":
+        raise ValueError("Kiro output normalization supports only findings-json")
+    prefix = KIRO_RESPONSE_PREFIX.match(stdout)
+    if prefix is None:
+        return ""
+    payload = stdout[prefix.end() :]
+    footer = KIRO_RAW_CREDITS_FOOTER.search(payload)
+    if footer is not None:
+        payload = payload[: footer.start()]
+    payload = KIRO_TRAILING_UI.sub(b"", payload)
+    payload = KIRO_LEADING_UI.sub(b"", payload)
+    if payload.startswith(b"json\n"):
+        candidate = KIRO_LEADING_UI.sub(b"", payload[len(b"json\n") :])
+        if candidate.lstrip().startswith((b"{", b"[")):
+            payload = candidate
+    if re.search(ANSI_ESCAPE_BYTES, payload):
+        raise ValueError("Kiro returned a styled response payload")
+    return payload.decode().replace("\r\n", "\n").strip("\r\n")
+
+
+def kiro_model_inventory(payload: bytes) -> tuple[tuple[str, ...], str]:
+    """Read only exact Kiro model identifiers observed from the installed CLI."""
+    try:
+        value = json.loads(payload, parse_constant=reject_nonstandard_json_constant)
+    except (json.JSONDecodeError, UnicodeError, ValueError) as error:
+        raise ValueError("Kiro returned malformed model inventory") from error
+    if type(value) is not dict:
+        raise ValueError("Kiro returned malformed model inventory")
+    models = value.get("models")
+    default_model = value.get("default_model")
+    if type(models) is not list or type(default_model) is not str or not default_model.strip():
+        raise ValueError("Kiro returned malformed model inventory")
+    identifiers: list[str] = []
+    for item in models:
+        identifier = item.get("model_id") if type(item) is dict else None
+        if (
+            type(identifier) is not str
+            or not identifier.strip()
+            or identifier != identifier.strip()
+        ):
+            raise ValueError("Kiro returned malformed model inventory")
+        identifiers.append(identifier)
+    if not identifiers or len(identifiers) != len(set(identifiers)):
+        raise ValueError("Kiro returned malformed model inventory")
+    if default_model not in identifiers:
+        raise ValueError("Kiro returned malformed model inventory")
+    return tuple(identifiers), default_model
+
+
+def kiro_session_id(payload: bytes, cwd: Path) -> str:
+    """Require one reproducible UUID session for the isolated Kiro working directory."""
+    try:
+        value = json.loads(payload, parse_constant=reject_nonstandard_json_constant)
+    except json.JSONDecodeError, UnicodeError, ValueError:
+        return ""
+    if type(value) is not list or len(value) != 1 or type(value[0]) is not dict:
+        return ""
+    sessions = value[0].get("sessions")
+    if (
+        value[0].get("cwd") != str(cwd.resolve())
+        or type(sessions) is not list
+        or len(sessions) != 1
+    ):
+        return ""
+    session = sessions[0]
+    identifier = session.get("sessionId") if type(session) is dict else None
+    if type(identifier) is not str or not KIRO_SESSION_ID.fullmatch(identifier):
+        return ""
+    return identifier
+
+
+def invoke_kiro(
+    *,
+    kiro_bin: str,
+    prompt: str,
+    model: str,
+    files: list[Path],
+    max_output_tokens: int,
+    response_contract: str,
+    timeout_seconds: int,
+    request_path: Path,
+    models_path: Path,
+    response_path: Path,
+    session_path: Path,
+    diagnostic_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
+) -> tuple[int, str, PersistedResponse]:
+    """Run Kiro from an empty directory and retain its runtime-owned evidence."""
+    blank = PersistedResponse("", None, None, None, model, None, None, "")
+    if response_contract != "findings-json":
+        return 502, "Kiro transport currently supports only findings-json", blank
+    environment = kiro_process_environment(os.environ)
+    stderr_chunks: list[bytes] = []
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+
+    def persist_stderr() -> str:
+        stderr = b"".join(stderr_chunks).decode(errors="replace")
+        write_private_exclusive(
+            diagnostic_path,
+            redact_diagnostic(stderr, limit=100_000).encode(),
+            expected_parent_identity=evidence_parent_identity,
+        )
+        return stderr
+
+    def run_process(
+        command: list[str],
+        cwd: Path,
+        input_bytes: bytes | None = None,
+    ) -> tuple[int, bytes, bytes, str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 124, b"", b"", "review attempt timed out"
+        if resource is None:
+            return 126, b"", b"", "Kiro bounded output capture unsupported on this platform"
+        capture_file_limit = max(MAX_KIRO_STDOUT_BYTES, MAX_KIRO_STDERR_BYTES) + 1
+
+        def limit_output_files() -> None:
+            resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+                resource.RLIMIT_FSIZE,
+                (capture_file_limit, capture_file_limit),
+            )
+
+        try:
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=environment,
+                    stdin=subprocess.PIPE if input_bytes is not None else None,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                    preexec_fn=limit_output_files,
+                )
+                try:
+                    communicated_stdout, communicated_stderr = process.communicate(
+                        input=input_bytes, timeout=remaining
+                    )
+                    code = process.returncode
+                    transport_error = ""
+                except subprocess.TimeoutExpired as error:
+                    terminate_process_group(process, grace_seconds=0)
+                    communicated_stdout = error.output
+                    communicated_stderr = error.stderr
+                    code = 124
+                    transport_error = "review attempt timed out"
+
+                def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                    if not isinstance(value, bytes):
+                        stream.seek(0)
+                        value = stream.read(limit + 1)
+                    return value[:limit], len(value) > limit
+
+                stdout, stdout_truncated = bounded_output(
+                    communicated_stdout, stdout_file, MAX_KIRO_STDOUT_BYTES
+                )
+                stderr, stderr_truncated = bounded_output(
+                    communicated_stderr, stderr_file, MAX_KIRO_STDERR_BYTES
+                )
+                if stdout_truncated or stderr_truncated:
+                    return 502, stdout, stderr, "Kiro transport output exceeded bounded capture"
+                return code, stdout, stderr, transport_error
+        except FileNotFoundError:
+            return 127, b"", b"", f"Kiro transport executable not found: {kiro_bin}"
+        except subprocess.SubprocessError as error:
+            return 126, b"", b"", f"Kiro bounded output capture failed: {error}"
+        except OSError as error:
+            return 127, b"", b"", f"Kiro transport could not execute: {error}"
+
+    with tempfile.TemporaryDirectory(prefix="reviewctl-kiro-") as directory:
+        cwd = Path(directory).resolve()
+        agent_dir = cwd / ".kiro" / "agents"
+        agent_dir.mkdir(parents=True, mode=0o700)
+        agent_path = agent_dir / "reviewctl_readonly.json"
+        agent_bytes = canonical_json(KIRO_REVIEW_AGENT) + b"\n"
+        write_private_exclusive(agent_path, agent_bytes)
+        inline_packet = openrouter_packet(prompt, files, response_contract)
+        command = [
+            kiro_bin,
+            "chat",
+            "--no-interactive",
+            "--agent",
+            "reviewctl_readonly",
+            "--model",
+            model,
+            "--wrap",
+            "never",
+        ]
+        inventory_command = [kiro_bin, "chat", "--list-models", "--format", "json"]
+        code, inventory_stdout, inventory_stderr, transport_error = run_process(
+            inventory_command, cwd
+        )
+        write_private_exclusive(
+            models_path,
+            inventory_stdout,
+            expected_parent_identity=evidence_parent_identity,
+        )
+        write_private_exclusive(
+            request_path,
+            canonical_json(
+                {
+                    "command": command,
+                    "agentConfig": {
+                        "sha256": sha256_bytes(agent_bytes),
+                        "value": KIRO_REVIEW_AGENT,
+                    },
+                    "inventoryCommand": inventory_command,
+                    "inventoryExitCode": code,
+                    "model": model,
+                    "models": {
+                        "path": str(models_path),
+                        "sha256": sha256_bytes(inventory_stdout),
+                    },
+                    "outputTokenLimitEnforced": False,
+                    "prompt": inline_packet,
+                    "requestedMaxOutputTokens": max_output_tokens,
+                    "responseContract": response_contract,
+                }
+            )
+            + b"\n",
+            expected_parent_identity=evidence_parent_identity,
+        )
+        stderr_chunks.append(inventory_stderr)
+        if code != 0:
+            stderr = persist_stderr()
+            return code, transport_error or stderr or "Kiro model inventory failed", blank
+        try:
+            models, _default_model = kiro_model_inventory(inventory_stdout)
+        except ValueError as error:
+            persist_stderr()
+            return 502, str(error), blank
+        if model == "auto":
+            persist_stderr()
+            return (
+                502,
+                "Kiro model auto is rejected because resolved identity is unobservable",
+                blank,
+            )
+        if model not in models:
+            persist_stderr()
+            return 502, f"Kiro model is not listed by the installed CLI: {model}", blank
+
+        code, stdout, invocation_stderr, transport_error = run_process(
+            command, cwd, input_bytes=inline_packet.encode()
+        )
+        write_private_exclusive(
+            response_path,
+            stdout,
+            expected_parent_identity=evidence_parent_identity,
+        )
+        stderr_chunks.append(invocation_stderr)
+        if code != 0:
+            stderr = persist_stderr()
+            return code, transport_error or stderr or "Kiro review invocation failed", blank
+
+        session_command = [kiro_bin, "chat", "--list-sessions", "--format", "json"]
+        code, session_stdout, session_stderr, transport_error = run_process(session_command, cwd)
+        write_private_exclusive(
+            session_path,
+            session_stdout,
+            expected_parent_identity=evidence_parent_identity,
+        )
+        stderr_chunks.append(session_stderr)
+        stderr = persist_stderr()
+        if code != 0:
+            return code, transport_error or stderr or "Kiro session inventory failed", blank
+        session = kiro_session_id(session_stdout, cwd)
+        if not session:
+            if b"Monthly request limit reached" in invocation_stderr:
+                return 429, "Kiro monthly request limit reached", blank
+            return 502, "Kiro returned no coherent session for the review directory", blank
+        try:
+            normalized_response = normalize_kiro_output(stdout, response_contract)
+        except UnicodeDecodeError:
+            return 502, "Kiro returned non-UTF-8 terminal output", blank
+        except ValueError as error:
+            return 502, str(error), blank
+        return (
+            0,
+            stderr,
+            PersistedResponse(
+                session,
+                None,
+                round((time.monotonic() - started) * 1000),
+                None,
+                model,
+                None,
+                None,
+                normalized_response,
+            ),
+        )
+
+
 def numeric_value(value: object) -> float | None:
-    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 def token_value(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def gemini_process_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Retain Gemini CLI login/configuration while excluding unrelated credentials."""
+    allowed = (
+        "PATH",
+        "SYSTEMROOT",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "GEMINI_CLI_HOME",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    )
+    environment = {key: source[key] for key in allowed if key in source}
+    environment["NO_COLOR"] = "1"
+    environment["CLICOLOR"] = "0"
+    environment["TERM"] = "dumb"
+    return environment
+
+
+def gemini_usage(payload: Mapping[str, object]) -> tuple[int | None, int | None]:
+    """Sum the CLI's per-model token counters without trusting absent values."""
+    stats = payload.get("stats")
+    models = stats.get("models") if isinstance(stats, dict) else None
+    if not isinstance(models, dict):
+        return None, None
+    input_tokens = 0
+    output_tokens = 0
+    saw_input = False
+    saw_output = False
+    for details in models.values():
+        tokens = details.get("tokens") if isinstance(details, dict) else None
+        if not isinstance(tokens, dict):
+            continue
+        input_value = token_value(tokens.get("input", tokens.get("prompt")))
+        output_value = token_value(tokens.get("candidates", tokens.get("output")))
+        if input_value is not None:
+            input_tokens += input_value
+            saw_input = True
+        if output_value is not None:
+            output_tokens += output_value
+            saw_output = True
+    return (
+        input_tokens if saw_input else None,
+        output_tokens if saw_output else None,
+    )
+
+
+def invoke_gemini(
+    *,
+    gemini_bin: str,
+    prompt: str,
+    model: str,
+    files: list[Path],
+    max_output_tokens: int,
+    response_contract: str,
+    timeout_seconds: int,
+    request_path: Path,
+    response_path: Path,
+    session_path: Path,
+    diagnostic_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
+) -> tuple[int, str, PersistedResponse]:
+    """Run Gemini CLI headlessly with a read-only plan and durable JSON evidence."""
+    blank = PersistedResponse("", None, None, None, "", None, None, "")
+    packet = openrouter_packet(prompt, files, response_contract)
+    command = [
+        gemini_bin,
+        "--model",
+        model,
+        "--prompt",
+        "Read the complete review packet from standard input. Do not use tools or edit files.",
+        "--output-format",
+        "json",
+        "--approval-mode",
+        "plan",
+        "--sandbox",
+        "--skip-trust",
+    ]
+    write_private_exclusive(
+        request_path,
+        canonical_json(
+            {
+                "command": command,
+                "model": model,
+                "maxOutputTokens": max_output_tokens,
+                "outputTokenLimitEnforced": False,
+                "responseContract": response_contract,
+                "files": [str(file) for file in files],
+                "prompt": packet,
+                "approvalMode": "plan",
+                "sandbox": True,
+                "session": str(session_path),
+            }
+        )
+        + b"\n",
+        label="Gemini request evidence",
+        expected_parent_identity=evidence_parent_identity,
+    )
+    started = time.monotonic()
+    environment = gemini_process_environment(os.environ)
+    stdout = b""
+    stderr = b""
+    with tempfile.TemporaryDirectory(prefix="reviewctl-gemini-") as directory:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=directory,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(input=packet.encode(), timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as error:
+                terminate_process_group(process)
+                stdout = error.output if isinstance(error.output, bytes) else b""
+                stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+                stdout_after, stderr_after = process.communicate()
+                stdout += stdout_after
+                stderr += stderr_after
+                if stdout:
+                    write_private_exclusive(
+                        response_path,
+                        stdout,
+                        expected_parent_identity=evidence_parent_identity,
+                    )
+                if stderr:
+                    write_private_exclusive(
+                        diagnostic_path,
+                        redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
+                        expected_parent_identity=evidence_parent_identity,
+                    )
+                return 124, "review attempt timed out", blank
+        except FileNotFoundError:
+            return 127, f"Gemini transport executable not found: {gemini_bin}", blank
+        except OSError as error:
+            return 127, f"Gemini transport could not execute: {error}", blank
+
+    if stdout:
+        write_private_exclusive(
+            response_path,
+            stdout,
+            expected_parent_identity=evidence_parent_identity,
+        )
+    diagnostic = redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
+    if diagnostic:
+        write_private_exclusive(
+            diagnostic_path,
+            diagnostic.encode(),
+            expected_parent_identity=evidence_parent_identity,
+        )
+    if process.returncode != 0:
+        return process.returncode, diagnostic, blank
+    try:
+        payload = json.loads(
+            stdout,
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
+    except json.JSONDecodeError, UnicodeDecodeError, ValueError:
+        return 502, "Gemini returned invalid JSON", blank
+    if not isinstance(payload, dict):
+        return 502, "Gemini returned a non-object response", blank
+    conversation_id = payload.get("session_id")
+    response_text = payload.get("response")
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        return 502, "Gemini returned no session identifier", blank
+    if not isinstance(response_text, str):
+        return 502, "Gemini returned no response", blank
+    response_text = normalize_pi_response(response_text, response_contract)
+    write_private_exclusive(
+        session_path,
+        canonical_json(
+            {
+                "session_id": conversation_id,
+                "observedModels": payload.get("stats", {}).get("models", {})
+                if isinstance(payload.get("stats"), dict)
+                else {},
+            }
+        )
+        + b"\n",
+        label="Gemini session evidence",
+        expected_parent_identity=evidence_parent_identity,
+    )
+    input_tokens, output_tokens = gemini_usage(payload)
+    return (
+        0,
+        diagnostic,
+        PersistedResponse(
+            conversation_id=conversation_id,
+            cost_usd=None,
+            duration_ms=round((time.monotonic() - started) * 1000),
+            input_tokens=input_tokens,
+            model=model,
+            output_tokens=output_tokens,
+            provider="google-gemini-cli",
+            response=response_text,
+        ),
+    )
 
 
 def positive_timeout_seconds(value: str) -> int:
@@ -1244,6 +2447,7 @@ def invoke_openrouter(
     timeout_seconds: int,
     request_path: Path,
     response_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Call OpenRouter directly and persist source-safe request and raw response evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -1257,6 +2461,13 @@ def invoke_openrouter(
             {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
         ],
     }
+    # Gemini 3.6 Flash accepts effort levels. GLM 5.2 may spend the entire
+    # completion cap reasoning even when a small budget is requested, so
+    # formal JSON reviews disable reasoning and reserve the cap for the answer.
+    if model == "google/gemini-3.6-flash":
+        payload["reasoning"] = {"effort": "minimal"}
+    elif model == "z-ai/glm-5.2":
+        payload["reasoning"] = {"effort": "none"}
     if schema := response_schema(response_contract):
         payload["response_format"] = {
             "type": "json_schema",
@@ -1264,7 +2475,12 @@ def invoke_openrouter(
         }
     if provider_preferences:
         payload["provider"] = provider_preferences
-    request_path.write_bytes(canonical_json(payload) + b"\n")
+    write_private_exclusive(
+        request_path,
+        canonical_json(payload) + b"\n",
+        label="OpenRouter request evidence",
+        expected_parent_identity=evidence_parent_identity,
+    )
     started = time.monotonic()
     curl_bin = os.environ.get("CURL_BIN", "curl")
     curl_config = (
@@ -1284,33 +2500,86 @@ def invoke_openrouter(
         "POST",
         "--data-binary",
         f"@{request_path}",
-        "--output",
-        str(response_path),
-        "--write-out",
-        "%{http_code}",
-        "https://openrouter.ai/api/v1/chat/completions",
     ]
-    try:
-        completed = subprocess.run(
-            command,
-            input=curl_config,
-            capture_output=True,
-            check=False,
-            timeout=timeout_seconds + 1,
+    if resource is None:
+        return 126, "OpenRouter bounded output capture unsupported on this platform", blank
+    capture_file_limit = (
+        max(
+            MAX_OPENROUTER_RESPONSE_BYTES,
+            MAX_OPENROUTER_STDERR_BYTES,
+            MAX_OPENROUTER_STATUS_BYTES,
         )
-    except FileNotFoundError:
-        return 127, f"OpenRouter transport executable not found: {curl_bin}", blank
-    except OSError as error:
-        return 127, f"OpenRouter transport could not execute: {error}", blank
-    except subprocess.TimeoutExpired:
-        return 124, "review attempt timed out", blank
-    raw_response = response_path.read_bytes() if response_path.is_file() else b""
+        + 1
+    )
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
+    with tempfile.TemporaryDirectory(prefix="reviewctl-openrouter-") as scratch_directory:
+        scratch_response = Path(scratch_directory).resolve() / "response.json"
+        command.extend(
+            [
+                "--output",
+                str(scratch_response),
+                "--write-out",
+                "%{http_code}",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ]
+        )
+        try:
+            with tempfile.TemporaryFile() as status_file, tempfile.TemporaryFile() as stderr_file:
+                completed = subprocess.run(
+                    command,
+                    input=curl_config,
+                    stdout=status_file,
+                    stderr=stderr_file,
+                    check=False,
+                    timeout=timeout_seconds + 1,
+                    preexec_fn=limit_output_files,
+                )
+                status_file.seek(0)
+                http_status_bytes = status_file.read(MAX_OPENROUTER_STATUS_BYTES + 1)
+                stderr_file.seek(0)
+                stderr = stderr_file.read(MAX_OPENROUTER_STDERR_BYTES + 1)
+        except FileNotFoundError:
+            return 127, f"OpenRouter transport executable not found: {curl_bin}", blank
+        except subprocess.TimeoutExpired:
+            return 124, "review attempt timed out", blank
+        except subprocess.SubprocessError as error:
+            return 126, f"OpenRouter bounded output capture failed: {error}", blank
+        except OSError as error:
+            return 127, f"OpenRouter transport could not execute: {error}", blank
+        if (
+            len(http_status_bytes) > MAX_OPENROUTER_STATUS_BYTES
+            or len(stderr) > MAX_OPENROUTER_STDERR_BYTES
+        ):
+            return 502, "OpenRouter transport output exceeded bounded capture", blank
+        raw_response = b""
+        if scratch_response.exists():
+            try:
+                with confined_regular_descriptor(scratch_response, os.O_RDONLY) as descriptor:
+                    with os.fdopen(os.dup(descriptor), "rb") as stream:
+                        raw_response = stream.read(MAX_OPENROUTER_RESPONSE_BYTES + 1)
+            except OSError as error:
+                return 502, f"OpenRouter response evidence was unsafe: {error}", blank
+        if len(raw_response) > MAX_OPENROUTER_RESPONSE_BYTES:
+            return 502, "OpenRouter transport output exceeded bounded capture", blank
+    if raw_response:
+        write_private_exclusive(
+            response_path,
+            raw_response,
+            label="OpenRouter response evidence",
+            expected_parent_identity=evidence_parent_identity,
+        )
     if completed.returncode == 28:
         return 124, "review attempt timed out", blank
-    http_status_text = completed.stdout.decode(errors="replace").strip()
+    http_status_text = http_status_bytes.decode(errors="replace").strip()
     http_status = int(http_status_text) if http_status_text.isdigit() else None
     if completed.returncode != 0:
-        message = raw_response.decode(errors="replace") or completed.stderr.decode(errors="replace")
+        message = raw_response.decode(errors="replace") or stderr.decode(errors="replace")
         status = http_status if http_status is not None and http_status >= 400 else 502
         return status, message or "OpenRouter transport failed", blank
     if http_status is None:
@@ -1318,8 +2587,13 @@ def invoke_openrouter(
     if http_status >= 400:
         return http_status, raw_response.decode(errors="replace"), blank
     try:
-        payload_response = json.loads(raw_response)
-    except json.JSONDecodeError:
+        payload_response = json.loads(
+            raw_response,
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
+    except json.JSONDecodeError, UnicodeDecodeError, ValueError:
         return 502, "OpenRouter returned invalid JSON", blank
     if not isinstance(payload_response, dict):
         return 502, "OpenRouter returned a non-object response", blank
@@ -1371,18 +2645,27 @@ def invoke_agy(
     timeout_seconds: int,
     request_path: Path,
     response_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run a native Antigravity model in an empty sandbox with durable JSON evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
+    if resource is None:
+        return 126, "Antigravity bounded output capture unsupported on this platform", blank
+    packet = openrouter_packet(prompt, files, response_contract)
     request_payload: dict[str, object] = {
         "command": "agy",
         "maxOutputTokens": max_output_tokens,
         "model": model,
-        "prompt": openrouter_packet(prompt, files, response_contract),
+        "prompt": packet,
         "responseContract": response_contract,
         "sandbox": True,
     }
-    request_path.write_bytes(canonical_json(request_payload) + b"\n")
+    write_private_exclusive(
+        request_path,
+        canonical_json(request_payload) + b"\n",
+        label="AGY request evidence",
+        expected_parent_identity=evidence_parent_identity,
+    )
     command = [
         agy_bin,
         "--model",
@@ -1396,30 +2679,70 @@ def invoke_agy(
     ]
     if schema := response_schema(response_contract):
         command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
-    command.extend(["--print", str(request_payload["prompt"])])
+    command.append("--print")
+    capture_file_limit = max(MAX_AGY_STDOUT_BYTES, MAX_AGY_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
     try:
         with tempfile.TemporaryDirectory(prefix="reviewctl-agy-") as sandbox:
-            process = subprocess.Popen(
-                command,
-                cwd=sandbox,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-            try:
-                stdout, stderr = process.communicate(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                terminate_process_group(process)
-                return 124, "review attempt timed out", blank
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=sandbox,
+                    stdin=subprocess.PIPE,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                    preexec_fn=limit_output_files,
+                )
+                try:
+                    communicated_stdout, communicated_stderr = process.communicate(
+                        input=packet.encode(), timeout=timeout_seconds
+                    )
+                except subprocess.TimeoutExpired:
+                    terminate_process_group(process)
+                    return 124, "review attempt timed out", blank
+
+                def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                    if not isinstance(value, bytes):
+                        stream.seek(0)
+                        value = stream.read(limit + 1)
+                    return value[:limit], len(value) > limit
+
+                stdout, stdout_truncated = bounded_output(
+                    communicated_stdout, stdout_file, MAX_AGY_STDOUT_BYTES
+                )
+                stderr, stderr_truncated = bounded_output(
+                    communicated_stderr, stderr_file, MAX_AGY_STDERR_BYTES
+                )
+            if stdout_truncated or stderr_truncated:
+                return 502, "Antigravity transport output exceeded bounded capture", blank
     except OSError as error:
         return 127, str(error), blank
-    response_path.write_bytes(stdout)
+    except subprocess.SubprocessError as error:
+        return 126, f"Antigravity bounded output capture failed: {error}", blank
+    write_private_exclusive(
+        response_path,
+        stdout,
+        label="AGY response evidence",
+        expected_parent_identity=evidence_parent_identity,
+    )
     stderr_text = stderr.decode(errors="replace")
     if process.returncode != 0:
         return process.returncode, stderr_text, blank
     try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
+        payload = json.loads(
+            stdout,
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
+    except json.JSONDecodeError, ValueError:
         return 502, "agy returned invalid JSON", blank
     if not isinstance(payload, dict):
         return 502, "agy returned a non-object response", blank
@@ -1430,7 +2753,12 @@ def invoke_agy(
     usage_values = usage if isinstance(usage, dict) else {}
     duration_seconds = numeric_value(payload.get("duration_seconds"))
     conversation_id = payload.get("conversation_id")
-    response = payload.get("response")
+    structured_output = payload.get("structured_output")
+    response = (
+        canonical_json(structured_output).decode()
+        if isinstance(structured_output, dict)
+        else payload.get("response")
+    )
     return (
         0,
         "",
@@ -1447,16 +2775,645 @@ def invoke_agy(
     )
 
 
-def codex_prompt(prompt: str, response_contract: str) -> str:
+def pi_content_text(content: object) -> str:
+    """Extract only text blocks from one Pi assistant message."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        block.get("text", "")
+        for block in content
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        )
+    )
+
+
+def pi_usage(usage: object) -> tuple[float | None, int | None, int | None]:
+    """Normalize Pi's nested usage object into the portable receipt fields."""
+    if not isinstance(usage, dict):
+        return None, None, None
+    cost = usage.get("cost")
+    cost_value = cost.get("total") if isinstance(cost, dict) else cost
+    return (
+        numeric_value(cost_value),
+        token_value(usage.get("input")),
+        token_value(usage.get("output")),
+    )
+
+
+def pi_resolved_model(requested: str, provider: str | None, resolved: str) -> str:
+    """Rebuild Pi's provider/model identity from its split assistant metadata."""
+    if not resolved:
+        return ""
+    if "/" not in requested:
+        return resolved
+    if not provider or "/" in provider:
+        return ""
+    return resolved if resolved.startswith(f"{provider}/") else f"{provider}/{resolved}"
+
+
+def pi_persisted_response(
+    stdout: bytes,
+    requested_model: str,
+    duration_ms: int,
+    *,
+    include_response: bool = True,
+) -> PersistedResponse:
+    """Recover the metadata Pi emitted, including from a partial event stream."""
+    session_id = ""
+    assistant_message: dict[str, object] | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "session" and isinstance(event.get("id"), str):
+            session_id = event["id"]
+        if event.get("type") == "message_end":
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                assistant_message = message
+        if event.get("type") == "agent_end":
+            messages = event.get("messages")
+            if isinstance(messages, list):
+                for message in messages:
+                    if isinstance(message, dict) and message.get("role") == "assistant":
+                        assistant_message = message
+    if assistant_message is None:
+        return PersistedResponse(session_id, None, duration_ms, None, "", None, None, "")
+    cost_usd, input_tokens, output_tokens = pi_usage(assistant_message.get("usage"))
+    provider = assistant_message.get("provider")
+    resolved_model = assistant_message.get("model")
+    response = pi_content_text(assistant_message.get("content")) if include_response else ""
+    return PersistedResponse(
+        conversation_id=session_id,
+        cost_usd=cost_usd,
+        duration_ms=duration_ms,
+        input_tokens=input_tokens,
+        model=(
+            pi_resolved_model(requested_model, provider, resolved_model)
+            if isinstance(resolved_model, str)
+            else ""
+        ),
+        output_tokens=output_tokens,
+        provider=provider if isinstance(provider, str) else None,
+        response=response,
+    )
+
+
+def pi_timeout_diagnostic(stderr: bytes) -> str:
+    details = stderr.decode(errors="replace").strip()
+    return f"review attempt timed out: {details}" if details else "review attempt timed out"
+
+
+def pi_system_prompt(response_contract: str) -> str:
+    """Replace Pi's coding-agent prompt with the selected review contract."""
+    schema = response_schema(response_contract)
+    if schema is not None:
+        return (
+            "You are a bounded review transport. Read only the supplied files. "
+            "Return exactly one JSON object and no Markdown fences, commentary, or alternative "
+            "review format. The object must satisfy this JSON Schema:\n"
+            f"{canonical_json(schema).decode()}"
+        )
+    if response_contract == "document":
+        return "You are a bounded document transport. Return only the requested Markdown document."
+    return (
+        "You are a bounded review transport. Return one complete verdict beginning with VERDICT:."
+    )
+
+
+def reject_nonstandard_json_constant(constant: str) -> None:
+    """Reject NaN and infinity values accepted by Python but forbidden by JSON."""
+    raise ValueError(f"non-standard JSON constant: {constant}")
+
+
+def parse_finite_json_float(value: str) -> float:
+    """Reject finite-parser overflow while decoding strict JSON evidence."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
+
+
+def normalize_pi_response(response: str, response_contract: str) -> str:
+    """Remove only one outer JSON fence that Pi may add despite the contract."""
+    if response_contract not in {"findings-json", "product-review-json", "product-judge-json"}:
+        return response
+    match = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", response, flags=re.DOTALL)
+    if match is None:
+        return response
+    candidate = match.group(1)
+    try:
+        value = json.loads(candidate, parse_constant=reject_nonstandard_json_constant)
+    except json.JSONDecodeError, ValueError:
+        return response
+    return candidate if isinstance(value, dict) else response
+
+
+def invoke_pi(
+    *,
+    pi_bin: str,
+    prompt: str,
+    model: str,
+    files: list[Path],
+    max_output_tokens: int,
+    response_contract: str,
+    timeout_seconds: int,
+    request_path: Path,
+    response_path: Path,
+    session_path: Path,
+    diagnostic_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
+) -> tuple[int, str, PersistedResponse]:
+    """Run Pi in JSON mode and retain its complete event stream and session."""
+    blank = PersistedResponse("", None, None, None, "", None, None, "")
+    if resource is None:
+        return 126, "Pi bounded output capture unsupported on this platform", blank
+    command = [
+        pi_bin,
+        "--mode",
+        "json",
+        "--print",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-context-files",
+        "--no-approve",
+        "--system-prompt",
+        pi_system_prompt(response_contract),
+        "--model",
+        model,
+        "--session",
+        str(session_path),
+    ]
+    command.extend(f"@{file}" for file in files)
+    command.append(
+        f"{prompt}\n\nReturn only the requested {response_contract} response. "
+        "Do not edit files, run commands, or use information outside the supplied files."
+    )
+    write_private_exclusive(
+        request_path,
+        canonical_json(
+            {
+                "command": "pi",
+                "mode": "json",
+                "model": model,
+                "requestedMaxOutputTokens": max_output_tokens,
+                "outputTokenLimitEnforced": False,
+                "responseContract": response_contract,
+                "files": [str(file) for file in files],
+                "prompt": prompt,
+                "session": str(session_path),
+            }
+        )
+        + b"\n",
+        label="Pi request evidence",
+        expected_parent_identity=evidence_parent_identity,
+    )
+    started = time.monotonic()
+    stdout = b""
+    stderr = b""
+    capture_file_limit = max(MAX_PI_LEGACY_STDOUT_BYTES, MAX_PI_LEGACY_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=files[0].parent if files else None,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+                preexec_fn=limit_output_files,
+            )
+            timed_out = False
+            try:
+                communicated_stdout, communicated_stderr = process.communicate(
+                    timeout=timeout_seconds
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                terminate_process_group(process)
+                communicated_stdout, communicated_stderr = process.communicate()
+
+            def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                if not isinstance(value, bytes):
+                    stream.seek(0)
+                    value = stream.read(limit + 1)
+                return value[:limit], len(value) > limit
+
+            stdout, stdout_truncated = bounded_output(
+                communicated_stdout, stdout_file, MAX_PI_LEGACY_STDOUT_BYTES
+            )
+            stderr, stderr_truncated = bounded_output(
+                communicated_stderr, stderr_file, MAX_PI_LEGACY_STDERR_BYTES
+            )
+        if stdout_truncated or stderr_truncated:
+            return 502, "Pi transport output exceeded bounded capture", blank
+        if timed_out:
+            if stdout:
+                write_private_exclusive(
+                    response_path,
+                    stdout,
+                    label="Pi response evidence",
+                    expected_parent_identity=evidence_parent_identity,
+                )
+            if stderr:
+                write_private_exclusive(
+                    diagnostic_path,
+                    redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
+                    label="Pi diagnostic evidence",
+                    expected_parent_identity=evidence_parent_identity,
+                )
+            return (
+                124,
+                pi_timeout_diagnostic(stderr),
+                pi_persisted_response(
+                    stdout,
+                    model,
+                    round((time.monotonic() - started) * 1000),
+                    include_response=False,
+                ),
+            )
+    except FileNotFoundError:
+        return 127, f"Pi transport executable not found: {pi_bin}", blank
+    except subprocess.SubprocessError as error:
+        return 126, f"Pi bounded output capture failed: {error}", blank
+    except OSError as error:
+        return 127, f"Pi transport could not execute: {error}", blank
+
+    if stdout:
+        write_private_exclusive(
+            response_path,
+            stdout,
+            label="Pi response evidence",
+            expected_parent_identity=evidence_parent_identity,
+        )
+    if stderr:
+        write_private_exclusive(
+            diagnostic_path,
+            redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
+            label="Pi diagnostic evidence",
+            expected_parent_identity=evidence_parent_identity,
+        )
+    persisted = pi_persisted_response(stdout, model, round((time.monotonic() - started) * 1000))
+    if not persisted.response:
+        return (
+            process.returncode,
+            stderr.decode(errors="replace"),
+            persisted,
+        )
+    return (
+        process.returncode,
+        stderr.decode(errors="replace"),
+        PersistedResponse(
+            conversation_id=persisted.conversation_id,
+            cost_usd=persisted.cost_usd,
+            duration_ms=persisted.duration_ms,
+            input_tokens=persisted.input_tokens,
+            model=persisted.model,
+            output_tokens=persisted.output_tokens,
+            provider=persisted.provider,
+            response=normalize_pi_response(persisted.response, response_contract),
+        ),
+    )
+
+
+DEFAULT_EXPLORATION_TOOLS = "read,grep,find,ls"
+
+
+def exploration_path(root: str | Path, exploration_id: str) -> Path:
+    """Resolve one named exploration below its user-owned root."""
+    if not REVIEW_ID.fullmatch(exploration_id):
+        raise ValueError("invalid exploration id")
+    root_path = Path(root).expanduser().resolve()
+    return root_path / exploration_id
+
+
+def read_exploration_prompt(prompt: str | None, prompt_file: str | None) -> str:
+    """Load one non-empty prompt for an exploratory turn."""
+    if prompt and prompt_file:
+        raise ValueError("use either --prompt or --prompt-file")
+    if not prompt and not prompt_file:
+        raise ValueError("one of --prompt or --prompt-file is required")
+    value = Path(prompt_file).read_text() if prompt_file else prompt or ""
+    if not value.strip():
+        raise ValueError("exploration prompt must not be empty")
+    return value
+
+
+def invoke_pi_exploration(
+    *,
+    pi_bin: str,
+    prompt: str,
+    model: str,
+    tools: str,
+    cwd: Path,
+    timeout_seconds: int,
+    session_path: Path,
+    events_path: Path,
+) -> tuple[int, str, str, PersistedResponse]:
+    """Run one full-tool Pi turn while preserving its resumable session."""
+    blank = PersistedResponse("", None, None, None, "", None, None, "")
+    command = [
+        pi_bin,
+        "--mode",
+        "json",
+        "--print",
+        "--model",
+        model,
+        "--tools",
+        tools,
+        "--no-approve",
+        "--session",
+        str(session_path),
+        prompt,
+    ]
+    started = time.monotonic()
+    stdout = b""
+    stderr = b""
+    if resource is None:
+        return 126, "Pi exploration bounded output capture unsupported", "", blank
+    capture_file_limit = max(MAX_PI_EXPLORATION_STDOUT_BYTES, MAX_PI_EXPLORATION_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+                preexec_fn=limit_output_files,
+            )
+            timed_out = False
+            try:
+                communicated_stdout, communicated_stderr = process.communicate(
+                    timeout=timeout_seconds
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                terminate_process_group(process)
+                communicated_stdout, communicated_stderr = process.communicate()
+
+            def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                if not isinstance(value, bytes):
+                    stream.seek(0)
+                    value = stream.read(limit + 1)
+                return value[:limit], len(value) > limit
+
+            stdout, stdout_truncated = bounded_output(
+                communicated_stdout, stdout_file, MAX_PI_EXPLORATION_STDOUT_BYTES
+            )
+            stderr, stderr_truncated = bounded_output(
+                communicated_stderr, stderr_file, MAX_PI_EXPLORATION_STDERR_BYTES
+            )
+        if stdout:
+            events_path.write_bytes(stdout)
+        if stdout_truncated or stderr_truncated:
+            return 502, "Pi exploration output exceeded bounded capture", "", blank
+        if timed_out:
+            return (
+                124,
+                pi_timeout_diagnostic(stderr).replace("review attempt", "exploration turn", 1),
+                stderr.decode(errors="replace"),
+                pi_persisted_response(
+                    stdout,
+                    model,
+                    round((time.monotonic() - started) * 1000),
+                    include_response=False,
+                ),
+            )
+    except FileNotFoundError:
+        return 127, f"Pi exploration executable not found: {pi_bin}", "", blank
+    except subprocess.SubprocessError as error:
+        return 126, f"Pi exploration bounded output capture failed: {error}", "", blank
+    except OSError as error:
+        return 127, f"Pi exploration could not execute: {error}", "", blank
+
+    return (
+        process.returncode,
+        stderr.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+        pi_persisted_response(stdout, model, round((time.monotonic() - started) * 1000)),
+    )
+
+
+def load_exploration(root: str | Path, exploration_id: str) -> tuple[Path, dict[str, object]]:
+    """Load and validate the manifest for one named exploration."""
+    path = exploration_path(root, exploration_id)
+    manifest_path = path / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"exploration does not exist: {exploration_id}")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read exploration manifest: {error}") from error
+    if not isinstance(manifest, dict) or manifest.get("id") != exploration_id:
+        raise ValueError(f"invalid exploration manifest: {manifest_path}")
+    return path, manifest
+
+
+def exploration_manifest_path(path: Path) -> Path:
+    return path / "manifest.json"
+
+
+def write_exploration_manifest(path: Path, manifest: dict[str, object]) -> None:
+    exploration_manifest_path(path).write_text(
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def run_exploration_turn(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, *, starting: bool
+) -> int:
+    """Start or resume one Pi exploration turn."""
+    try:
+        prompt = read_exploration_prompt(args.prompt, args.prompt_file)
+        root = Path(args.exploration_root).expanduser().resolve()
+        if starting:
+            path = exploration_path(root, args.id)
+            if path.exists():
+                fail(parser, f"exploration already exists: {args.id}")
+            model = args.model
+            if not model:
+                fail(parser, "--model is required for explore start")
+            cwd = Path(args.cwd).expanduser().resolve()
+            if not cwd.is_dir():
+                fail(parser, f"exploration cwd does not exist: {cwd}")
+            path.mkdir(parents=True)
+            (path / "turns").mkdir()
+            manifest: dict[str, object] = {
+                "format": "reviewctl.exploration.v1",
+                "id": args.id,
+                "model": model,
+                "tools": args.tools,
+                "cwd": str(cwd),
+                "session": None,
+                "createdAt": utc_now(),
+                "updatedAt": utc_now(),
+                "turns": 0,
+                "status": "created",
+            }
+        else:
+            path, manifest = load_exploration(root, args.id)
+            model = args.model or manifest.get("model")
+            if not isinstance(model, str) or not model:
+                fail(parser, "exploration manifest has no model; pass --model")
+            cwd_value = args.cwd or manifest.get("cwd")
+            cwd = (
+                Path(cwd_value).expanduser().resolve() if isinstance(cwd_value, str) else Path.cwd()
+            )
+            if not cwd.is_dir():
+                fail(parser, f"exploration cwd does not exist: {cwd}")
+            if args.tools is None and isinstance(manifest.get("tools"), str):
+                tools = manifest["tools"]
+            else:
+                tools = args.tools or DEFAULT_EXPLORATION_TOOLS
+        tools = args.tools if starting else tools
+        session_path = path / "session.jsonl"
+        turn_number = int(manifest.get("turns", 0)) + 1
+        turn_path = path / "turns" / f"{turn_number:03d}"
+        turn_path.mkdir(parents=True, exist_ok=False)
+        request_path = turn_path / "request.md"
+        events_path = turn_path / "events.jsonl"
+        response_path = turn_path / "response.md"
+        stderr_path = turn_path / "stderr.log"
+        request_path.write_text(prompt)
+        exit_code, diagnostic, transport_stderr, persisted = invoke_pi_exploration(
+            pi_bin=os.environ.get("PI_BIN", "pi"),
+            prompt=prompt,
+            model=model,
+            tools=tools,
+            cwd=cwd,
+            timeout_seconds=args.timeout_seconds,
+            session_path=session_path,
+            events_path=events_path,
+        )
+        if persisted.response:
+            response_path.write_text(persisted.response)
+        if transport_stderr:
+            stderr_path.write_text(redact_diagnostic(transport_stderr, limit=100_000))
+        turn_manifest = {
+            "turn": turn_number,
+            "model": persisted.model or model,
+            "provider": persisted.provider,
+            "conversationId": persisted.conversation_id,
+            "costUsd": persisted.cost_usd,
+            "durationMs": persisted.duration_ms,
+            "exitCode": exit_code,
+            "diagnostic": redact_diagnostic(diagnostic, limit=100_000),
+            "status": "completed" if exit_code == 0 and persisted.response else "unavailable",
+        }
+        (turn_path / "turn.json").write_text(
+            json.dumps(turn_manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        )
+        manifest.update(
+            {
+                "model": model,
+                "tools": tools,
+                "cwd": str(cwd),
+                "session": (
+                    str(session_path)
+                    if session_path.is_file() and session_path.stat().st_size > 0
+                    else None
+                ),
+                "updatedAt": utc_now(),
+                "turns": turn_number,
+                "status": turn_manifest["status"],
+                "lastTurn": str(turn_path),
+            }
+        )
+        write_exploration_manifest(path, manifest)
+        print(turn_path)
+        return 0 if turn_manifest["status"] == "completed" else 1
+    except ValueError as error:
+        fail(parser, str(error))
+    return 1
+
+
+def show_exploration(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    try:
+        _, manifest = load_exploration(args.exploration_root, args.id)
+    except ValueError as error:
+        fail(parser, str(error))
+    print(json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True))
+    return 0
+
+
+def promote_exploration(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    try:
+        path, manifest = load_exploration(args.exploration_root, args.id)
+    except ValueError as error:
+        fail(parser, str(error))
+    last_turn = manifest.get("lastTurn")
+    if not isinstance(last_turn, str):
+        fail(parser, "exploration has no completed turn to promote")
+    response_path = Path(last_turn) / "response.md"
+    if not response_path.is_file() or not response_path.read_text().strip():
+        fail(parser, "exploration has no non-empty response to promote")
+    output = Path(args.output).expanduser().resolve()
+    if output.exists():
+        if not output.is_dir():
+            fail(parser, f"promotion output is not a directory: {output}")
+        if any(output.iterdir()):
+            fail(parser, f"promotion output is not empty: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "exploration.md").write_text(response_path.read_text())
+    prompt = (
+        "Treat exploration.md as exploratory working material; it is not an approval or a source "
+        "of truth. Independently verify its claims against the attached source files and tests. "
+        "Report only findings supported by the frozen inputs.\n\n"
+        f"Exploration id: {args.id}\n"
+        "The formal review must not treat the exploratory response as a merge decision."
+    )
+    (output / "prompt.md").write_text(prompt + "\n")
+    promoted_manifest = {
+        "format": "reviewctl.exploration-promotion.v1",
+        "exploration": str(path),
+        "id": args.id,
+        "sourceManifest": manifest,
+        "explorationResponse": str(output / "exploration.md"),
+        "formalPrompt": str(output / "prompt.md"),
+        "status": "working-material",
+    }
+    (output / "manifest.json").write_text(
+        json.dumps(promoted_manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    )
+    print(output)
+    return 0
+
+
+def codex_prompt(
+    prompt: str, response_contract: str, *, review_declaration_required: bool = True
+) -> str:
     """Add the output contract Codex must satisfy without expanding source scope."""
     if response_contract == "findings-json":
+        prepared = get_contract(response_contract).prepare(
+            ContractContext(review_declaration_required=review_declaration_required)
+        )
         contract = (
             "Read the frozen files in the current working directory before reviewing. "
-            "Return only JSON matching the supplied findings schema. "
-            "Use approved only when there are no findings, and changes-requested only when "
-            "findings is non-empty. List every frozen snapshot you actually reviewed in "
-            "reviewedFiles; do not emit a verdict if you cannot read a file. The runner, not "
-            "you, records the authoritative source hashes."
+            f"{prepared.output_instructions}"
         )
     elif response_contract == "product-review-json":
         contract = (
@@ -1493,6 +3450,12 @@ def invoke_codex(
     workspace: Path,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Codex against the isolated snapshots and recover its final response."""
+    if resource is None:
+        return (
+            126,
+            "Codex bounded output capture unsupported on this platform",
+            PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+        )
     isolation: CodexIsolation | None = None
     try:
         if source_roots:
@@ -1508,8 +3471,11 @@ def invoke_codex(
         )
 
     temporary_root = isolation.home if isolation else workspace
-    output_path = temporary_root / "codex-response.md"
+    output_path = temporary_root.resolve() / "codex-response.md"
     schema_path: Path | None = None
+    sandbox_arguments = (
+        ["--dangerously-bypass-approvals-and-sandbox"] if isolation else ["--sandbox", "read-only"]
+    )
     command = [
         codex_bin,
         "exec",
@@ -1517,8 +3483,7 @@ def invoke_codex(
         "--ignore-rules",
         "--ephemeral",
         "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
+        *sandbox_arguments,
         "--model",
         model,
         "-C",
@@ -1530,34 +3495,96 @@ def invoke_codex(
         schema_path = output_path.with_name("codex-response.schema.json")
         schema_path.write_bytes(canonical_json(schema))
         command.extend(["--output-schema", str(schema_path)])
-    command.append(codex_prompt(prompt, response_contract))
+    command.append(
+        codex_prompt(
+            prompt,
+            response_contract,
+            review_declaration_required=source_roots is not None,
+        )
+    )
     if isolation:
+        # Codex's own seatbelt cannot be nested inside macOS sandbox-exec.
+        # The outer profile already denies the original proprietary checkout;
+        # use Codex's documented external-sandbox mode for the inner process.
         command = ["sandbox-exec", "-f", str(isolation.profile), *command]
 
     started = time.monotonic()
     timed_out = False
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=workspace,
-            env=isolation.environment if isolation else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+    process_environment = (
+        isolation.environment
+        if isolation
+        else codex_process_environment(
+            os.environ,
+            {"HOME": os.environ.get("HOME") or str(account_home())},
         )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-            exit_code = process.returncode
-            stderr_text = stderr.decode(errors="replace")
-        except subprocess.TimeoutExpired:
-            terminate_process_group(process)
-            stdout = b""
-            exit_code = 124
-            stderr_text = "review attempt timed out"
-            timed_out = True
+    )
+    capture_file_limit = (
+        max(MAX_CODEX_RESPONSE_BYTES, MAX_CODEX_STDOUT_BYTES, MAX_CODEX_STDERR_BYTES) + 1
+    )
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=workspace,
+                env=process_environment,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+                preexec_fn=limit_output_files,
+            )
+            try:
+                communicated_stdout, communicated_stderr = process.communicate(
+                    timeout=timeout_seconds
+                )
+                exit_code = process.returncode
+            except subprocess.TimeoutExpired:
+                terminate_process_group(process)
+                communicated_stdout = b""
+                communicated_stderr = b""
+                exit_code = 124
+                timed_out = True
+
+            def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                if not isinstance(value, bytes):
+                    stream.seek(0)
+                    value = stream.read(limit + 1)
+                return value[:limit], len(value) > limit
+
+            stdout, stdout_truncated = bounded_output(
+                communicated_stdout, stdout_file, MAX_CODEX_STDOUT_BYTES
+            )
+            stderr, stderr_truncated = bounded_output(
+                communicated_stderr, stderr_file, MAX_CODEX_STDERR_BYTES
+            )
+        if stdout_truncated or stderr_truncated:
+            return (
+                502,
+                "Codex transport output exceeded bounded capture",
+                PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+            )
+        stderr_text = "review attempt timed out" if timed_out else stderr.decode(errors="replace")
         transport_output = f"{stdout.decode(errors='replace')}\n{stderr_text}"
         session = re.search(r"session id:\s*([^\s]+)", transport_output)
         resolved_model = re.search(r"^model:\s*([^\s]+)", transport_output, flags=re.MULTILINE)
+        response_text = ""
+        if output_path.is_file() and not timed_out:
+            with confined_regular_descriptor(output_path, os.O_RDONLY) as descriptor:
+                with os.fdopen(os.dup(descriptor), "rb") as stream:
+                    raw_response = stream.read(MAX_CODEX_RESPONSE_BYTES + 1)
+            if len(raw_response) > MAX_CODEX_RESPONSE_BYTES:
+                return (
+                    502,
+                    "Codex final response exceeded bounded capture",
+                    PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+                )
+            response_text = raw_response.decode("utf-8")
         return (
             exit_code,
             stderr_text,
@@ -1568,10 +3595,8 @@ def invoke_codex(
                 input_tokens=None,
                 model=resolved_model.group(1) if resolved_model else "",
                 output_tokens=None,
-                provider="openai-codex",
-                response=(
-                    output_path.read_text() if output_path.is_file() and not timed_out else ""
-                ),
+                provider=None,
+                response=response_text,
             ),
         )
     finally:
@@ -1583,11 +3608,19 @@ def invoke_codex(
             isolation_context.__exit__(None, None, None)
 
 
-def load_response(database: Path) -> PersistedResponse | None:
-    if not database.is_file():
+def load_response(database: Path | bytes) -> PersistedResponse | None:
+    if isinstance(database, Path):
+        try:
+            database_bytes = read_confined_bytes(database)
+        except OSError:
+            return None
+    else:
+        database_bytes = database
+    if not database_bytes:
         return None
     try:
-        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(":memory:")) as connection:
+            connection.deserialize(database_bytes)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(responses)")}
             required = {"response", "conversation_id", "model"}
             if not required <= columns:
@@ -1624,8 +3657,436 @@ def load_response(database: Path) -> PersistedResponse | None:
     )
 
 
+def execute_llm_backend(request: BackendRequest) -> BackendExecution:
+    database = request.attempt_dir / "transport.sqlite3"
+    with tempfile.TemporaryDirectory(prefix="reviewctl-llm-") as scratch_directory:
+        scratch_database = Path(scratch_directory).resolve() / "transport.sqlite3"
+        exit_code, diagnostic = invoke_llm(
+            llm_bin=os.environ.get("LLM_BIN", "llm"),
+            prompt=request.prompt,
+            model=request.model,
+            database=scratch_database,
+            files=list(request.files),
+            max_output_tokens=request.max_output_tokens,
+            response_contract=request.response_contract,
+            timeout_seconds=request.timeout_seconds,
+        )
+        response = None
+        if os.path.lexists(scratch_database):
+            try:
+                scratch_bytes = read_confined_bytes(scratch_database)
+                response = load_response(scratch_bytes)
+                write_private_exclusive(
+                    database,
+                    scratch_bytes,
+                    label="LLM database evidence",
+                    expected_parent_identity=request.evidence_parent_identity,
+                )
+            except OSError as error:
+                return BackendExecution(
+                    502,
+                    f"LLM database evidence was unsafe: {error}",
+                    None,
+                    BackendEvidence(database=database),
+                )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(database=database),
+    )
+
+
+def execute_codex_backend(request: BackendRequest) -> BackendExecution:
+    response_path = request.attempt_dir / "response.md"
+    exit_code, diagnostic, response = invoke_codex(
+        codex_bin=os.environ.get("CODEX_BIN", "codex"),
+        prompt=request.prompt,
+        model=request.model,
+        response_contract=request.response_contract,
+        source_roots=list(request.source_roots) or None,
+        timeout_seconds=request.timeout_seconds,
+        workspace=request.files[0].parent,
+    )
+    write_private_exclusive(
+        response_path,
+        response.response.encode(),
+        label="Codex response evidence",
+        expected_parent_identity=request.evidence_parent_identity,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(response=response_path),
+    )
+
+
+def execute_kiro_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    models_path = request.attempt_dir / "models.json"
+    response_path = request.attempt_dir / "response.log"
+    session_path = request.attempt_dir / "session.json"
+    final_response_path = request.attempt_dir / "response.md"
+    diagnostic_path = request.attempt_dir / "stderr.log"
+    exit_code, diagnostic, response = invoke_kiro(
+        kiro_bin=os.environ.get("KIRO_BIN", "kiro-cli"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        models_path=models_path,
+        response_path=response_path,
+        session_path=session_path,
+        diagnostic_path=diagnostic_path,
+        evidence_parent_identity=request.evidence_parent_identity,
+    )
+    final_evidence = None
+    if response.response:
+        write_private_exclusive(
+            final_response_path,
+            response.response.encode(),
+            expected_parent_identity=request.evidence_parent_identity,
+        )
+        final_evidence = final_response_path
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(
+            request=request_path,
+            response=response_path,
+            session=session_path,
+            final_response=final_evidence,
+            stderr=diagnostic_path,
+        ),
+    )
+
+
+def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    exit_code, diagnostic, response = invoke_openrouter(
+        api_key=os.environ.get("OPENROUTER_API_KEY"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        provider_preferences=request.provider_preferences,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=response_path,
+        evidence_parent_identity=request.evidence_parent_identity,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(request=request_path, response=response_path),
+    )
+
+
+def execute_agy_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    exit_code, diagnostic, response = invoke_agy(
+        agy_bin=os.environ.get("AGY_BIN", "agy"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=response_path,
+        evidence_parent_identity=request.evidence_parent_identity,
+    )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(request=request_path, response=response_path),
+    )
+
+
+def execute_gemini_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    response_path = request.attempt_dir / "response.json"
+    session_path = request.attempt_dir / "session.json"
+    final_response_path = request.attempt_dir / "response.md"
+    diagnostic_path = request.attempt_dir / "stderr.log"
+    exit_code, diagnostic, response = invoke_gemini(
+        gemini_bin=os.environ.get("GEMINI_BIN", "gemini"),
+        prompt=request.prompt,
+        model=request.model,
+        files=list(request.files),
+        max_output_tokens=request.max_output_tokens,
+        response_contract=request.response_contract,
+        timeout_seconds=request.timeout_seconds,
+        request_path=request_path,
+        response_path=response_path,
+        session_path=session_path,
+        diagnostic_path=diagnostic_path,
+        evidence_parent_identity=request.evidence_parent_identity,
+    )
+    if response.response:
+        write_private_exclusive(
+            final_response_path,
+            response.response.encode(),
+            expected_parent_identity=request.evidence_parent_identity,
+        )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(
+            request=request_path,
+            response=response_path,
+            session=session_path,
+            final_response=final_response_path if response.response else None,
+            stderr=diagnostic_path,
+        ),
+    )
+
+
+def execute_pi_backend(request: BackendRequest) -> BackendExecution:
+    request_path = request.attempt_dir / "request.json"
+    events_path = request.attempt_dir / "events.jsonl"
+    session_path = request.attempt_dir / "session.jsonl"
+    final_response_path = request.attempt_dir / "response.md"
+    stderr_path = request.attempt_dir / "stderr.log"
+    with tempfile.TemporaryDirectory(prefix="reviewctl-pi-") as scratch_directory:
+        scratch_session = Path(scratch_directory).resolve() / "session.jsonl"
+        exit_code, diagnostic, response = invoke_pi(
+            pi_bin=os.environ.get("PI_BIN", "pi"),
+            prompt=request.prompt,
+            model=request.model,
+            files=list(request.files),
+            max_output_tokens=request.max_output_tokens,
+            response_contract=request.response_contract,
+            timeout_seconds=request.timeout_seconds,
+            request_path=request_path,
+            response_path=events_path,
+            session_path=scratch_session,
+            diagnostic_path=stderr_path,
+            evidence_parent_identity=request.evidence_parent_identity,
+        )
+        if os.path.lexists(scratch_session):
+            try:
+                scratch_bytes = read_confined_bytes(scratch_session)
+                write_private_exclusive(
+                    session_path,
+                    scratch_bytes,
+                    label="Pi session evidence",
+                    expected_parent_identity=request.evidence_parent_identity,
+                )
+            except OSError as error:
+                return BackendExecution(
+                    502,
+                    f"Pi session evidence was unsafe: {error}",
+                    response,
+                    BackendEvidence(
+                        request=request_path,
+                        response=events_path,
+                        session=session_path,
+                        stderr=stderr_path,
+                    ),
+                )
+    if response.response:
+        write_private_exclusive(
+            final_response_path,
+            response.response.encode(),
+            label="Pi final response evidence",
+            expected_parent_identity=request.evidence_parent_identity,
+        )
+    return BackendExecution(
+        exit_code,
+        diagnostic,
+        response,
+        BackendEvidence(
+            request=request_path,
+            response=events_path,
+            session=session_path,
+            final_response=final_response_path,
+            stderr=stderr_path,
+        ),
+    )
+
+
+def build_backend_registry() -> BackendRegistry:
+    registry = BackendRegistry()
+    registry.register(
+        BackendDescriptor(
+            "agy",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "AGY_BIN",
+            "agy",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_agy_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "codex",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "CODEX_BIN",
+            "codex",
+            BackendCapabilities(
+                ReadOnlyCapability.SANDBOXED,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                True,
+                SourceIsolation.EXTERNAL_SANDBOX,
+            ),
+            "unqualified",
+        ),
+        execute_codex_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "gemini",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "GEMINI_BIN",
+            "gemini",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                False,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_gemini_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "kiro",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "KIRO_BIN",
+            "kiro-cli",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                True,
+                True,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_kiro_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "llm",
+            BackendFamily.GENERIC_MODEL_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "LLM_BIN",
+            "llm",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_llm_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "openrouter",
+            BackendFamily.PROVIDER_GATEWAY,
+            DiscoveryKind.REMOTE_API,
+            "",
+            "",
+            BackendCapabilities(
+                ReadOnlyCapability.UNSUPPORTED,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_openrouter_backend,
+    )
+    registry.register(
+        BackendDescriptor(
+            "pi",
+            BackendFamily.AGENT_CLI,
+            DiscoveryKind.EXECUTABLE,
+            "PI_BIN",
+            "pi",
+            BackendCapabilities(
+                ReadOnlyCapability.ADVISORY,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                SourceIsolation.UNAVAILABLE,
+            ),
+            "unqualified",
+        ),
+        execute_pi_backend,
+    )
+    return registry
+
+
 def response_is_complete(response: str) -> bool:
     stripped = response.strip()
+    if re.fullmatch(r"VERDICT:\s*(?:approved|changes-requested)[.!?]?", stripped, re.IGNORECASE):
+        return True
     return len(stripped) >= 20 and "VERDICT" in stripped.upper() and stripped[-1] in ".]}"
 
 
@@ -1749,8 +4210,17 @@ def validate_read_proof(value: dict[str, Any], expected_file_hashes: dict[str, s
         normalized = reviewed.strip()
         if not normalized:
             return False
-        snapshot_name = Path(normalized).name
-        proof_path = normalized if normalized in expected_file_hashes else snapshot_name
+        if normalized in expected_file_hashes:
+            proof_path = normalized
+        else:
+            snapshot_path = Path(normalized)
+            if (
+                not snapshot_path.is_absolute()
+                or not snapshot_path.parent.name.startswith("reviewctl-input-")
+                or snapshot_path.name not in expected_file_hashes
+            ):
+                return False
+            proof_path = snapshot_path.name
         if proof_path in reviewed_paths:
             return False
         # The model declares only the frozen snapshots it reviewed. The runner
@@ -1772,6 +4242,13 @@ def validate_review_response(
     if contract == "document":
         stripped = response.strip()
         return {"document": stripped} if len(stripped) >= 20 else None
+    if contract == "findings-json":
+        context = ContractContext(
+            file_names=tuple(expected_file_hashes or ()),
+            review_declaration_required=expected_file_hashes is not None,
+        )
+        prepared = get_contract(contract).prepare(context)
+        return get_contract(contract).evaluate(response, prepared, context).value
     try:
         value = json.loads(response)
     except json.JSONDecodeError:
@@ -1796,44 +4273,7 @@ def validate_review_response(
                 return None
             value = {key: item for key, item in value.items() if key != "reviewedFiles"}
         return validate_product_judge(value)
-    if contract != "findings-json" or not isinstance(value.get("verdict"), str):
-        return None
-    if value["verdict"] not in REVIEW_VERDICTS:
-        return None
-    findings = value.get("findings")
-    if not isinstance(findings, list):
-        return None
-    for finding in findings:
-        if not isinstance(finding, dict) or not FINDING_FIELDS <= finding.keys():
-            return None
-        if not all(
-            isinstance(finding[field], str) and finding[field].strip()
-            for field in FINDING_FIELDS - {"line"}
-        ):
-            return None
-        if finding["severity"] not in FINDING_SEVERITIES:
-            return None
-        if not isinstance(finding["line"], int) or finding["line"] < 1:
-            return None
-        if expected_file_hashes is not None and finding["path"] not in expected_file_hashes:
-            return None
-    if (value["verdict"] == "approved") != (not findings):
-        return None
-    if expected_file_hashes is None:
-        if value.get("reviewedFiles") is not None or set(value) != {"verdict", "findings"}:
-            return None
-        return {"verdict": value["verdict"], "findings": findings}
-    if set(value) != {
-        "verdict",
-        "findings",
-        "reviewedFiles",
-    } or not validate_read_proof(value, expected_file_hashes):
-        return None
-    return {
-        "verdict": value["verdict"],
-        "findings": findings,
-        "reviewedFiles": value["reviewedFiles"],
-    }
+    return None
 
 
 def review_validation_error(
@@ -1843,6 +4283,14 @@ def review_validation_error(
     expected_file_hashes: dict[str, str] | None = None,
 ) -> str | None:
     """Explain a rejected structured response without changing the acceptance contract."""
+    if contract == "findings-json":
+        context = ContractContext(
+            file_names=tuple(expected_file_hashes or ()),
+            review_declaration_required=expected_file_hashes is not None,
+        )
+        prepared = get_contract(contract).prepare(context)
+        evaluation = get_contract(contract).evaluate(response, prepared, context)
+        return findings_validation_error(response, evaluation)
     if (
         validate_review_response(response, contract, expected_file_hashes=expected_file_hashes)
         is not None
@@ -1871,23 +4319,70 @@ def review_validation_error(
         if not validate_read_proof(value, expected_file_hashes):
             return f"{contract}: reviewedFiles proof does not match frozen inputs"
 
-    if contract == "findings-json":
-        verdict = value.get("verdict")
-        if not isinstance(verdict, str):
-            return "findings-json: verdict must be a string"
-        if verdict not in REVIEW_VERDICTS:
-            return (
-                f"findings-json: invalid verdict {verdict!r}; "
-                "expected approved or changes-requested"
-            )
-        return "findings-json: findings do not satisfy the required schema or verdict invariant"
     return f"{contract}: response does not satisfy the required schema"
 
 
-def seal(path: Path, contents: bytes, recipient: str) -> str:
+def findings_validation_error(response: str, evaluation: ContractEvaluation) -> str | None:
+    """Render one native findings evaluation using the stable CLI diagnostics."""
+    if not evaluation.violations:
+        return None
+    violation = evaluation.violations[0]
+    if violation == "invalid-json":
+        return "findings-json: invalid JSON"
+    if violation == "top-level-not-object":
+        return "findings-json: top-level response must be an object"
+    if violation == "response-fields":
+        return "findings-json: response fields do not match the required schema"
+    if violation == "review-declaration":
+        return "findings-json: reviewedFiles proof does not match frozen inputs"
+    if violation == "verdict":
+        value = json.loads(response)
+        verdict = value.get("verdict")
+        if not isinstance(verdict, str):
+            return "findings-json: verdict must be a string"
+        return f"findings-json: invalid verdict {verdict!r}; expected approved or changes-requested"
+    return "findings-json: findings do not satisfy the required schema or verdict invariant"
+
+
+def persisted_receipt_valid(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> bool:
+    """Verify the digest of the exact receipt bytes persisted by a review run."""
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        receipt = json.loads(
+            read_confined_text(path, expected_parent_identity=expected_parent_identity),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_constant,
+        )
+        if not isinstance(receipt, dict):
+            return False
+        recorded = receipt.pop("sha256", None)
+        return (
+            isinstance(recorded, str)
+            and (expected_sha256 is None or recorded == expected_sha256)
+            and recorded == sha256_bytes(contract_canonical_json(receipt))
+        )
+    except OSError, UnicodeError, TypeError, ValueError, OverflowError:
+        return False
+
+
+def seal(
+    path: Path,
+    contents: bytes,
+    recipient: str,
+    *,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> str:
     target = path.with_suffix(path.suffix + ".age")
     result = subprocess.run(
-        ["age", "-r", recipient, "-o", str(target)],
+        ["age", "-r", recipient],
         input=contents,
         text=False,
         capture_output=True,
@@ -1895,13 +4390,45 @@ def seal(path: Path, contents: bytes, recipient: str) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors="replace").strip() or "age failed")
+    write_private_exclusive(
+        target,
+        result.stdout,
+        label="sealed review evidence",
+        expected_parent_identity=expected_parent_identity,
+    )
     return target.name
 
 
 def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     prompt, files = validate_request(parser, args)
     routes, route_profile = review_routes(parser, args)
+    if any(route.transport == "pi" and "/" not in route.model for route in routes):
+        parser.error("pi review models must use provider/model identity")
+    if any(route.transport == "kiro" and route.model == "auto" for route in routes):
+        parser.error("Kiro review model auto is rejected because resolved identity is unobservable")
+    if (
+        any(route.transport == "kiro" for route in routes)
+        and args.response_contract != "findings-json"
+    ):
+        parser.error(
+            "Kiro transport currently supports only --response-contract findings-json; "
+            "terminal-rendered document and verdict output cannot be verified without rewriting"
+        )
+    route_transports = {route.transport for route in routes}
+    transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
+    if route_profile:
+        raw_defaults = route_profile.get("defaultSettings")
+        transport_defaults = raw_defaults if isinstance(raw_defaults, dict) else {}
+        execution_config = {
+            "path": str(route_profile["path"]),
+            "sha256": str(route_profile["sha256"]),
+        }
+    else:
+        transport_defaults, execution_config = load_transport_defaults(
+            parser, getattr(args, "config", None), transport_default_key
+        )
     review_prompt = packet_prompt(prompt, files, args.response_contract)
+    packet_digest = sha256_bytes(review_prompt.encode())
     try:
         provider_preferences = provider_preferences_from_args(args)
     except ValueError as error:
@@ -1911,9 +4438,38 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             parser.error("provider preferences require at least one openrouter route")
         parser.error("provider preferences require --transport openrouter")
     policy_digest: str | None = None
+    loaded_policy: dict[str, Any] | None = None
     if args.policy:
-        load_policy(args.policy)
-        policy_digest = policy_sha256(args.policy)
+        try:
+            loaded_policy, policy_bytes = load_policy_evidence(args.policy)
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+            parser.error(f"could not read policy {args.policy}: {error}")
+        policy_digest = sha256_bytes(policy_bytes)
+    local_policy_routes = [route for route in routes if route.transport in LOCAL_POLICY_TRANSPORTS]
+    kiro_routes = [route for route in local_policy_routes if route.transport == "kiro"]
+    if args.source_class == "proprietary":
+        scoped_routes = local_policy_routes if loaded_policy is not None else []
+        if kiro_routes and loaded_policy is None:
+            parser.error("proprietary Kiro reviews require --policy")
+        if (
+            any(
+                route.transport in REQUIRED_LOCAL_POLICY_TRANSPORTS for route in local_policy_routes
+            )
+            and loaded_policy is None
+        ):
+            parser.error("proprietary local transport reviews require --policy")
+        for route in scoped_routes:
+            if loaded_policy is None or not source_allowed(
+                loaded_policy, route.model, transport=route.transport
+            ):
+                parser.error(f"policy does not allow {route.transport} model {route.model}")
+            if route.transport == "kiro" and not unresolved_identity_waived(
+                loaded_policy, route.model, transport=route.transport
+            ):
+                parser.error(
+                    f"policy must explicitly allow unresolved Kiro model identity for {route.model}"
+                )
+    kiro_identity_waiver = args.source_class == "proprietary" and bool(kiro_routes)
     artifact_root = Path(args.artifact_root)
     log_path = (
         Path(args.log_file).expanduser()
@@ -1921,9 +4477,17 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         else artifact_root / "reviewctl.log"
     )
     logger = configure_runtime_logger(log_path)
-    turn_dir = review_root(artifact_root, args.review_id)
+    turn_dir, turn_identity = review_root(artifact_root, args.review_id)
     attempts_dir = turn_dir / "attempts"
-    attempts_dir.mkdir()
+    with confined_directory_descriptor(
+        turn_dir, expected_identity=turn_identity
+    ) as turn_descriptor:
+        with confined_relative_directory_descriptor(
+            turn_descriptor, ("attempts",), create=True
+        ) as attempts_descriptor:
+            metadata = os.fstat(attempts_descriptor)
+            attempts_identity = (metadata.st_dev, metadata.st_ino)
+    attempt_identities: dict[Path, tuple[int, int]] = {}
     codex_source_roots = (
         review_source_roots(files)
         if any(route.transport == "codex" for route in routes)
@@ -1932,17 +4496,60 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     )
     snapshots_context = frozen_review_files(files)
     source_files, snapshots = snapshots_context.__enter__()
+    if not source_files:
+        prompt_source: dict[str, str] = {
+            "name": Path(args.prompt_file).name if args.prompt_file else "prompt.txt",
+            "sha256": sha256_bytes(prompt.encode()),
+        }
+        if args.prompt_file:
+            prompt_source["path"] = str(Path(args.prompt_file))
+        source_files.append(prompt_source)
     snapshot_hashes = {file.name: sha256_bytes(file.read_bytes()) for file in snapshots}
+    native_contract = (
+        get_contract(args.response_contract) if args.response_contract == "findings-json" else None
+    )
     source = {
         "files": source_files,
         "git": source_git_metadata(files),
     }
     attempts: list[dict[str, Any]] = []
     accepted: PersistedResponse | None = None
+    accepted_capabilities: BackendCapabilities | None = None
     accepted_review: dict[str, Any] | None = None
     accepted_attempt: int | None = None
+    promoted_fragments: tuple[PromotedFragment, ...] = ()
+    fallback_relationships: list[FallbackRelationship] = []
+    completion_request = None
+    previous_attempt: int | None = None
+    previous_route_index: int | None = None
+    previous_gate_result: str | None = None
+    consolidation_context: ContractContext | None = None
 
-    max_attempts = getattr(args, "max_attempts", 1)
+    profile_settings = route_profile.get("settings", {}) if route_profile else {}
+    configured_timeout = (
+        profile_settings.get("timeout_seconds")
+        if isinstance(profile_settings, dict)
+        else transport_defaults.get("timeout_seconds")
+    )
+    if configured_timeout is None:
+        configured_timeout = transport_defaults.get("timeout_seconds")
+    configured_attempts = (
+        profile_settings.get("max_attempts")
+        if isinstance(profile_settings, dict)
+        else transport_defaults.get("max_attempts")
+    )
+    if configured_attempts is None:
+        configured_attempts = transport_defaults.get("max_attempts")
+    timeout_seconds = (
+        args.timeout_seconds
+        if args.timeout_seconds is not None
+        else configured_timeout or DEFAULT_REVIEW_TIMEOUT_SECONDS
+    )
+    max_attempts = (
+        args.max_attempts
+        if args.max_attempts is not None
+        else configured_attempts or DEFAULT_REVIEW_MAX_ATTEMPTS
+    )
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
     requested_models = [route.model for route in routes]
@@ -1953,6 +4560,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         routes=[{"model": route.model, "transport": route.transport} for route in routes],
         source_class=args.source_class,
     )
+    backend_registry = build_backend_registry()
     number = 0
     for route_index, route in enumerate(routes):
         for _ in range(max_attempts):
@@ -1962,11 +4570,104 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             transport_model = (
                 model.removeprefix("openrouter/") if transport == "openrouter" else model
             )
+            contract_context = (
+                ContractContext(
+                    file_names=tuple(item["name"] for item in source_files),
+                    review_declaration_required=(
+                        transport == "codex" and args.source_class == "proprietary"
+                    ),
+                )
+                if native_contract
+                else None
+            )
+            prepared_contract = (
+                native_contract.prepare(contract_context)
+                if native_contract and contract_context
+                else None
+            )
+            if contract_context is not None:
+                consolidation_context = contract_context
+            attempt_prompt = review_prompt
+            completion_fragments: tuple[PromotedFragment, ...] = ()
+            if prepared_contract is not None and contract_context is not None:
+                completion_fragments = tuple(
+                    fragment
+                    for fragment in promoted_fragments
+                    if fragment.contract_context == contract_context
+                    and fragment.prepared_digest == prepared_contract.digest
+                )
+            if (
+                completion_fragments
+                and completion_request is not None
+                and prepared_contract is not None
+                and contract_context is not None
+            ):
+                target_missing_fields = ("verdict", "findings")
+                if contract_context.review_declaration_required:
+                    target_missing_fields += ("reviewedFiles",)
+                target_completion_request = ContractCompletionRequest(
+                    prepared_digest=prepared_contract.digest,
+                    packet_digest=packet_digest,
+                    missing_fields=target_missing_fields,
+                    invalid_fragment_indexes=completion_request.invalid_fragment_indexes,
+                    violations=completion_request.violations,
+                )
+                completion_context = build_completion_context(
+                    target_completion_request,
+                    completion_fragments,
+                    allowed_file_names=contract_context.file_names,
+                    review_declaration_required=(contract_context.review_declaration_required),
+                )
+                attempt_prompt = render_completion_prompt(review_prompt, completion_context)
+            if (
+                previous_attempt is not None
+                and previous_route_index is not None
+                and previous_gate_result is not None
+            ):
+                relationship_kind = (
+                    "retry" if previous_route_index == route_index else "route-fallback"
+                )
+                relationship = FallbackRelationship(
+                    from_attempt=previous_attempt,
+                    to_attempt=number,
+                    kind=relationship_kind,
+                    reason=previous_gate_result,
+                    promoted_fragment_ids=tuple(
+                        fragment.fragment_id
+                        for fragment in promoted_fragments
+                        if fragment in completion_fragments
+                    ),
+                )
+                fallback_relationships.append(relationship)
+                log_event(
+                    logger,
+                    "attempt_retry" if relationship_kind == "retry" else "route_fallback",
+                    from_attempt=previous_attempt,
+                    to_attempt=number,
+                    from_model=routes[previous_route_index].model,
+                    from_transport=routes[previous_route_index].transport,
+                    to_model=model,
+                    to_transport=transport,
+                    reason=previous_gate_result,
+                    review_id=args.review_id,
+                )
             attempt_dir = attempts_dir / f"{number:02d}"
-            attempt_dir.mkdir()
+            with confined_directory_descriptor(
+                attempts_dir, expected_identity=attempts_identity
+            ) as attempts_descriptor:
+                os.mkdir(attempt_dir.name, mode=0o700, dir_fd=attempts_descriptor)
+                with confined_relative_directory_descriptor(
+                    attempts_descriptor, (attempt_dir.name,)
+                ) as attempt_descriptor:
+                    metadata = os.fstat(attempt_descriptor)
+                    attempt_identity = (metadata.st_dev, metadata.st_ino)
+            attempt_identities[attempt_dir] = attempt_identity
             database: Path | None = None
             request_path: Path | None = None
             response_path: Path | None = None
+            session_path: Path | None = None
+            final_response_path: Path | None = None
+            diagnostic_path: Path | None = None
             log_event(
                 logger,
                 "attempt_started",
@@ -1976,126 +4677,197 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 route_index=route_index,
                 transport=transport,
             )
-            if transport == "codex":
-                exit_code, stderr, persisted = invoke_codex(
-                    codex_bin=os.environ.get("CODEX_BIN", "codex"),
-                    prompt=review_prompt,
-                    model=model,
-                    response_contract=args.response_contract,
-                    source_roots=codex_source_roots,
-                    timeout_seconds=args.timeout_seconds,
-                    workspace=snapshots[0].parent,
-                )
-                # Codex writes its transient response inside the isolated
-                # sandbox, which is removed after the attempt. Persist a copy
-                # in the caller-controlled evidence root so a rejected output
-                # remains diagnosable without weakening the contract gate.
-                response_path = attempt_dir / "response.md"
-                response_path.write_text(persisted.response)
-            elif transport == "openrouter":
-                request_path = attempt_dir / "request.json"
-                response_path = attempt_dir / "response.json"
-                exit_code, stderr, persisted = invoke_openrouter(
-                    api_key=os.environ.get("OPENROUTER_API_KEY"),
-                    prompt=review_prompt,
+            backend = backend_registry.require(transport)
+            capabilities = backend.descriptor.capabilities
+            execution = backend.execute(
+                BackendRequest(
+                    prompt=attempt_prompt,
                     model=transport_model,
-                    files=snapshots,
+                    response_contract=args.response_contract,
+                    files=tuple(snapshots),
+                    attempt_dir=attempt_dir,
+                    timeout_seconds=timeout_seconds,
                     max_output_tokens=args.max_output_tokens,
+                    source_class=args.source_class,
+                    source_roots=tuple(codex_source_roots or ()),
                     provider_preferences=provider_preferences,
-                    response_contract=args.response_contract,
-                    timeout_seconds=args.timeout_seconds,
-                    request_path=request_path,
-                    response_path=response_path,
+                    evidence_parent_identity=attempt_identity,
                 )
-            elif transport == "agy":
-                request_path = attempt_dir / "request.json"
-                response_path = attempt_dir / "response.json"
-                exit_code, stderr, persisted = invoke_agy(
-                    agy_bin=os.environ.get("AGY_BIN", "agy"),
-                    prompt=review_prompt,
-                    model=transport_model,
-                    files=snapshots,
-                    max_output_tokens=args.max_output_tokens,
-                    response_contract=args.response_contract,
-                    timeout_seconds=args.timeout_seconds,
-                    request_path=request_path,
-                    response_path=response_path,
-                )
-            else:
-                database = attempt_dir / "transport.sqlite3"
-                exit_code, stderr = invoke_llm(
-                    llm_bin=os.environ.get("LLM_BIN", "llm"),
-                    prompt=review_prompt,
-                    model=model,
-                    database=database,
-                    files=snapshots,
-                    max_output_tokens=args.max_output_tokens,
-                    response_contract=args.response_contract,
-                    timeout_seconds=args.timeout_seconds,
-                )
-                persisted = load_response(database)
-            review = (
-                validate_review_response(
-                    persisted.response,
-                    args.response_contract,
-                    expected_file_hashes=(
-                        snapshot_hashes
-                        if transport == "codex" and args.source_class == "proprietary"
-                        else None
-                    ),
-                )
-                if persisted is not None
-                else None
             )
-            validation_error = (
-                review_validation_error(
-                    persisted.response,
-                    args.response_contract,
-                    expected_file_hashes=(
-                        snapshot_hashes
-                        if transport == "codex" and args.source_class == "proprietary"
-                        else None
-                    ),
+            exit_code = execution.exit_code
+            stderr = execution.diagnostic
+            persisted = execution.response
+            database = execution.evidence.database
+            request_path = execution.evidence.request
+            response_path = execution.evidence.response
+            session_path = execution.evidence.session
+            final_response_path = execution.evidence.final_response
+            diagnostic_path = execution.evidence.stderr
+            raw_response: dict[str, object] | None = None
+            if persisted is not None:
+                raw_response_path = attempt_dir / "raw-response.txt"
+                raw_response_bytes = persisted.response.encode(errors="surrogatepass")
+                write_private_exclusive(
+                    raw_response_path,
+                    raw_response_bytes,
+                    expected_parent_identity=attempt_identity,
                 )
-                if persisted is not None and review is None
-                else None
-            )
+                raw_response = {
+                    "path": str(raw_response_path),
+                    "sha256": sha256_bytes(raw_response_bytes),
+                    "characters": len(persisted.response),
+                }
+            contract_evaluation = None
+            evaluation_error: dict[str, str] | None = None
+            review = None
+            validation_error = None
             if exit_code == 124:
-                result = "timeout"
+                gate_result = "timeout"
             elif exit_code != 0:
-                result = "transport-failed"
+                gate_result = "transport-failed"
             elif persisted is None:
-                result = "missing-response"
-            elif persisted.model != transport_model:
-                result = "model-mismatch"
-            elif not resolved_provider_matches(provider_preferences, persisted.provider):
-                result = "provider-mismatch"
+                gate_result = "missing-response"
+            elif capabilities.resolved_model_identity and persisted.model != transport_model:
+                gate_result = "model-mismatch"
+            elif capabilities.resolved_provider_identity and not resolved_provider_matches(
+                provider_preferences, persisted.provider
+            ):
+                gate_result = "provider-mismatch"
             elif not persisted.response.strip():
-                result = "empty"
+                gate_result = "empty"
             elif not persisted.conversation_id:
-                result = "missing-conversation"
-            elif review is None:
-                result = "incomplete"
+                gate_result = "missing-conversation"
             else:
-                result = "accepted"
+                if native_contract and prepared_contract and contract_context:
+                    try:
+                        contract_evaluation = native_contract.evaluate(
+                            persisted.response,
+                            prepared_contract,
+                            contract_context,
+                            evidence=EvaluationContext(packet_digest=packet_digest),
+                        )
+                    except (ValueError, UnicodeError, OverflowError) as error:
+                        exception_name = type(error).__name__
+                        evaluation_error = {
+                            "type": exception_name,
+                            "message": "response data could not be evaluated safely",
+                        }
+                        validation_error = (
+                            "findings-json: response data could not be evaluated safely "
+                            f"({exception_name})"
+                        )
+                        gate_result = "contract-invalid"
+                    else:
+                        review = contract_evaluation.value
+                        validation_error = (
+                            findings_validation_error(persisted.response, contract_evaluation)
+                            if review is None
+                            else None
+                        )
+                        if contract_evaluation.status is EvaluationStatus.COMPLETE:
+                            gate_result = "accepted"
+                        elif contract_evaluation.status is EvaluationStatus.INCOMPLETE:
+                            gate_result = "contract-incomplete"
+                        else:
+                            gate_result = "contract-invalid"
+                else:
+                    expected_file_hashes = (
+                        snapshot_hashes
+                        if transport == "codex" and args.source_class == "proprietary"
+                        else None
+                    )
+                    review = validate_review_response(
+                        persisted.response,
+                        args.response_contract,
+                        expected_file_hashes=expected_file_hashes,
+                    )
+                    validation_error = (
+                        review_validation_error(
+                            persisted.response,
+                            args.response_contract,
+                            expected_file_hashes=expected_file_hashes,
+                        )
+                        if review is None
+                        else None
+                    )
+                    gate_result = "incomplete" if review is None else "accepted"
+
+            result = (
+                "incomplete"
+                if gate_result in {"contract-incomplete", "contract-invalid"}
+                else gate_result
+            )
+            newly_promoted: tuple[PromotedFragment, ...] = ()
+            if native_contract and contract_evaluation is not None and raw_response is not None:
+                newly_promoted = promote_fragments(
+                    contract_evaluation,
+                    contract_context=contract_context,
+                    gate_result=gate_result,
+                    attempt=number,
+                    route_index=route_index,
+                    raw_response_digest=str(raw_response["sha256"]),
+                )
+                if newly_promoted and contract_evaluation.completion_request is not None:
+                    promoted_fragments = (*promoted_fragments, *newly_promoted)
+                    completion_request = contract_evaluation.completion_request
 
             attempt = {
+                "number": number,
+                "routeIndex": route_index,
                 "database": str(database) if database else None,
                 "evidence": {
-                    "request": str(request_path) if request_path else None,
-                    "response": str(response_path) if response_path else None,
+                    "request": (
+                        str(request_path)
+                        if request_path is not None and request_path.is_file()
+                        else None
+                    ),
+                    "response": (
+                        str(response_path)
+                        if response_path is not None and response_path.is_file()
+                        else None
+                    ),
+                    "session": (
+                        str(session_path)
+                        if session_path is not None
+                        and session_path.is_file()
+                        and session_path.stat().st_size > 0
+                        else None
+                    ),
+                    "finalResponse": (
+                        str(final_response_path)
+                        if final_response_path is not None and final_response_path.is_file()
+                        else None
+                    ),
+                    "stderr": (
+                        str(diagnostic_path)
+                        if diagnostic_path is not None and diagnostic_path.is_file()
+                        else None
+                    ),
                 },
                 "diagnostic": redact_diagnostic(stderr),
                 "exitCode": exit_code,
                 "isolation": ("macos-source-root-deny" if codex_source_roots else None),
-                "model": {"requested": model, "resolved": persisted.model if persisted else None},
+                "model": {
+                    "requested": model,
+                    "resolved": (
+                        persisted.model
+                        if persisted is not None and capabilities.resolved_model_identity
+                        else None
+                    ),
+                },
                 "provider": {
                     "requested": provider_preferences.get("only", [])
                     if provider_preferences
                     else [],
-                    "resolved": persisted.provider if persisted else None,
+                    "resolved": (
+                        persisted.provider
+                        if persisted is not None and capabilities.resolved_provider_identity
+                        else None
+                    ),
                 },
                 "providerPreferences": provider_preferences,
+                "rawResponse": raw_response,
+                "attemptRequestSha256": sha256_bytes(attempt_prompt.encode()),
                 "result": result,
                 "route": {"model": model, "transport": transport},
                 "validationError": validation_error,
@@ -2110,8 +4882,87 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 "conversationId": persisted.conversation_id if persisted else None,
                 "findings": review.get("findings", []) if review else [],
             }
+            if (
+                args.response_contract in {"product-review-json", "product-judge-json"}
+                and result == "accepted"
+                and review is not None
+            ):
+                contract_identity = receipt_contract_identity(args.response_contract)
+                attempt["contractOutput"] = {
+                    "name": contract_identity["name"],
+                    "version": contract_identity["version"],
+                    "status": "complete",
+                    "normalizedSha256": sha256_bytes(contract_canonical_json(review)),
+                    "contractContext": {
+                        "fileNames": [item["name"] for item in source_files],
+                        "reviewDeclarationRequired": (
+                            transport == "codex" and args.source_class == "proprietary"
+                        ),
+                    },
+                }
+            if native_contract:
+                attempt["promotedFragments"] = [fragment.to_dict() for fragment in newly_promoted]
+            if contract_evaluation:
+                attempt["contractEvaluation"] = {
+                    "name": contract_evaluation.name,
+                    "version": contract_evaluation.version,
+                    "preparedSha256": contract_evaluation.prepared_digest,
+                    "payloadSha256": contract_evaluation.payload_digest,
+                    "normalizedSha256": contract_evaluation.normalized_digest,
+                    "normalizedValue": contract_evaluation.value,
+                    "contractContext": {
+                        "fileNames": list(contract_context.file_names),
+                        "reviewDeclarationRequired": (contract_context.review_declaration_required),
+                    },
+                    "violations": list(contract_evaluation.violations),
+                    "status": contract_evaluation.status.value,
+                    "fragments": [
+                        {
+                            "fragmentId": fragment.fragment_id,
+                            "fingerprint": fragment.fingerprint,
+                            "kind": fragment.kind.value,
+                            "value": fragment.value,
+                            "payloadDigest": fragment.payload_digest,
+                            "scope": list(fragment.scope),
+                        }
+                        for fragment in contract_evaluation.valid_fragments
+                    ],
+                    "coverage": (
+                        {
+                            "requiredFields": list(contract_evaluation.coverage.required_fields),
+                            "coveredFields": list(contract_evaluation.coverage.covered_fields),
+                            "missingFields": list(contract_evaluation.coverage.missing_fields),
+                        }
+                        if contract_evaluation.coverage is not None
+                        else None
+                    ),
+                    "completionRequest": (
+                        {
+                            "preparedDigest": (
+                                contract_evaluation.completion_request.prepared_digest
+                            ),
+                            "packetDigest": contract_evaluation.completion_request.packet_digest,
+                            "missingFields": list(
+                                contract_evaluation.completion_request.missing_fields
+                            ),
+                            "invalidFragmentIndexes": list(
+                                contract_evaluation.completion_request.invalid_fragment_indexes
+                            ),
+                            "violations": list(contract_evaluation.completion_request.violations),
+                        }
+                        if contract_evaluation.completion_request is not None
+                        else None
+                    ),
+                }
+            if evaluation_error is not None:
+                attempt["evaluationError"] = evaluation_error
             attempts.append(attempt)
-            (attempt_dir / "attempt.json").write_bytes(canonical_json(attempt) + b"\n")
+            write_private_exclusive(
+                attempt_dir / "attempt.json",
+                canonical_json(attempt) + b"\n",
+                label="attempt metadata evidence",
+                expected_parent_identity=attempt_identity,
+            )
             log_event(
                 logger,
                 "attempt_finished",
@@ -2127,20 +4978,15 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             )
             if result == "accepted":
                 accepted = persisted
+                accepted_capabilities = capabilities
                 accepted_review = review
                 accepted_attempt = number
                 break
+            previous_attempt = number
+            previous_route_index = route_index
+            previous_gate_result = gate_result
             if result not in RETRIABLE_REVIEW_RESULTS:
                 break
-            log_event(
-                logger,
-                "route_fallback",
-                attempt=number,
-                from_model=model,
-                from_transport=transport,
-                reason=result,
-                review_id=args.review_id,
-            )
         if accepted is not None:
             break
 
@@ -2157,24 +5003,38 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         }
 
     receipt: dict[str, Any] = {
+        "receiptSchemaVersion": 2,
         "acceptedAttempt": accepted_attempt,
         "attempts": attempts,
         "createdAt": utc_now(),
         "model": {
             "requested": requested_models,
-            "resolved": accepted.model if accepted else None,
+            "resolved": (
+                accepted.model
+                if accepted is not None
+                and accepted_capabilities is not None
+                and accepted_capabilities.resolved_model_identity
+                else None
+            ),
         },
         "policy": {"sha256": policy_digest},
         "prompt": {
             "sha256": sha256_bytes(prompt.encode()),
             "characters": len(prompt),
-            "packetSha256": sha256_bytes(review_prompt.encode()),
+            "packetSha256": packet_digest,
         },
         "result": "accepted" if accepted else "unavailable",
         "reviewContract": args.response_contract,
+        "contract": receipt_contract_identity(args.response_contract),
         "reviewId": args.review_id,
+        "sourceClass": args.source_class,
         "source": source,
         "tool": {"name": "reviewctl", "version": __version__},
+        "executionSettings": {
+            "timeoutSeconds": timeout_seconds,
+            "maxAttempts": max_attempts,
+        },
+        "executionConfig": execution_config,
         "transport": (
             routes[0].transport if len({route.transport for route in routes}) == 1 else "routed"
         ),
@@ -2187,6 +5047,22 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "rotation": {"maxBytes": 5 * 1024 * 1024, "backupCount": 5},
         },
     }
+    if kiro_identity_waiver:
+        receipt["extension.kiroUnresolvedIdentityWaiver"] = True
+    if accepted_attempt is not None and attempts[accepted_attempt - 1]["transport"] == "kiro":
+        receipt["extension.backendQualification"] = "unqualified"
+        receipt["extension.mergeGateEligible"] = False
+    if native_contract:
+        assert consolidation_context is not None
+        receipt["fallbackRelationships"] = [
+            relationship.to_dict() for relationship in fallback_relationships
+        ]
+        receipt["consolidatedReview"] = consolidate(
+            accepted_review,
+            promoted_fragments,
+            accepted_attempt,
+            contract_context=consolidation_context,
+        ).to_dict()
     if accepted:
         receipt["response"] = {
             "sha256": sha256_bytes(accepted.response.encode()),
@@ -2194,7 +5070,12 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "conversationId": accepted.conversation_id,
             "costUsd": accepted.cost_usd,
             "durationMs": accepted.duration_ms,
-            "provider": accepted.provider,
+            "provider": (
+                accepted.provider
+                if accepted_capabilities is not None
+                and accepted_capabilities.resolved_provider_identity
+                else None
+            ),
         }
         if args.response_contract == "findings-json":
             receipt["findings"] = accepted_review["findings"] if accepted_review else []
@@ -2213,16 +5094,48 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 }
             )
             receipt["sealed"] = {
-                "request": seal(turn_dir / "request.json", request_payload, args.seal_to),
+                "request": seal(
+                    turn_dir / "request.json",
+                    request_payload,
+                    args.seal_to,
+                    expected_parent_identity=turn_identity,
+                ),
                 "response": seal(
                     turn_dir / "response.md",
                     (accepted.response if accepted else "").encode(),
                     args.seal_to,
+                    expected_parent_identity=turn_identity,
                 ),
             }
 
-        receipt["sha256"] = sha256_bytes(canonical_json(receipt))
-        (turn_dir / "receipt.json").write_bytes(canonical_json(receipt) + b"\n")
+        receipt["sha256"] = sha256_bytes(contract_canonical_json(receipt))
+        expected_receipt_sha256 = receipt["sha256"]
+        receipt_path = turn_dir / "receipt.json"
+        write_private_exclusive(
+            receipt_path,
+            canonical_json(receipt) + b"\n",
+            label="review receipt evidence",
+            expected_parent_identity=turn_identity,
+        )
+        if not persisted_receipt_valid(
+            receipt_path,
+            expected_sha256=expected_receipt_sha256,
+            expected_parent_identity=turn_identity,
+        ):
+            log_event(
+                logger,
+                "review_finished",
+                accepted_attempt=accepted_attempt,
+                attempts=len(attempts),
+                result="receipt_invalid",
+                review_id=args.review_id,
+            )
+            print(turn_dir)
+            print(
+                "reviewctl: receipt_invalid: persisted review receipt failed verification",
+                file=sys.stderr,
+            )
+            return exit_code_for("receipt_invalid")
         log_event(
             logger,
             "review_finished",
@@ -2235,22 +5148,116 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         return 0 if accepted else 1
     finally:
         snapshots_context.__exit__(None, None, None)
-        for database in attempts_dir.glob("*/transport.sqlite3"):
-            database.unlink(missing_ok=True)
+        for attempt_dir, attempt_identity in attempt_identities.items():
+            try:
+                with confined_directory_descriptor(
+                    attempt_dir, expected_identity=attempt_identity
+                ) as attempt_descriptor:
+                    try:
+                        os.unlink("transport.sqlite3", dir_fd=attempt_descriptor)
+                    except FileNotFoundError:
+                        pass
+            except OSError:
+                pass
 
 
 def valid_receipt(receipt: dict[str, Any]) -> bool:
     """Verify the hash embedded in an in-memory receipt without mutating it."""
     recorded = receipt.get("sha256")
     unsigned = {key: value for key, value in receipt.items() if key != "sha256"}
-    return isinstance(recorded, str) and recorded == sha256_bytes(canonical_json(unsigned))
+    try:
+        reproduced = sha256_bytes(canonical_json(unsigned))
+    except TypeError, ValueError, UnicodeError, OverflowError:
+        return False
+    return isinstance(recorded, str) and recorded == reproduced
+
+
+def legacy_receipt_declares_transport(receipt: dict[str, Any], transport: str) -> bool:
+    """Detect a transport claim in the routing positions of a legacy receipt."""
+    if receipt.get("transport") == transport:
+        return True
+    routes = receipt.get("routes")
+    if type(routes) is list and any(
+        type(route) is dict and route.get("transport") == transport for route in routes
+    ):
+        return True
+    attempts = receipt.get("attempts")
+    if type(attempts) is not list:
+        return False
+    for attempt in attempts:
+        if type(attempt) is not dict:
+            continue
+        route = attempt.get("route")
+        if attempt.get("transport") == transport or (
+            type(route) is dict and route.get("transport") == transport
+        ):
+            return True
+    return False
 
 
 def verify_receipt(args: argparse.Namespace) -> int:
     receipt_path = Path(args.receipt)
-    receipt = json.loads(receipt_path.read_text())
-    valid = isinstance(receipt, dict) and valid_receipt(receipt)
-    print(json.dumps({"receipt": str(receipt_path), "valid": valid}, sort_keys=True))
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        receipt = json.loads(
+            read_confined_text(receipt_path),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except OSError, UnicodeError, ValueError:
+        violations = ("json-receipt",)
+    else:
+        if (
+            isinstance(receipt, dict)
+            and "reviewId" in receipt
+            and "configDigest" in receipt
+            and "sha256" in receipt
+        ):
+            from reviewctl.api import verify_project_receipt
+
+            diagnostic = verify_project_receipt(receipt_path)
+            violations = (diagnostic.code,) if diagnostic is not None else ()
+            valid = not violations
+            print(
+                json.dumps(
+                    {
+                        "receipt": str(receipt_path),
+                        "valid": valid,
+                        "violations": list(violations),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0 if valid else exit_code_for("receipt_invalid")
+        if not isinstance(receipt, dict):
+            violations = ("receipt-object",)
+        elif "receiptSchemaVersion" not in receipt:
+            if not valid_receipt(receipt):
+                violations = ("receipt-digest",)
+            elif legacy_receipt_declares_transport(receipt, "kiro"):
+                violations = ("backend-qualification",)
+            else:
+                violations = ()
+        elif receipt.get("receiptSchemaVersion") == 2 and not isinstance(
+            receipt.get("receiptSchemaVersion"), bool
+        ):
+            violations = validate_v2_receipt(receipt)
+        else:
+            violations = ("receipt-schema-version",)
+    valid = not violations
+    print(
+        json.dumps(
+            {
+                "receipt": str(receipt_path),
+                "valid": valid,
+                "violations": list(violations),
+            },
+            sort_keys=True,
+        )
+    )
     return 0 if valid else 1
 
 
@@ -2498,7 +5505,7 @@ def run_candidate_tournament(
             exit_code = run_review(parser, namespace)
             receipt_paths = sorted(set(case_root.glob("**/receipt.json")) - before)
             receipt_path = receipt_paths[0]
-            receipt = json.loads(receipt_path.read_text())
+            receipt = json.loads(read_confined_text(receipt_path))
             actual_cost = receipt_attempt_cost(receipt)
             if candidate.cost_mode == "metered" and actual_cost is not None:
                 actual_spend += actual_cost
@@ -2542,10 +5549,16 @@ def run_candidate_tournament(
 def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     plan_path = Path(args.plan)
     plan = load_policy(str(plan_path))
-    budget = float(plan.get("budget_usd", 0))
-    max_output_tokens = int(plan.get("max_output_tokens", 4096))
+    budget = numeric_value(plan.get("budget_usd", 0))
+    max_output_tokens = plan.get("max_output_tokens", 4096)
     timeout_seconds = plan.get("timeout_seconds", 90)
-    if budget <= 0 or max_output_tokens <= 0:
+    if (
+        budget is None
+        or budget <= 0
+        or not isinstance(max_output_tokens, int)
+        or isinstance(max_output_tokens, bool)
+        or max_output_tokens <= 0
+    ):
         parser.error("tournament plan requires positive budget_usd and max_output_tokens")
     if (
         not isinstance(timeout_seconds, int)
@@ -2586,6 +5599,29 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     legacy_max_attempts = plan.get("max_attempts", 1)
     if not isinstance(legacy_max_attempts, int) or not 1 <= legacy_max_attempts <= 3:
         parser.error("tournament plan max_attempts must be an integer from 1 to 3")
+    legacy_models: list[tuple[str, float, float, int]] = []
+    for model, pricing in models.items():
+        if not isinstance(pricing, dict):
+            parser.error("tournament model pricing must be an object")
+        input_price = numeric_value(pricing.get("input_per_million_usd"))
+        output_price = numeric_value(pricing.get("output_per_million_usd"))
+        if input_price is None or output_price is None or input_price < 0 or output_price < 0:
+            parser.error("tournament model requires finite nonnegative pricing")
+        raw_candidate_max_output_tokens = pricing.get("max_output_tokens")
+        if raw_candidate_max_output_tokens is not None and (
+            not isinstance(raw_candidate_max_output_tokens, int)
+            or isinstance(raw_candidate_max_output_tokens, bool)
+            or raw_candidate_max_output_tokens <= 0
+        ):
+            parser.error("tournament model max_output_tokens must be a positive integer")
+        legacy_models.append(
+            (
+                model,
+                input_price,
+                output_price,
+                raw_candidate_max_output_tokens or max_output_tokens,
+            )
+        )
 
     report_path = tournament_report_path(plan, plan_path)
     runs: list[dict[str, Any]] = []
@@ -2598,20 +5634,10 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         ]
         prompt = str(case["prompt"])
         input_tokens = estimate_tokens(packet_prompt(prompt, files), files)
-        for model, pricing in models.items():
-            if not isinstance(pricing, dict):
-                parser.error("tournament model pricing must be an object")
-            raw_candidate_max_output_tokens = pricing.get("max_output_tokens")
-            if raw_candidate_max_output_tokens is not None and (
-                not isinstance(raw_candidate_max_output_tokens, int)
-                or isinstance(raw_candidate_max_output_tokens, bool)
-                or raw_candidate_max_output_tokens <= 0
-            ):
-                parser.error("tournament model max_output_tokens must be a positive integer")
-            candidate_max_output_tokens = raw_candidate_max_output_tokens or max_output_tokens
+        for model, input_price, output_price, candidate_max_output_tokens in legacy_models:
             estimate = (
-                input_tokens * float(pricing["input_per_million_usd"]) / 1_000_000
-                + candidate_max_output_tokens * float(pricing["output_per_million_usd"]) / 1_000_000
+                input_tokens * input_price / 1_000_000
+                + candidate_max_output_tokens * output_price / 1_000_000
             ) * legacy_max_attempts
             if estimated_spend + estimate > budget:
                 write_tournament_report(
@@ -2663,7 +5689,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             after = set(case_root.glob("**/receipt.json"))
             receipt_paths = sorted(after - before)
             receipt_path = receipt_paths[0]
-            receipt = json.loads(receipt_path.read_text())
+            receipt = json.loads(read_confined_text(receipt_path))
             receipt_result = str(receipt["result"])
             actual_cost = receipt_attempt_cost(receipt)
             if actual_cost is None:
@@ -2741,9 +5767,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-file",
         help="write the accepted model response to this document path",
     )
-    run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=90)
+    run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
     run.add_argument("--max-output-tokens", type=int, default=4096)
-    run.add_argument("--max-attempts", type=int, default=1)
+    run.add_argument("--max-attempts", type=int, default=None)
     run.add_argument("--policy")
     run.add_argument("--provider-only", action="append", default=[])
     run.add_argument("--provider-order", action="append", default=[])
@@ -2764,8 +5790,89 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--seal-to")
     run.add_argument("--source-class", choices=("proprietary", "synthetic"), default="synthetic")
     run.add_argument("--response-contract", choices=sorted(RESPONSE_CONTRACTS), default="verdict")
-    run.add_argument("--transport", choices=("llm", "codex", "openrouter", "agy"), default="llm")
+    run.add_argument(
+        "--transport",
+        choices=("llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"),
+        default="llm",
+    )
     run.set_defaults(handler=lambda namespace: run_review(parser, namespace))
+
+    explore = commands.add_parser(
+        "explore", help="run resumable Pi conversations and prepare formal review handoffs"
+    )
+    explore_commands = explore.add_subparsers(dest="explore_command", required=True)
+    explore_start = explore_commands.add_parser("start", help="start a named Pi exploration")
+    explore_start.add_argument("--id", required=True)
+    explore_start.add_argument("--model", required=True)
+    explore_start.add_argument("--prompt")
+    explore_start.add_argument("--prompt-file")
+    explore_start.add_argument("--cwd", default=".")
+    explore_start.add_argument("--tools", default=DEFAULT_EXPLORATION_TOOLS)
+    explore_start.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=900)
+    explore_start.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
+    explore_start.set_defaults(
+        handler=lambda namespace: run_exploration_turn(parser, namespace, starting=True)
+    )
+
+    explore_resume = explore_commands.add_parser("resume", help="continue a named Pi exploration")
+    explore_resume.add_argument("--id", required=True)
+    explore_resume.add_argument("--model")
+    explore_resume.add_argument("--prompt")
+    explore_resume.add_argument("--prompt-file")
+    explore_resume.add_argument("--cwd")
+    explore_resume.add_argument("--tools")
+    explore_resume.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=900)
+    explore_resume.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
+    explore_resume.set_defaults(
+        handler=lambda namespace: run_exploration_turn(parser, namespace, starting=False)
+    )
+
+    explore_show = explore_commands.add_parser("show", help="show a named exploration manifest")
+    explore_show.add_argument("--id", required=True)
+    explore_show.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
+    explore_show.set_defaults(handler=lambda namespace: show_exploration(parser, namespace))
+
+    explore_promote = explore_commands.add_parser(
+        "promote", help="prepare the latest exploration response for formal review"
+    )
+    explore_promote.add_argument("--id", required=True)
+    explore_promote.add_argument("--output", required=True)
+    explore_promote.add_argument("--exploration-root", default="~/.cache/reviewctl/explorations")
+    explore_promote.set_defaults(handler=lambda namespace: promote_exploration(parser, namespace))
+
+    setup = commands.add_parser(
+        "setup",
+        help="inspect local backend executable availability",
+        epilog="Use a setup subcommand with --format human or --format json.",
+    )
+    setup.set_defaults(backends=())
+    setup_commands = setup.add_subparsers(dest="setup_command", required=True)
+    for name, help_text in (
+        ("discover", "discover the observed local backend topology"),
+        ("show", "show the observed local backend topology"),
+    ):
+        setup_command = setup_commands.add_parser(name, help=help_text)
+        setup_command.add_argument("--format", choices=("human", "json"), default="human")
+        setup_command.set_defaults(handler=run_setup)
+    setup_check = setup_commands.add_parser(
+        "check", help="check local executable backend availability"
+    )
+    setup_check.add_argument(
+        "--backend",
+        dest="backends",
+        action="append",
+        choices=tuple(descriptor.name for descriptor in build_backend_registry().descriptors()),
+        default=[],
+        help="backend name to check (repeatable; defaults to all local executables)",
+    )
+    setup_check.add_argument("--format", choices=("human", "json"), default="human")
+    setup_check.set_defaults(handler=run_setup)
+
+    help_llm_parser = commands.add_parser(
+        "help-llm", help="print concise usage guidance for coding agents"
+    )
+    help_llm_parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    help_llm_parser.set_defaults(handler=lambda namespace: help_llm(parser, namespace))
 
     verify = commands.add_parser("verify", help="verify a receipt hash")
     verify.add_argument("receipt")
@@ -2816,14 +5923,23 @@ def build_parser() -> argparse.ArgumentParser:
     council_plan.set_defaults(
         handler=lambda namespace: write_product_council_plan(parser, namespace)
     )
+    add_project_commands(commands)
     return parser
 
 
-def main() -> None:
+def run_cli(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
-        raise SystemExit(args.handler(args))
+        return int(args.handler(args))
     except RuntimeError as error:
         print(f"reviewctl: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
+        return 1
+    except ReviewctlError as error:
+        diagnostic = Diagnostic("config_invalid", str(error))
+        print(f"reviewctl: {diagnostic.code}: {diagnostic.message}", file=sys.stderr)
+        return exit_code_for(diagnostic.code)
+
+
+def main(argv: list[str] | None = None) -> None:
+    raise SystemExit(run_cli(argv))

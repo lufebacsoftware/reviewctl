@@ -1,0 +1,17 @@
+# Project-local reviewctl configuration. Keep credentials in Pi or the
+# environment; never commit them here.
+[project]
+visibility = "private"
+privacy_mode = "private"
+
+[profiles.pi-review]
+routes = [
+  "pi:openrouter/stealth/ox-alpha",
+  "pi:openrouter/meta/muse-spark-1.2-contributor",
+]
+response_contract = "findings-json"
+execution = "remote"
+tools = "none"
+timeout_seconds = 300
+max_attempts = 1
+max_output_tokens = 8000

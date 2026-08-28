@@ -8,6 +8,8 @@ repository. It uses `llm` as a transport, not as the source of review governance
 
 ## Install
 
+Python 3.14 or newer is required.
+
 ```bash
 uv tool install git+https://github.com/lufebacsoftware/reviewctl.git
 ```
@@ -25,12 +27,47 @@ evidence features call external tools only when selected:
 | Codex transport | Codex CLI; macOS `sandbox-exec` for proprietary-source isolation |
 | OpenRouter direct transport | `curl` and `OPENROUTER_API_KEY` |
 | Gemini/Antigravity transport | `agy` |
+| Gemini CLI transport | local `gemini` CLI; unqualified and advisory |
 | Sealed evidence | `age` |
 
 Missing optional tools produce a typed unavailable attempt; they never count
 as an accepted review.
 
 ## Run a review
+
+For the simpler project-local workflow, initialize once and use the Pi-backed
+front door:
+
+```bash
+reviewctl init --project .
+reviewctl doctor --project . --format json
+reviewctl review --project . --profile default \
+  --prompt "Review this change and return actionable findings." \
+  --file src/example.py --format json
+reviewctl findings --project . --status open
+```
+
+Project reviews keep a private append-only journal under `.reviewctl/`, try
+ordered routes, preserve validated findings from incomplete attempts, and
+write receipts that can be checked offline with `reviewctl verify`. The
+existing `run` command below remains the compatibility and organization-level
+path.
+
+The project journal deduplicates repeated observations by stable finding ID.
+Use the lifecycle command to record a human or CI decision without rewriting
+history:
+
+```bash
+reviewctl findings --project . --status open --format json
+reviewctl findings set-status --project . \
+  --id finding-<stable-id> --status fixed \
+  --reason "patched in commit abc123" --format json
+```
+
+Supported statuses are `open`, `disputed`, `fixed`, `verified`, and
+`dismissed`. The command appends a `finding_status_changed` event; it never
+edits an earlier journal line. Re-observing a finding updates its observation
+count but does not reset its lifecycle status.
 
 ```bash
 reviewctl run \
@@ -59,6 +96,10 @@ provider, duration, exit code, and a redacted diagnostic; it never records promp
 contents. By default it is `<artifact-root>/reviewctl.log`, with five 5 MiB backups. Use
 `--log-file /path/to/reviewctl.log` to place it elsewhere. The receipt records the configured log
 path and rotation policy.
+
+`reviewctl verify` checks receipt integrity; it does not convert an unavailable
+receipt into an accepted one. Automation must also require `result: accepted`
+and a non-null `acceptedAttempt` before treating a run as formal review evidence.
 
 To use a review as working documentation, use `--response-contract document` and add
 `--output-file docs/reviews/<name>.md`. The accepted Markdown response is written there and the
@@ -97,26 +138,67 @@ routes = [
 
 [profiles.code]
 routes = [
-  "llm:openrouter/moonshotai/kimi-k2.7-code",
-  "openrouter:google/gemini-2.5-flash",
+  "codex:gpt-5.6-luna",
 ]
+
+[defaults.codex]
+timeout_seconds = 600
+max_attempts = 2
 ```
 
 Select a profile with `--profile gemini`. A profile cannot be combined with `--model` or
-`--route`; the receipt records the profile name, config path, and config SHA-256. This makes a
-quota fallback easy to use while keeping the exact routing decision reviewable.
+`--route`; the receipt records the profile name, config path, config SHA-256, and execution settings.
+`defaults.<transport>` applies to direct `--transport` invocations and profile runs when the
+profile does not override a setting. Explicit `--timeout-seconds` and `--max-attempts` values take
+precedence. This makes a quota fallback or a long-running Codex review easy to use while keeping
+the exact routing decision reviewable. The receipt records the config digest and effective settings.
 
 `--policy` is optional review metadata. When provided, its SHA-256 is retained in the receipt; it does
 not block a model, transport, or response contract. `policy-check` is advisory by default; use
 `policy-check --enforce` only for a deliberate privacy gate.
 
+The receipt also records the effective `executionSettings`, including the timeout and attempt limit
+after applying profile values and any CLI overrides.
+
 ### Interactive exploration with pi
 
-Use `pi` for exploratory threads, REPL sessions, and trying a review question.
-Use `reviewctl` for the formal review, receipt verification, and evidence
-archive. A `pi` transcript is working material; it is never an approval or a
-substitute for a frozen `--file` packet. See [Pi and reviewctl](docs/PI-INTEGRATION.md)
-for the promotion workflow.
+Use the integrated exploration flow for product ideas, architecture questions,
+repository research, and iterative review preparation:
+
+```bash
+reviewctl explore start \
+  --id ledger-product-ideas \
+  --model openai-codex/gpt-5.6-sol \
+  --cwd ~/Code/workspaces/ledger \
+  --prompt "Explore the product direction and identify questions we should validate."
+
+reviewctl explore resume \
+  --id ledger-product-ideas \
+  --prompt "Now compare those ideas with the current repository and propose a bounded next step."
+
+reviewctl explore show --id ledger-product-ideas
+reviewctl explore promote --id ledger-product-ideas --output /tmp/ledger-product-review
+```
+
+Explorations are named, resumable Pi sessions. The default tool set is read-only
+repository inspection (`read,grep,find,ls`); pass `--tools` explicitly when a
+different capability set is appropriate. Selecting `bash`, `edit`, or `write`
+deliberately expands the local execution boundary. Each turn stores its request and
+turn manifest under `~/.cache/reviewctl/explorations`; Pi event, response, stderr,
+and session artifacts are retained only when Pi actually emits or creates them.
+Runner-generated failures remain in the turn manifest's `diagnostic` field.
+
+`promote` creates `prompt.md`, `exploration.md`, and a manifest for the formal
+handoff. The exploratory response is working material, not an approval or a
+substitute for frozen source files. Run `reviewctl run` separately with the
+bounded source files, response contract, privacy policy, and receipt
+verification required for a formal review. For a bounded headless Pi attempt,
+use `--route pi:<provider/model>`; that transport remains separate from these
+full-tool sessions. See [Pi and reviewctl](docs/PI-INTEGRATION.md).
+
+Pi's current CLI does not expose an output-token cap. Formal Pi request evidence
+therefore records the requested value separately with
+`outputTokenLimitEnforced: false`; do not treat that value as a budget guarantee.
 
 ### Gemini/Antigravity product review
 
@@ -178,12 +260,15 @@ reviewctl run \
 ```
 
 For proprietary reviews on macOS, the Codex transport creates an ephemeral `CODEX_HOME`, copies only
-the required Codex authentication file, and uses `sandbox-exec` to deny reads from the original source
-roots. Codex works from frozen snapshots rather than the checkout. This is a targeted source boundary,
-not a claim that an LLM process is isolated from every host system path. The transport records the
+the required Codex authentication file, and uses `sandbox-exec` to deny reads and writes against the
+original source roots and writes throughout the invoking user's real home. Codex works from frozen
+snapshots rather than the checkout. This is not a claim that an LLM process is isolated from every host
+system path. The transport records the
 Codex session identifier and removes the plaintext final message after extracting its hash and
-validated findings. Codex `*-pro` availability depends on the organization's Codex account; use a
-successful synthetic qualification before making a role mandatory.
+validated findings. Because Codex cannot nest its own macOS seatbelt inside `sandbox-exec`, the
+proprietary path uses Codex's external-sandbox bypass flag; the outer profile remains the enforced
+source-read and home-write boundary. Codex `*-pro` availability depends on the organization's Codex account; use a successful
+synthetic qualification before making a role mandatory.
 
 The tournament command accepts only synthetic cases by policy. It estimates the maximum spend from
 the assembled packet and attached file bytes before each request, then stops before crossing the
@@ -202,7 +287,14 @@ OpenAI/Codex reviews are an approved independent lane, run through the organizat
 and retained in that organization's evidence repository. `reviewctl` currently controls the portable
 `llm` packet transport; it does not route proprietary source through OpenRouter by default.
 
-Read [the council policy](docs/COUNCIL.md), [evidence contract](docs/EVIDENCE.md),
+For coding agents and local automation, `reviewctl help-llm --format json`
+returns machine-readable commands, failure results, contract violations, and
+recovery guidance. The same material is available in
+[Help for LLMs](docs/HELP-LLM.md).
+
+Read [the architecture and canonical vocabulary](docs/ARCHITECTURE.md),
+[the current project handoff and roadmap](docs/HANDOFF.md),
+[the council policy](docs/COUNCIL.md), [evidence contract](docs/EVIDENCE.md),
 [Pi and reviewctl integration](docs/PI-INTEGRATION.md),
 [project-instruction integration guide](docs/PROJECT-INTEGRATION.md), and
 [tournament guide](docs/TOURNAMENT.md) before adding the tool to CI. Model
