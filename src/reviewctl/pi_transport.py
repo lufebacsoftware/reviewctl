@@ -86,6 +86,14 @@ def _terminate_timed_out_process(process: Any) -> tuple[bytes | None, bytes | No
     return killed_stdout or stdout, killed_stderr or stderr
 
 
+def _kill_failed_process(process: Any) -> None:
+    _signal_process(process, signal.SIGKILL)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired, OSError:
+        pass
+
+
 def _run_process(
     command: list[str], *, input_text: str, timeout_seconds: int, cwd: Path
 ) -> PiProcessResult:
@@ -125,8 +133,7 @@ def _run_process(
             if isinstance(trailing_stderr, bytes) and trailing_stderr:
                 stderr = trailing_stderr
         except OSError as error:
-            process.kill()
-            process.wait()
+            _kill_failed_process(process)
             return PiProcessResult(127, b"", str(error).encode("utf-8"), False)
 
         def bounded_output(value: bytes | None, stream, limit: int) -> tuple[bytes, bool]:

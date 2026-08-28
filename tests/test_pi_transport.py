@@ -200,7 +200,6 @@ def test_run_process_returns_successful_process_result(
         "Popen",
         popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
     )
-
     result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
 
     assert result == PiProcessResult(0, b"stdout", b"stderr", False)
@@ -499,7 +498,8 @@ def test_run_process_reports_communication_oserror(
         def kill(self) -> None:
             self.killed = True
 
-        def wait(self) -> None:
+        def wait(self, *, timeout: int) -> None:
+            assert timeout == 2
             self.waited = True
 
     process = BrokenProcess()
@@ -508,12 +508,54 @@ def test_run_process_reports_communication_oserror(
         "Popen",
         popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
     )
+    monkeypatch.setattr(
+        pi_module.os,
+        "killpg",
+        lambda pid, sig: (_ for _ in ()).throw(PermissionError("group signal denied")),
+    )
 
     result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
 
     assert result == PiProcessResult(127, b"", b"pipe broke", False)
     assert process.killed is True
     assert process.waited is True
+
+
+@pytest.mark.parametrize("cleanup_error", [ProcessLookupError, PermissionError])
+def test_run_process_preserves_communication_oserror_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cleanup_error: type[OSError],
+) -> None:
+    class VanishedProcess:
+        pid = 102
+        returncode = 1
+
+        def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
+            raise OSError("primary pipe broke")
+
+        def kill(self) -> None:
+            raise cleanup_error("cleanup failed")
+
+        def wait(self, *, timeout: int) -> None:
+            assert timeout == 2
+            raise OSError("wait failed")
+
+    process = VanishedProcess()
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "Popen",
+        popen_factory(process, expected_command=["pi"], expected_cwd=tmp_path),
+    )
+    monkeypatch.setattr(
+        pi_module.os,
+        "killpg",
+        lambda pid, sig: (_ for _ in ()).throw(PermissionError("group signal denied")),
+    )
+
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(127, b"", b"primary pipe broke", False)
 
 
 def test_text_blocks_accepts_strings_and_rejects_nonlists() -> None:
