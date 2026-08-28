@@ -5211,6 +5211,82 @@ def test_invoke_codex_passes_an_explicit_allowlisted_environment(
     assert response.response == "VERDICT: approved."
 
 
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "final_response", "expected_error"),
+    [
+        (b"12345", b"", b"ok", "Codex transport output exceeded bounded capture"),
+        (b"", b"12345", b"ok", "Codex transport output exceeded bounded capture"),
+        (b"", b"", b"12345", "Codex final response exceeded bounded capture"),
+    ],
+)
+def test_invoke_codex_rejects_oversized_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+    stderr: bytes,
+    final_response: bytes,
+    expected_error: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, timeout: int) -> tuple[bytes, bytes]:
+            command = captured["command"]
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_bytes(final_response)
+            return stdout, stderr
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        captured["command"] = command
+        return Process()
+
+    monkeypatch.setattr(cli, "MAX_CODEX_STDOUT_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli, "MAX_CODEX_STDERR_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli, "MAX_CODEX_RESPONSE_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+
+    exit_code, error, response = cli.invoke_codex(
+        codex_bin="codex",
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=1,
+        workspace=tmp_path,
+    )
+
+    assert (exit_code, error, response.response) == (502, expected_error, "")
+
+
+def test_invoke_codex_fails_closed_without_bounded_capture_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "resource", None)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+
+    exit_code, error, response = cli.invoke_codex(
+        codex_bin="codex",
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=1,
+        workspace=tmp_path,
+    )
+
+    assert (exit_code, error, response.response) == (
+        126,
+        "Codex bounded output capture unsupported on this platform",
+        "",
+    )
+
+
 @pytest.mark.skipif(cli.shutil.which("sandbox-exec") is None, reason="macOS integration")
 def test_macos_sandbox_profile_denies_the_original_source_root(tmp_path: Path) -> None:
     source_root = tmp_path / "source-root"
@@ -7898,6 +7974,53 @@ def test_invoke_llm_attaches_schema_for_structured_contract(tmp_path: Path) -> N
     )
 
     assert exit_code == 0
+
+
+def test_invoke_llm_rejects_oversized_subprocess_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, timeout: int) -> tuple[bytes, bytes]:
+            assert timeout == 1
+            return b"12345", b""
+
+    monkeypatch.setattr(cli, "MAX_LLM_STDOUT_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Process())
+
+    assert cli.invoke_llm(
+        llm_bin="llm",
+        prompt="Review",
+        model="test",
+        database=tmp_path / "transport.sqlite3",
+        files=[],
+        max_output_tokens=20,
+        response_contract="findings-json",
+        timeout_seconds=1,
+    ) == (502, "LLM transport output exceeded bounded capture")
+
+
+def test_invoke_llm_fails_closed_without_bounded_capture_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "resource", None)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+
+    assert cli.invoke_llm(
+        llm_bin="llm",
+        prompt="Review",
+        model="test",
+        database=tmp_path / "transport.sqlite3",
+        files=[],
+        max_output_tokens=20,
+        response_contract="findings-json",
+        timeout_seconds=1,
+    ) == (126, "LLM bounded output capture unsupported on this platform")
 
 
 def test_openrouter_packet_makes_findings_verdict_semantics_explicit(tmp_path: Path) -> None:

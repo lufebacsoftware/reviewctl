@@ -90,11 +90,17 @@ MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
 MAX_KIRO_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_KIRO_STDERR_BYTES = 100_000
+MAX_LLM_DATABASE_BYTES = 4 * 1024 * 1024
+MAX_LLM_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_LLM_STDERR_BYTES = 100_000
 MAX_OPENROUTER_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_OPENROUTER_STDERR_BYTES = 100_000
 MAX_OPENROUTER_STATUS_BYTES = 32
 MAX_PI_EXPLORATION_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_PI_EXPLORATION_STDERR_BYTES = 100_000
+MAX_CODEX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_CODEX_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_CODEX_STDERR_BYTES = 100_000
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
@@ -1750,6 +1756,8 @@ def invoke_llm(
     response_contract: str,
     timeout_seconds: int,
 ) -> tuple[int, str]:
+    if resource is None:
+        return 126, "LLM bounded output capture unsupported on this platform"
     command = [
         llm_bin,
         "prompt",
@@ -1770,18 +1778,41 @@ def invoke_llm(
     if schema := response_schema(response_contract):
         command.extend(["--schema", json.dumps(schema, separators=(",", ":"))])
 
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    capture_file_limit = max(MAX_LLM_DATABASE_BYTES, MAX_LLM_STDOUT_BYTES, MAX_LLM_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+            preexec_fn=limit_output_files,
+        )
+        try:
+            communicated_stdout, communicated_stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(process)
+            return 124, "review attempt timed out"
+
+        def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+            if not isinstance(value, bytes):
+                stream.seek(0)
+                value = stream.read(limit + 1)
+            return value[:limit], len(value) > limit
+
+        _, stdout_truncated = bounded_output(communicated_stdout, stdout_file, MAX_LLM_STDOUT_BYTES)
+        stderr, stderr_truncated = bounded_output(
+            communicated_stderr, stderr_file, MAX_LLM_STDERR_BYTES
+        )
+        if stdout_truncated or stderr_truncated:
+            return 502, "LLM transport output exceeded bounded capture"
         return process.returncode, stderr.decode(errors="replace")
-    except subprocess.TimeoutExpired:
-        terminate_process_group(process)
-        return 124, "review attempt timed out"
 
 
 def openrouter_packet(
@@ -3324,6 +3355,12 @@ def invoke_codex(
     workspace: Path,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Codex against the isolated snapshots and recover its final response."""
+    if resource is None:
+        return (
+            126,
+            "Codex bounded output capture unsupported on this platform",
+            PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+        )
     isolation: CodexIsolation | None = None
     try:
         if source_roots:
@@ -3339,7 +3376,7 @@ def invoke_codex(
         )
 
     temporary_root = isolation.home if isolation else workspace
-    output_path = temporary_root / "codex-response.md"
+    output_path = temporary_root.resolve() / "codex-response.md"
     schema_path: Path | None = None
     sandbox_arguments = (
         ["--dangerously-bypass-approvals-and-sandbox"] if isolation else ["--sandbox", "read-only"]
@@ -3386,28 +3423,73 @@ def invoke_codex(
             {"HOME": os.environ.get("HOME") or str(account_home())},
         )
     )
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=workspace,
-            env=process_environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+    capture_file_limit = (
+        max(MAX_CODEX_RESPONSE_BYTES, MAX_CODEX_STDOUT_BYTES, MAX_CODEX_STDERR_BYTES) + 1
+    )
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
         )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-            exit_code = process.returncode
-            stderr_text = stderr.decode(errors="replace")
-        except subprocess.TimeoutExpired:
-            terminate_process_group(process)
-            stdout = b""
-            exit_code = 124
-            stderr_text = "review attempt timed out"
-            timed_out = True
+
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=workspace,
+                env=process_environment,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+                preexec_fn=limit_output_files,
+            )
+            try:
+                communicated_stdout, communicated_stderr = process.communicate(
+                    timeout=timeout_seconds
+                )
+                exit_code = process.returncode
+            except subprocess.TimeoutExpired:
+                terminate_process_group(process)
+                communicated_stdout = b""
+                communicated_stderr = b""
+                exit_code = 124
+                timed_out = True
+
+            def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
+                if not isinstance(value, bytes):
+                    stream.seek(0)
+                    value = stream.read(limit + 1)
+                return value[:limit], len(value) > limit
+
+            stdout, stdout_truncated = bounded_output(
+                communicated_stdout, stdout_file, MAX_CODEX_STDOUT_BYTES
+            )
+            stderr, stderr_truncated = bounded_output(
+                communicated_stderr, stderr_file, MAX_CODEX_STDERR_BYTES
+            )
+        if stdout_truncated or stderr_truncated:
+            return (
+                502,
+                "Codex transport output exceeded bounded capture",
+                PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+            )
+        stderr_text = "review attempt timed out" if timed_out else stderr.decode(errors="replace")
         transport_output = f"{stdout.decode(errors='replace')}\n{stderr_text}"
         session = re.search(r"session id:\s*([^\s]+)", transport_output)
         resolved_model = re.search(r"^model:\s*([^\s]+)", transport_output, flags=re.MULTILINE)
+        response_text = ""
+        if output_path.is_file() and not timed_out:
+            with confined_regular_descriptor(output_path, os.O_RDONLY) as descriptor:
+                with os.fdopen(os.dup(descriptor), "rb") as stream:
+                    raw_response = stream.read(MAX_CODEX_RESPONSE_BYTES + 1)
+            if len(raw_response) > MAX_CODEX_RESPONSE_BYTES:
+                return (
+                    502,
+                    "Codex final response exceeded bounded capture",
+                    PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+                )
+            response_text = raw_response.decode("utf-8")
         return (
             exit_code,
             stderr_text,
@@ -3419,9 +3501,7 @@ def invoke_codex(
                 model=resolved_model.group(1) if resolved_model else "",
                 output_tokens=None,
                 provider=None,
-                response=(
-                    output_path.read_text() if output_path.is_file() and not timed_out else ""
-                ),
+                response=response_text,
             ),
         )
     finally:
