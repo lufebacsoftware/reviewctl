@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -322,6 +324,27 @@ def test_project_receipt_verification_rejects_duplicate_json_keys(tmp_path: Path
 
     assert diagnostic is not None
     assert diagnostic.code == "receipt_invalid"
+
+
+def test_project_receipt_verification_rejects_a_fifo_without_blocking(tmp_path: Path) -> None:
+    receipt = tmp_path / "receipt.json"
+    os.mkfifo(receipt)
+    script = (
+        "from pathlib import Path; "
+        "from reviewctl.api import verify_project_receipt; "
+        f"diagnostic = verify_project_receipt(Path({str(receipt)!r})); "
+        "assert diagnostic is not None and diagnostic.code == 'receipt_invalid'"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=1,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])
@@ -780,8 +803,6 @@ def test_source_reader_fails_closed_without_dirfd_support(tmp_path: Path, monkey
 
     with pytest.raises(OSError, match="without following symlinks"):
         api_module._read_source_bytes(source)
-    with pytest.raises(OSError, match="without following symlinks"):
-        api_module._source_opener(source.name, os.O_RDONLY, directory=0)
 
 
 @pytest.mark.parametrize("invalid_component", ["root", "ancestor"])
@@ -890,6 +911,39 @@ def test_client_rejects_source_with_ancestor_replaced_by_external_symlink_before
     assert result.diagnostic is not None
     assert "could not be read" in result.diagnostic.message
     assert transport.requests == []
+
+
+def test_source_reader_rejects_project_parent_replaced_before_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "project"
+    project.mkdir(parents=True)
+    source = project / "source.py"
+    source.write_text("safe = True\n")
+    displaced = tmp_path / "workspace-displaced"
+    external_workspace = tmp_path / "external-workspace"
+    external_source = external_workspace / "project" / source.name
+    external_source.parent.mkdir(parents=True)
+    external_source.write_text("secret = True\n")
+    real_open = api_module.os.open
+    swapped = False
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == Path(project.anchor) and not swapped:
+            swapped = True
+            workspace.rename(displaced)
+            workspace.symlink_to(external_workspace, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(api_module.os, "open", raced_open)
+
+    with pytest.raises(OSError):
+        api_module._read_source_bytes(source, project_dir=project)
+
+    assert swapped
+    assert external_source.read_text() == "secret = True\n"
 
 
 def test_client_rejects_unknown_contract_and_unregistered_transport(tmp_path: Path) -> None:

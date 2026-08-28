@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,6 +70,38 @@ def test_journal_append_rejects_state_file_replaced_by_symlink_before_open(
     assert external.stat().st_mode & 0o777 == 0o644
 
 
+def test_journal_append_rejects_project_parent_replaced_before_directory_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "project"
+    project.mkdir(parents=True)
+    path = project / ".reviewctl" / "journal.jsonl"
+    journal = ProjectJournal(path)
+    displaced = tmp_path / "workspace-displaced"
+    external_workspace = tmp_path / "external-workspace"
+    external_root = external_workspace / "project" / ".reviewctl"
+    external_root.mkdir(parents=True)
+    real_open = journal_module.os.open
+    swapped = False
+
+    def raced_open(open_path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(open_path) == Path(project.anchor) and not swapped:
+            swapped = True
+            workspace.rename(displaced)
+            workspace.symlink_to(external_workspace, target_is_directory=True)
+        return real_open(open_path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(journal_module.os, "open", raced_open)
+
+    with pytest.raises(JournalOperationError, match="journal directory"):
+        journal.append({"type": "review_started", "reviewId": "r1"})
+
+    assert swapped
+    assert list(external_root.iterdir()) == []
+
+
 def test_journal_reports_existing_non_regular_path_as_corrupt(tmp_path: Path) -> None:
     path = tmp_path / ".reviewctl" / "journal.jsonl"
     path.mkdir(parents=True)
@@ -96,7 +129,7 @@ def test_journal_descriptor_open_fails_closed_for_platform_and_path_errors(
     real_open = journal_module.os.open
 
     def fail_parent(path, flags, *args, **kwargs):
-        if Path(path) == journal.path.parent:
+        if Path(path) == Path(journal.path.anchor):
             raise OSError("parent failed")
         return real_open(path, flags, *args, **kwargs)
 
@@ -112,13 +145,17 @@ def test_journal_descriptor_open_rejects_non_directory_and_missing_create(
     real_open = journal_module.os.open
     real_fstat = journal_module.os.fstat
     parent_descriptor: int | None = None
+    real_dup = journal_module.os.dup
 
     def tracked_open(path, flags, *args, **kwargs):
         nonlocal parent_descriptor
         descriptor = real_open(path, flags, *args, **kwargs)
-        if Path(path) == journal.path.parent:
-            parent_descriptor = descriptor
         return descriptor
+
+    def tracked_dup(descriptor: int) -> int:
+        nonlocal parent_descriptor
+        parent_descriptor = real_dup(descriptor)
+        return parent_descriptor
 
     def non_directory_parent(descriptor: int):
         if descriptor == parent_descriptor:
@@ -126,6 +163,7 @@ def test_journal_descriptor_open_rejects_non_directory_and_missing_create(
         return real_fstat(descriptor)
 
     monkeypatch.setattr(journal_module.os, "open", tracked_open)
+    monkeypatch.setattr(journal_module.os, "dup", tracked_dup)
     monkeypatch.setattr(journal_module.os, "fstat", non_directory_parent)
     with pytest.raises(JournalOperationError, match="not a directory"):
         journal.append({"type": "review_started"})
@@ -148,6 +186,8 @@ def test_journal_descriptor_open_preserves_error_when_parent_close_fails(
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     real_open = journal_module.os.open
     real_close = journal_module.os.close
+    real_dup = journal_module.os.dup
+    parent_descriptor: int | None = None
 
     def fail_file(path, flags, *args, **kwargs):
         if Path(path) == Path(journal.path.name):
@@ -155,12 +195,21 @@ def test_journal_descriptor_open_preserves_error_when_parent_close_fails(
         return real_open(path, flags, *args, **kwargs)
 
     def fail_close(descriptor: int) -> None:
+        if descriptor != parent_descriptor:
+            real_close(descriptor)
+            return
         try:
             raise OSError("close failed")
         finally:
             real_close(descriptor)
 
+    def tracked_dup(descriptor: int) -> int:
+        nonlocal parent_descriptor
+        parent_descriptor = real_dup(descriptor)
+        return parent_descriptor
+
     monkeypatch.setattr(journal_module.os, "open", fail_file)
+    monkeypatch.setattr(journal_module.os, "dup", tracked_dup)
     monkeypatch.setattr(journal_module.os, "close", fail_close)
     with pytest.raises(JournalOperationError, match="file failed"):
         journal.append({"type": "review_started"})
@@ -169,15 +218,13 @@ def test_journal_descriptor_open_preserves_error_when_parent_close_fails(
 def test_journal_close_failure_is_reported_for_append_and_read(tmp_path: Path, monkeypatch) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     journal.append({"type": "review_started"})
-    real_close = journal_module.os.close
+    real_close_descriptors = journal._close_descriptors
 
-    def fail_close(descriptor: int) -> None:
-        try:
-            raise OSError("close failed")
-        finally:
-            real_close(descriptor)
+    def fail_close_descriptors(*descriptors: int) -> None:
+        real_close_descriptors(*descriptors)
+        raise OSError("close failed")
 
-    monkeypatch.setattr(journal_module.os, "close", fail_close)
+    monkeypatch.setattr(journal, "_close_descriptors", fail_close_descriptors)
     with pytest.raises(OSError, match="close failed"):
         journal.append({"type": "review_finished"})
 
@@ -185,6 +232,26 @@ def test_journal_close_failure_is_reported_for_append_and_read(tmp_path: Path, m
     assert events == []
     assert diagnostic is not None
     assert diagnostic.code == "journal_corrupt"
+
+
+def test_journal_descriptor_close_reports_a_failure_without_a_primary_error(
+    monkeypatch,
+) -> None:
+    read_descriptor, write_descriptor = os.pipe()
+    real_close = journal_module.os.close
+
+    def fail_close(descriptor: int) -> None:
+        try:
+            if descriptor == read_descriptor:
+                raise OSError("close failed")
+        finally:
+            real_close(descriptor)
+
+    monkeypatch.setattr(journal_module.os, "close", fail_close)
+
+    with pytest.raises(OSError, match="close failed"):
+        ProjectJournal._close_descriptors(read_descriptor)
+    real_close(write_descriptor)
 
 
 def test_journal_appends_and_reads_events(tmp_path: Path) -> None:
@@ -913,30 +980,43 @@ def test_journal_append_preserves_primary_when_rollback_and_close_fail(
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     real_open = journal_module.os.open
     real_close = journal_module.os.close
+    real_dup = journal_module.os.dup
     descriptors: list[int] = []
     rollback_attempts: list[tuple[int, int]] = []
+    evidence_descriptors: set[int] = set()
 
-    def tracked_open(*args, **kwargs):
-        descriptor = real_open(*args, **kwargs)
-        descriptors.append(descriptor)
+    def tracked_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == Path(journal.path.name):
+            descriptors.append(descriptor)
+            evidence_descriptors.add(descriptor)
         return descriptor
+
+    def tracked_dup(descriptor: int) -> int:
+        duplicate = real_dup(descriptor)
+        descriptors.append(duplicate)
+        evidence_descriptors.add(duplicate)
+        return duplicate
 
     def fail_rollback(descriptor, length):
         rollback_attempts.append((descriptor, length))
         raise OSError("rollback secondary")
 
     monkeypatch.setattr(journal_module.os, "open", tracked_open)
+    monkeypatch.setattr(journal_module.os, "dup", tracked_dup)
     monkeypatch.setattr(
         journal_module.os,
         "write",
         lambda descriptor, contents: (_ for _ in ()).throw(RuntimeError("write primary")),
     )
     monkeypatch.setattr(journal_module.os, "ftruncate", fail_rollback)
-    monkeypatch.setattr(
-        journal_module.os,
-        "close",
-        lambda descriptor: (_ for _ in ()).throw(OSError("close secondary")),
-    )
+
+    def fail_evidence_close(descriptor: int) -> None:
+        if descriptor in evidence_descriptors:
+            raise OSError("close secondary")
+        real_close(descriptor)
+
+    monkeypatch.setattr(journal_module.os, "close", fail_evidence_close)
 
     with pytest.raises(RuntimeError, match="write primary"):
         journal.append({"type": "review_started", "reviewId": "r1"})

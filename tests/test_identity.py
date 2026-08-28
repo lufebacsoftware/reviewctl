@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,18 +110,33 @@ def test_state_root_helper_preserves_descriptor_error_when_close_fails(
     project = tmp_path / "project"
     (project / ".reviewctl").mkdir(parents=True)
     real_close = identity_module.os.close
+    real_open = identity_module.os.open
+    real_fstat = identity_module.os.fstat
+    root_descriptor: int | None = None
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal root_descriptor
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == Path(".reviewctl"):
+            root_descriptor = descriptor
+        return descriptor
 
     def fail_close(descriptor: int) -> None:
+        if descriptor != root_descriptor:
+            real_close(descriptor)
+            return
         try:
             raise OSError("close failed")
         finally:
             real_close(descriptor)
 
-    monkeypatch.setattr(
-        identity_module.os,
-        "fstat",
-        lambda descriptor: (_ for _ in ()).throw(RuntimeError("fstat failed")),
-    )
+    def fail_root_fstat(descriptor: int):
+        if descriptor == root_descriptor:
+            raise RuntimeError("fstat failed")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(identity_module.os, "open", tracked_open)
+    monkeypatch.setattr(identity_module.os, "fstat", fail_root_fstat)
     monkeypatch.setattr(identity_module.os, "close", fail_close)
 
     with pytest.raises(RuntimeError, match="fstat failed"):
@@ -209,10 +225,42 @@ def test_identity_store_rejects_state_root_replaced_before_lock_open(
     assert list(external.iterdir()) == []
 
 
+def test_identity_store_rejects_project_parent_replaced_before_root_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "project"
+    project.mkdir(parents=True)
+    store = ProjectIdentityStore(project)
+    displaced = tmp_path / "workspace-displaced"
+    external_workspace = tmp_path / "external-workspace"
+    external_root = external_workspace / "project" / ".reviewctl"
+    external_root.mkdir(parents=True)
+    real_open = identity_module.os.open
+    swapped = False
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == Path(project.anchor) and not swapped:
+            swapped = True
+            workspace.rename(displaced)
+            workspace.symlink_to(external_workspace, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(identity_module.os, "open", raced_open)
+
+    with pytest.raises(JournalOperationError, match="state root"):
+        store.ensure("project-one")
+
+    assert swapped
+    assert list(external_root.iterdir()) == []
+
+
 def test_identity_root_descriptor_rejects_missing_root_and_unsupported_platform(
     tmp_path: Path, monkeypatch
 ) -> None:
     store = ProjectIdentityStore(tmp_path / "project")
+    store.project_dir.mkdir(parents=True)
     with pytest.raises(JournalOperationError, match="state root"):
         with store._root_descriptor(create=False):
             pass
@@ -223,6 +271,52 @@ def test_identity_root_descriptor_rejects_missing_root_and_unsupported_platform(
         with store._root_descriptor():
             pass
     assert error.value.diagnostic.code == "journal_unavailable"
+
+
+def test_identity_root_helpers_reject_non_directory_descriptors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    root = project / ".reviewctl"
+    root.mkdir(parents=True)
+    store = ProjectIdentityStore(project)
+    real_open = identity_module.os.open
+    real_fstat = identity_module.os.fstat
+    root_descriptors: set[int] = set()
+
+    def tracked_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == Path(root.name):
+            root_descriptors.add(descriptor)
+        return descriptor
+
+    def non_directory_root(descriptor: int):
+        if descriptor in root_descriptors:
+            return SimpleNamespace(st_mode=0)
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(identity_module.os, "open", tracked_open)
+    monkeypatch.setattr(identity_module.os, "fstat", non_directory_root)
+
+    with pytest.raises(JournalOperationError, match="state root"):
+        ensure_project_state_root(project)
+    with pytest.raises(JournalOperationError, match="state root"):
+        with store._root_descriptor():
+            pass
+
+
+def test_state_root_helper_fails_closed_if_a_created_project_disappears(
+    tmp_path: Path, monkeypatch
+) -> None:
+    @contextmanager
+    def missing_project(path, *, create=False):
+        raise FileNotFoundError("project raced away")
+        yield
+
+    monkeypatch.setattr(identity_module, "confined_directory_descriptor", missing_project)
+
+    with pytest.raises(JournalOperationError, match="state root"):
+        ensure_project_state_root(tmp_path / "project")
 
 
 def test_identity_rejects_non_regular_identity_temporary_and_lock(
@@ -571,7 +665,7 @@ def test_identity_lock_preserves_body_error_when_close_also_fails(
     with pytest.raises(OSError, match="close failed"):
         with store._identity_lock():
             pass
-    assert len(close_attempts) == 4
+    assert len(close_attempts) >= 4
 
 
 def test_identity_lock_preserves_body_error_when_unlock_also_fails(

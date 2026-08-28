@@ -20,7 +20,7 @@ import threading
 import time
 import tomllib
 from collections.abc import Iterator, Mapping
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
@@ -61,6 +61,7 @@ from reviewctl.contracts import (
     canonical_json as contract_canonical_json,
 )
 from reviewctl.errors import Diagnostic, ReviewctlError, exit_code_for
+from reviewctl.filesystem import confined_regular_descriptor, read_confined_text
 from reviewctl.project_cli import add_project_commands
 from reviewctl.review_flow import (
     FallbackRelationship,
@@ -355,31 +356,29 @@ def sha256_bytes(value: bytes) -> str:
 def write_private_exclusive(
     path: Path, contents: bytes, *, label: str = "raw response evidence"
 ) -> None:
-    try:
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-    except FileExistsError as error:
-        if label == "raw response evidence":
-            message = (
-                f"{label} collision at {path}: "
-                "the adapter already created the reserved raw-response.txt path; "
-                "configure the adapter to use a different evidence path"
+    with ExitStack() as descriptors:
+        try:
+            descriptor = descriptors.enter_context(
+                confined_regular_descriptor(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
             )
-        else:
-            message = f"{label} collision at {path}: the reserved path already exists"
-        raise RuntimeError(message) from error
-    try:
+        except FileExistsError as error:
+            if label == "raw response evidence":
+                message = (
+                    f"{label} collision at {path}: "
+                    "the adapter already created the reserved raw-response.txt path; "
+                    "configure the adapter to use a different evidence path"
+                )
+            else:
+                message = f"{label} collision at {path}: the reserved path already exists"
+            raise RuntimeError(message) from error
+        except OSError as error:
+            raise RuntimeError(f"{label} path is unsafe at {path}: {error}") from error
         remaining = memoryview(contents)
         while remaining:
             written = os.write(descriptor, remaining)
             if written == 0:
                 raise OSError(f"could not finish writing raw response evidence at {path}")
             remaining = remaining[written:]
-    finally:
-        os.close(descriptor)
 
 
 def canonical_json(value: object) -> bytes:
@@ -2423,8 +2422,12 @@ def invoke_agy(
     if process.returncode != 0:
         return process.returncode, stderr_text, blank
     try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
+        payload = json.loads(
+            stdout,
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+        )
+    except json.JSONDecodeError, ValueError:
         return 502, "agy returned invalid JSON", blank
     if not isinstance(payload, dict):
         return 502, "agy returned a non-object response", blank
@@ -3821,7 +3824,7 @@ def persisted_receipt_valid(path: Path, *, expected_sha256: str | None = None) -
 
     try:
         receipt = json.loads(
-            path.read_text(encoding="utf-8"),
+            read_confined_text(path),
             object_pairs_hook=exact_json_object,
             parse_constant=reject_nonstandard_constant,
         )

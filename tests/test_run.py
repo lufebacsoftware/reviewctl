@@ -330,7 +330,9 @@ if delay := os.environ.get('AGY_SLEEP'):
     time.sleep(float(delay))
 if exit_code := os.environ.get('AGY_EXIT'):
     sys.exit(int(exit_code))
-if os.environ.get('AGY_INVALID_JSON'):
+if raw_payload := os.environ.get('AGY_RAW_PAYLOAD'):
+    print(raw_payload)
+elif os.environ.get('AGY_INVALID_JSON'):
     print('{')
 elif os.environ.get('AGY_LIST'):
     print('[]')
@@ -3439,6 +3441,26 @@ def test_persisted_receipt_validation_requires_the_expected_digest(tmp_path: Pat
     assert cli.persisted_receipt_valid(receipt, expected_sha256="0" * 64) is False
 
 
+def test_persisted_receipt_validation_rejects_a_fifo_without_blocking(tmp_path: Path) -> None:
+    receipt = tmp_path / "receipt.json"
+    os.mkfifo(receipt)
+    script = (
+        "from pathlib import Path; "
+        "from reviewctl.cli import persisted_receipt_valid; "
+        f"assert persisted_receipt_valid(Path({str(receipt)!r})) is False"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=1,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_run_rejects_a_receipt_path_replaced_with_a_symlink(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -3458,6 +3480,30 @@ def test_run_rejects_a_receipt_path_replaced_with_a_symlink(
     assert cli.run_cli(review_arguments(tmp_path, "accepted")) == 1
     assert external.read_text() == "outside"
     assert "review receipt evidence collision" in capsys.readouterr().err
+
+
+def test_run_rejects_a_receipt_parent_replaced_with_a_symlink(tmp_path: Path, monkeypatch) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    external = tmp_path / "external-turn"
+    external.mkdir()
+    real_write_private_exclusive = cli.write_private_exclusive
+    swapped = False
+
+    def replace_receipt_parent(path: Path, contents: bytes, **kwargs: object) -> None:
+        nonlocal swapped
+        if path.name == "receipt.json":
+            displaced = path.parent.with_name(f"{path.parent.name}-displaced")
+            path.parent.rename(displaced)
+            path.parent.symlink_to(external, target_is_directory=True)
+            swapped = True
+        real_write_private_exclusive(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "write_private_exclusive", replace_receipt_parent)
+    monkeypatch.setenv("LLM_BIN", str(fake_llm))
+
+    assert cli.run_cli(review_arguments(tmp_path, "accepted")) == 1
+    assert swapped
+    assert list(external.iterdir()) == []
 
 
 def test_findings_contract_rejects_a_severity_outside_the_shared_taxonomy() -> None:
@@ -8282,6 +8328,35 @@ def test_invoke_agy_prefers_schema_validated_structured_output(
     assert response.response == json.dumps(structured, separators=(",", ":"), sort_keys=True)
 
 
+def test_invoke_agy_rejects_duplicate_keys_in_structured_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setenv(
+        "AGY_RAW_PAYLOAD",
+        '{"status":"SUCCESS","structured_output":'
+        '{"verdict":"changes-requested","verdict":"approved","findings":[]}}',
+    )
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin=str(fake_agy),
+        prompt="Review synthetic source.",
+        model="gemini-3.7-flash-high",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert exit_code == 502
+    assert error == "agy returned invalid JSON"
+    assert response.response == ""
+
+
 def test_invoke_agy_rejects_non_success_or_invalid_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9295,8 +9370,8 @@ def test_cli_task8_schema_write_defaults_and_account_edges(tmp_path: Path, monke
     opened: list[int] = []
     closed: list[int] = []
 
-    def recording_open(*args: object) -> int:
-        descriptor = original_open(*args)
+    def recording_open(*args: object, **kwargs: object) -> int:
+        descriptor = original_open(*args, **kwargs)
         opened.append(descriptor)
         return descriptor
 
@@ -9310,11 +9385,12 @@ def test_cli_task8_schema_write_defaults_and_account_edges(tmp_path: Path, monke
     with pytest.raises(OSError, match="could not finish writing"):
         cli.write_private_exclusive(destination, b"payload")
     assert destination.read_bytes() == b""
-    assert len(opened) == 1
-    assert closed == opened
-    with pytest.raises(OSError) as error:
-        cli.os.fstat(opened[0])
-    assert error.value.errno == errno.EBADF
+    assert len(opened) > 1
+    assert sorted(closed) == sorted(opened)
+    for descriptor in opened:
+        with pytest.raises(OSError) as error:
+            cli.os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF
 
     parser = argparse.ArgumentParser()
     with monkeypatch.context() as isolated:

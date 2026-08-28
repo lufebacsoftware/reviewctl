@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import stat
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 
+from reviewctl.filesystem import confined_directory_descriptor
 from reviewctl.identity import confine_project_state_path
 
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
@@ -17,13 +18,6 @@ class ArtifactStore:
 
     def __init__(self, root: Path) -> None:
         self.root = confine_project_state_path(root)
-        self._anchor = self.root.parent
-        self._root_parts = (self.root.name,)
-        for candidate in (self.root, *self.root.parents):
-            if candidate.name == ".reviewctl":
-                self._anchor = candidate.parent
-                self._root_parts = (candidate.name, *self.root.relative_to(candidate).parts)
-                break
         with self._directory_descriptor(()):
             pass
 
@@ -39,26 +33,9 @@ class ArtifactStore:
 
     @contextmanager
     def _directory_descriptor(self, parts: tuple[str, ...]):
-        no_follow = getattr(os, "O_NOFOLLOW", None)
-        directory_flag = getattr(os, "O_DIRECTORY", None)
-        if no_follow is None or directory_flag is None or not _OPEN_SUPPORTS_DIR_FD:
+        if not _OPEN_SUPPORTS_DIR_FD:
             raise OSError("this platform cannot confine review artifacts")
-        flags = os.O_RDONLY | directory_flag | no_follow
-        with ExitStack() as descriptors:
-            current = os.open(self._anchor, flags)
-            descriptors.callback(os.close, current)
-            if not stat.S_ISDIR(os.fstat(current).st_mode):
-                raise OSError("artifact anchor is not a directory")
-            for component in (*self._root_parts, *parts):
-                try:
-                    child = os.open(component, flags, dir_fd=current)
-                except FileNotFoundError:
-                    os.mkdir(component, mode=0o700, dir_fd=current)
-                    child = os.open(component, flags, dir_fd=current)
-                descriptors.callback(os.close, child)
-                if not stat.S_ISDIR(os.fstat(child).st_mode):
-                    raise OSError("artifact path component is not a directory")
-                current = child
+        with confined_directory_descriptor(self.root.joinpath(*parts), create=True) as current:
             os.fchmod(current, 0o700)
             yield current
 

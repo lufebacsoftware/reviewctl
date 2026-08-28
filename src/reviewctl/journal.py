@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
 
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError
+from reviewctl.filesystem import confined_directory_descriptor
 from reviewctl.identity import confine_project_state_path
 
 FINDING_STATUSES = frozenset({"open", "disputed", "fixed", "verified", "dismissed"})
@@ -148,10 +149,8 @@ class ProjectJournal:
                 )
             )
         try:
-            parent = os.open(
-                self.path.parent,
-                os.O_RDONLY | directory_flag | no_follow,
-            )
+            with confined_directory_descriptor(self.path.parent) as confined_parent:
+                parent = os.dup(confined_parent)
         except OSError as error:
             raise JournalOperationError(
                 Diagnostic("journal_corrupt", f"could not open journal directory: {error}")

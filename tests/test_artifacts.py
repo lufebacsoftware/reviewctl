@@ -102,13 +102,18 @@ def test_artifact_store_rejects_non_directory_and_non_file_descriptors(
     tmp_path: Path, monkeypatch, invalid_descriptor: str
 ) -> None:
     store = ArtifactStore(tmp_path / "review")
+    if invalid_descriptor == "artifact":
+        monkeypatch.setattr(artifacts_module.stat, "S_ISREG", lambda mode: False)
+        with pytest.raises(OSError, match="not a regular file"):
+            store.write_text("packet.json", "private prompt")
+        return
     real_fstat = artifacts_module.os.fstat
     calls = 0
 
     def fake_fstat(descriptor: int):
         nonlocal calls
         calls += 1
-        invalid_call = {"anchor": 1, "component": 2, "artifact": 3}[invalid_descriptor]
+        invalid_call = {"anchor": 1, "component": 2}[invalid_descriptor]
         if calls == invalid_call:
             return SimpleNamespace(st_mode=0)
         return real_fstat(descriptor)
@@ -193,7 +198,7 @@ def test_artifact_write_rejects_project_root_replaced_before_anchor_open(
 
     def raced_open(path, flags, *args, **kwargs):
         nonlocal swapped
-        if Path(path) == store._anchor and not swapped:
+        if Path(path) == Path(store.root.anchor) and not swapped:
             swapped = True
             project.rename(displaced)
             project.symlink_to(external_project, target_is_directory=True)
@@ -206,3 +211,34 @@ def test_artifact_write_rejects_project_root_replaced_before_anchor_open(
 
     assert swapped
     assert list((external_project / ".reviewctl" / "reviews" / "r1").iterdir()) == []
+
+
+def test_artifact_write_rejects_project_parent_replaced_before_anchor_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "project"
+    project.mkdir(parents=True)
+    store = ArtifactStore(project / ".reviewctl" / "reviews" / "r1")
+    displaced = tmp_path / "workspace-displaced"
+    external_workspace = tmp_path / "external-workspace"
+    external_root = external_workspace / "project" / ".reviewctl" / "reviews" / "r1"
+    external_root.mkdir(parents=True)
+    real_open = artifacts_module.os.open
+    swapped = False
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == Path(store.root.anchor) and not swapped:
+            swapped = True
+            workspace.rename(displaced)
+            workspace.symlink_to(external_workspace, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(artifacts_module.os, "open", raced_open)
+
+    with pytest.raises(OSError):
+        store.write_text("packet.json", "private prompt")
+
+    assert swapped
+    assert list(external_root.iterdir()) == []

@@ -8,7 +8,7 @@ import os
 import secrets
 import stat
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - journal support is POSIX-only
     fcntl = None
 
 from reviewctl.errors import Diagnostic, JournalOperationError
+from reviewctl.filesystem import confined_directory_descriptor
 
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
@@ -52,33 +53,40 @@ def ensure_project_state_root(project_dir: Path, *, create: bool = True) -> Path
     """Return a literal private .reviewctl directory without following a root symlink."""
     project = project_dir.expanduser().resolve()
     root = project / ".reviewctl"
-    if root.is_symlink():
-        raise _unsafe_state_root(root)
-    if not root.exists():
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        with confined_directory_descriptor(project, create=create) as project_descriptor:
+            try:
+                descriptor = os.open(root.name, flags, dir_fd=project_descriptor)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                os.mkdir(root.name, mode=0o700, dir_fd=project_descriptor)
+                descriptor = os.open(root.name, flags, dir_fd=project_descriptor)
+            try:
+                if create:
+                    os.fchmod(descriptor, 0o700)
+                if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise _unsafe_state_root(root)
+            finally:
+                primary = sys.exc_info()[1]
+                if primary is None:
+                    os.close(descriptor)
+                else:
+                    try:
+                        os.close(descriptor)
+                    except BaseException:
+                        pass
+                descriptor = None
+    except FileNotFoundError as error:
         if not create:
             return None
-        root.mkdir(mode=0o700)
-    if not root.is_dir():
-        raise _unsafe_state_root(root)
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    try:
-        descriptor = os.open(root, flags)
+        raise _unsafe_state_root(root) from error
+    except JournalOperationError:
+        raise
     except OSError as error:
         raise _unsafe_state_root(root) from error
-    try:
-        if create:
-            os.fchmod(descriptor, 0o700)
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise _unsafe_state_root(root)
-    finally:
-        primary = sys.exc_info()[1]
-        if primary is None:
-            os.close(descriptor)
-        else:
-            try:
-                os.close(descriptor)
-            except BaseException:
-                pass
     return root
 
 
@@ -170,14 +178,6 @@ class ProjectIdentityStore:
     @contextmanager
     def _root_descriptor(self, *, create: bool = True):
         root = self.root
-        if root.is_symlink():
-            raise _unsafe_state_root(root)
-        if not root.exists():
-            if not create:
-                raise _unsafe_state_root(root)
-            root.mkdir(mode=0o700)
-        if not root.is_dir():
-            raise _unsafe_state_root(root)
         no_follow = getattr(os, "O_NOFOLLOW", None)
         directory_flag = getattr(os, "O_DIRECTORY", None)
         if no_follow is None or directory_flag is None or not _OPEN_SUPPORTS_DIR_FD:
@@ -188,30 +188,57 @@ class ProjectIdentityStore:
                     retryable=False,
                 )
             )
-        try:
-            descriptor = os.open(root, os.O_RDONLY | directory_flag | no_follow)
-        except OSError as error:
-            raise _unsafe_state_root(root) from error
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise _unsafe_state_root(root)
-            yield descriptor
-            current = os.stat(root, follow_symlinks=False)
-            if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (
-                metadata.st_dev,
-                metadata.st_ino,
-            ):
-                raise _unsafe_state_root(root)
-        finally:
-            primary = sys.exc_info()[1]
-            if primary is None:
-                os.close(descriptor)
-            else:
+        with ExitStack() as descriptors:
+            try:
+                project_descriptor = descriptors.enter_context(
+                    confined_directory_descriptor(self.project_dir, create=create)
+                )
+            except OSError as error:
+                raise _unsafe_state_root(root) from error
+            try:
                 try:
+                    descriptor = os.open(
+                        root.name,
+                        os.O_RDONLY | directory_flag | no_follow,
+                        dir_fd=project_descriptor,
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise _unsafe_state_root(root) from None
+                    os.mkdir(root.name, mode=0o700, dir_fd=project_descriptor)
+                    descriptor = os.open(
+                        root.name,
+                        os.O_RDONLY | directory_flag | no_follow,
+                        dir_fd=project_descriptor,
+                    )
+            except JournalOperationError:
+                raise
+            except OSError as error:
+                raise _unsafe_state_root(root) from error
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise _unsafe_state_root(root)
+                yield descriptor
+                current = os.stat(
+                    root.name,
+                    dir_fd=project_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(current.st_mode) or (
+                    current.st_dev,
+                    current.st_ino,
+                ) != (metadata.st_dev, metadata.st_ino):
+                    raise _unsafe_state_root(root)
+            finally:
+                primary = sys.exc_info()[1]
+                if primary is None:
                     os.close(descriptor)
-                except BaseException:
-                    pass
+                else:
+                    try:
+                        os.close(descriptor)
+                    except BaseException:
+                        pass
 
     def _read(self, root_descriptor: int | None = None) -> ProjectIdentity:
         if root_descriptor is None:
