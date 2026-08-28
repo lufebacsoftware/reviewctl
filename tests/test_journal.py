@@ -456,6 +456,44 @@ def test_journal_append_retries_short_writes(tmp_path: Path, monkeypatch) -> Non
     assert journal.events() == [event]
 
 
+def test_journal_append_retries_short_reads_before_deriving_envelope(
+    tmp_path: Path, monkeypatch
+) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl", project_id="p", origin_id="o")
+    journal.append({"type": "review_started", "reviewId": "r1"})
+    journal.append({"type": "review_attempt", "reviewId": "r1", "attempt": 1})
+    first_line_size = len(journal.path.read_bytes().splitlines(keepends=True)[0])
+    real_read = journal_module.os.read
+    read_sizes: list[int] = []
+
+    def short_first_read(descriptor: int, size: int) -> bytes:
+        limit = first_line_size if not read_sizes else size
+        chunk = real_read(descriptor, limit)
+        read_sizes.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(journal_module.os, "read", short_first_read)
+
+    appended = journal.append({"type": "review_finished", "reviewId": "r1"})
+
+    assert len(read_sizes) == 2
+    assert appended["sequence"] == 3
+    assert journal.verify() == []
+
+
+def test_journal_descriptor_read_rejects_early_eof(tmp_path: Path, monkeypatch) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.path.write_bytes(b'{"type":"review_started"}\n')
+    monkeypatch.setattr(journal_module.os, "read", lambda descriptor, size: b"")
+
+    with journal.path.open("rb") as stream:
+        events, diagnostic = journal._read_descriptor(stream.fileno())
+
+    assert events == []
+    assert diagnostic is not None
+    assert "complete journal" in diagnostic.message
+
+
 def test_journal_append_rejects_zero_length_write(tmp_path: Path, monkeypatch) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     monkeypatch.setattr(journal_module.os, "write", lambda descriptor, contents: 0)
