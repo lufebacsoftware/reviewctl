@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -70,19 +71,33 @@ def _run_command(
     input_bytes: bytes | None = None,
 ) -> CommandResult:
     try:
-        completed = subprocess.run(
-            list(command),
-            cwd=cwd,
-            capture_output=True,
-            check=False,
-            input=input_bytes,
-            timeout=timeout_seconds,
-        )
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            completed = subprocess.run(
+                list(command),
+                cwd=cwd,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                check=False,
+                input=input_bytes,
+                timeout=timeout_seconds,
+            )
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = (
+                completed.stdout
+                if isinstance(completed.stdout, bytes)
+                else stdout_file.read(MAX_GITHUB_DIFF_BYTES + 1)
+            )
+            stderr = (
+                completed.stderr
+                if isinstance(completed.stderr, bytes)
+                else stderr_file.read(MAX_GITHUB_DIFF_BYTES + 1)
+            )
     except subprocess.TimeoutExpired:
         return CommandResult(124, b"", b"timeout")
     except OSError:
         return CommandResult(127, b"", b"command unavailable")
-    return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+    return CommandResult(completed.returncode, stdout, stderr)
 
 
 class GitHubSourceError(ReviewctlError):

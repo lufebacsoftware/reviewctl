@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -355,6 +356,23 @@ def test_github_command_runner_maps_timeout_oserror_and_success(
     monkeypatch.setattr(github_module.subprocess, "run", lambda *args, **kwargs: Completed())
     result = github_module._run_command(["gh"], cwd=tmp_path, timeout_seconds=1, input_bytes=b"in")
     assert result.stdout == b"out"
+
+
+def test_github_command_runner_bounds_captured_stdout(tmp_path: Path) -> None:
+    output_size = github_module.MAX_GITHUB_DIFF_BYTES + 1024
+
+    result = github_module._run_command(
+        [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.buffer.write(b'x' * {output_size})",
+        ],
+        cwd=tmp_path,
+        timeout_seconds=10,
+    )
+
+    assert result.returncode == 0
+    assert len(result.stdout) == github_module.MAX_GITHUB_DIFF_BYTES + 1
 
 
 def test_snapshot_context_and_added_line_fallback_branches() -> None:
