@@ -222,7 +222,7 @@ class GitHubPublisher:
         heading = f"reviewctl review {plan.review_id} at head {plan.head_sha}"
         return heading if not summary_items else heading + "\n\n" + "\n\n".join(summary_items)
 
-    def _post(self, plan: ReviewPublicationPlan, items: Sequence[Any]) -> dict[str, Any]:
+    def _post(self, plan: ReviewPublicationPlan, items: Sequence[Any]) -> str:
         endpoint = f"repos/{plan.repository}/pulls/{plan.pull_number}/reviews"
         command = [
             "gh",
@@ -271,10 +271,7 @@ class GitHubPublisher:
                 "github_publication_response_invalid",
                 "GitHub publication did not return a valid review id",
             )
-        return {
-            "summaryCommentId": str(review_id),
-            "commentIds": self._published_comment_ids(plan, review_id),
-        }
+        return str(review_id)
 
     def publish(self, plan: ReviewPublicationPlan) -> PublicationResult:
         key = publication_key(plan)
@@ -331,7 +328,9 @@ class GitHubPublisher:
                     observed_head_sha=prepost_head,
                     diagnostic=diagnostic,
                 )
-            posted = self._post(plan, pending)
+            review_id = self._post(plan, pending)
+            posted = {"summaryCommentId": review_id, "commentIds": ()}
+            posted["commentIds"] = self._published_comment_ids(plan, review_id)
             observed_head = self._head(plan)
             if observed_head != plan.head_sha.lower():
                 diagnostic = Diagnostic(

@@ -330,6 +330,31 @@ def test_publisher_preserves_posted_ids_when_final_head_lookup_fails() -> None:
     assert len(post_calls(runner)) == 1
 
 
+def test_publisher_preserves_review_id_when_comment_lookup_fails() -> None:
+    class MalformedCommentLookupRunner(FakeRunner):
+        def __call__(self, command, *, cwd, timeout_seconds, input_bytes=None):
+            if command[2].endswith("/reviews/9001/comments"):
+                self.calls.append(tuple(command))
+                return CommandResult(0, b"{}", b"")
+            return super().__call__(
+                command,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                input_bytes=input_bytes,
+            )
+
+    runner = MalformedCommentLookupRunner()
+
+    result = GitHubPublisher(Path("."), runner=runner).publish(make_plan())
+
+    assert result.status == "reconciliation_incomplete"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "publication_reconciliation_incomplete"
+    assert result.summary_comment_id == "9001"
+    assert result.published_comment_ids == ()
+    assert len(post_calls(runner)) == 1
+
+
 def test_publisher_redacts_failed_command_details() -> None:
     class FailedRunner(FakeRunner):
         def __call__(self, command, *, cwd, timeout_seconds, input_bytes=None):
