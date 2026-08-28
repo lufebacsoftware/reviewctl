@@ -89,6 +89,15 @@ def write_default_config(project: Path) -> None:
     )
 
 
+def test_client_from_project_does_not_create_a_missing_project(tmp_path: Path) -> None:
+    missing = tmp_path / "mistyped"
+
+    with pytest.raises(ValueError, match="existing project directory"):
+        ReviewClient.from_project(missing)
+
+    assert not missing.exists()
+
+
 def test_client_review_returns_typed_result_and_journal(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     (tmp_path / "a.py").write_text("value = 1\n")
@@ -716,7 +725,7 @@ def test_client_rejects_relative_outside_missing_and_invalid_utf8_files(tmp_path
     assert "UTF-8" in result.diagnostic.message
 
 
-def test_client_rejects_duplicate_source_basenames_before_creating_artifacts(
+def test_client_preserves_relative_paths_when_source_basenames_collide(
     tmp_path: Path,
 ) -> None:
     write_default_config(tmp_path)
@@ -726,7 +735,15 @@ def test_client_rejects_duplicate_source_basenames_before_creating_artifacts(
     second.parent.mkdir()
     first.write_text("first = 1\n")
     second.write_text("second = 2\n")
-    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    transport = QueueTransport(
+        [
+            '{"verdict":"changes-requested","findings":['
+            '{"severity":"high","path":"first%2Fentry.py","line":1,'
+            '"title":"First","evidence":"e","reproduction":"r"},'
+            '{"severity":"medium","path":"second%2Fentry.py","line":1,'
+            '"title":"Second","evidence":"e","reproduction":"r"}]}'
+        ]
+    )
     client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
 
     result = client.review(
@@ -737,12 +754,76 @@ def test_client_rejects_duplicate_source_basenames_before_creating_artifacts(
         )
     )
 
+    assert result.status == "accepted"
+    assert [path.name for path in transport.requests[0].files] == [
+        "first%2Fentry.py",
+        "second%2Fentry.py",
+    ]
+    assert [finding.path for finding in result.findings] == [
+        "first/entry.py",
+        "second/entry.py",
+    ]
+    packet = json.loads(result.receipt_path.with_name("packet.json").read_text())
+    assert [item["name"] for item in packet["files"]] == [
+        "first%2Fentry.py",
+        "second%2Fentry.py",
+    ]
+
+
+def test_client_rejects_source_file_count_before_creating_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    write_default_config(tmp_path)
+    files = tuple(tmp_path / f"source-{index}.py" for index in range(3))
+    for path in files:
+        path.write_text("value = 1\n")
+    monkeypatch.setattr(api_module, "MAX_SOURCE_FILES", 2, raising=False)
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    result = client.review(ReviewRequest(prompt="review", files=files))
+
     assert result.status == "invalid_request"
     assert result.diagnostic is not None
-    assert result.diagnostic.code == "invalid_request"
-    assert "unique basenames" in result.diagnostic.message
+    assert "file limit" in result.diagnostic.message
     assert transport.requests == []
     assert not client.review_root.exists()
+
+
+def test_client_rejects_aggregate_source_bytes_before_creating_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    write_default_config(tmp_path)
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("1234")
+    second.write_text("5678")
+    monkeypatch.setattr(api_module, "MAX_SOURCE_SET_BYTES", 7, raising=False)
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    result = client.review(ReviewRequest(prompt="review", files=(first, second)))
+
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "aggregate source byte limit" in result.diagnostic.message
+    assert transport.requests == []
+    assert not client.review_root.exists()
+
+
+def test_client_rejects_the_same_project_relative_source_twice(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("value = 1\n")
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    result = client.review(ReviewRequest(prompt="review", files=(source, source)))
+
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "unique project-relative paths" in result.diagnostic.message
+    assert transport.requests == []
 
 
 def test_client_rejects_non_json_source_context(tmp_path: Path) -> None:

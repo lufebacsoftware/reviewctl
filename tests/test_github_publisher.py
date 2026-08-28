@@ -110,7 +110,9 @@ class FakeRunner:
                 )
                 return CommandResult(
                     0,
-                    json.dumps([{"id": 9002}, {"id": 9003}] if page == 1 else []).encode(),
+                    json.dumps(
+                        [{"id": 9002, "body": make_plan().items[0].body}] if page == 1 else []
+                    ).encode(),
                     b"",
                 )
             page = int(
@@ -143,7 +145,10 @@ def test_publisher_reconciles_both_comment_and_review_bodies_and_posts_one_group
 
     assert result.status == "published"
     assert result.summary_comment_id == "9001"
-    assert result.published_comment_ids == ("9002", "9003")
+    assert result.published_comment_ids == ("9002",)
+    assert result.to_payload()["publishedComments"] == [
+        {"findingId": "finding-inline", "commentId": "9002"}
+    ]
     assert result.skipped_finding_ids == ()
     posts = post_calls(runner)
     assert len(posts) == 1
@@ -179,7 +184,7 @@ def test_publisher_recovers_inline_comment_ids_from_review_comments_endpoint() -
                 self.calls.append(tuple(command))
                 return CommandResult(
                     0,
-                    json.dumps([{"id": 9002}, {"id": 9003}]).encode(),
+                    json.dumps([{"id": 9002, "body": make_plan().items[0].body}]).encode(),
                     b"",
                 )
             if "--method" in command and command[command.index("--method") + 1] == "POST":
@@ -198,7 +203,7 @@ def test_publisher_recovers_inline_comment_ids_from_review_comments_endpoint() -
     result = GitHubPublisher(Path("."), runner=runner).publish(make_plan())
 
     assert result.status == "published"
-    assert result.published_comment_ids == ("9002", "9003")
+    assert result.published_comment_ids == ("9002",)
     review_comment_calls = [
         call for call in runner.calls if call[2].endswith("/reviews/9001/comments")
     ]
@@ -343,7 +348,7 @@ def test_publisher_preserves_posted_ids_when_final_head_lookup_fails() -> None:
     assert result.diagnostic is not None
     assert result.diagnostic.code == "github_publication_timeout"
     assert result.summary_comment_id == "9001"
-    assert result.published_comment_ids == ("9002", "9003")
+    assert result.published_comment_ids == ("9002",)
     assert len(post_calls(runner)) == 1
 
 
@@ -471,6 +476,32 @@ def test_publisher_rejects_malformed_post_bodies(raw: bytes) -> None:
         publisher._post(make_plan(), make_plan().items)
 
 
+@pytest.mark.parametrize(
+    "comments",
+    [
+        [{"id": 9002, "body": None}],
+        [{"id": 9002, "body": "unrelated"}],
+        [
+            {"id": 9002, "body": make_plan().items[0].body},
+            {"id": 9003, "body": make_plan().items[0].body},
+        ],
+        [],
+    ],
+)
+def test_publisher_requires_one_finding_marker_per_published_comment(
+    comments: list[dict[str, object]],
+) -> None:
+    publisher = GitHubPublisher(
+        Path("."),
+        runner=lambda *args, **kwargs: CommandResult(0, json.dumps(comments).encode(), b""),
+    )
+
+    with pytest.raises(
+        publisher_module.GitHubPublisherError, match="body|finding|every inline finding"
+    ):
+        publisher._published_comments(make_plan(), 9001)
+
+
 @pytest.mark.parametrize("value", [None, [], {}, "", 0, -1, True])
 def test_publisher_rejects_invalid_posted_comment_id(value: object) -> None:
     publisher = GitHubPublisher(
@@ -503,7 +534,11 @@ def test_publisher_rejects_invalid_created_review_id(value: object) -> None:
 def test_publisher_bounds_posted_comment_lookup() -> None:
     publisher = GitHubPublisher(
         Path("."),
-        runner=lambda *args, **kwargs: CommandResult(0, b'[{"id": 1}]', b""),
+        runner=lambda *args, **kwargs: CommandResult(
+            0,
+            json.dumps([{"id": 1, "body": make_plan().items[0].body}]).encode(),
+            b"",
+        ),
         page_size=1,
         max_pages=1,
     )
@@ -535,3 +570,10 @@ def test_publication_result_payload_and_key_are_stable() -> None:
     result = publisher_module.PublicationResult("key", HEAD, "published")
     assert result.to_payload()["publicationKey"] == "key"
     assert publisher_module.publication_key(plan).startswith("github:example/project:7:review-1:")
+
+
+def test_publication_result_rejects_comment_ids_without_finding_evidence() -> None:
+    with pytest.raises(ValueError, match="finding/comment evidence"):
+        publisher_module.PublicationResult(
+            "key", HEAD, "published", published_comment_ids=("9002",)
+        )

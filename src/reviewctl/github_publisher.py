@@ -26,15 +26,31 @@ class GitHubPublisherError(ReviewctlError):
 
 
 @dataclass(frozen=True)
+class PublishedComment:
+    finding_id: str
+    comment_id: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {"findingId": self.finding_id, "commentId": self.comment_id}
+
+
+@dataclass(frozen=True)
 class PublicationResult:
     publication_key: str
     head_sha: str
     status: str
     published_comment_ids: tuple[str, ...] = ()
+    published_comments: tuple[PublishedComment, ...] = ()
     skipped_finding_ids: tuple[str, ...] = ()
     summary_comment_id: str | None = None
     observed_head_sha: str | None = None
     diagnostic: Diagnostic | None = None
+
+    def __post_init__(self) -> None:
+        if self.published_comment_ids != tuple(
+            comment.comment_id for comment in self.published_comments
+        ):
+            raise ValueError("published comment ids must match finding/comment evidence")
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -42,6 +58,7 @@ class PublicationResult:
             "headSha": self.head_sha,
             "status": self.status,
             "publishedCommentIds": list(self.published_comment_ids),
+            "publishedComments": [comment.to_payload() for comment in self.published_comments],
             "skippedFindingIds": list(self.skipped_finding_ids),
             "summaryCommentId": self.summary_comment_id,
             "observedHeadSha": self.observed_head_sha,
@@ -215,15 +232,18 @@ class GitHubPublisher:
                 )
         return tuple(bodies)
 
-    def _published_comment_ids(
+    def _published_comments(
         self,
         plan: ReviewPublicationPlan,
         review_id: object,
+        items: Sequence[Any] | None = None,
         *,
         deadline: float | None = None,
-    ) -> tuple[str, ...]:
+    ) -> tuple[PublishedComment, ...]:
         endpoint = f"repos/{plan.repository}/pulls/{plan.pull_number}/reviews/{review_id}/comments"
-        comment_ids: list[str] = []
+        inline_items = tuple(item for item in (items or plan.items) if item.target is not None)
+        comments_by_finding: dict[str, PublishedComment] = {}
+        observed_comment_ids: set[str] = set()
         for page in range(1, self.max_pages + 1):
             values = self._page(endpoint, page, deadline=deadline)
             for value in values:
@@ -233,12 +253,55 @@ class GitHubPublisher:
                         "github_publication_response_invalid",
                         "GitHub publication did not return valid comment ids",
                     )
-                comment_ids.append(str(comment_id))
+                body = value.get("body")
+                if not isinstance(body, str):
+                    raise _failure(
+                        "publication_reconciliation_incomplete",
+                        "GitHub publication comment lacks a text body for finding reconciliation",
+                    )
+                matches = [item for item in inline_items if item.marker in body]
+                if len(matches) != 1:
+                    raise _failure(
+                        "publication_reconciliation_incomplete",
+                        "GitHub publication comment could not be bound to one finding",
+                    )
+                finding_id = matches[0].finding_id
+                normalized_comment_id = str(comment_id)
+                if (
+                    finding_id in comments_by_finding
+                    or normalized_comment_id in observed_comment_ids
+                ):
+                    raise _failure(
+                        "publication_reconciliation_incomplete",
+                        "GitHub publication returned duplicate finding/comment evidence",
+                    )
+                observed_comment_ids.add(normalized_comment_id)
+                comments_by_finding[finding_id] = PublishedComment(
+                    finding_id=finding_id,
+                    comment_id=normalized_comment_id,
+                )
             if len(values) < self.page_size:
-                return tuple(comment_ids)
+                if set(comments_by_finding) != {item.finding_id for item in inline_items}:
+                    raise _failure(
+                        "publication_reconciliation_incomplete",
+                        "GitHub publication did not return one comment for every inline finding",
+                    )
+                return tuple(comments_by_finding[item.finding_id] for item in inline_items)
         raise _failure(
             "github_publication_response_invalid",
             "GitHub publication comment lookup exceeded its page budget",
+        )
+
+    def _published_comment_ids(
+        self,
+        plan: ReviewPublicationPlan,
+        review_id: object,
+        *,
+        deadline: float | None = None,
+    ) -> tuple[str, ...]:
+        return tuple(
+            comment.comment_id
+            for comment in self._published_comments(plan, review_id, deadline=deadline)
         )
 
     @staticmethod
@@ -362,8 +425,11 @@ class GitHubPublisher:
                     diagnostic=diagnostic,
                 )
             review_id = self._post(plan, pending, deadline=deadline)
-            posted = {"summaryCommentId": review_id, "commentIds": ()}
-            posted["commentIds"] = self._published_comment_ids(plan, review_id, deadline=deadline)
+            posted = {"summaryCommentId": review_id, "comments": (), "commentIds": ()}
+            posted["comments"] = self._published_comments(
+                plan, review_id, pending, deadline=deadline
+            )
+            posted["commentIds"] = tuple(comment.comment_id for comment in posted["comments"])
             observed_head = self._head(plan, deadline=deadline)
             if observed_head != plan.head_sha.lower():
                 diagnostic = Diagnostic(
@@ -376,6 +442,7 @@ class GitHubPublisher:
                     plan.head_sha,
                     "stale_head_race",
                     published_comment_ids=posted["commentIds"],
+                    published_comments=posted["comments"],
                     skipped_finding_ids=skipped,
                     summary_comment_id=posted["summaryCommentId"],
                     observed_head_sha=observed_head,
@@ -386,6 +453,7 @@ class GitHubPublisher:
                 plan.head_sha,
                 "published",
                 published_comment_ids=posted["commentIds"],
+                published_comments=posted["comments"],
                 skipped_finding_ids=skipped,
                 summary_comment_id=posted["summaryCommentId"],
                 observed_head_sha=observed_head,
@@ -401,10 +469,17 @@ class GitHubPublisher:
                 plan.head_sha,
                 status,
                 published_comment_ids=posted["commentIds"] if posted is not None else (),
+                published_comments=posted["comments"] if posted is not None else (),
                 skipped_finding_ids=skipped,
                 summary_comment_id=posted["summaryCommentId"] if posted is not None else None,
                 diagnostic=error.diagnostic,
             )
 
 
-__all__ = ["GitHubPublisher", "GitHubPublisherError", "PublicationResult", "publication_key"]
+__all__ = [
+    "GitHubPublisher",
+    "GitHubPublisherError",
+    "PublicationResult",
+    "PublishedComment",
+    "publication_key",
+]

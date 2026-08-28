@@ -36,7 +36,7 @@ from reviewctl.github import (
 )
 from reviewctl.github_publisher import GitHubPublisher, PublicationResult, publication_key
 from reviewctl.identity import ProjectIdentityStore, ensure_project_state_root
-from reviewctl.journal import ProjectJournal
+from reviewctl.journal import FINDING_STATUSES, ProjectJournal
 from reviewctl.pi_transport import PiTransport
 
 PROJECT_TEMPLATE = """# Project-local reviewctl configuration.
@@ -369,12 +369,13 @@ def _record_github_publication_events(
                 "findingId": finding_id_value,
             }
         )
-    for comment_id in result.published_comment_ids:
+    for published_comment in result.published_comments:
         journal.append(
             {
                 "type": "github_comment_published",
                 **common,
-                "commentId": comment_id,
+                "findingId": published_comment.finding_id,
+                "commentId": published_comment.comment_id,
             }
         )
     if result.summary_comment_id is not None:
@@ -617,6 +618,15 @@ def status_project(args: Any) -> int:
 
 
 def findings_project(args: Any) -> int:
+    if args.status is not None and args.status not in FINDING_STATUSES:
+        return _diagnostic_result(
+            Diagnostic(
+                "invalid_request",
+                f"unsupported finding status: {args.status}",
+                next="choose open, disputed, fixed, verified, or dismissed",
+            ),
+            args.format,
+        )
     try:
         client = ReviewClient.from_project(_project_path(args.project))
     except JournalOperationError as error:
@@ -822,7 +832,7 @@ def add_project_commands(commands: Any) -> None:
 
     findings = commands.add_parser("findings", help="show findings from the project journal")
     findings.add_argument("--project", default=".")
-    findings.add_argument("--status")
+    findings.add_argument("--status", choices=tuple(sorted(FINDING_STATUSES)))
     findings.add_argument("--dimension")
     findings.add_argument("--format", choices=("text", "json"), default="text")
     findings.set_defaults(handler=findings_project)

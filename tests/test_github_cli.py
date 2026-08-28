@@ -18,7 +18,7 @@ from reviewctl.github import (
     PullRequestRef,
     PullRequestSnapshot,
 )
-from reviewctl.github_publisher import PublicationResult
+from reviewctl.github_publisher import PublicationResult, PublishedComment
 
 
 def write_config(project: Path) -> None:
@@ -124,6 +124,7 @@ class FakePublisher:
             head_sha="b" * 40,
             status="published",
             published_comment_ids=("9002",),
+            published_comments=(PublishedComment("finding-inline", "9002"),),
             summary_comment_id="9001",
         )
 
@@ -312,6 +313,8 @@ def test_github_publish_is_explicit_and_receives_only_the_plan(
         "github_comment_published",
         "github_summary_published",
     ]
+    assert FakeClient.instance.journal().events[2]["findingId"] == "finding-inline"
+    assert FakeClient.instance.journal().events[2]["commentId"] == "9002"
 
 
 def test_github_invalid_review_without_receipt_does_not_write_plan_to_cwd(

@@ -731,6 +731,14 @@ def test_findings_status_text_and_client_error_paths(tmp_path: Path, monkeypatch
             return journal
 
     monkeypatch.setattr(project_cli.ReviewClient, "from_project", lambda path: Client())
+
+    invalid_filter = SimpleNamespace(
+        project=str(tmp_path), status="opne", dimension=None, format="json"
+    )
+    assert project_cli.findings_project(invalid_filter) == 2
+    invalid_payload = json.loads(capsys.readouterr().out)
+    assert invalid_payload["diagnostic"]["code"] == "invalid_request"
+
     args = SimpleNamespace(
         project=str(tmp_path), finding_id="f1", finding_status="fixed", reason="", format="text"
     )
