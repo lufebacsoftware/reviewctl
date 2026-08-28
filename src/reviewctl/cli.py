@@ -4925,6 +4925,29 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     legacy_max_attempts = plan.get("max_attempts", 1)
     if not isinstance(legacy_max_attempts, int) or not 1 <= legacy_max_attempts <= 3:
         parser.error("tournament plan max_attempts must be an integer from 1 to 3")
+    legacy_models: list[tuple[str, float, float, int]] = []
+    for model, pricing in models.items():
+        if not isinstance(pricing, dict):
+            parser.error("tournament model pricing must be an object")
+        input_price = numeric_value(pricing.get("input_per_million_usd"))
+        output_price = numeric_value(pricing.get("output_per_million_usd"))
+        if input_price is None or output_price is None or input_price < 0 or output_price < 0:
+            parser.error("tournament model requires finite nonnegative pricing")
+        raw_candidate_max_output_tokens = pricing.get("max_output_tokens")
+        if raw_candidate_max_output_tokens is not None and (
+            not isinstance(raw_candidate_max_output_tokens, int)
+            or isinstance(raw_candidate_max_output_tokens, bool)
+            or raw_candidate_max_output_tokens <= 0
+        ):
+            parser.error("tournament model max_output_tokens must be a positive integer")
+        legacy_models.append(
+            (
+                model,
+                input_price,
+                output_price,
+                raw_candidate_max_output_tokens or max_output_tokens,
+            )
+        )
 
     report_path = tournament_report_path(plan, plan_path)
     runs: list[dict[str, Any]] = []
@@ -4937,21 +4960,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         ]
         prompt = str(case["prompt"])
         input_tokens = estimate_tokens(packet_prompt(prompt, files), files)
-        for model, pricing in models.items():
-            if not isinstance(pricing, dict):
-                parser.error("tournament model pricing must be an object")
-            input_price = numeric_value(pricing.get("input_per_million_usd"))
-            output_price = numeric_value(pricing.get("output_per_million_usd"))
-            if input_price is None or output_price is None or input_price < 0 or output_price < 0:
-                parser.error("tournament model requires finite nonnegative pricing")
-            raw_candidate_max_output_tokens = pricing.get("max_output_tokens")
-            if raw_candidate_max_output_tokens is not None and (
-                not isinstance(raw_candidate_max_output_tokens, int)
-                or isinstance(raw_candidate_max_output_tokens, bool)
-                or raw_candidate_max_output_tokens <= 0
-            ):
-                parser.error("tournament model max_output_tokens must be a positive integer")
-            candidate_max_output_tokens = raw_candidate_max_output_tokens or max_output_tokens
+        for model, input_price, output_price, candidate_max_output_tokens in legacy_models:
             estimate = (
                 input_tokens * input_price / 1_000_000
                 + candidate_max_output_tokens * output_price / 1_000_000
