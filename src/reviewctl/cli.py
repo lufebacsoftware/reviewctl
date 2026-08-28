@@ -528,6 +528,32 @@ def load_execution_config(
     return config_path, config, raw
 
 
+def execution_default_settings(
+    parser: argparse.ArgumentParser, config: dict[str, Any], transport: str
+) -> dict[str, int]:
+    """Validate defaults for one transport from an already loaded config snapshot."""
+    defaults = config.get("defaults")
+    transport_defaults = defaults.get(transport) if isinstance(defaults, dict) else None
+    if transport_defaults is None:
+        return {}
+    if not isinstance(transport_defaults, dict):
+        parser.error(f"defaults.{transport} must be a TOML table")
+    settings: dict[str, int] = {}
+    for key, minimum, maximum in (
+        ("timeout_seconds", 1, None),
+        ("max_attempts", 1, 3),
+    ):
+        value = transport_defaults.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            parser.error(f"defaults.{transport}.{key} must be a positive integer")
+        if maximum is not None and value > maximum:
+            parser.error(f"defaults.{transport}.{key} must be from {minimum} to {maximum}")
+        settings[key] = value
+    return settings
+
+
 def load_route_profile(
     parser: argparse.ArgumentParser, config_value: str | None, profile: str
 ) -> tuple[tuple[ReviewRoute, ...], dict[str, object]]:
@@ -547,6 +573,9 @@ def load_route_profile(
         routes = tuple(parse_route(value) for value in route_specs)
     except ValueError as error:
         parser.error(f"profile {profile!r}: {error}")
+    route_transports = {route.transport for route in routes}
+    transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
+    default_settings = execution_default_settings(parser, config, transport_default_key)
     settings: dict[str, int] = {}
     for key, minimum, maximum in (
         ("timeout_seconds", 1, None),
@@ -565,6 +594,7 @@ def load_route_profile(
         "path": str(config_path),
         "sha256": sha256_bytes(raw),
         "settings": settings,
+        "defaultSettings": default_settings,
     }
 
 
@@ -576,29 +606,7 @@ def load_transport_defaults(
     if loaded is None:
         return {}, None
     config_path, config, raw = loaded
-    defaults = config.get("defaults")
-    transport_defaults = defaults.get(transport) if isinstance(defaults, dict) else None
-    if transport_defaults is None:
-        return {}, {
-            "path": str(config_path),
-            "sha256": sha256_bytes(raw),
-        }
-    if not isinstance(transport_defaults, dict):
-        parser.error(f"defaults.{transport} must be a TOML table")
-    settings: dict[str, int] = {}
-    for key, minimum, maximum in (
-        ("timeout_seconds", 1, None),
-        ("max_attempts", 1, 3),
-    ):
-        value = transport_defaults.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-            parser.error(f"defaults.{transport}.{key} must be a positive integer")
-        if maximum is not None and value > maximum:
-            parser.error(f"defaults.{transport}.{key} must be from {minimum} to {maximum}")
-        settings[key] = value
-    return settings, {
+    return execution_default_settings(parser, config, transport), {
         "path": str(config_path),
         "sha256": sha256_bytes(raw),
     }
@@ -4408,9 +4416,17 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         )
     route_transports = {route.transport for route in routes}
     transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
-    transport_defaults, execution_config = load_transport_defaults(
-        parser, getattr(args, "config", None), transport_default_key
-    )
+    if route_profile:
+        raw_defaults = route_profile.get("defaultSettings")
+        transport_defaults = raw_defaults if isinstance(raw_defaults, dict) else {}
+        execution_config = {
+            "path": str(route_profile["path"]),
+            "sha256": str(route_profile["sha256"]),
+        }
+    else:
+        transport_defaults, execution_config = load_transport_defaults(
+            parser, getattr(args, "config", None), transport_default_key
+        )
     review_prompt = packet_prompt(prompt, files, args.response_contract)
     packet_digest = sha256_bytes(review_prompt.encode())
     try:
@@ -4424,7 +4440,10 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     policy_digest: str | None = None
     loaded_policy: dict[str, Any] | None = None
     if args.policy:
-        loaded_policy, policy_bytes = load_policy_evidence(args.policy)
+        try:
+            loaded_policy, policy_bytes = load_policy_evidence(args.policy)
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+            parser.error(f"could not read policy {args.policy}: {error}")
         policy_digest = sha256_bytes(policy_bytes)
     local_policy_routes = [route for route in routes if route.transport in LOCAL_POLICY_TRANSPORTS]
     kiro_routes = [route for route in local_policy_routes if route.transport == "kiro"]

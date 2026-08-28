@@ -924,6 +924,29 @@ def test_run_hashes_the_exact_policy_bytes_used_for_authorization(
     assert receipt["policy"]["sha256"] == hashlib.sha256(authorized).hexdigest()
 
 
+def test_run_reports_unsafe_policy_path_without_a_traceback(tmp_path: Path) -> None:
+    policy_target = tmp_path / "policy-target.toml"
+    policy_target.write_text('[models."codex-model"]\nsource_allowed = true\n')
+    policy = tmp_path / "policy.toml"
+    policy.symlink_to(policy_target)
+
+    result = run_cli(
+        *review_arguments(tmp_path, "codex-model"),
+        "--transport",
+        "codex",
+        "--source-class",
+        "proprietary",
+        "--policy",
+        str(policy),
+        "--response-contract",
+        "verdict",
+    )
+
+    assert result.returncode == 2
+    assert "could not read policy" in result.stderr.lower()
+    assert "traceback" not in result.stderr.lower()
+
+
 def test_run_uses_kiro_without_policy_for_synthetic_source_and_hides_unresolved_identity(
     tmp_path: Path,
 ) -> None:
@@ -2955,6 +2978,57 @@ def test_route_profile_applies_execution_settings_when_cli_omits_them(tmp_path: 
         "timeoutSeconds": 600,
         "maxAttempts": 2,
     }
+
+
+def test_route_profile_reuses_one_config_snapshot_for_defaults_and_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    registry = cli.BackendRegistry()
+    registry.register(
+        cli.build_backend_registry().require("llm").descriptor,
+        lambda request: cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse(
+                "conversation", None, 1, 2, request.model, 3, None, "VERDICT: approved"
+            ),
+            cli.BackendEvidence(),
+        ),
+    )
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    config = tmp_path / "reviewctl.toml"
+    original = (
+        b'[profiles.code]\nroutes = ["llm:accepted"]\n[defaults.llm]\ntimeout_seconds = 111\n'
+    )
+    replacement = (
+        b'[profiles.code]\nroutes = ["llm:replacement"]\n[defaults.llm]\ntimeout_seconds = 222\n'
+    )
+    config.write_bytes(original)
+    real_load_execution_config = cli.load_execution_config
+    load_calls = 0
+
+    def load_then_replace(*args: object, **kwargs: object):
+        nonlocal load_calls
+        loaded = real_load_execution_config(*args, **kwargs)
+        load_calls += 1
+        if load_calls == 1:
+            config.write_bytes(replacement)
+        return loaded
+
+    monkeypatch.setattr(cli, "load_execution_config", load_then_replace)
+    arguments = review_arguments(tmp_path)
+    arguments.remove("--timeout-seconds")
+    arguments.remove("5")
+    namespace = cli.build_parser().parse_args(
+        [*arguments, "--profile", "code", "--config", str(config)]
+    )
+
+    assert namespace.handler(namespace) == 0
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    assert load_calls == 1
+    assert receipt["routes"] == [{"model": "accepted", "transport": "llm"}]
+    assert receipt["executionSettings"]["timeoutSeconds"] == 111
+    assert receipt["executionConfig"]["sha256"] == hashlib.sha256(original).hexdigest()
 
 
 def test_direct_transport_applies_configured_transport_defaults(tmp_path: Path) -> None:
