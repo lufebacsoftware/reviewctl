@@ -32,6 +32,15 @@ def test_project_config_wins_over_user_profile(tmp_path: Path) -> None:
     assert config.profile("default").routes == ("pi:openrouter/meta/muse-spark-1.2-contributor",)
 
 
+def test_project_config_rejects_an_unexpected_directory_identity(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "reviewctl.toml").write_text('[project]\nprivacy_mode = "private"\n')
+
+    with pytest.raises(ConfigError, match="project directory identity changed"):
+        load_config(project, user_path=None, expected_project_identity=(-1, -1))
+
+
 def test_user_stricter_privacy_cannot_be_weakened_by_project(tmp_path: Path) -> None:
     user = tmp_path / "user.toml"
     project = tmp_path / "reviewctl.toml"

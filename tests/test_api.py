@@ -98,6 +98,57 @@ def test_client_from_project_does_not_create_a_missing_project(tmp_path: Path) -
     assert not missing.exists()
 
 
+def test_client_rejects_an_unexpected_project_identity(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    config = api_module.load_config(tmp_path)
+
+    with pytest.raises(ValueError, match="project directory identity changed"):
+        ReviewClient(
+            tmp_path,
+            config,
+            {"pi": FakeTransport()},
+            expected_project_identity=(-1, -1),
+        )
+
+
+def test_client_from_project_rejects_an_unsafe_project_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unsafe_project(*args: object, **kwargs: object):
+        raise PermissionError("unsafe project")
+
+    monkeypatch.setattr(api_module, "confined_directory_descriptor", unsafe_project)
+
+    with pytest.raises(ValueError, match="safe project directory"):
+        ReviewClient.from_project(tmp_path)
+
+
+def test_client_from_project_rejects_project_directory_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    displaced = tmp_path / "displaced"
+    project.mkdir()
+    write_default_config(project)
+    real_load_config = api_module.load_config
+
+    def load_then_replace(path: Path, *args: object, **kwargs: object):
+        config = real_load_config(path, *args, **kwargs)
+        project.rename(displaced)
+        project.mkdir()
+        (project / "reviewctl.toml").write_text(
+            '[project]\nprivacy_mode = "sensitive"\n[profiles.default]\nroutes = []\n'
+        )
+        return config
+
+    monkeypatch.setattr(api_module, "load_config", load_then_replace)
+
+    with pytest.raises(JournalOperationError, match="unsafe"):
+        ReviewClient.from_project(project, transports={"pi": FakeTransport()})
+
+    assert not (project / ".reviewctl").exists()
+
+
 def test_client_review_returns_typed_result_and_journal(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     (tmp_path / "a.py").write_text("value = 1\n")

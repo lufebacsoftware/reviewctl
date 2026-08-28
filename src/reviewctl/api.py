@@ -274,10 +274,17 @@ class ReviewClient:
         *,
         project_id: str | None = None,
         origin_id: str | None = None,
+        expected_project_identity: tuple[int, int] | None = None,
     ) -> None:
-        self.project_dir = project_dir.expanduser().resolve()
-        project_metadata = os.stat(self.project_dir, follow_symlinks=False)
-        self._project_identity = (project_metadata.st_dev, project_metadata.st_ino)
+        self.project_dir = Path(os.path.abspath(project_dir.expanduser()))
+        try:
+            with confined_directory_descriptor(
+                self.project_dir, expected_identity=expected_project_identity
+            ) as project_descriptor:
+                project_metadata = os.fstat(project_descriptor)
+                self._project_identity = (project_metadata.st_dev, project_metadata.st_ino)
+        except OSError as error:
+            raise ValueError(f"project directory identity changed: {self.project_dir}") from error
         self.config = config
         self.transports = transports
         self.review_root = self.project_dir / ".reviewctl" / "reviews"
@@ -294,22 +301,33 @@ class ReviewClient:
         *,
         transports: Mapping[str, ReviewTransport] | None = None,
     ) -> ReviewClient:
-        project_dir = project_dir.expanduser().resolve()
-        if not project_dir.is_dir():
-            raise ValueError(f"review requires an existing project directory: {project_dir}")
-        config = load_config(project_dir)
-        identity = ProjectIdentityStore(project_dir).ensure(config.project.project_id)
-        if transports is None:
-            from reviewctl.pi_transport import PiTransport
+        project_dir = Path(os.path.abspath(project_dir.expanduser()))
+        try:
+            with confined_directory_descriptor(project_dir) as project_descriptor:
+                project_metadata = os.fstat(project_descriptor)
+                project_identity = (project_metadata.st_dev, project_metadata.st_ino)
+                config = load_config(project_dir, expected_project_identity=project_identity)
+                identity = ProjectIdentityStore(
+                    project_dir, expected_project_identity=project_identity
+                ).ensure(config.project.project_id)
+                if transports is None:
+                    from reviewctl.pi_transport import PiTransport
 
-            transports = {"pi": PiTransport()}
-        return cls(
-            project_dir,
-            config,
-            transports,
-            project_id=identity.project_id,
-            origin_id=identity.origin_id,
-        )
+                    transports = {"pi": PiTransport()}
+                return cls(
+                    project_dir,
+                    config,
+                    transports,
+                    project_id=identity.project_id,
+                    origin_id=identity.origin_id,
+                    expected_project_identity=project_identity,
+                )
+        except FileNotFoundError as error:
+            raise ValueError(
+                f"review requires an existing project directory: {project_dir}"
+            ) from error
+        except OSError as error:
+            raise ValueError(f"review requires a safe project directory: {project_dir}") from error
 
     def journal(self) -> ProjectJournal:
         return self._journal

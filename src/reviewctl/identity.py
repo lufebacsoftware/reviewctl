@@ -142,8 +142,14 @@ class ProjectIdentity:
 class ProjectIdentityStore:
     """Create and validate the machine-local identity without changing it silently."""
 
-    def __init__(self, project_dir: Path) -> None:
-        self.project_dir = project_dir.expanduser().resolve()
+    def __init__(
+        self,
+        project_dir: Path,
+        *,
+        expected_project_identity: tuple[int, int] | None = None,
+    ) -> None:
+        self.project_dir = Path(os.path.abspath(project_dir.expanduser()))
+        self.expected_project_identity = expected_project_identity
         self.root = self.project_dir / ".reviewctl"
         self.path = self.root / "identity.json"
 
@@ -201,7 +207,11 @@ class ProjectIdentityStore:
         with ExitStack() as descriptors:
             try:
                 project_descriptor = descriptors.enter_context(
-                    confined_directory_descriptor(self.project_dir, create=create)
+                    confined_directory_descriptor(
+                        self.project_dir,
+                        create=create,
+                        expected_identity=self.expected_project_identity,
+                    )
                 )
             except OSError as error:
                 raise _unsafe_state_root(root) from error

@@ -106,12 +106,18 @@ def _descriptor_bytes(descriptor: int) -> bytes:
         return stream.read()
 
 
-def _read(path: Path | None) -> tuple[dict[str, Any], bytes, Path | None]:
+def _read(
+    path: Path | None,
+    *,
+    expected_directory_identity: tuple[int, int] | None = None,
+) -> tuple[dict[str, Any], bytes, Path | None]:
     if path is None:
         return {}, b"", None
     candidate = Path(os.path.abspath(path.expanduser()))
     try:
-        with confined_directory_descriptor(candidate) as directory_descriptor:
+        with confined_directory_descriptor(
+            candidate, expected_identity=expected_directory_identity
+        ) as directory_descriptor:
             resolved = candidate / "reviewctl.toml"
             try:
                 with confined_relative_regular_descriptor(
@@ -126,7 +132,9 @@ def _read(path: Path | None) -> tuple[dict[str, Any], bytes, Path | None]:
                 ) from error
     except ConfigError:
         raise
-    except OSError:
+    except OSError as error:
+        if expected_directory_identity is not None:
+            raise ConfigError(f"project directory identity changed: {candidate}") from error
         resolved = candidate
         try:
             raw = read_confined_bytes(resolved)
@@ -266,9 +274,12 @@ def load_config(
     project_path: Path,
     *,
     user_path: Path | None = DEFAULT_USER_CONFIG,
+    expected_project_identity: tuple[int, int] | None = None,
 ) -> ReviewConfig:
     """Load user defaults and project settings with a monotonic privacy floor."""
-    project, project_raw, resolved_project = _read(project_path)
+    project, project_raw, resolved_project = _read(
+        project_path, expected_directory_identity=expected_project_identity
+    )
     user, user_raw, resolved_user = _read(user_path)
     merged = _merge_tables(user, project)
     project_table = merged.get("project", {})
