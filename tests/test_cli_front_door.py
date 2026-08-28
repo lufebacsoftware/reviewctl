@@ -878,6 +878,7 @@ def test_journal_verify_and_doctor_error_and_text_paths(
         "load_config",
         lambda *a, **k: SimpleNamespace(project=SimpleNamespace(project_id="project")),
     )
+    (tmp_path / ".reviewctl").mkdir()
     monkeypatch.setattr(project_cli.ProjectIdentityStore, "read_existing", lambda self: None)
     monkeypatch.setattr(project_cli, "ProjectJournal", lambda *a, **k: BrokenJournal())
     assert project_cli.verify_journal_project(args) == 5
@@ -1210,6 +1211,28 @@ def test_journal_verify_reports_validity_without_rewriting_bytes(tmp_path: Path,
     assert payload["sequence"] == 1
     assert payload["compatibility"] == "versioned"
     assert journal.path.read_bytes() == before
+
+
+def test_journal_verify_does_not_create_missing_project_state(tmp_path: Path, capsys) -> None:
+    (tmp_path / "reviewctl.toml").write_text('[project]\nprivacy_mode = "private"\n')
+
+    assert run_cli(["journal", "verify", "--project", str(tmp_path), "--format", "json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["compatibility"] == "empty"
+    assert not (tmp_path / ".reviewctl").exists()
+
+
+def test_journal_verify_does_not_chmod_existing_project_state(tmp_path: Path, capsys) -> None:
+    (tmp_path / "reviewctl.toml").write_text('[project]\nprivacy_mode = "private"\n')
+    state = tmp_path / ".reviewctl"
+    state.mkdir(mode=0o750)
+
+    assert run_cli(["journal", "verify", "--project", str(tmp_path), "--format", "json"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+    assert state.stat().st_mode & 0o777 == 0o750
 
 
 def test_journal_requires_a_subcommand(capsys) -> None:

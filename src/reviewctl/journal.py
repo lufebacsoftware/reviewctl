@@ -75,15 +75,19 @@ class ProjectJournal:
         *,
         project_id: str | None = None,
         origin_id: str | None = None,
+        prepare_for_writes: bool = True,
     ) -> None:
         if (project_id is None) != (origin_id is None):
             raise ValueError("project_id and origin_id must be provided together")
-        self.path = confine_project_state_path(path)
+        self.path = confine_project_state_path(path, create_root=prepare_for_writes)
         self.project_id = project_id
         self.origin_id = origin_id
         try:
-            with confined_directory_descriptor(self.path.parent, create=True) as descriptor:
-                os.fchmod(descriptor, 0o700)
+            with confined_directory_descriptor(
+                self.path.parent, create=prepare_for_writes
+            ) as descriptor:
+                if prepare_for_writes:
+                    os.fchmod(descriptor, 0o700)
                 metadata = os.fstat(descriptor)
                 self._parent_identity = (metadata.st_dev, metadata.st_ino)
         except OSError as error:

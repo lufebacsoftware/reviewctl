@@ -688,13 +688,21 @@ def verify_journal_project(args: Any) -> int:
     try:
         config = load_config(project)
         identity = ProjectIdentityStore(project).read_existing()
-        journal = ProjectJournal(
-            project / ".reviewctl" / "journal.jsonl",
-            project_id=config.project.project_id if identity is not None else None,
-            origin_id=identity.origin_id if identity is not None else None,
-        )
-        violations = journal.verify()
-        events, diagnostic = journal.read_with_diagnostic()
+        state_root = ensure_project_state_root(project, create=False)
+        journal = None
+        if state_root is None:
+            violations: list[str] = []
+            events: list[dict[str, Any]] = []
+            diagnostic = None
+        else:
+            journal = ProjectJournal(
+                state_root / "journal.jsonl",
+                project_id=config.project.project_id if identity is not None else None,
+                origin_id=identity.origin_id if identity is not None else None,
+                prepare_for_writes=False,
+            )
+            violations = journal.verify()
+            events, diagnostic = journal.read_with_diagnostic()
     except JournalOperationError as error:
         payload = {
             "valid": False,
@@ -715,11 +723,12 @@ def verify_journal_project(args: Any) -> int:
     versioned = [event for event in events if event.get("schemaVersion") == 1]
     payload: dict[str, Any] = {
         "valid": not violations and diagnostic is None,
-        "projectId": journal.project_id
+        "projectId": (journal.project_id if journal is not None else None)
         or (versioned[0].get("projectId") if versioned else config.project.project_id),
-        "originId": journal.origin_id or (versioned[0].get("originId") if versioned else None),
+        "originId": (journal.origin_id if journal is not None else None)
+        or (versioned[0].get("originId") if versioned else None),
         "sequence": versioned[-1].get("sequence", 0) if versioned else 0,
-        "compatibility": journal.compatibility(),
+        "compatibility": journal.compatibility() if journal is not None else "empty",
         "violations": violations,
     }
     if diagnostic is not None:
