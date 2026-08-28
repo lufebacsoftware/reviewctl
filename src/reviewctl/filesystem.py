@@ -25,7 +25,12 @@ def _close_descriptors(descriptors: list[int]) -> None:
 
 
 @contextmanager
-def confined_directory_descriptor(path: Path, *, create: bool = False):
+def confined_directory_descriptor(
+    path: Path,
+    *,
+    create: bool = False,
+    expected_identity: tuple[int, int] | None = None,
+):
     """Open an absolute directory without following any pathname component."""
     absolute = Path(os.path.abspath(path.expanduser()))
     anchor = Path(absolute.anchor)
@@ -53,6 +58,12 @@ def confined_directory_descriptor(path: Path, *, create: bool = False):
             if not stat.S_ISDIR(os.fstat(child).st_mode):
                 raise OSError("filesystem path component is not a directory")
             current = child
+        metadata = os.fstat(current)
+        if (
+            expected_identity is not None
+            and (metadata.st_dev, metadata.st_ino) != expected_identity
+        ):
+            raise OSError("filesystem directory identity changed")
         yield current
     finally:
         _close_descriptors(descriptors)
@@ -128,12 +139,20 @@ def confined_relative_regular_descriptor(
 
 
 @contextmanager
-def confined_regular_descriptor(path: Path, flags: int, mode: int = 0o600):
+def confined_regular_descriptor(
+    path: Path,
+    flags: int,
+    mode: int = 0o600,
+    *,
+    expected_parent_identity: tuple[int, int] | None = None,
+):
     """Open a regular file relative to a fully confined parent directory."""
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None or not _OPEN_SUPPORTS_DIR_FD:
         raise OSError("this platform cannot confine filesystem paths")
-    with confined_directory_descriptor(path.parent) as parent:
+    with confined_directory_descriptor(
+        path.parent, expected_identity=expected_parent_identity
+    ) as parent:
         descriptor = os.open(
             path.name,
             flags | no_follow | getattr(os, "O_NONBLOCK", 0),
@@ -154,13 +173,23 @@ def confined_regular_descriptor(path: Path, flags: int, mode: int = 0o600):
                 raise
 
 
-def read_confined_bytes(path: Path) -> bytes:
+def read_confined_bytes(
+    path: Path, *, expected_parent_identity: tuple[int, int] | None = None
+) -> bytes:
     """Read bytes from a confined regular-file descriptor."""
-    with confined_regular_descriptor(path, os.O_RDONLY) as descriptor:
+    with confined_regular_descriptor(
+        path,
+        os.O_RDONLY,
+        expected_parent_identity=expected_parent_identity,
+    ) as descriptor:
         with os.fdopen(os.dup(descriptor), "rb") as stream:
             return stream.read()
 
 
-def read_confined_text(path: Path) -> str:
+def read_confined_text(
+    path: Path, *, expected_parent_identity: tuple[int, int] | None = None
+) -> str:
     """Read UTF-8 text from a confined regular-file descriptor."""
-    return read_confined_bytes(path).decode("utf-8")
+    return read_confined_bytes(path, expected_parent_identity=expected_parent_identity).decode(
+        "utf-8"
+    )

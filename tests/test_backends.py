@@ -395,6 +395,27 @@ def test_execute_llm_backend_preserves_failure_without_persisted_response(
     )
 
 
+def test_execute_llm_backend_classifies_unsafe_runtime_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    external = tmp_path / "external.sqlite3"
+    external.write_bytes(b"outside")
+
+    def fake_invoke_llm(**kwargs: object) -> tuple[int, str]:
+        Path(kwargs["database"]).symlink_to(external)
+        return 0, ""
+
+    monkeypatch.setattr(cli, "invoke_llm", fake_invoke_llm)
+
+    execution = cli.execute_llm_backend(request)
+
+    assert execution.exit_code == 502
+    assert "database evidence was unsafe" in execution.diagnostic
+    assert execution.response is None
+    assert external.read_bytes() == b"outside"
+
+
 @pytest.mark.parametrize(
     ("environment", "execute_name", "invoker", "executable_argument"),
     [
@@ -570,6 +591,7 @@ def test_execute_gemini_backend_invokes_headless_transport_and_maps_all_evidence
         "response_path": response_path,
         "session_path": session_path,
         "diagnostic_path": stderr_path,
+        "evidence_parent_identity": request.evidence_parent_identity,
     }
     assert final_response_path.read_text() == "ok"
     assert execution == BackendExecution(
@@ -616,6 +638,7 @@ def test_execute_openrouter_backend_invokes_legacy_transport_and_maps_json_evide
         "timeout_seconds": request.timeout_seconds,
         "request_path": request_path,
         "response_path": response_path,
+        "evidence_parent_identity": request.evidence_parent_identity,
     }
     assert execution == BackendExecution(
         0,
@@ -654,6 +677,7 @@ def test_execute_agy_backend_invokes_legacy_transport_and_maps_json_evidence(
         "timeout_seconds": request.timeout_seconds,
         "request_path": request_path,
         "response_path": response_path,
+        "evidence_parent_identity": request.evidence_parent_identity,
     }
     assert execution == BackendExecution(
         0,
@@ -704,6 +728,7 @@ def test_execute_pi_backend_invokes_legacy_transport_and_maps_all_evidence(
         "response_path": events_path,
         "session_path": scratch_session,
         "diagnostic_path": stderr_path,
+        "evidence_parent_identity": request.evidence_parent_identity,
     }
     assert scratch_session != session_path
     assert session_path.read_text() == "session evidence"
@@ -723,3 +748,23 @@ def test_execute_pi_backend_invokes_legacy_transport_and_maps_all_evidence(
         ),
     )
     assert_execution_has_transport_semantics_only(execution)
+
+
+def test_execute_pi_backend_classifies_unsafe_runtime_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = backend_request(tmp_path)
+    external = tmp_path / "external-session.jsonl"
+    external.write_text("outside")
+
+    def fake_invoke_pi(**kwargs: object) -> tuple[int, str, PersistedResponse]:
+        Path(kwargs["session_path"]).symlink_to(external)
+        return 0, "", PersistedResponse("turn", None, 1, 2, "model", 3, None, "ok")
+
+    monkeypatch.setattr(cli, "invoke_pi", fake_invoke_pi)
+
+    execution = cli.execute_pi_backend(request)
+
+    assert execution.exit_code == 502
+    assert "session evidence was unsafe" in execution.diagnostic
+    assert external.read_text() == "outside"

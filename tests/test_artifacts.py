@@ -258,3 +258,31 @@ def test_artifact_write_rejects_root_replaced_by_a_real_directory(tmp_path: Path
         store.write_text("packet.json", "private prompt")
 
     assert list(root.iterdir()) == []
+
+
+def test_artifact_write_does_not_return_a_path_after_root_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "review"
+    store = ArtifactStore(root)
+    displaced = tmp_path / "review-displaced"
+    real_write = artifacts_module.os.write
+    swapped = False
+
+    def raced_write(descriptor: int, value: memoryview) -> int:
+        nonlocal swapped
+        written = real_write(descriptor, value)
+        if not swapped:
+            swapped = True
+            root.rename(displaced)
+            root.mkdir()
+        return written
+
+    monkeypatch.setattr(artifacts_module.os, "write", raced_write)
+
+    with pytest.raises(OSError, match="identity changed"):
+        store.write_text("packet.json", "private prompt")
+
+    assert swapped
+    assert list(root.iterdir()) == []
+    assert (displaced / "packet.json").read_text() == "private prompt"

@@ -158,6 +158,19 @@ def test_journal_append_rejects_project_parent_replaced_before_directory_open(
     assert list(external_root.iterdir()) == []
 
 
+def test_journal_rejects_a_real_parent_directory_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "project" / ".reviewctl" / "journal.jsonl"
+    journal = ProjectJournal(path)
+    displaced = tmp_path / "displaced-state"
+    path.parent.rename(displaced)
+    path.parent.mkdir()
+
+    with pytest.raises(JournalOperationError, match="identity changed"):
+        journal.append({"type": "review_started", "reviewId": "r1"})
+
+    assert list(path.parent.iterdir()) == []
+
+
 def test_journal_reports_existing_non_regular_path_as_corrupt(tmp_path: Path) -> None:
     path = tmp_path / ".reviewctl" / "journal.jsonl"
     path.mkdir(parents=True)

@@ -39,23 +39,54 @@ def test_review_root_does_not_create_through_replaced_artifact_ancestor(
     external = tmp_path / "external"
     external.mkdir()
     displaced = tmp_path / "displaced-artifacts"
-    real_mkdir = Path.mkdir
+    real_mkdir = cli.os.mkdir
     swapped = False
 
-    def raced_mkdir(path: Path, *args, **kwargs) -> None:
+    def raced_mkdir(path, *args, **kwargs) -> None:
         nonlocal swapped
-        if artifact_root in path.parents and not swapped:
+        if path == "review-id" and not swapped:
             swapped = True
             artifact_root.rename(displaced)
             artifact_root.symlink_to(external, target_is_directory=True)
         real_mkdir(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "mkdir", raced_mkdir)
+    monkeypatch.setattr(cli.os, "mkdir", raced_mkdir)
 
-    directory = cli.review_root(artifact_root, "review-id")
+    directory, identity = cli.review_root(artifact_root, "review-id")
 
-    assert directory.is_dir()
+    created = displaced / "review-id" / directory.name
+    assert swapped
+    assert created.is_dir()
+    assert identity == (created.stat().st_dev, created.stat().st_ino)
     assert not (external / "review-id").exists()
+
+
+def test_review_root_rejects_a_symlinked_artifact_root(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        cli.review_root(artifact_root, "review-id")
+
+    assert list(external.iterdir()) == []
+
+
+def test_review_root_identity_rejects_a_real_directory_replacement(tmp_path: Path) -> None:
+    turn, identity = cli.review_root(tmp_path / "artifacts", "review-id")
+    displaced = tmp_path / "displaced-turn"
+    turn.rename(displaced)
+    turn.mkdir()
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        cli.write_private_exclusive(
+            turn / "receipt.json",
+            b"{}\n",
+            expected_parent_identity=identity,
+        )
+
+    assert list(turn.iterdir()) == []
 
 
 def run_cli(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -188,7 +219,7 @@ def mock_openrouter_curl(
     returncode: int = 0,
     status: int | str = 200,
     stderr: bytes = b"",
-    include_separator: bool = True,
+    write_body: bool = True,
 ) -> dict[str, object]:
     """Replace curl while preserving the response-body and status contract."""
     captured: dict[str, object] = {}
@@ -199,11 +230,17 @@ def mock_openrouter_curl(
         captured["timeout"] = kwargs["timeout"]
         config = command[command.index("--config") + 1]
         captured["config"] = kwargs["input"].decode() if config == "-" else Path(config).read_text()
+        if write_body:
+            Path(command[command.index("--output") + 1]).write_bytes(body)
+        kwargs["stdout"].write(str(status).encode())
+        kwargs["stdout"].flush()
+        kwargs["stderr"].write(stderr)
+        kwargs["stderr"].flush()
         return subprocess.CompletedProcess(
             command,
             returncode=returncode,
-            stdout=(body + b"\n" if include_separator else body) + str(status).encode(),
-            stderr=stderr,
+            stdout=None,
+            stderr=None,
         )
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
@@ -336,8 +373,11 @@ import time
 from pathlib import Path
 
 arguments = sys.argv[1:]
+packet = sys.stdin.read()
 if log := os.environ.get('AGY_ARGUMENTS_LOG'):
     Path(log).write_text(json.dumps(arguments))
+if stdin_log := os.environ.get('AGY_STDIN_LOG'):
+    Path(stdin_log).write_text(packet)
 payload = {
     'conversation_id': 'agy-conversation',
     'status': os.environ.get('AGY_STATUS', 'SUCCESS'),
@@ -380,7 +420,9 @@ test_mode = os.environ.get('GEMINI_API_KEY', '')
 if log := os.environ.get('GEMINI_ARGUMENTS_LOG'):
     from pathlib import Path
     Path(log).write_text(json.dumps(arguments))
-if test_mode == 'invalid':
+if test_mode == 'duplicate':
+    print('{"session_id":"first","session_id":"second","response":"ok"}')
+elif test_mode == 'invalid':
     print('{')
 elif test_mode == 'list':
     print('[]')
@@ -4163,6 +4205,36 @@ def test_blind_package_requires_a_verified_accepted_receipt(tmp_path: Path) -> N
         )
 
 
+def test_blind_package_rejects_duplicate_receipt_keys(tmp_path: Path) -> None:
+    receipt = tmp_path / "receipt.json"
+    unsigned = {
+        "result": "accepted",
+        "review": product_review_payload(),
+        "response": {"sha256": "a" * 64},
+    }
+    verified = {
+        **unsigned,
+        "sha256": cli.sha256_bytes(cli.canonical_json(unsigned)),
+    }
+    encoded = cli.canonical_json(verified).decode()
+    receipt.write_text(encoded.replace('"review":', '"review":{},"review":', 1))
+
+    with pytest.raises(ValueError):
+        cli.build_blind_product_package(
+            {
+                "runs": [
+                    {
+                        "candidate": "candidate",
+                        "case": "flow",
+                        "receipt": str(receipt),
+                        "result": "accepted",
+                    }
+                ]
+            },
+            salt=b"salt",
+        )
+
+
 def test_selects_two_non_self_council_judges_with_one_codex() -> None:
     candidates = cli.parse_tournament_candidates(
         {
@@ -7917,6 +7989,178 @@ def test_invoke_openrouter_rejects_a_malformed_choice_shape(
     )
 
 
+def test_invoke_openrouter_rejects_duplicate_response_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(
+        monkeypatch,
+        body=b'{"id":"first","id":"second","choices":[{"message":{"content":"ok"}}]}',
+    )
+
+    result = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Review.",
+        model="test-model",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="document",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert result[0:2] == (502, "OpenRouter returned invalid JSON")
+
+
+def test_invoke_openrouter_rejects_an_oversized_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setattr(cli, "MAX_OPENROUTER_RESPONSE_BYTES", 4)
+    mock_openrouter_curl(monkeypatch, body=b"12345")
+    response_path = tmp_path / "response.json"
+
+    exit_code, error, response = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Review.",
+        model="test-model",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=response_path,
+    )
+
+    assert (exit_code, error, response.response) == (
+        502,
+        "OpenRouter transport output exceeded bounded capture",
+        "",
+    )
+    assert not response_path.exists()
+
+
+def test_invoke_openrouter_fails_closed_without_bounded_capture_support(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setattr(cli, "resource", None)
+
+    result = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Review.",
+        model="test-model",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert result[0:2] == (
+        126,
+        "OpenRouter bounded output capture unsupported on this platform",
+    )
+
+
+def test_invoke_openrouter_classifies_bounded_capture_setup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.SubprocessError("Exception occurred in preexec_fn")
+        ),
+    )
+
+    result = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Review.",
+        model="test-model",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="document",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert result[0] == 126
+    assert "bounded output capture failed" in result[1]
+
+
+def test_invoke_openrouter_rejects_oversized_status_or_stderr_capture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(
+        monkeypatch,
+        status="x" * (cli.MAX_OPENROUTER_STATUS_BYTES + 1),
+    )
+
+    result = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Review.",
+        model="test-model",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="document",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert result[0:2] == (502, "OpenRouter transport output exceeded bounded capture")
+
+
+def test_invoke_openrouter_handles_missing_or_unsafe_scratch_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(monkeypatch, status=500, write_body=False)
+    common = {
+        "api_key": "test",
+        "prompt": "Review.",
+        "model": "test-model",
+        "files": [source],
+        "max_output_tokens": 10,
+        "response_contract": "document",
+        "timeout_seconds": 1,
+    }
+
+    missing = cli.invoke_openrouter(
+        **common,
+        request_path=tmp_path / "missing-request.json",
+        response_path=tmp_path / "missing-response.json",
+    )
+    assert missing[0:2] == (500, "")
+
+    def unsafe_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        Path(command[command.index("--output") + 1]).mkdir()
+        kwargs["stdout"].write(b"200")
+        kwargs["stdout"].flush()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", unsafe_run)
+    unsafe = cli.invoke_openrouter(
+        **common,
+        request_path=tmp_path / "unsafe-request.json",
+        response_path=tmp_path / "unsafe-response.json",
+    )
+    assert unsafe[0] == 502
+    assert "response evidence was unsafe" in unsafe[1]
+
+
 def test_invoke_openrouter_enforces_an_absolute_response_deadline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -8023,7 +8267,7 @@ def test_invoke_openrouter_rejects_missing_or_error_http_status(
 ) -> None:
     source = tmp_path / "source.py"
     source.write_text("pass\n")
-    mock_openrouter_curl(monkeypatch, status="not-a-status", include_separator=False)
+    mock_openrouter_curl(monkeypatch, status="not-a-status")
 
     no_status = cli.invoke_openrouter(
         api_key="test",
@@ -8321,6 +8565,36 @@ def test_invoke_agy_persists_a_sandboxed_structured_response(tmp_path: Path) -> 
     assert json.loads(response_path.read_text())["conversation_id"] == "agy-conversation"
 
 
+def test_invoke_agy_sends_the_review_packet_over_standard_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_bytes(b"x" * cli.MAX_FRAGMENT_BYTES)
+    arguments_log = tmp_path / "arguments.json"
+    stdin_log = tmp_path / "stdin.txt"
+    monkeypatch.setenv("AGY_ARGUMENTS_LOG", str(arguments_log))
+    monkeypatch.setenv("AGY_STDIN_LOG", str(stdin_log))
+
+    result = cli.invoke_agy(
+        agy_bin=str(fake_agy),
+        prompt="Review.",
+        model="gemini-3.6-flash-medium",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    arguments = json.loads(arguments_log.read_text())
+    assert result[0] == 0
+    assert arguments[-1] == "--print"
+    assert max(map(len, arguments)) < 10_000
+    assert len(stdin_log.read_bytes()) > cli.MAX_FRAGMENT_BYTES
+
+
 def test_invoke_agy_does_not_write_evidence_through_a_symlinked_parent(tmp_path: Path) -> None:
     fake_agy = write_fake_agy(tmp_path)
     source = tmp_path / "source.py"
@@ -8597,6 +8871,31 @@ def test_invoke_gemini_persists_headless_json_and_observed_stats(
     assert json.loads(session_path.read_text())["session_id"] == "gemini-session"
 
 
+def test_invoke_gemini_rejects_duplicate_response_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_gemini = write_fake_gemini(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setenv("GEMINI_API_KEY", "duplicate")
+
+    result = cli.invoke_gemini(
+        gemini_bin=str(fake_gemini),
+        prompt="Review.",
+        model="gemini-3.6-flash",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="document",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+        session_path=tmp_path / "session.json",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert result[0:2] == (502, "Gemini returned invalid JSON")
+
+
 @pytest.mark.parametrize(
     ("environment", "timeout_seconds", "expected_exit", "expected_error"),
     [
@@ -8696,6 +8995,34 @@ def invoke_fake_kiro(
         timeout_seconds=timeout_seconds,
         **kiro_paths(tmp_path),
     )
+
+
+def test_invoke_kiro_classifies_preexec_setup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.SubprocessError("Exception occurred in preexec_fn")
+        ),
+    )
+
+    result = cli.invoke_kiro(
+        kiro_bin="kiro-cli",
+        prompt="Review.",
+        model="claude-sonnet-5",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        **kiro_paths(tmp_path),
+    )
+
+    assert result[0] == 126
+    assert "bounded output capture failed" in result[1]
 
 
 def test_normalize_kiro_output_strips_only_terminal_framing() -> None:

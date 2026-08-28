@@ -105,6 +105,7 @@ class BackendRequest:
     source_class: str
     source_roots: tuple[Path, ...]
     provider_preferences: dict[str, object] | None
+    evidence_parent_identity: tuple[int, int] | None = None
     tools: str = "none"
 
 

@@ -72,6 +72,8 @@ class ArtifactStore:
                     view = view[written:]
             finally:
                 os.close(descriptor)
+        with confined_directory_descriptor(self.root, expected_identity=self._root_identity):
+            pass
         return target
 
     def write_text(self, name: str, contents: str) -> Path:

@@ -69,6 +69,7 @@ from reviewctl.errors import Diagnostic, ReviewctlError, exit_code_for
 from reviewctl.filesystem import (
     confined_directory_descriptor,
     confined_regular_descriptor,
+    confined_relative_directory_descriptor,
     read_confined_bytes,
     read_confined_text,
 )
@@ -89,6 +90,9 @@ MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
 MAX_KIRO_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_KIRO_STDERR_BYTES = 100_000
+MAX_OPENROUTER_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_OPENROUTER_STDERR_BYTES = 100_000
+MAX_OPENROUTER_STATUS_BYTES = 32
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
@@ -366,12 +370,20 @@ def sha256_bytes(value: bytes) -> str:
 
 
 def write_private_exclusive(
-    path: Path, contents: bytes, *, label: str = "raw response evidence"
+    path: Path,
+    contents: bytes,
+    *,
+    label: str = "raw response evidence",
+    expected_parent_identity: tuple[int, int] | None = None,
 ) -> None:
     with ExitStack() as descriptors:
         try:
             descriptor = descriptors.enter_context(
-                confined_regular_descriptor(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                confined_regular_descriptor(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    expected_parent_identity=expected_parent_identity,
+                )
             )
         except FileExistsError as error:
             if label == "raw response evidence":
@@ -898,13 +910,24 @@ def validate_request(
     return prompt, files
 
 
-def review_root(artifact_root: Path, review_id: str) -> Path:
+def review_root(artifact_root: Path, review_id: str) -> tuple[Path, tuple[int, int]]:
     turn_name = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}.{secrets.token_hex(3)}"
-    review_directory = artifact_root.expanduser().resolve() / review_id
+    root = Path(os.path.abspath(artifact_root.expanduser()))
+    review_directory = root / review_id
     directory = review_directory / turn_name
-    with confined_directory_descriptor(review_directory, create=True) as parent_descriptor:
-        os.mkdir(turn_name, mode=0o700, dir_fd=parent_descriptor)
-    return directory
+    with confined_directory_descriptor(root, create=True) as root_descriptor:
+        with confined_relative_directory_descriptor(
+            root_descriptor, (review_id,), create=True
+        ) as review_descriptor:
+            os.mkdir(turn_name, mode=0o700, dir_fd=review_descriptor)
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            turn_descriptor = os.open(turn_name, flags, dir_fd=review_descriptor)
+            try:
+                metadata = os.fstat(turn_descriptor)
+                identity = (metadata.st_dev, metadata.st_ino)
+            finally:
+                os.close(turn_descriptor)
+    return directory, identity
 
 
 def git_metadata(cwd: Path) -> dict[str, str | None]:
@@ -1369,7 +1392,12 @@ def build_blind_product_package(
         receipt_path = run.get("receipt")
         if not all(isinstance(item, str) and item for item in (candidate, case, receipt_path)):
             raise ValueError("accepted product run requires candidate, case, and receipt")
-        receipt = json.loads(read_confined_text(Path(receipt_path)))
+        receipt = json.loads(
+            read_confined_text(Path(receipt_path)),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
         if receipt.get("result") != "accepted" or not valid_receipt(receipt):
             raise ValueError("accepted product run requires a verified accepted receipt")
         response = receipt.get("review")
@@ -1872,6 +1900,7 @@ def invoke_kiro(
     response_path: Path,
     session_path: Path,
     diagnostic_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Kiro from an empty directory and retain its runtime-owned evidence."""
     blank = PersistedResponse("", None, None, None, model, None, None, "")
@@ -1884,7 +1913,11 @@ def invoke_kiro(
 
     def persist_stderr() -> str:
         stderr = b"".join(stderr_chunks).decode(errors="replace")
-        write_private_exclusive(diagnostic_path, redact_diagnostic(stderr, limit=100_000).encode())
+        write_private_exclusive(
+            diagnostic_path,
+            redact_diagnostic(stderr, limit=100_000).encode(),
+            expected_parent_identity=evidence_parent_identity,
+        )
         return stderr
 
     def run_process(
@@ -1947,6 +1980,8 @@ def invoke_kiro(
                 return code, stdout, stderr, transport_error
         except FileNotFoundError:
             return 127, b"", b"", f"Kiro transport executable not found: {kiro_bin}"
+        except subprocess.SubprocessError as error:
+            return 126, b"", b"", f"Kiro bounded output capture failed: {error}"
         except OSError as error:
             return 127, b"", b"", f"Kiro transport could not execute: {error}"
 
@@ -1973,7 +2008,11 @@ def invoke_kiro(
         code, inventory_stdout, inventory_stderr, transport_error = run_process(
             inventory_command, cwd
         )
-        write_private_exclusive(models_path, inventory_stdout)
+        write_private_exclusive(
+            models_path,
+            inventory_stdout,
+            expected_parent_identity=evidence_parent_identity,
+        )
         write_private_exclusive(
             request_path,
             canonical_json(
@@ -1997,6 +2036,7 @@ def invoke_kiro(
                 }
             )
             + b"\n",
+            expected_parent_identity=evidence_parent_identity,
         )
         stderr_chunks.append(inventory_stderr)
         if code != 0:
@@ -2021,7 +2061,11 @@ def invoke_kiro(
         code, stdout, invocation_stderr, transport_error = run_process(
             command, cwd, input_bytes=inline_packet.encode()
         )
-        write_private_exclusive(response_path, stdout)
+        write_private_exclusive(
+            response_path,
+            stdout,
+            expected_parent_identity=evidence_parent_identity,
+        )
         stderr_chunks.append(invocation_stderr)
         if code != 0:
             stderr = persist_stderr()
@@ -2029,7 +2073,11 @@ def invoke_kiro(
 
         session_command = [kiro_bin, "chat", "--list-sessions", "--format", "json"]
         code, session_stdout, session_stderr, transport_error = run_process(session_command, cwd)
-        write_private_exclusive(session_path, session_stdout)
+        write_private_exclusive(
+            session_path,
+            session_stdout,
+            expected_parent_identity=evidence_parent_identity,
+        )
         stderr_chunks.append(session_stderr)
         stderr = persist_stderr()
         if code != 0:
@@ -2145,6 +2193,7 @@ def invoke_gemini(
     response_path: Path,
     session_path: Path,
     diagnostic_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Gemini CLI headlessly with a read-only plan and durable JSON evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -2180,6 +2229,7 @@ def invoke_gemini(
         )
         + b"\n",
         label="Gemini request evidence",
+        expected_parent_identity=evidence_parent_identity,
     )
     started = time.monotonic()
     environment = gemini_process_environment(os.environ)
@@ -2206,11 +2256,16 @@ def invoke_gemini(
                 stdout += stdout_after
                 stderr += stderr_after
                 if stdout:
-                    write_private_exclusive(response_path, stdout)
+                    write_private_exclusive(
+                        response_path,
+                        stdout,
+                        expected_parent_identity=evidence_parent_identity,
+                    )
                 if stderr:
                     write_private_exclusive(
                         diagnostic_path,
                         redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
+                        expected_parent_identity=evidence_parent_identity,
                     )
                 return 124, "review attempt timed out", blank
         except FileNotFoundError:
@@ -2219,14 +2274,27 @@ def invoke_gemini(
             return 127, f"Gemini transport could not execute: {error}", blank
 
     if stdout:
-        write_private_exclusive(response_path, stdout)
+        write_private_exclusive(
+            response_path,
+            stdout,
+            expected_parent_identity=evidence_parent_identity,
+        )
     diagnostic = redact_diagnostic(stderr.decode(errors="replace"), limit=100_000)
     if diagnostic:
-        write_private_exclusive(diagnostic_path, diagnostic.encode())
+        write_private_exclusive(
+            diagnostic_path,
+            diagnostic.encode(),
+            expected_parent_identity=evidence_parent_identity,
+        )
     if process.returncode != 0:
         return process.returncode, diagnostic, blank
     try:
-        payload = json.loads(stdout, parse_constant=reject_nonstandard_json_constant)
+        payload = json.loads(
+            stdout,
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
     except json.JSONDecodeError, UnicodeDecodeError, ValueError:
         return 502, "Gemini returned invalid JSON", blank
     if not isinstance(payload, dict):
@@ -2250,6 +2318,7 @@ def invoke_gemini(
         )
         + b"\n",
         label="Gemini session evidence",
+        expected_parent_identity=evidence_parent_identity,
     )
     input_tokens, output_tokens = gemini_usage(payload)
     return (
@@ -2291,6 +2360,7 @@ def invoke_openrouter(
     timeout_seconds: int,
     request_path: Path,
     response_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Call OpenRouter directly and persist source-safe request and raw response evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -2322,6 +2392,7 @@ def invoke_openrouter(
         request_path,
         canonical_json(payload) + b"\n",
         label="OpenRouter request evidence",
+        expected_parent_identity=evidence_parent_identity,
     )
     started = time.monotonic()
     curl_bin = os.environ.get("CURL_BIN", "curl")
@@ -2342,40 +2413,86 @@ def invoke_openrouter(
         "POST",
         "--data-binary",
         f"@{request_path}",
-        "--write-out",
-        "\n%{http_code}",
-        "https://openrouter.ai/api/v1/chat/completions",
     ]
-    try:
-        completed = subprocess.run(
-            command,
-            input=curl_config,
-            capture_output=True,
-            check=False,
-            timeout=timeout_seconds + 1,
+    if resource is None:
+        return 126, "OpenRouter bounded output capture unsupported on this platform", blank
+    capture_file_limit = (
+        max(
+            MAX_OPENROUTER_RESPONSE_BYTES,
+            MAX_OPENROUTER_STDERR_BYTES,
+            MAX_OPENROUTER_STATUS_BYTES,
         )
-    except FileNotFoundError:
-        return 127, f"OpenRouter transport executable not found: {curl_bin}", blank
-    except OSError as error:
-        return 127, f"OpenRouter transport could not execute: {error}", blank
-    except subprocess.TimeoutExpired:
-        return 124, "review attempt timed out", blank
-    raw_response, separator, http_status_bytes = completed.stdout.rpartition(b"\n")
-    if not separator:
+        + 1
+    )
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE,
+            (capture_file_limit, capture_file_limit),
+        )
+
+    with tempfile.TemporaryDirectory(prefix="reviewctl-openrouter-") as scratch_directory:
+        scratch_response = Path(scratch_directory).resolve() / "response.json"
+        command.extend(
+            [
+                "--output",
+                str(scratch_response),
+                "--write-out",
+                "%{http_code}",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ]
+        )
+        try:
+            with tempfile.TemporaryFile() as status_file, tempfile.TemporaryFile() as stderr_file:
+                completed = subprocess.run(
+                    command,
+                    input=curl_config,
+                    stdout=status_file,
+                    stderr=stderr_file,
+                    check=False,
+                    timeout=timeout_seconds + 1,
+                    preexec_fn=limit_output_files,
+                )
+                status_file.seek(0)
+                http_status_bytes = status_file.read(MAX_OPENROUTER_STATUS_BYTES + 1)
+                stderr_file.seek(0)
+                stderr = stderr_file.read(MAX_OPENROUTER_STDERR_BYTES + 1)
+        except FileNotFoundError:
+            return 127, f"OpenRouter transport executable not found: {curl_bin}", blank
+        except subprocess.TimeoutExpired:
+            return 124, "review attempt timed out", blank
+        except subprocess.SubprocessError as error:
+            return 126, f"OpenRouter bounded output capture failed: {error}", blank
+        except OSError as error:
+            return 127, f"OpenRouter transport could not execute: {error}", blank
+        if (
+            len(http_status_bytes) > MAX_OPENROUTER_STATUS_BYTES
+            or len(stderr) > MAX_OPENROUTER_STDERR_BYTES
+        ):
+            return 502, "OpenRouter transport output exceeded bounded capture", blank
         raw_response = b""
-        http_status_bytes = completed.stdout
+        if scratch_response.exists():
+            try:
+                with confined_regular_descriptor(scratch_response, os.O_RDONLY) as descriptor:
+                    with os.fdopen(os.dup(descriptor), "rb") as stream:
+                        raw_response = stream.read(MAX_OPENROUTER_RESPONSE_BYTES + 1)
+            except OSError as error:
+                return 502, f"OpenRouter response evidence was unsafe: {error}", blank
+        if len(raw_response) > MAX_OPENROUTER_RESPONSE_BYTES:
+            return 502, "OpenRouter transport output exceeded bounded capture", blank
     if raw_response:
         write_private_exclusive(
             response_path,
             raw_response,
             label="OpenRouter response evidence",
+            expected_parent_identity=evidence_parent_identity,
         )
     if completed.returncode == 28:
         return 124, "review attempt timed out", blank
     http_status_text = http_status_bytes.decode(errors="replace").strip()
     http_status = int(http_status_text) if http_status_text.isdigit() else None
     if completed.returncode != 0:
-        message = raw_response.decode(errors="replace") or completed.stderr.decode(errors="replace")
+        message = raw_response.decode(errors="replace") or stderr.decode(errors="replace")
         status = http_status if http_status is not None and http_status >= 400 else 502
         return status, message or "OpenRouter transport failed", blank
     if http_status is None:
@@ -2383,8 +2500,13 @@ def invoke_openrouter(
     if http_status >= 400:
         return http_status, raw_response.decode(errors="replace"), blank
     try:
-        payload_response = json.loads(raw_response)
-    except json.JSONDecodeError:
+        payload_response = json.loads(
+            raw_response,
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
+    except json.JSONDecodeError, UnicodeDecodeError, ValueError:
         return 502, "OpenRouter returned invalid JSON", blank
     if not isinstance(payload_response, dict):
         return 502, "OpenRouter returned a non-object response", blank
@@ -2436,14 +2558,16 @@ def invoke_agy(
     timeout_seconds: int,
     request_path: Path,
     response_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run a native Antigravity model in an empty sandbox with durable JSON evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
+    packet = openrouter_packet(prompt, files, response_contract)
     request_payload: dict[str, object] = {
         "command": "agy",
         "maxOutputTokens": max_output_tokens,
         "model": model,
-        "prompt": openrouter_packet(prompt, files, response_contract),
+        "prompt": packet,
         "responseContract": response_contract,
         "sandbox": True,
     }
@@ -2451,6 +2575,7 @@ def invoke_agy(
         request_path,
         canonical_json(request_payload) + b"\n",
         label="AGY request evidence",
+        expected_parent_identity=evidence_parent_identity,
     )
     command = [
         agy_bin,
@@ -2465,24 +2590,30 @@ def invoke_agy(
     ]
     if schema := response_schema(response_contract):
         command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
-    command.extend(["--print", str(request_payload["prompt"])])
+    command.append("--print")
     try:
         with tempfile.TemporaryDirectory(prefix="reviewctl-agy-") as sandbox:
             process = subprocess.Popen(
                 command,
                 cwd=sandbox,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
             try:
-                stdout, stderr = process.communicate(timeout=timeout_seconds)
+                stdout, stderr = process.communicate(input=packet.encode(), timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
                 terminate_process_group(process)
                 return 124, "review attempt timed out", blank
     except OSError as error:
         return 127, str(error), blank
-    write_private_exclusive(response_path, stdout, label="AGY response evidence")
+    write_private_exclusive(
+        response_path,
+        stdout,
+        label="AGY response evidence",
+        expected_parent_identity=evidence_parent_identity,
+    )
     stderr_text = stderr.decode(errors="replace")
     if process.returncode != 0:
         return process.returncode, stderr_text, blank
@@ -2681,6 +2812,7 @@ def invoke_pi(
     response_path: Path,
     session_path: Path,
     diagnostic_path: Path,
+    evidence_parent_identity: tuple[int, int] | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Pi in JSON mode and retain its complete event stream and session."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -2724,6 +2856,7 @@ def invoke_pi(
         )
         + b"\n",
         label="Pi request evidence",
+        expected_parent_identity=evidence_parent_identity,
     )
     started = time.monotonic()
     stdout = b""
@@ -2748,12 +2881,14 @@ def invoke_pi(
                     response_path,
                     stdout,
                     label="Pi response evidence",
+                    expected_parent_identity=evidence_parent_identity,
                 )
             if stderr:
                 write_private_exclusive(
                     diagnostic_path,
                     redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
                     label="Pi diagnostic evidence",
+                    expected_parent_identity=evidence_parent_identity,
                 )
             return (
                 124,
@@ -2771,12 +2906,18 @@ def invoke_pi(
         return 127, f"Pi transport could not execute: {error}", blank
 
     if stdout:
-        write_private_exclusive(response_path, stdout, label="Pi response evidence")
+        write_private_exclusive(
+            response_path,
+            stdout,
+            label="Pi response evidence",
+            expected_parent_identity=evidence_parent_identity,
+        )
     if stderr:
         write_private_exclusive(
             diagnostic_path,
             redact_diagnostic(stderr.decode(errors="replace"), limit=100_000).encode(),
             label="Pi diagnostic evidence",
+            expected_parent_identity=evidence_parent_identity,
         )
     persisted = pi_persisted_response(stdout, model, round((time.monotonic() - started) * 1000))
     if not persisted.response:
@@ -3293,13 +3434,24 @@ def execute_llm_backend(request: BackendRequest) -> BackendExecution:
             response_contract=request.response_contract,
             timeout_seconds=request.timeout_seconds,
         )
-        response = load_response(scratch_database)
-        if scratch_database.exists():
-            write_private_exclusive(
-                database,
-                read_confined_bytes(scratch_database),
-                label="LLM database evidence",
-            )
+        response = None
+        if os.path.lexists(scratch_database):
+            try:
+                scratch_bytes = read_confined_bytes(scratch_database)
+                response = load_response(scratch_database)
+                write_private_exclusive(
+                    database,
+                    scratch_bytes,
+                    label="LLM database evidence",
+                    expected_parent_identity=request.evidence_parent_identity,
+                )
+            except OSError as error:
+                return BackendExecution(
+                    502,
+                    f"LLM database evidence was unsafe: {error}",
+                    None,
+                    BackendEvidence(database=database),
+                )
     return BackendExecution(
         exit_code,
         diagnostic,
@@ -3323,6 +3475,7 @@ def execute_codex_backend(request: BackendRequest) -> BackendExecution:
         response_path,
         response.response.encode(),
         label="Codex response evidence",
+        expected_parent_identity=request.evidence_parent_identity,
     )
     return BackendExecution(
         exit_code,
@@ -3352,10 +3505,15 @@ def execute_kiro_backend(request: BackendRequest) -> BackendExecution:
         response_path=response_path,
         session_path=session_path,
         diagnostic_path=diagnostic_path,
+        evidence_parent_identity=request.evidence_parent_identity,
     )
     final_evidence = None
     if response.response:
-        write_private_exclusive(final_response_path, response.response.encode())
+        write_private_exclusive(
+            final_response_path,
+            response.response.encode(),
+            expected_parent_identity=request.evidence_parent_identity,
+        )
         final_evidence = final_response_path
     return BackendExecution(
         exit_code,
@@ -3385,6 +3543,7 @@ def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
         timeout_seconds=request.timeout_seconds,
         request_path=request_path,
         response_path=response_path,
+        evidence_parent_identity=request.evidence_parent_identity,
     )
     return BackendExecution(
         exit_code,
@@ -3407,6 +3566,7 @@ def execute_agy_backend(request: BackendRequest) -> BackendExecution:
         timeout_seconds=request.timeout_seconds,
         request_path=request_path,
         response_path=response_path,
+        evidence_parent_identity=request.evidence_parent_identity,
     )
     return BackendExecution(
         exit_code,
@@ -3434,9 +3594,14 @@ def execute_gemini_backend(request: BackendRequest) -> BackendExecution:
         response_path=response_path,
         session_path=session_path,
         diagnostic_path=diagnostic_path,
+        evidence_parent_identity=request.evidence_parent_identity,
     )
     if response.response:
-        write_private_exclusive(final_response_path, response.response.encode())
+        write_private_exclusive(
+            final_response_path,
+            response.response.encode(),
+            expected_parent_identity=request.evidence_parent_identity,
+        )
     return BackendExecution(
         exit_code,
         diagnostic,
@@ -3471,18 +3636,35 @@ def execute_pi_backend(request: BackendRequest) -> BackendExecution:
             response_path=events_path,
             session_path=scratch_session,
             diagnostic_path=stderr_path,
+            evidence_parent_identity=request.evidence_parent_identity,
         )
-        if scratch_session.exists():
-            write_private_exclusive(
-                session_path,
-                read_confined_bytes(scratch_session),
-                label="Pi session evidence",
-            )
+        if os.path.lexists(scratch_session):
+            try:
+                scratch_bytes = read_confined_bytes(scratch_session)
+                write_private_exclusive(
+                    session_path,
+                    scratch_bytes,
+                    label="Pi session evidence",
+                    expected_parent_identity=request.evidence_parent_identity,
+                )
+            except OSError as error:
+                return BackendExecution(
+                    502,
+                    f"Pi session evidence was unsafe: {error}",
+                    response,
+                    BackendEvidence(
+                        request=request_path,
+                        response=events_path,
+                        session=session_path,
+                        stderr=stderr_path,
+                    ),
+                )
     if response.response:
         write_private_exclusive(
             final_response_path,
             response.response.encode(),
             label="Pi final response evidence",
+            expected_parent_identity=request.evidence_parent_identity,
         )
     return BackendExecution(
         exit_code,
@@ -3925,7 +4107,12 @@ def findings_validation_error(response: str, evaluation: ContractEvaluation) -> 
     return "findings-json: findings do not satisfy the required schema or verdict invariant"
 
 
-def persisted_receipt_valid(path: Path, *, expected_sha256: str | None = None) -> bool:
+def persisted_receipt_valid(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> bool:
     """Verify the digest of the exact receipt bytes persisted by a review run."""
 
     def reject_nonstandard_constant(value: str) -> None:
@@ -3933,7 +4120,7 @@ def persisted_receipt_valid(path: Path, *, expected_sha256: str | None = None) -
 
     try:
         receipt = json.loads(
-            read_confined_text(path),
+            read_confined_text(path, expected_parent_identity=expected_parent_identity),
             object_pairs_hook=exact_json_object,
             parse_constant=reject_nonstandard_constant,
         )
@@ -3949,7 +4136,13 @@ def persisted_receipt_valid(path: Path, *, expected_sha256: str | None = None) -
         return False
 
 
-def seal(path: Path, contents: bytes, recipient: str) -> str:
+def seal(
+    path: Path,
+    contents: bytes,
+    recipient: str,
+    *,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> str:
     target = path.with_suffix(path.suffix + ".age")
     result = subprocess.run(
         ["age", "-r", recipient],
@@ -3960,7 +4153,12 @@ def seal(path: Path, contents: bytes, recipient: str) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors="replace").strip() or "age failed")
-    write_private_exclusive(target, result.stdout, label="sealed review evidence")
+    write_private_exclusive(
+        target,
+        result.stdout,
+        label="sealed review evidence",
+        expected_parent_identity=expected_parent_identity,
+    )
     return target.name
 
 
@@ -4031,10 +4229,17 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         else artifact_root / "reviewctl.log"
     )
     logger = configure_runtime_logger(log_path)
-    turn_dir = review_root(artifact_root, args.review_id)
+    turn_dir, turn_identity = review_root(artifact_root, args.review_id)
     attempts_dir = turn_dir / "attempts"
-    with confined_directory_descriptor(attempts_dir, create=True):
-        pass
+    with confined_directory_descriptor(
+        turn_dir, expected_identity=turn_identity
+    ) as turn_descriptor:
+        with confined_relative_directory_descriptor(
+            turn_descriptor, ("attempts",), create=True
+        ) as attempts_descriptor:
+            metadata = os.fstat(attempts_descriptor)
+            attempts_identity = (metadata.st_dev, metadata.st_ino)
+    attempt_identities: dict[Path, tuple[int, int]] = {}
     codex_source_roots = (
         review_source_roots(files)
         if any(route.transport == "codex" for route in routes)
@@ -4199,8 +4404,16 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     review_id=args.review_id,
                 )
             attempt_dir = attempts_dir / f"{number:02d}"
-            with confined_directory_descriptor(attempts_dir) as attempts_descriptor:
+            with confined_directory_descriptor(
+                attempts_dir, expected_identity=attempts_identity
+            ) as attempts_descriptor:
                 os.mkdir(attempt_dir.name, mode=0o700, dir_fd=attempts_descriptor)
+                with confined_relative_directory_descriptor(
+                    attempts_descriptor, (attempt_dir.name,)
+                ) as attempt_descriptor:
+                    metadata = os.fstat(attempt_descriptor)
+                    attempt_identity = (metadata.st_dev, metadata.st_ino)
+            attempt_identities[attempt_dir] = attempt_identity
             database: Path | None = None
             request_path: Path | None = None
             response_path: Path | None = None
@@ -4230,6 +4443,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     source_class=args.source_class,
                     source_roots=tuple(codex_source_roots or ()),
                     provider_preferences=provider_preferences,
+                    evidence_parent_identity=attempt_identity,
                 )
             )
             exit_code = execution.exit_code
@@ -4245,7 +4459,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             if persisted is not None:
                 raw_response_path = attempt_dir / "raw-response.txt"
                 raw_response_bytes = persisted.response.encode(errors="surrogatepass")
-                write_private_exclusive(raw_response_path, raw_response_bytes)
+                write_private_exclusive(
+                    raw_response_path,
+                    raw_response_bytes,
+                    expected_parent_identity=attempt_identity,
+                )
                 raw_response = {
                     "path": str(raw_response_path),
                     "sha256": sha256_bytes(raw_response_bytes),
@@ -4495,6 +4713,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 attempt_dir / "attempt.json",
                 canonical_json(attempt) + b"\n",
                 label="attempt metadata evidence",
+                expected_parent_identity=attempt_identity,
             )
             log_event(
                 logger,
@@ -4627,11 +4846,17 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 }
             )
             receipt["sealed"] = {
-                "request": seal(turn_dir / "request.json", request_payload, args.seal_to),
+                "request": seal(
+                    turn_dir / "request.json",
+                    request_payload,
+                    args.seal_to,
+                    expected_parent_identity=turn_identity,
+                ),
                 "response": seal(
                     turn_dir / "response.md",
                     (accepted.response if accepted else "").encode(),
                     args.seal_to,
+                    expected_parent_identity=turn_identity,
                 ),
             }
 
@@ -4642,8 +4867,13 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             receipt_path,
             canonical_json(receipt) + b"\n",
             label="review receipt evidence",
+            expected_parent_identity=turn_identity,
         )
-        if not persisted_receipt_valid(receipt_path, expected_sha256=expected_receipt_sha256):
+        if not persisted_receipt_valid(
+            receipt_path,
+            expected_sha256=expected_receipt_sha256,
+            expected_parent_identity=turn_identity,
+        ):
             log_event(
                 logger,
                 "review_finished",
@@ -4670,8 +4900,17 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         return 0 if accepted else 1
     finally:
         snapshots_context.__exit__(None, None, None)
-        for database in attempts_dir.glob("*/transport.sqlite3"):
-            database.unlink(missing_ok=True)
+        for attempt_dir, attempt_identity in attempt_identities.items():
+            try:
+                with confined_directory_descriptor(
+                    attempt_dir, expected_identity=attempt_identity
+                ) as attempt_descriptor:
+                    try:
+                        os.unlink("transport.sqlite3", dir_fd=attempt_descriptor)
+                    except FileNotFoundError:
+                        pass
+            except OSError:
+                pass
 
 
 def valid_receipt(receipt: dict[str, Any]) -> bool:

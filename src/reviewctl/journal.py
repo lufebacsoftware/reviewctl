@@ -84,6 +84,8 @@ class ProjectJournal:
         try:
             with confined_directory_descriptor(self.path.parent, create=True) as descriptor:
                 os.fchmod(descriptor, 0o700)
+                metadata = os.fstat(descriptor)
+                self._parent_identity = (metadata.st_dev, metadata.st_ino)
         except OSError as error:
             raise JournalOperationError(
                 Diagnostic("journal_corrupt", f"could not confine journal directory: {error}")
@@ -155,7 +157,9 @@ class ProjectJournal:
                 )
             )
         try:
-            with confined_directory_descriptor(self.path.parent) as confined_parent:
+            with confined_directory_descriptor(
+                self.path.parent, expected_identity=self._parent_identity
+            ) as confined_parent:
                 parent = os.dup(confined_parent)
         except OSError as error:
             raise JournalOperationError(
