@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,7 +57,7 @@ class CommandRunner(Protocol):
         command: Sequence[str],
         *,
         cwd: Path,
-        timeout_seconds: int,
+        timeout_seconds: float,
         input_bytes: bytes | None = None,
     ) -> CommandResult: ...
 
@@ -65,7 +66,7 @@ def _run_command(
     command: Sequence[str],
     *,
     cwd: Path,
-    timeout_seconds: int,
+    timeout_seconds: float,
     input_bytes: bytes | None = None,
 ) -> CommandResult:
     try:
@@ -574,11 +575,21 @@ class LocalGitHubSource:
         self.runner = runner
         self.timeout_seconds = timeout_seconds
 
-    def _run(self, operation: str, command: Sequence[str]) -> bytes:
+    def _run(
+        self, operation: str, command: Sequence[str], *, deadline: float | None = None
+    ) -> bytes:
+        timeout_seconds = self.timeout_seconds
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _source_diagnostic(
+                    "github_source_timeout", f"{operation} timed out", retryable=True
+                )
+            timeout_seconds = remaining
         result = self.runner(
             command,
             cwd=self.project_dir,
-            timeout_seconds=self.timeout_seconds,
+            timeout_seconds=timeout_seconds,
         )
         if result.returncode == 124:
             raise _source_diagnostic(
@@ -603,8 +614,11 @@ class LocalGitHubSource:
             ) from error
 
     def resolve(self, ref: PullRequestRef) -> PullRequestSnapshot:
+        deadline = time.monotonic() + self.timeout_seconds
         endpoint = f"repos/{ref.repository}/pulls/{ref.number}"
-        metadata_bytes = self._run("GitHub pull-request metadata", ["gh", "api", endpoint])
+        metadata_bytes = self._run(
+            "GitHub pull-request metadata", ["gh", "api", endpoint], deadline=deadline
+        )
         try:
             metadata = json.loads(self._decode("GitHub pull-request metadata", metadata_bytes))
         except (TypeError, ValueError) as error:
@@ -639,7 +653,11 @@ class LocalGitHubSource:
         local_head = (
             self._decode(
                 "local checkout head",
-                self._run("local checkout head", ["git", "rev-parse", "HEAD"]),
+                self._run(
+                    "local checkout head",
+                    ["git", "rev-parse", "HEAD"],
+                    deadline=deadline,
+                ),
             )
             .strip()
             .lower()
@@ -653,6 +671,7 @@ class LocalGitHubSource:
         diff_bytes = self._run(
             "GitHub pull-request diff",
             ["gh", "api", endpoint, "--header", "Accept: application/vnd.github.diff"],
+            deadline=deadline,
         )
         if len(diff_bytes) > MAX_GITHUB_DIFF_BYTES:
             raise _source_diagnostic(
@@ -660,7 +679,9 @@ class LocalGitHubSource:
             )
         diff = self._decode("GitHub pull-request diff", diff_bytes)
         metadata_recheck_bytes = self._run(
-            "GitHub pull-request metadata recheck", ["gh", "api", endpoint]
+            "GitHub pull-request metadata recheck",
+            ["gh", "api", endpoint],
+            deadline=deadline,
         )
         try:
             metadata_recheck = json.loads(
@@ -712,6 +733,7 @@ class LocalGitHubSource:
             size_bytes = self._run(
                 "local committed source size",
                 ["git", "cat-file", "-s", f"{source_sha}:{source_path}"],
+                deadline=deadline,
             )
             try:
                 blob_size = int(self._decode("local committed source size", size_bytes).strip())
@@ -735,6 +757,7 @@ class LocalGitHubSource:
             content_bytes = self._run(
                 "local committed source",
                 ["git", "show", f"{source_sha}:{source_path}"],
+                deadline=deadline,
             )
             if len(content_bytes) > MAX_GITHUB_FILE_BYTES:
                 raise _source_diagnostic(

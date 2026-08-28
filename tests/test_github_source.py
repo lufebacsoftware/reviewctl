@@ -41,7 +41,7 @@ class FakeRunner:
         }
         self.calls: list[tuple[str, ...]] = []
         self.cwds: list[Path] = []
-        self.timeouts: list[int] = []
+        self.timeouts: list[float] = []
 
     def __call__(self, command, *, cwd: Path, timeout_seconds: int) -> CommandResult:
         self.cwds.append(cwd)
@@ -88,7 +88,8 @@ def test_local_source_freezes_metadata_diff_and_exact_commit_content(tmp_path: P
     assert any(command[:2] == ("gh", "api") for command in runner.calls)
     assert ("git", "show", f"{HEAD}:src/app.py") in runner.calls
     assert runner.cwds and all(cwd == tmp_path.resolve() for cwd in runner.cwds)
-    assert runner.timeouts and set(runner.timeouts) == {17}
+    assert runner.timeouts and all(0 < timeout <= 17 for timeout in runner.timeouts)
+    assert runner.timeouts == sorted(runner.timeouts, reverse=True)
 
 
 def test_local_source_requests_diff_media_type(tmp_path: Path) -> None:
@@ -103,6 +104,23 @@ def test_local_source_requests_diff_media_type(tmp_path: Path) -> None:
         "--header",
         "Accept: application/vnd.github.diff",
     ) in runner.calls
+
+
+def test_local_source_enforces_one_deadline_across_all_commands(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = FakeRunner()
+    moments = iter([100.0, 100.0, 104.0, 109.25, 110.0])
+    monkeypatch.setattr(github_module.time, "monotonic", lambda: next(moments))
+
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=runner, timeout_seconds=10).resolve(
+            PullRequestRef("example/project", 7)
+        )
+
+    assert error.value.diagnostic.code == "github_source_timeout"
+    assert runner.timeouts == [10, 6, 0.75]
+    assert len(runner.calls) == 3
 
 
 @pytest.mark.parametrize(
