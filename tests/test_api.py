@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -708,24 +709,82 @@ def test_client_rejects_read_errors_and_post_stat_growth(tmp_path: Path, monkeyp
     source = tmp_path / "source.py"
     source.write_text("value = 1\n")
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
-    original_read = Path.read_bytes
+    original_read = api_module._read_source_bytes
 
     def fail_read(path: Path) -> bytes:
         if path == source:
             raise OSError("denied")
         return original_read(path)
 
-    monkeypatch.setattr(Path, "read_bytes", fail_read)
+    monkeypatch.setattr(api_module, "_read_source_bytes", fail_read)
     result = client.review(ReviewRequest(prompt="review", files=(source,)))
     assert result.status == "invalid_request"
     assert result.diagnostic is not None
     assert "could not be read" in result.diagnostic.message
 
-    monkeypatch.setattr(Path, "read_bytes", lambda path: b"x" * (MAX_SOURCE_BYTES + 1))
+    monkeypatch.setattr(
+        api_module, "_read_source_bytes", lambda path: b"x" * (MAX_SOURCE_BYTES + 1)
+    )
     result = client.review(ReviewRequest(prompt="review", files=(source,)))
     assert result.status == "invalid_request"
     assert result.diagnostic is not None
     assert "exceeds" in result.diagnostic.message
+
+
+def test_source_reader_fails_closed_without_nofollow_or_for_non_regular_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fifo = tmp_path / "source"
+    os.mkfifo(fifo)
+    with pytest.raises(OSError, match="regular file"):
+        api_module._read_source_bytes(fifo)
+
+    source = tmp_path / "source.py"
+    source.write_text("safe = True\n")
+    monkeypatch.setattr(api_module.os, "O_NOFOLLOW", None)
+    with pytest.raises(OSError, match="without following symlinks"):
+        api_module._read_source_bytes(source)
+
+
+def test_client_rejects_source_replaced_by_external_symlink_before_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_default_config(project)
+    source = project / "source.py"
+    source.write_text("safe = True\n")
+    external = tmp_path / "external.py"
+    external.write_text("secret = True\n")
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    client = ReviewClient.from_project(project, transports={"pi": transport})
+    real_read = Path.read_bytes
+    real_open = os.open
+
+    def swap_source() -> None:
+        if not source.is_symlink():
+            source.unlink()
+            source.symlink_to(external)
+
+    def raced_read(path: Path) -> bytes:
+        if path == source:
+            swap_source()
+        return real_read(path)
+
+    def raced_open(path, flags, *args):
+        if Path(path) == source:
+            swap_source()
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(Path, "read_bytes", raced_read)
+    monkeypatch.setattr(os, "open", raced_open)
+
+    result = client.review(ReviewRequest(prompt="review", files=(source,)))
+
+    assert result.status == "invalid_request"
+    assert result.diagnostic is not None
+    assert "could not be read" in result.diagnostic.message
+    assert transport.requests == []
 
 
 def test_client_rejects_unknown_contract_and_unregistered_transport(tmp_path: Path) -> None:

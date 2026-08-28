@@ -221,6 +221,17 @@ def test_config_read_rejects_malformed_and_non_table_toml(tmp_path: Path, monkey
         config_module._read(malformed)
 
 
+def test_config_read_rejects_existing_non_regular_project_config(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "reviewctl.toml").mkdir()
+    user = tmp_path / "user.toml"
+    user.write_text('[profiles.default]\nroutes = ["pi:openrouter/model"]\nexecution = "remote"\n')
+
+    with pytest.raises(ConfigError, match="regular file"):
+        load_config(project, user_path=user)
+
+
 def test_config_merge_handles_nested_tables_and_bad_profile_values() -> None:
     merged = config_module._merge_tables(
         {"profiles": {"default": "not-a-table"}, "project": {"name": "base"}},

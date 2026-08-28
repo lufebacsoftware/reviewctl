@@ -195,6 +195,8 @@ def test_local_source_rejects_identity_change_after_diff_before_materialization(
         json.dumps({"head": {}}).encode(),
         json.dumps({"base": {"sha": BASE}, "head": {"sha": 7}}).encode(),
         json.dumps({"base": {"sha": 7}, "head": {"sha": HEAD}}).encode(),
+        json.dumps({"base": {"sha": "HEAD"}, "head": {"sha": HEAD}}).encode(),
+        json.dumps({"base": {"sha": BASE}, "head": {"sha": "HEAD"}}).encode(),
     ],
 )
 def test_local_source_rejects_invalid_head_recheck(tmp_path: Path, recheck_metadata: bytes) -> None:
@@ -370,6 +372,22 @@ def test_github_source_rejects_malformed_metadata(tmp_path: Path, metadata: byte
         LocalGitHubSource(tmp_path, runner=MetadataRunner()).resolve(
             PullRequestRef("example/project", 7)
         )
+
+
+def test_github_source_rejects_invalid_sha_before_local_source_reads(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        metadata={
+            "base": {"sha": "HEAD"},
+            "head": {"sha": HEAD},
+            "repository": {"visibility": "private"},
+        }
+    )
+
+    with pytest.raises(GitHubSourceError) as error:
+        LocalGitHubSource(tmp_path, runner=runner).resolve(PullRequestRef("example/project", 7))
+
+    assert error.value.diagnostic.code == "github_metadata_invalid"
+    assert runner.calls == [("gh", "api", "repos/example/project/pulls/7")]
 
 
 def test_github_source_accepts_boolean_visibility_fallback(tmp_path: Path) -> None:

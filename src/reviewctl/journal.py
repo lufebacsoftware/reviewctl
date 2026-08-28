@@ -355,8 +355,10 @@ class ProjectJournal:
         return events, None
 
     def _read_locked(self) -> tuple[list[dict[str, Any]], Diagnostic | None]:
-        if not self.path.is_file():
+        if not self.path.exists():
             return [], None
+        if not self.path.is_file():
+            return [], Diagnostic("journal_corrupt", "journal path must be a regular file")
         try:
             with self.path.open("rb") as stream:
                 with self._shared_lock(stream.fileno()):

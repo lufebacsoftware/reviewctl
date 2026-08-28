@@ -95,8 +95,10 @@ def _read(path: Path | None) -> tuple[dict[str, Any], bytes, Path | None]:
     if path is None:
         return {}, b"", None
     resolved = _config_path(path)
-    if not resolved.is_file():
+    if not resolved.exists():
         return {}, b"", None
+    if not resolved.is_file():
+        raise ConfigError(f"configuration {resolved} must be a regular file")
     try:
         raw = resolved.read_bytes()
         value = tomllib.loads(raw.decode("utf-8"))

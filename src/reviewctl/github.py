@@ -687,6 +687,16 @@ class LocalGitHubSource:
             raise _source_diagnostic(
                 "github_metadata_invalid", "GitHub pull-request metadata lacks base/head SHA"
             ) from error
+        if (
+            not isinstance(base_sha, str)
+            or not _SHA.fullmatch(base_sha)
+            or not isinstance(head_sha, str)
+            or not _SHA.fullmatch(head_sha)
+        ):
+            raise _source_diagnostic(
+                "github_metadata_invalid",
+                "GitHub pull-request metadata lacks valid base/head SHAs",
+            )
         repository = metadata.get("repository")
         if not isinstance(repository, dict):
             base = metadata.get("base")
@@ -745,7 +755,12 @@ class LocalGitHubSource:
                 "github_metadata_invalid",
                 "GitHub pull-request metadata recheck lacks valid base/head SHAs",
             ) from error
-        if not isinstance(rechecked_base, str) or not isinstance(rechecked_head, str):
+        if (
+            not isinstance(rechecked_base, str)
+            or not _SHA.fullmatch(rechecked_base)
+            or not isinstance(rechecked_head, str)
+            or not _SHA.fullmatch(rechecked_head)
+        ):
             raise _source_diagnostic(
                 "github_metadata_invalid",
                 "GitHub pull-request metadata recheck lacks valid base/head SHAs",
@@ -824,23 +839,20 @@ class LocalGitHubSource:
                     content=content,
                 )
             )
-        try:
-            return PullRequestSnapshot(
-                ref=ref,
-                base_sha=str(base_sha),
-                head_sha=str(head_sha),
-                visibility=visibility,
-                changed_files=tuple(changed_files),
-                diff=diff,
-                evidence=(
-                    "github.pull_request",
-                    "github.pull_request_diff",
-                    "git.rev_parse_head",
-                    "git.show",
-                ),
-            )
-        except ValueError as error:
-            raise _source_diagnostic("github_metadata_invalid", str(error)) from error
+        return PullRequestSnapshot(
+            ref=ref,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            visibility=visibility,
+            changed_files=tuple(changed_files),
+            diff=diff,
+            evidence=(
+                "github.pull_request",
+                "github.pull_request_diff",
+                "git.rev_parse_head",
+                "git.show",
+            ),
+        )
 
 
 __all__ = [

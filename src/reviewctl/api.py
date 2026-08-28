@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -35,6 +37,23 @@ class ReviewTransport(Protocol):
 _REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_CONTEXT_BYTES = 32 * 1024
+
+
+def _source_opener(path: str, flags: int) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("this platform cannot open review sources without following symlinks")
+    return os.open(path, flags | no_follow | getattr(os, "O_NONBLOCK", 0))
+
+
+def _read_source_bytes(path: Path) -> bytes | None:
+    with open(path, "rb", opener=_source_opener) as stream:
+        source = os.fstat(stream.fileno())
+        if not stat.S_ISREG(source.st_mode):
+            raise OSError("review source is not a regular file")
+        if source.st_size > MAX_SOURCE_BYTES:
+            return None
+        return stream.read(MAX_SOURCE_BYTES + 1)
 
 
 @dataclass(frozen=True)
@@ -340,14 +359,14 @@ class ReviewClient:
                 )
                 return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
             try:
-                if path.stat().st_size > MAX_SOURCE_BYTES:
+                source_bytes = _read_source_bytes(path)
+                if source_bytes is None or len(source_bytes) > MAX_SOURCE_BYTES:
                     diagnostic = Diagnostic(
                         "invalid_request",
                         f"review file exceeds the {MAX_SOURCE_BYTES} byte limit: {requested_path}",
                         next="select a smaller bounded file or split the review",
                     )
                     return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
-                source_bytes = path.read_bytes()
                 source_bytes.decode("utf-8")
             except (OSError, UnicodeDecodeError) as error:
                 diagnostic = Diagnostic(
@@ -361,13 +380,6 @@ class ReviewClient:
                         f"review file could not be read: {requested_path}",
                         next="check the file permissions and retry",
                     )
-                return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
-            if len(source_bytes) > MAX_SOURCE_BYTES:
-                diagnostic = Diagnostic(
-                    "invalid_request",
-                    f"review file exceeds the {MAX_SOURCE_BYTES} byte limit: {requested_path}",
-                    next="select a smaller bounded file or split the review",
-                )
                 return ReviewResult("invalid_request", review_id, Path(), (), diagnostic)
             source_files.append(path)
             source_contents.append(source_bytes)

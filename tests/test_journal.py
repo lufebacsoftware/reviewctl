@@ -39,6 +39,20 @@ def test_journal_rejects_symlinked_state_file(tmp_path: Path) -> None:
     assert external.read_text() == "outside\n"
 
 
+def test_journal_reports_existing_non_regular_path_as_corrupt(tmp_path: Path) -> None:
+    path = tmp_path / ".reviewctl" / "journal.jsonl"
+    path.mkdir(parents=True)
+    journal = ProjectJournal(path)
+
+    events, diagnostic = journal.read_with_diagnostic()
+
+    assert events == []
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_corrupt"
+    assert "regular file" in diagnostic.message
+    assert journal.verify() == [diagnostic.message]
+
+
 def test_journal_appends_and_reads_events(tmp_path: Path) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     journal.append({"type": "review_started", "reviewId": "r1"})
