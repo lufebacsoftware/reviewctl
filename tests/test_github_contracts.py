@@ -358,6 +358,18 @@ def test_github_command_runner_maps_timeout_oserror_and_success(
     assert result.stdout == b"out"
 
 
+def test_github_command_runner_fails_typed_without_resource_limits(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(github_module, "resource", None)
+
+    result = github_module._run_command(["gh"], cwd=tmp_path, timeout_seconds=1)
+
+    assert result.returncode == 126
+    assert b"bounded" in result.stderr
+    assert b"unsupported" in result.stderr
+
+
 def test_github_command_runner_bounds_captured_stdout(tmp_path: Path) -> None:
     output_size = github_module.MAX_GITHUB_DIFF_BYTES + 1024
 

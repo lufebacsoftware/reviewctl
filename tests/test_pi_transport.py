@@ -205,6 +205,21 @@ def test_run_process_returns_successful_process_result(
     assert result == PiProcessResult(0, b"stdout", b"stderr", False)
 
 
+def test_run_process_fails_typed_without_resource_limits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(pi_module, "resource", None)
+
+    result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
+
+    assert result == PiProcessResult(
+        126,
+        b"",
+        b"Pi bounded output capture unsupported on this platform",
+        False,
+    )
+
+
 @pytest.mark.parametrize(
     ("stream", "size", "limit_name", "truncated_name"),
     [

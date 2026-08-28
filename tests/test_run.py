@@ -42,6 +42,33 @@ def run_cli(*arguments: str, env: dict[str, str] | None = None) -> subprocess.Co
     )
 
 
+def test_cli_imports_without_the_posix_resource_module() -> None:
+    script = """
+import builtins
+
+real_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == "resource":
+        raise ImportError("resource unavailable")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+from reviewctl.cli import build_parser
+assert build_parser().prog == "reviewctl"
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPOSITORY,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def write_fake_python_executable(path: Path, name: str, source: str) -> Path:
     """Create a coverage-neutral stdlib fake without disabling CLI coverage."""
     executable = path / name

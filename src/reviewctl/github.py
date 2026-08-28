@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import resource
 import subprocess
 import tempfile
 import time
@@ -20,6 +19,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from reviewctl.errors import Diagnostic, ReviewctlError
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - exercised on non-POSIX hosts
+    resource = None  # type: ignore[assignment]
 
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SHA = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -72,6 +76,12 @@ def _run_command(
     timeout_seconds: float,
     input_bytes: bytes | None = None,
 ) -> CommandResult:
+    if resource is None:
+        return CommandResult(
+            126,
+            b"",
+            b"bounded command capture unsupported on this platform",
+        )
     capture_limit = MAX_GITHUB_DIFF_BYTES + 1
 
     def limit_output_files() -> None:

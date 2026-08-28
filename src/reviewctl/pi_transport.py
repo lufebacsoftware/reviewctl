@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import resource
 import signal
 import subprocess
 import tempfile
@@ -25,6 +24,11 @@ from reviewctl.backends import (
     ReadOnlyCapability,
     SourceIsolation,
 )
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - exercised on non-POSIX hosts
+    resource = None  # type: ignore[assignment]
 
 MAX_PI_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_PI_STDERR_BYTES = 1024 * 1024
@@ -97,6 +101,13 @@ def _kill_failed_process(process: Any) -> None:
 def _run_process(
     command: list[str], *, input_text: str, timeout_seconds: int, cwd: Path
 ) -> PiProcessResult:
+    if resource is None:
+        return PiProcessResult(
+            126,
+            b"",
+            b"Pi bounded output capture unsupported on this platform",
+            False,
+        )
     capture_file_limit = max(MAX_PI_STDOUT_BYTES, MAX_PI_STDERR_BYTES) + 1
 
     def limit_output_files() -> None:
