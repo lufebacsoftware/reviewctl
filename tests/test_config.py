@@ -8,6 +8,7 @@ import pytest
 import reviewctl.config as config_module
 from reviewctl.cli import run_cli
 from reviewctl.config import ConfigError, load_config, parse_route
+from reviewctl.filesystem import read_confined_bytes
 
 
 def test_project_config_wins_over_user_profile(tmp_path: Path) -> None:
@@ -137,6 +138,28 @@ def test_dangling_project_config_symlink_is_not_treated_as_missing(tmp_path: Pat
     (project / "reviewctl.toml").symlink_to(tmp_path / "missing.toml")
 
     with pytest.raises(ConfigError, match="regular file"):
+        load_config(project, user_path=None)
+
+
+def test_project_config_swap_to_symlink_fails_at_confined_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "reviewctl.toml"
+    external = tmp_path / "external.toml"
+    project.write_text('[project]\nprivacy_mode = "sensitive"\n')
+    external.write_text(
+        '[project]\nprivacy_mode = "personal"\n'
+        '[profiles.default]\nroutes = ["pi:openrouter/model"]\nexecution = "remote"\n'
+    )
+
+    def swap_then_read(path: Path) -> bytes:
+        project.unlink()
+        project.symlink_to(external)
+        return read_confined_bytes(path)
+
+    monkeypatch.setattr(config_module, "read_confined_bytes", swap_then_read, raising=False)
+
+    with pytest.raises(ConfigError, match="could not read configuration"):
         load_config(project, user_path=None)
 
 

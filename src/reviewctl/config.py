@@ -12,6 +12,7 @@ from typing import Any
 
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import ConfigError
+from reviewctl.filesystem import read_confined_bytes
 
 SUPPORTED_TRANSPORTS = frozenset({"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"})
 PRIVACY_RANK = {"personal": 0, "private": 1, "sensitive": 2}
@@ -97,17 +98,15 @@ def _read(path: Path | None) -> tuple[dict[str, Any], bytes, Path | None]:
     if path is None:
         return {}, b"", None
     resolved = _config_path(path)
-    if resolved.is_symlink():
-        raise ConfigError(f"configuration {resolved} must be a regular file")
-    if not resolved.exists():
-        return {}, b"", None
-    if not resolved.is_file():
-        raise ConfigError(f"configuration {resolved} must be a regular file")
     try:
-        raw = resolved.read_bytes()
+        raw = read_confined_bytes(resolved)
         value = tomllib.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        return {}, b"", None
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise ConfigError(f"could not read configuration {resolved}: {error}") from error
+        raise ConfigError(
+            f"could not read configuration {resolved}; it must be a regular file: {error}"
+        ) from error
     if not isinstance(value, dict):
         raise ConfigError(f"configuration {resolved} must contain a TOML table")
     return value, raw, resolved
