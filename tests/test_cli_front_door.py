@@ -175,6 +175,21 @@ def test_init_rejects_corrupt_retained_identity_before_writing_config(
     assert not (tmp_path / "reviewctl.toml").exists()
 
 
+def test_init_rejects_config_invalid_retained_project_id_before_writing_config(
+    tmp_path: Path, capsys
+) -> None:
+    store = project_cli.ProjectIdentityStore(tmp_path)
+    store.ensure("project-existing")
+    identity_path = tmp_path / ".reviewctl" / "identity.json"
+    identity = json.loads(identity_path.read_text())
+    identity["projectId"] = "bad id"
+    identity_path.write_text(json.dumps(identity))
+
+    assert run_cli(["init", "--project", str(tmp_path)]) == 5
+    assert "invalid schema" in capsys.readouterr().err
+    assert not (tmp_path / "reviewctl.toml").exists()
+
+
 def test_init_rejects_symlinked_state_root_before_writing_config(tmp_path: Path, capsys) -> None:
     project = tmp_path / "project"
     project.mkdir()

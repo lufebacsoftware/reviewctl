@@ -19,6 +19,7 @@ try:
 except ImportError:  # pragma: no cover - journal support is POSIX-only
     fcntl = None
 
+from reviewctl.config import PROJECT_ID
 from reviewctl.errors import Diagnostic, JournalOperationError
 from reviewctl.filesystem import confined_directory_descriptor
 
@@ -289,6 +290,7 @@ class ProjectIdentityStore:
             or schema_version != 1
             or not isinstance(project_id, str)
             or not project_id
+            or not PROJECT_ID.fullmatch(project_id)
             or not isinstance(origin_id, str)
             or not origin_id
             or not isinstance(created_at, str)
