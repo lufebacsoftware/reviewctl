@@ -3796,6 +3796,28 @@ def findings_validation_error(response: str, evaluation: ContractEvaluation) -> 
     return "findings-json: findings do not satisfy the required schema or verdict invariant"
 
 
+def persisted_receipt_valid(path: Path) -> bool:
+    """Verify the digest of the exact receipt bytes persisted by a review run."""
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        receipt = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_constant,
+        )
+        if not isinstance(receipt, dict):
+            return False
+        recorded = receipt.pop("sha256", None)
+        return isinstance(recorded, str) and recorded == sha256_bytes(
+            contract_canonical_json(receipt)
+        )
+    except OSError, UnicodeError, TypeError, ValueError, OverflowError:
+        return False
+
+
 def seal(path: Path, contents: bytes, recipient: str) -> str:
     target = path.with_suffix(path.suffix + ".age")
     result = subprocess.run(
@@ -4476,7 +4498,23 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             }
 
         receipt["sha256"] = sha256_bytes(contract_canonical_json(receipt))
-        (turn_dir / "receipt.json").write_bytes(canonical_json(receipt) + b"\n")
+        receipt_path = turn_dir / "receipt.json"
+        receipt_path.write_bytes(canonical_json(receipt) + b"\n")
+        if not persisted_receipt_valid(receipt_path):
+            log_event(
+                logger,
+                "review_finished",
+                accepted_attempt=accepted_attempt,
+                attempts=len(attempts),
+                result="receipt_invalid",
+                review_id=args.review_id,
+            )
+            print(turn_dir)
+            print(
+                "reviewctl: receipt_invalid: persisted review receipt failed verification",
+                file=sys.stderr,
+            )
+            return exit_code_for("receipt_invalid")
         log_event(
             logger,
             "review_finished",

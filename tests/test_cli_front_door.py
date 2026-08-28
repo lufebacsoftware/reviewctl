@@ -526,6 +526,7 @@ def test_review_prompt_file_client_errors_and_exit_rules(
             return ReviewResult("accepted", "r", Path("receipt"), ())
 
     monkeypatch.setattr(project_cli, "ReviewClient", Client)
+    monkeypatch.setattr(project_cli, "verify_project_receipt", lambda path: None)
     args = SimpleNamespace(
         project=str(tmp_path),
         prompt=None,
@@ -590,6 +591,39 @@ def test_review_prompt_file_client_errors_and_exit_rules(
     args.fail_on = None
     assert project_cli.review_project(args) == 3
     capsys.readouterr()
+
+
+def test_project_review_rejects_an_unverified_persisted_receipt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    class Client:
+        @classmethod
+        def from_project(cls, project_dir):
+            return cls()
+
+        def review(self, request):
+            return ReviewResult("accepted", "r", tmp_path / "receipt.json", ())
+
+    monkeypatch.setattr(project_cli, "ReviewClient", Client)
+    monkeypatch.setattr(
+        project_cli,
+        "verify_project_receipt",
+        lambda path: Diagnostic("receipt_invalid", "persisted receipt is invalid"),
+    )
+    args = SimpleNamespace(
+        project=str(tmp_path),
+        prompt="review",
+        prompt_file=None,
+        files=[],
+        profile="default",
+        review_id=None,
+        dimensions=[],
+        format="json",
+        fail_on=None,
+    )
+
+    assert project_cli.review_project(args) == 5
+    assert "receipt_invalid" in capsys.readouterr().out
 
 
 def test_findings_status_text_and_client_error_paths(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -812,6 +846,7 @@ def test_review_front_door_renders_typed_result_as_json(
             )
 
     monkeypatch.setattr("reviewctl.project_cli.ReviewClient", FakeClient)
+    monkeypatch.setattr("reviewctl.project_cli.verify_project_receipt", lambda path: None)
 
     result = run_cli(
         [

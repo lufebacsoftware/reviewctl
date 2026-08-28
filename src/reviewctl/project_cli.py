@@ -269,6 +269,10 @@ def review_project(args: Any) -> int:
             dimensions=tuple(args.dimensions),
         )
     )
+    if result.status == "accepted":
+        receipt_diagnostic = verify_project_receipt(result.receipt_path)
+        if receipt_diagnostic is not None:
+            return _diagnostic_result(receipt_diagnostic, args.format)
     _print_result(result, args.format)
     if result.status == "accepted":
         if args.fail_on is not None and any(

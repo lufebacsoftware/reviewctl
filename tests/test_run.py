@@ -3391,6 +3391,35 @@ def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) ->
     assert verified.returncode == 0, verified.stderr
 
 
+def test_run_rejects_a_receipt_corrupted_immediately_after_persistence(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    real_write_bytes = Path.write_bytes
+
+    def corrupt_receipt(path: Path, contents: bytes) -> int:
+        written = real_write_bytes(path, contents)
+        if path.name == "receipt.json":
+            real_write_bytes(path, b"{}\n")
+        return written
+
+    monkeypatch.setattr(Path, "write_bytes", corrupt_receipt)
+    monkeypatch.setenv("LLM_BIN", str(fake_llm))
+
+    assert cli.run_cli(review_arguments(tmp_path, "accepted")) == 5
+    assert "receipt_invalid" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("contents", ["NaN", "[]", "{"])
+def test_persisted_receipt_validation_rejects_nonstandard_or_malformed_json(
+    tmp_path: Path, contents: str
+) -> None:
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(contents)
+
+    assert cli.persisted_receipt_valid(receipt) is False
+
+
 def test_findings_contract_rejects_a_severity_outside_the_shared_taxonomy() -> None:
     response = json.dumps(
         {
