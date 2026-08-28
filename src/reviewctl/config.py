@@ -269,14 +269,12 @@ def load_config(
     profiles_table = merged.get("profiles", {})
     if not isinstance(profiles_table, dict):
         raise ConfigError("profiles must be a TOML table")
-    project_profile_names = set(project.get("profiles", {}))
     profiles = {
         name: _profile(name, profile, project_privacy, required_dimensions)
         for name, profile in profiles_table.items()
     }
     if project_privacy == "sensitive":
-        for name in project_profile_names:
-            profile = profiles[name]
+        for name, profile in profiles.items():
             if profile.execution != "local":
                 raise ConfigError(f"sensitive project cannot use remote profile {name!r}")
     if not profiles:

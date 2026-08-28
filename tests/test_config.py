@@ -55,6 +55,33 @@ def test_sensitive_remote_profile_is_rejected_at_load(tmp_path: Path) -> None:
         load_config(project, user_path=None)
 
 
+def test_sensitive_project_rejects_remote_profile_inherited_from_user(tmp_path: Path) -> None:
+    user = tmp_path / "user.toml"
+    project = tmp_path / "reviewctl.toml"
+    user.write_text(
+        '[profiles.inherited]\nroutes = ["pi:openrouter/model"]\nexecution = "remote"\n'
+    )
+    project.write_text('[project]\nprivacy_mode = "sensitive"\n')
+
+    with pytest.raises(ConfigError, match="sensitive"):
+        load_config(project, user_path=user)
+
+
+def test_sensitive_project_accepts_local_override_of_remote_user_profile(tmp_path: Path) -> None:
+    user = tmp_path / "user.toml"
+    project = tmp_path / "reviewctl.toml"
+    user.write_text('[profiles.default]\nroutes = ["pi:openrouter/model"]\nexecution = "remote"\n')
+    project.write_text(
+        '[project]\nprivacy_mode = "sensitive"\n'
+        '[profiles.default]\nroutes = []\nexecution = "local"\n'
+    )
+
+    config = load_config(project, user_path=user)
+
+    assert config.profile("default").execution == "local"
+    assert config.profile("default").routes == ()
+
+
 @pytest.mark.parametrize(
     "route",
     [

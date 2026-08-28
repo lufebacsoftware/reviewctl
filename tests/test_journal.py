@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -344,6 +345,11 @@ def test_append_requires_a_supported_lock(tmp_path: Path, monkeypatch) -> None:
 
     assert error.value.diagnostic.code == "journal_unavailable"
     assert journal.path.read_bytes() == b""
+    events, diagnostic = journal.read_with_diagnostic()
+    assert events == []
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_unavailable"
+    assert journal.verify()
 
 
 def test_append_rejects_a_different_configured_identity(tmp_path: Path) -> None:
@@ -454,6 +460,65 @@ def test_journal_append_retries_short_writes(tmp_path: Path, monkeypatch) -> Non
 
     assert len(write_sizes) == 2
     assert journal.events() == [event]
+
+
+@pytest.mark.parametrize("operation", ["read", "verify"])
+def test_journal_readers_wait_for_partial_append(
+    tmp_path: Path, monkeypatch, operation: str
+) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.append({"type": "review_started", "reviewId": "r1"})
+    real_write = journal_module.os.write
+    partial_written = threading.Event()
+    finish_write = threading.Event()
+    reader_done = threading.Event()
+    write_paused = False
+    writer_errors: list[BaseException] = []
+    reader_results: list[object] = []
+
+    def short_then_pause(descriptor: int, contents) -> int:
+        nonlocal write_paused
+        if write_paused:
+            return real_write(descriptor, contents)
+        write_paused = True
+        written = real_write(descriptor, contents[: max(1, len(contents) // 2)])
+        partial_written.set()
+        if not finish_write.wait(2):
+            raise RuntimeError("reader did not release writer")
+        return written
+
+    def append_event() -> None:
+        try:
+            journal.append({"type": "review_finished", "reviewId": "r1"})
+        except BaseException as error:
+            writer_errors.append(error)
+
+    def read_journal() -> None:
+        reader_results.append(
+            journal.read_with_diagnostic() if operation == "read" else journal.verify()
+        )
+        reader_done.set()
+
+    monkeypatch.setattr(journal_module.os, "write", short_then_pause)
+    writer = threading.Thread(target=append_event)
+    writer.start()
+    assert partial_written.wait(2)
+    reader = threading.Thread(target=read_journal)
+    reader.start()
+    reader_blocked = not reader_done.wait(0.1)
+    finish_write.set()
+    writer.join(2)
+    reader.join(2)
+
+    assert reader_blocked
+    assert not writer.is_alive() and not reader.is_alive()
+    assert writer_errors == []
+    if operation == "read":
+        events, diagnostic = reader_results[0]
+        assert len(events) == 2
+        assert diagnostic is None
+    else:
+        assert reader_results == [[]]
 
 
 def test_journal_append_retries_short_reads_before_deriving_envelope(
@@ -606,26 +671,36 @@ def test_journal_envelope_identity_and_read_diagnostics(tmp_path: Path, monkeypa
     assert journal.findings_with_diagnostic()[1] is not None
     with pytest.raises(JournalOperationError):
         journal.head_sequence()
-    monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(OSError("denied")))
+    monkeypatch.setattr(
+        Path,
+        "open",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(OSError("denied")),
+    )
     assert journal.verify()
 
 
 def test_journal_lock_failures_are_typed(tmp_path: Path, monkeypatch) -> None:
     class LockFailure:
+        LOCK_SH = 0
         LOCK_EX = 1
         LOCK_UN = 2
 
         @staticmethod
         def flock(descriptor, mode):
-            if mode == LockFailure.LOCK_EX:
+            if mode in {LockFailure.LOCK_SH, LockFailure.LOCK_EX}:
                 raise OSError("lock failure")
 
     monkeypatch.setattr(journal_module, "fcntl", LockFailure)
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     with pytest.raises(JournalOperationError, match="could not lock"):
         journal.append({"type": "review_started"})
+    events, diagnostic = journal.read_with_diagnostic()
+    assert events == []
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_unavailable"
 
     class UnlockFailure:
+        LOCK_SH = 0
         LOCK_EX = 1
         LOCK_UN = 2
 
@@ -638,6 +713,9 @@ def test_journal_lock_failures_are_typed(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(OSError, match="unlock failure"):
         with journal._exclusive_lock(-1):
             pass
+    with pytest.raises(RuntimeError, match="read primary"):
+        with journal._shared_lock(-1):
+            raise RuntimeError("read primary")
 
     monkeypatch.setattr(
         journal_module.os,
@@ -658,7 +736,11 @@ def test_journal_read_and_verify_diagnostics(tmp_path: Path, monkeypatch) -> Non
     events, diagnostic = journal.read_with_diagnostic()
     assert events == [] and diagnostic is not None
     assert journal.verify()
-    monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(OSError("denied")))
+    monkeypatch.setattr(
+        Path,
+        "open",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(OSError("denied")),
+    )
     events, diagnostic = journal.read_with_diagnostic()
     assert events == [] and diagnostic is not None
 

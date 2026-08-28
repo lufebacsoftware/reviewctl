@@ -154,6 +154,40 @@ class ProjectJournal:
                 except BaseException:
                     pass
 
+    @contextmanager
+    def _shared_lock(self, descriptor: int):
+        if fcntl is None:
+            raise JournalOperationError(
+                Diagnostic(
+                    "journal_unavailable",
+                    "this platform has no supported journal lock primitive",
+                    retryable=True,
+                    next="run reviewctl on a POSIX filesystem with advisory locking",
+                )
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+        except OSError as error:
+            raise JournalOperationError(
+                Diagnostic(
+                    "journal_unavailable",
+                    f"could not lock the project journal for reading: {error}",
+                    retryable=True,
+                    next="check filesystem locking and retry",
+                )
+            ) from error
+        try:
+            yield
+        finally:
+            primary = sys.exc_info()[1]
+            if primary is None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            else:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except BaseException:
+                    pass
+
     def _with_envelope(self, event: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
         identities = self._journal_identity(events)
         if (
@@ -291,19 +325,25 @@ class ProjectJournal:
         return self.append(event)
 
     def read_with_diagnostic(self) -> tuple[list[dict[str, Any]], Diagnostic | None]:
-        if not self.path.is_file():
-            return [], None
-        try:
-            raw = self.path.read_bytes()
-        except (OSError, UnicodeDecodeError) as error:
-            return [], Diagnostic("journal_corrupt", f"could not read journal: {error}")
-        events, diagnostic = self._parse_bytes(raw)
+        events, diagnostic = self._read_locked()
         if diagnostic is not None:
             return events, diagnostic
         violations = self._verify_events(events)
         if violations:
             return events, Diagnostic("journal_corrupt", "; ".join(violations))
         return events, None
+
+    def _read_locked(self) -> tuple[list[dict[str, Any]], Diagnostic | None]:
+        if not self.path.is_file():
+            return [], None
+        try:
+            with self.path.open("rb") as stream:
+                with self._shared_lock(stream.fileno()):
+                    return self._read_descriptor(stream.fileno())
+        except JournalOperationError as error:
+            return [], error.diagnostic
+        except OSError as error:
+            return [], Diagnostic("journal_corrupt", f"could not read journal: {error}")
 
     def _read_descriptor(self, descriptor: int) -> tuple[list[dict[str, Any]], Diagnostic | None]:
         try:
@@ -396,12 +436,7 @@ class ProjectJournal:
 
     def verify(self) -> list[str]:
         """Return structural journal violations without changing journal bytes."""
-        if not self.path.is_file():
-            return []
-        try:
-            events, diagnostic = self._parse_bytes(self.path.read_bytes())
-        except OSError as error:
-            return [f"could not read journal: {error}"]
+        events, diagnostic = self._read_locked()
         violations = self._verify_events(events)
         if diagnostic is not None:
             violations.insert(0, diagnostic.message)
