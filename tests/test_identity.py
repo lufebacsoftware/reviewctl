@@ -101,7 +101,7 @@ def test_identity_store_lock_failure_and_unlock_failure(tmp_path: Path, monkeypa
     assert closed
 
 
-def test_identity_store_retains_source_after_replace_failure(tmp_path: Path, monkeypatch) -> None:
+def test_identity_store_cleans_source_after_replace_failure(tmp_path: Path, monkeypatch) -> None:
     store = ProjectIdentityStore(tmp_path)
     original_replace = identity_module.os.replace
     temporary_paths: list[str] = []
@@ -114,11 +114,11 @@ def test_identity_store_retains_source_after_replace_failure(tmp_path: Path, mon
     with pytest.raises(OSError, match="replace failed"):
         store.ensure("project-one")
     assert temporary_paths
-    assert Path(temporary_paths[0]).is_file()
+    assert not Path(temporary_paths[0]).exists()
     monkeypatch.setattr(identity_module.os, "replace", original_replace)
 
 
-@pytest.mark.parametrize("operation", ["fchmod", "write", "fsync", "close", "chmod"])
+@pytest.mark.parametrize("operation", ["fchmod", "write", "fsync", "close", "replace", "chmod"])
 def test_identity_write_cleans_temporary_files_on_every_failure(
     tmp_path: Path, monkeypatch, operation: str
 ) -> None:

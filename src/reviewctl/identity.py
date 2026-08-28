@@ -127,8 +127,7 @@ class ProjectIdentityStore:
             + b"\n"
         )
         descriptor, temporary = tempfile.mkstemp(prefix="identity.", dir=self.root)
-        installed = False
-        replace_attempted = False
+        staged_identity = os.fstat(descriptor)
         try:
             try:
                 os.fchmod(descriptor, 0o600)
@@ -148,16 +147,18 @@ class ProjectIdentityStore:
                         os.close(descriptor)
                     except BaseException:
                         pass
-            replace_attempted = True
             os.replace(temporary, self.path)
-            installed = True
             os.chmod(self.path, 0o600)
         except BaseException:
-            if not installed and not replace_attempted:
-                try:
+            try:
+                candidate = os.stat(temporary, follow_symlinks=False)
+                if (candidate.st_dev, candidate.st_ino) == (
+                    staged_identity.st_dev,
+                    staged_identity.st_ino,
+                ):
                     os.unlink(temporary)
-                except BaseException:
-                    pass
+            except BaseException:
+                pass
             raise
 
     @contextmanager
