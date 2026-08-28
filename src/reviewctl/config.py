@@ -78,7 +78,12 @@ def parse_route(value: str) -> Route:
         raise ConfigError(
             "route must use transport:model with a known transport and non-empty model"
         )
-    return Route(transport=transport, model=model.strip())
+    model = model.strip()
+    if transport == "pi":
+        provider, provider_separator, provider_model = model.partition("/")
+        if not provider_separator or not provider or not provider_model:
+            raise ConfigError("Pi route model must use provider/model")
+    return Route(transport=transport, model=model)
 
 
 def _config_path(path: Path) -> Path:

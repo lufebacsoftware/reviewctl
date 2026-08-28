@@ -121,6 +121,9 @@ def test_parse_route_requires_known_transport_and_model() -> None:
         parse_route("missing-colon")
     with pytest.raises(ConfigError, match="route"):
         parse_route("pi:")
+    for route in ("pi:model", "pi:/model", "pi:provider/"):
+        with pytest.raises(ConfigError, match="provider/model"):
+            parse_route(route)
 
 
 def test_review_dimensions_are_normalized_and_project_required(tmp_path: Path) -> None:
@@ -222,7 +225,7 @@ def test_profile_rejects_invalid_fields(
     project = tmp_path / "reviewctl.toml"
     project.write_text(
         "[profiles.default]\n"
-        + (f"routes = {value}\n" if field == "routes" else 'routes = ["pi:model"]\n')
+        + (f"routes = {value}\n" if field == "routes" else 'routes = ["pi:fake/model"]\n')
         + ("" if field == "routes" else f"{field} = {value}\n")
     )
     with pytest.raises(ConfigError, match=message):
@@ -288,7 +291,7 @@ def test_config_keeps_stricter_project_privacy_and_checks_all_profiles(tmp_path:
     project.write_text(
         '[project]\nprivacy_mode = "sensitive"\n'
         '[profiles.first]\nroutes = []\nexecution = "local"\n'
-        '[profiles.later]\nroutes = ["pi:model"]\nexecution = "remote"\n'
+        '[profiles.later]\nroutes = ["pi:fake/model"]\nexecution = "remote"\n'
     )
     with pytest.raises(ConfigError, match="sensitive"):
         load_config(project, user_path=user)

@@ -144,8 +144,10 @@ def _diagnostic_result(diagnostic: Diagnostic, output_format: str) -> int:
 def _replace_private_file(path: Path, contents: bytes) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
+    staged_identity = None
     try:
         try:
+            staged_identity = os.fstat(descriptor)
             stream = os.fdopen(descriptor, "wb")
         except BaseException:
             try:
@@ -170,7 +172,12 @@ def _replace_private_file(path: Path, contents: bytes) -> None:
         os.replace(temporary, path)
     except BaseException:
         try:
-            temporary.unlink()
+            candidate = os.stat(temporary, follow_symlinks=False)
+            if staged_identity is not None and (candidate.st_dev, candidate.st_ino) == (
+                staged_identity.st_dev,
+                staged_identity.st_ino,
+            ):
+                temporary.unlink()
         except BaseException:
             pass
         raise

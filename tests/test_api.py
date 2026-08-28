@@ -298,6 +298,50 @@ def test_project_receipt_verification_detects_tampering(tmp_path: Path) -> None:
     assert diagnostic.code == "receipt_invalid"
 
 
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_project_receipt_verification_rejects_nonfinite_json_number(
+    tmp_path: Path, number: str
+) -> None:
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(f'{{"sha256":"digest","usage":{{"costUsd":{number}}}}}')
+
+    diagnostic = verify_project_receipt(receipt)
+
+    assert diagnostic is not None
+    assert diagnostic.code == "receipt_invalid"
+    assert "could not read" in diagnostic.message
+
+
+def test_client_rejects_nonfinite_transport_usage_before_receipt(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+
+    class NonfiniteUsageTransport:
+        def execute(self, request):
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    "conversation",
+                    float("nan"),
+                    1,
+                    1,
+                    request.model,
+                    1,
+                    "fake",
+                    '{"verdict":"approved","findings":[]}',
+                ),
+                BackendEvidence(),
+            )
+
+    client = ReviewClient.from_project(tmp_path, transports={"pi": NonfiniteUsageTransport()})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == "transport_unavailable"
+    assert b"NaN" not in result.receipt_path.read_bytes()
+    assert verify_project_receipt(result.receipt_path) is None
+
+
 def test_client_maps_malformed_findings_payload_to_contract_failure(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     client = ReviewClient.from_project(
@@ -501,6 +545,30 @@ def test_private_api_helpers_cover_ids_and_execution_diagnostics() -> None:
 
 
 @pytest.mark.parametrize(
+    "changes",
+    [
+        {"cost_usd": float("nan")},
+        {"cost_usd": -1.0},
+        {"duration_ms": -1},
+        {"input_tokens": True},
+        {"output_tokens": -1},
+        {"provider": 7},
+        {"provider": ""},
+    ],
+)
+def test_response_metadata_rejects_invalid_usage(changes: dict[str, object]) -> None:
+    response = PersistedResponse("conversation", 0.0, 1, 1, "fake/model", 1, "fake", "{}")
+
+    assert not api_module._response_metadata_valid(replace(response, **changes))
+
+
+def test_response_metadata_accepts_nullable_usage() -> None:
+    response = PersistedResponse("conversation", None, None, None, "fake/model", None, None, "{}")
+
+    assert api_module._response_metadata_valid(response)
+
+
+@pytest.mark.parametrize(
     "value",
     [[], {"bad": object()}, "not-object"],
 )
@@ -543,7 +611,7 @@ def test_client_rejects_sensitive_remote_and_empty_route_profiles(tmp_path: Path
     project = tmp_path / "reviewctl.toml"
     project.write_text(
         '[project]\nprivacy_mode = "private"\n'
-        '[profiles.remote]\nroutes = ["pi:model"]\nexecution = "remote"\n'
+        '[profiles.remote]\nroutes = ["pi:fake/model"]\nexecution = "remote"\n'
         '[profiles.empty]\nroutes = []\nexecution = "local"\n'
     )
     config = api_module.load_config(tmp_path, user_path=None)
@@ -699,7 +767,7 @@ def test_client_maps_transport_and_empty_response_failures(tmp_path: Path) -> No
     assert result.status == "empty_response"
 
     (tmp_path / "reviewctl.toml").write_text(
-        '[profiles.default]\nroutes = ["pi:first", "pi:second"]\n'
+        '[profiles.default]\nroutes = ["pi:fake/first", "pi:fake/second"]\n'
     )
     raising = ReviewClient.from_project(tmp_path, transports={"pi": RaisingTransport()})
     result = raising.review(ReviewRequest(prompt="review"))
@@ -907,7 +975,7 @@ def test_client_handles_malformed_complete_and_incomplete_findings(
 
 def test_client_returns_partial_when_all_attempts_are_incomplete(tmp_path: Path) -> None:
     (tmp_path / "reviewctl.toml").write_text(
-        '[profiles.default]\nroutes = ["pi:model"]\nexecution = "remote"\n'
+        '[profiles.default]\nroutes = ["pi:fake/model"]\nexecution = "remote"\n'
     )
     partial = (
         '{"findings":[{"severity":"high","path":"source.py","line":1,'

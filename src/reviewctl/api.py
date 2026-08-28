@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import secrets
 from collections.abc import Mapping, Sequence
@@ -125,6 +126,34 @@ def _execution_diagnostic(execution: BackendExecution) -> Diagnostic:
             retryable=True,
         )
     return Diagnostic("empty_response", "review transport returned no usable response")
+
+
+def _response_metadata_valid(response: Any) -> bool:
+    cost = response.cost_usd
+    cost_valid = cost is None or (
+        isinstance(cost, (int, float))
+        and not isinstance(cost, bool)
+        and math.isfinite(cost)
+        and cost >= 0
+    )
+    counts_valid = all(
+        value is None or (type(value) is int and value >= 0)
+        for value in (response.duration_ms, response.input_tokens, response.output_tokens)
+    )
+    provider = response.provider
+    provider_valid = provider is None or (isinstance(provider, str) and bool(provider.strip()))
+    return cost_valid and counts_valid and provider_valid
+
+
+def _reject_nonstandard_json_number(value: str) -> None:
+    raise ValueError(f"non-standard JSON number: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
 
 
 def _normalize_source_context(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -507,10 +536,11 @@ class ReviewClient:
                 not isinstance(execution.response.conversation_id, str)
                 or not execution.response.conversation_id.strip()
                 or execution.response.model != route.model
+                or not _response_metadata_valid(execution.response)
             ):
                 diagnostic = Diagnostic(
                     "transport_unavailable",
-                    "review transport returned invalid response identity",
+                    "review transport returned invalid response identity or usage metadata",
                     retryable=True,
                 )
                 record_attempt({"attempt": index, "route": route_label, "status": diagnostic.code})
@@ -755,17 +785,27 @@ class ReviewClient:
                 "provider": usage.provider,
             }
         unsigned = json.dumps(
-            receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            receipt,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
         ).encode()
         receipt["sha256"] = _digest(unsigned)
-        contents = json.dumps(receipt, ensure_ascii=True, sort_keys=True, indent=2).encode()
+        contents = json.dumps(
+            receipt, ensure_ascii=True, sort_keys=True, indent=2, allow_nan=False
+        ).encode()
         return artifacts.write_bytes("receipt.json", contents + b"\n")
 
 
 def verify_project_receipt(path: Path) -> Diagnostic | None:
     """Verify the digest of a receipt produced by the project API."""
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_nonstandard_json_number,
+            parse_float=_parse_finite_json_float,
+        )
     except (OSError, UnicodeError, ValueError) as error:
         return Diagnostic("receipt_invalid", f"could not read receipt: {error}")
     if not isinstance(value, dict) or not isinstance(value.get("sha256"), str):
@@ -773,7 +813,11 @@ def verify_project_receipt(path: Path) -> Diagnostic | None:
     recorded = value["sha256"]
     unsigned = {key: item for key, item in value.items() if key != "sha256"}
     canonical = json.dumps(
-        unsigned, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        unsigned,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     ).encode()
     if recorded != _digest(canonical):
         return Diagnostic("receipt_invalid", "receipt digest does not match its contents")

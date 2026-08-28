@@ -411,6 +411,34 @@ def test_private_file_replace_does_not_unlink_reused_temporary_name(
     assert temporary_paths[0].read_bytes() == b"unrelated"
 
 
+def test_private_file_replace_preserves_reused_name_after_replace_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    temporary_paths: list[Path] = []
+    real_mkstemp = project_cli.tempfile.mkstemp
+    real_replace = project_cli.os.replace
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        temporary_paths.append(Path(name))
+        return descriptor, name
+
+    def replace_reuse_and_fail(source, destination):
+        real_replace(source, destination)
+        Path(source).write_bytes(b"unrelated")
+        raise RuntimeError("replace primary")
+
+    monkeypatch.setattr(project_cli.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(project_cli.os, "replace", replace_reuse_and_fail)
+
+    destination = tmp_path / "config"
+    with pytest.raises(RuntimeError, match="replace primary"):
+        project_cli._replace_private_file(destination, b"value")
+
+    assert destination.read_bytes() == b"value"
+    assert temporary_paths[0].read_bytes() == b"unrelated"
+
+
 def test_private_file_replace_preserves_primary_when_cleanup_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
