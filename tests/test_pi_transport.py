@@ -443,6 +443,8 @@ def test_run_process_preserves_timeout_when_termination_and_drain_fail(
 
         def __init__(self) -> None:
             self.communicate_calls = 0
+            self.terminate_attempts = 0
+            self.kill_attempts = 0
 
         def communicate(self, **kwargs: object) -> tuple[bytes, bytes]:
             self.communicate_calls += 1
@@ -453,9 +455,11 @@ def test_run_process_preserves_timeout_when_termination_and_drain_fail(
             raise OSError("drain failed")
 
         def terminate(self) -> None:
+            self.terminate_attempts += 1
             raise PermissionError("terminate denied")
 
         def kill(self) -> None:
+            self.kill_attempts += 1
             raise PermissionError("kill denied")
 
     process = UnstoppableProcess()
@@ -473,6 +477,9 @@ def test_run_process_preserves_timeout_when_termination_and_drain_fail(
     result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
 
     assert result == PiProcessResult(124, b"", b"", True)
+    assert process.communicate_calls == 3
+    assert process.terminate_attempts == 1
+    assert process.kill_attempts == 1
 
 
 def test_run_process_reports_communication_oserror(

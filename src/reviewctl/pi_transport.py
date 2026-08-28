@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from reviewctl.artifacts import ArtifactStore
 from reviewctl.backends import (
@@ -44,6 +45,45 @@ class PiProcessResult:
 
 
 ProcessRunner = Callable[..., PiProcessResult]
+
+
+def _signal_process(process: Any, sig: signal.Signals) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return
+    except OSError:
+        fallback = process.terminate if sig == signal.SIGTERM else process.kill
+        try:
+            fallback()
+        except OSError:
+            pass
+
+
+def _drain_process(process: Any) -> tuple[bytes | None, bytes | None, bool]:
+    try:
+        stdout, stderr = process.communicate(timeout=2)
+    except subprocess.TimeoutExpired as error:
+        stdout = error.stdout if isinstance(error.stdout, bytes) else None
+        stderr = error.stderr if isinstance(error.stderr, bytes) else None
+        return stdout, stderr, False
+    except OSError:
+        return None, None, False
+    return (
+        stdout if isinstance(stdout, bytes) else None,
+        stderr if isinstance(stderr, bytes) else None,
+        True,
+    )
+
+
+def _terminate_timed_out_process(process: Any) -> tuple[bytes | None, bytes | None]:
+    _signal_process(process, signal.SIGTERM)
+    stdout, stderr, finished = _drain_process(process)
+    if finished:
+        return stdout, stderr
+    _signal_process(process, signal.SIGKILL)
+    killed_stdout, killed_stderr, _finished = _drain_process(process)
+    return killed_stdout or stdout, killed_stderr or stderr
 
 
 def _run_process(
@@ -79,30 +119,7 @@ def _run_process(
             timed_out = True
             stdout = error.stdout if isinstance(error.stdout, bytes) else None
             stderr = error.stderr if isinstance(error.stderr, bytes) else None
-
-            def signal_process(sig: signal.Signals) -> None:
-                try:
-                    os.killpg(process.pid, sig)
-                except ProcessLookupError:
-                    return
-                except OSError:
-                    fallback = process.terminate if sig == signal.SIGTERM else process.kill
-                    try:
-                        fallback()
-                    except OSError:
-                        pass
-
-            signal_process(signal.SIGTERM)
-            try:
-                trailing_stdout, trailing_stderr = process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                signal_process(signal.SIGKILL)
-                try:
-                    trailing_stdout, trailing_stderr = process.communicate(timeout=2)
-                except OSError, subprocess.TimeoutExpired:
-                    trailing_stdout, trailing_stderr = None, None
-            except OSError:
-                trailing_stdout, trailing_stderr = None, None
+            trailing_stdout, trailing_stderr = _terminate_timed_out_process(process)
             if isinstance(trailing_stdout, bytes) and trailing_stdout:
                 stdout = trailing_stdout
             if isinstance(trailing_stderr, bytes) and trailing_stderr:
