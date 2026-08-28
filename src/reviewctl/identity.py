@@ -129,25 +129,15 @@ class ProjectIdentityStore:
         descriptor, temporary = tempfile.mkstemp(prefix="identity.", dir=self.root)
         staged_identity = None
         try:
-            try:
-                staged_identity = os.fstat(descriptor)
-                os.fchmod(descriptor, 0o600)
-                remaining = memoryview(payload)
-                while remaining:
-                    written = os.write(descriptor, remaining)
-                    if written == 0:
-                        raise OSError(f"could not finish writing project identity {self.path}")
-                    remaining = remaining[written:]
-                os.fsync(descriptor)
-            finally:
-                primary = sys.exc_info()[1]
-                if primary is None:
-                    os.close(descriptor)
-                else:
-                    try:
-                        os.close(descriptor)
-                    except BaseException:
-                        pass
+            staged_identity = os.fstat(descriptor)
+            os.fchmod(descriptor, 0o600)
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    raise OSError(f"could not finish writing project identity {self.path}")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
             os.replace(temporary, self.path)
             os.chmod(self.path, 0o600)
         except BaseException:
@@ -161,6 +151,15 @@ class ProjectIdentityStore:
             except BaseException:
                 pass
             raise
+        finally:
+            primary = sys.exc_info()[1]
+            if primary is None:
+                os.close(descriptor)
+            else:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
 
     @contextmanager
     def _identity_lock(self):
