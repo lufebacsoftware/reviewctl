@@ -101,6 +101,27 @@ def test_confine_project_state_path_validates_state_ancestor_and_resolves_other_
     assert confine_project_state_path(state_path) == state_path
     assert (tmp_path / ".reviewctl").is_dir()
     assert confine_project_state_path(tmp_path / "other") == (tmp_path / "other").resolve()
+    missing = tmp_path / "missing" / ".reviewctl" / "identity.json"
+    with pytest.raises(JournalOperationError, match="state path"):
+        confine_project_state_path(missing, create_root=False)
+
+
+@pytest.mark.parametrize("name", ["identity.json", "identity.lock"])
+def test_identity_store_rejects_symlinked_state_files_without_mutating_target(
+    tmp_path: Path, name: str
+) -> None:
+    store = ProjectIdentityStore(tmp_path / "project")
+    store.root.mkdir(parents=True)
+    external = tmp_path / f"external-{name}"
+    external.write_text("outside\n")
+    external.chmod(0o644)
+    (store.root / name).symlink_to(external)
+
+    with pytest.raises(JournalOperationError, match="state path"):
+        store.ensure("project-one")
+
+    assert external.read_text() == "outside\n"
+    assert stat.S_IMODE(external.stat().st_mode) == 0o644
 
 
 @pytest.mark.parametrize(

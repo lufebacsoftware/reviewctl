@@ -60,3 +60,17 @@ def test_artifact_store_rejects_symlinked_project_state_root(tmp_path: Path) -> 
         ArtifactStore(project / ".reviewctl" / "reviews")
 
     assert list(external.iterdir()) == []
+
+
+def test_artifact_store_rejects_symlinked_state_descendant(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    state = project / ".reviewctl"
+    state.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    (state / "reviews").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(JournalOperationError, match="state path"):
+        ArtifactStore(state / "reviews" / "review-one")
+
+    assert list(external.iterdir()) == []

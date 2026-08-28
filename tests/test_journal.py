@@ -24,6 +24,20 @@ def test_journal_rejects_symlinked_project_state_root(tmp_path: Path) -> None:
     assert list(external.iterdir()) == []
 
 
+def test_journal_rejects_symlinked_state_file(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    state = project / ".reviewctl"
+    state.mkdir(parents=True)
+    external = tmp_path / "external.jsonl"
+    external.write_text("outside\n")
+    (state / "journal.jsonl").symlink_to(external)
+
+    with pytest.raises(JournalOperationError, match="state path"):
+        ProjectJournal(state / "journal.jsonl")
+
+    assert external.read_text() == "outside\n"
+
+
 def test_journal_appends_and_reads_events(tmp_path: Path) -> None:
     journal = ProjectJournal(tmp_path / "journal.jsonl")
     journal.append({"type": "review_started", "reviewId": "r1"})

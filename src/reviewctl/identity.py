@@ -36,6 +36,16 @@ def _unsafe_state_root(root: Path) -> JournalOperationError:
     )
 
 
+def _unsafe_state_path(path: Path) -> JournalOperationError:
+    return JournalOperationError(
+        Diagnostic(
+            "journal_corrupt",
+            f"project state path is unsafe: {path}",
+            next="replace symlinks below .reviewctl with private project-local paths",
+        )
+    )
+
+
 def ensure_project_state_root(project_dir: Path, *, create: bool = True) -> Path | None:
     """Return a literal private .reviewctl directory without following a root symlink."""
     project = project_dir.expanduser().resolve()
@@ -70,14 +80,20 @@ def ensure_project_state_root(project_dir: Path, *, create: bool = True) -> Path
     return root
 
 
-def confine_project_state_path(path: Path) -> Path:
+def confine_project_state_path(path: Path, *, create_root: bool = True) -> Path:
     """Validate a literal .reviewctl ancestor before resolving a state path."""
     absolute = Path(os.path.abspath(path.expanduser()))
     for candidate in (absolute, *absolute.parents):
         if candidate.name == ".reviewctl":
-            root = ensure_project_state_root(candidate.parent)
-            assert root is not None
-            return root / absolute.relative_to(candidate)
+            root = ensure_project_state_root(candidate.parent, create=create_root)
+            if root is None:
+                raise _unsafe_state_path(absolute)
+            confined = root
+            for part in absolute.relative_to(candidate).parts:
+                confined /= part
+                if confined.is_symlink():
+                    raise _unsafe_state_path(confined)
+            return confined
     return absolute.resolve()
 
 
@@ -107,6 +123,7 @@ class ProjectIdentityStore:
 
     def ensure(self, project_id: str) -> ProjectIdentity:
         ensure_project_state_root(self.project_dir)
+        confine_project_state_path(self.path)
         with self._identity_lock():
             if self.path.exists():
                 identity = self._read()
@@ -143,6 +160,7 @@ class ProjectIdentityStore:
         """Read an existing identity without creating or modifying local state."""
         if ensure_project_state_root(self.project_dir, create=False) is None:
             return None
+        confine_project_state_path(self.path, create_root=False)
         if not self.path.exists():
             return None
         return self._read()
@@ -224,6 +242,8 @@ class ProjectIdentityStore:
             yield
             return
         lock_path = self.root / "identity.lock"
+        if lock_path.is_symlink():
+            raise _unsafe_state_path(lock_path)
         descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         acquired = False
         primary: BaseException | None = None
