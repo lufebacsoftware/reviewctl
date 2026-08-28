@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import sys
@@ -36,9 +37,24 @@ def _now() -> str:
 
 
 def _canonical_json(value: dict[str, Any]) -> bytes:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _reject_nonstandard_json_number(value: str) -> None:
+    raise ValueError(f"non-standard JSON number: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
 
 
 def _event_digest(event: dict[str, Any]) -> str:
@@ -92,7 +108,11 @@ class ProjectJournal:
                 normalized = self._with_envelope(normalized, events)
                 original_size = os.fstat(descriptor).st_size
                 line = json.dumps(
-                    normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                    normalized,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
                 )
                 remaining = memoryview((line + "\n").encode("utf-8"))
                 try:
@@ -375,11 +395,16 @@ class ProjectJournal:
             if not line.strip():
                 continue
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError as error:
+                event = json.loads(
+                    line,
+                    parse_constant=_reject_nonstandard_json_number,
+                    parse_float=_parse_finite_json_float,
+                )
+            except (json.JSONDecodeError, ValueError) as error:
+                reason = error.msg if isinstance(error, json.JSONDecodeError) else str(error)
                 return events, Diagnostic(
                     "journal_corrupt",
-                    f"invalid journal event at line {index}: {error.msg}",
+                    f"invalid journal event at line {index}: {reason}",
                 )
             if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                 return events, Diagnostic(
@@ -462,7 +487,9 @@ class ProjectJournal:
         return "legacy" if events else "empty"
 
     def events(self) -> list[dict[str, Any]]:
-        events, _diagnostic = self.read_with_diagnostic()
+        events, diagnostic = self.read_with_diagnostic()
+        if diagnostic is not None:
+            raise JournalOperationError(diagnostic)
         return events
 
     @staticmethod

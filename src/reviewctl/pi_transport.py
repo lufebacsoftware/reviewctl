@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import resource
 import signal
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +25,9 @@ from reviewctl.backends import (
     SourceIsolation,
 )
 
+MAX_PI_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_PI_STDERR_BYTES = 1024 * 1024
+
 
 @dataclass(frozen=True)
 class PiProcessResult:
@@ -30,6 +35,12 @@ class PiProcessResult:
     stdout: bytes
     stderr: bytes
     timed_out: bool
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+
+    @property
+    def output_truncated(self) -> bool:
+        return self.stdout_truncated or self.stderr_truncated
 
 
 ProcessRunner = Callable[..., PiProcessResult]
@@ -38,41 +49,70 @@ ProcessRunner = Callable[..., PiProcessResult]
 def _run_process(
     command: list[str], *, input_text: str, timeout_seconds: int, cwd: Path
 ) -> PiProcessResult:
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=cwd,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(
-            input=input_text.encode("utf-8"), timeout=timeout_seconds
+    capture_file_limit = max(MAX_PI_STDOUT_BYTES, MAX_PI_STDERR_BYTES) + 1
+
+    def limit_output_files() -> None:
+        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
+            resource.RLIMIT_FSIZE, (capture_file_limit, capture_file_limit)
         )
-    except subprocess.TimeoutExpired as error:
-        stdout = error.stdout if isinstance(error.stdout, bytes) else b""
-        stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            cwd=cwd,
+            start_new_session=True,
+            preexec_fn=limit_output_files,
+        )
+        stdout: bytes | None = None
+        stderr: bytes | None = None
+        timed_out = False
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            trailing_stdout, trailing_stderr = process.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            trailing_stdout, trailing_stderr = process.communicate()
+            communicated_stdout, communicated_stderr = process.communicate(
+                input=input_text.encode("utf-8"), timeout=timeout_seconds
+            )
+            stdout = communicated_stdout if isinstance(communicated_stdout, bytes) else None
+            stderr = communicated_stderr if isinstance(communicated_stderr, bytes) else None
+        except subprocess.TimeoutExpired as error:
+            timed_out = True
+            stdout = error.stdout if isinstance(error.stdout, bytes) else None
+            stderr = error.stderr if isinstance(error.stderr, bytes) else None
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                trailing_stdout, trailing_stderr = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                trailing_stdout, trailing_stderr = process.communicate()
+            if isinstance(trailing_stdout, bytes) and trailing_stdout:
+                stdout = trailing_stdout
+            if isinstance(trailing_stderr, bytes) and trailing_stderr:
+                stderr = trailing_stderr
+        except OSError as error:
+            process.kill()
+            process.wait()
+            return PiProcessResult(127, b"", str(error).encode("utf-8"), False)
+
+        def bounded_output(value: bytes | None, stream, limit: int) -> tuple[bytes, bool]:
+            if value is None:
+                stream.seek(0)
+                value = stream.read(limit + 1)
+            return value[:limit], len(value) > limit
+
+        stdout, stdout_truncated = bounded_output(stdout, stdout_file, MAX_PI_STDOUT_BYTES)
+        stderr, stderr_truncated = bounded_output(stderr, stderr_file, MAX_PI_STDERR_BYTES)
         return PiProcessResult(
-            124,
-            trailing_stdout if trailing_stdout else stdout,
-            trailing_stderr if trailing_stderr else stderr,
-            True,
+            124 if timed_out else process.returncode,
+            stdout,
+            stderr,
+            timed_out,
+            stdout_truncated,
+            stderr_truncated,
         )
-    except OSError as error:
-        process.kill()
-        process.wait()
-        return PiProcessResult(127, b"", str(error).encode("utf-8"), False)
-    return PiProcessResult(process.returncode, stdout, stderr, False)
 
 
 def _text_blocks(content: object) -> str:
@@ -261,20 +301,37 @@ class PiTransport:
         stderr_path = None
         if result.stderr:
             stderr_path = artifacts.write_bytes("stderr.log", result.stderr)
-        persisted = _persisted_response(
-            result.stdout,
-            request.model,
-            round((time.monotonic() - started) * 1000),
+        persisted = (
+            None
+            if result.output_truncated
+            else _persisted_response(
+                result.stdout,
+                request.model,
+                round((time.monotonic() - started) * 1000),
+            )
         )
+        exit_code = result.returncode
         diagnostic = ""
         if result.timed_out:
             diagnostic = "review attempt timed out"
+        elif result.output_truncated:
+            streams = " and ".join(
+                name
+                for name, truncated in (
+                    ("stdout", result.stdout_truncated),
+                    ("stderr", result.stderr_truncated),
+                )
+                if truncated
+            )
+            diagnostic = f"Pi process {streams} output exceeded the capture limit"
+            if exit_code == 0:
+                exit_code = 1
         elif result.returncode != 0:
             diagnostic = result.stderr.decode(errors="replace").strip() or "Pi process failed"
         elif persisted is None or not persisted.response.strip():
             diagnostic = "empty_response"
         return BackendExecution(
-            exit_code=result.returncode,
+            exit_code=exit_code,
             diagnostic=diagnostic,
             response=persisted,
             evidence=BackendEvidence(

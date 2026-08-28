@@ -745,6 +745,49 @@ def test_journal_read_and_verify_diagnostics(tmp_path: Path, monkeypatch) -> Non
     assert events == [] and diagnostic is not None
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_journal_append_rejects_nonfinite_values(tmp_path: Path, value: float) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+
+    with pytest.raises(ValueError, match="JSON"):
+        journal.append({"type": "review_started", "value": value})
+
+    assert journal.path.read_bytes() == b""
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_journal_reads_reject_nonfinite_json_numbers(tmp_path: Path, number: str) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.path.write_text(f'{{"type":"review_started","value":{number}}}\n')
+
+    events, diagnostic = journal.read_with_diagnostic()
+
+    assert events == []
+    assert diagnostic is not None
+    assert diagnostic.code == "journal_corrupt"
+    assert journal.verify()
+
+
+def test_journal_reads_preserve_finite_json_float(tmp_path: Path) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.path.write_text('{"type":"review_started","value":0.5}\n')
+
+    events, diagnostic = journal.read_with_diagnostic()
+
+    assert events == [{"type": "review_started", "value": 0.5}]
+    assert diagnostic is None
+
+
+def test_journal_events_raises_on_corrupt_suffix(tmp_path: Path) -> None:
+    journal = ProjectJournal(tmp_path / "journal.jsonl")
+    journal.path.write_text('{"type":"review_started","reviewId":"r1"}\n{"type":')
+
+    with pytest.raises(JournalOperationError) as error:
+        journal.events()
+
+    assert error.value.diagnostic.code == "journal_corrupt"
+
+
 def test_journal_parse_and_descriptor_fail_closed(tmp_path: Path) -> None:
     events, diagnostic = ProjectJournal._parse_bytes(b"\n[]\n")
     assert events == [] and diagnostic is not None

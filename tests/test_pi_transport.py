@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import signal
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -69,13 +70,15 @@ def popen_factory(process: object, *, expected_command: list[str], expected_cwd:
         stderr: object,
         cwd: Path,
         start_new_session: bool,
+        preexec_fn: object,
     ) -> object:
         assert command == expected_command
         assert stdin is subprocess.PIPE
-        assert stdout is subprocess.PIPE
-        assert stderr is subprocess.PIPE
+        assert hasattr(stdout, "write")
+        assert hasattr(stderr, "write")
         assert cwd == expected_cwd
         assert start_new_session is True
+        assert callable(preexec_fn)
         return process
 
     return fake_popen
@@ -170,6 +173,7 @@ def test_pi_transport_preserves_timeout_as_transport_diagnostic(tmp_path: Path) 
                 stdout=b"",
                 stderr=b"timed out",
                 timed_out=True,
+                stderr_truncated=True,
             )
 
     execution = PiTransport(run_process=TimeoutRunner(b"")).execute(request(tmp_path))
@@ -200,6 +204,81 @@ def test_run_process_returns_successful_process_result(
     result = pi_module._run_process(["pi"], input_text="prompt", timeout_seconds=4, cwd=tmp_path)
 
     assert result == PiProcessResult(0, b"stdout", b"stderr", False)
+
+
+@pytest.mark.parametrize(
+    ("stream", "size", "limit_name", "truncated_name"),
+    [
+        ("stdout", 8 * 1024 * 1024 + 1024, "MAX_PI_STDOUT_BYTES", "stdout_truncated"),
+        ("stderr", 1024 * 1024 + 1024, "MAX_PI_STDERR_BYTES", "stderr_truncated"),
+    ],
+)
+def test_run_process_bounds_child_output(
+    tmp_path: Path, stream: str, size: int, limit_name: str, truncated_name: str
+) -> None:
+    descriptor = 1 if stream == "stdout" else 2
+
+    result = pi_module._run_process(
+        [sys.executable, "-c", f"import os; os.write({descriptor}, b'x' * {size})"],
+        input_text="",
+        timeout_seconds=10,
+        cwd=tmp_path,
+    )
+
+    limit = getattr(pi_module, limit_name)
+    assert len(getattr(result, stream)) <= limit
+    assert getattr(result, truncated_name)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout_truncated", "stderr_truncated", "stream"),
+    [(0, True, False, "stdout"), (2, False, True, "stderr")],
+)
+def test_pi_transport_maps_truncated_output_to_failure(
+    tmp_path: Path,
+    returncode: int,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stream: str,
+) -> None:
+    class TruncatedRunner(FakeRunner):
+        def __call__(self, command, *, input_text, timeout_seconds, cwd):
+            return PiProcessResult(
+                returncode=returncode,
+                stdout=assistant_stream('{"verdict":"approved","findings":[]}'),
+                stderr=b"",
+                timed_out=False,
+                stdout_truncated=stdout_truncated,
+                stderr_truncated=stderr_truncated,
+            )
+
+    execution = PiTransport(run_process=TruncatedRunner(b"")).execute(request(tmp_path))
+
+    assert execution.exit_code != 0
+    assert execution.response is None
+    assert stream in execution.diagnostic
+    assert "output" in execution.diagnostic
+    assert "limit" in execution.diagnostic
+
+
+def test_run_process_keeps_timeout_priority_with_bounded_output(tmp_path: Path) -> None:
+    size = pi_module.MAX_PI_STDERR_BYTES + 1024
+
+    result = pi_module._run_process(
+        [
+            sys.executable,
+            "-c",
+            f"import os,time; os.write(2, b'x' * {size}); time.sleep(5)",
+        ],
+        input_text="",
+        timeout_seconds=1,
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 124
+    assert result.timed_out
+    assert result.stderr_truncated
+    assert len(result.stderr) == pi_module.MAX_PI_STDERR_BYTES
 
 
 def test_run_process_terminates_then_kills_a_timed_out_process(
