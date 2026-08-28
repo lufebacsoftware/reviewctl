@@ -3405,15 +3405,14 @@ def test_run_rejects_a_receipt_corrupted_immediately_after_persistence(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     fake_llm = write_fake_llm(tmp_path)
-    real_write_bytes = Path.write_bytes
+    real_write_private_exclusive = cli.write_private_exclusive
 
-    def corrupt_receipt(path: Path, contents: bytes) -> int:
-        written = real_write_bytes(path, contents)
+    def corrupt_receipt(path: Path, contents: bytes, **kwargs: object) -> None:
+        real_write_private_exclusive(path, contents, **kwargs)
         if path.name == "receipt.json":
-            real_write_bytes(path, b"{}\n")
-        return written
+            path.write_bytes(b"{}\n")
 
-    monkeypatch.setattr(Path, "write_bytes", corrupt_receipt)
+    monkeypatch.setattr(cli, "write_private_exclusive", corrupt_receipt)
     monkeypatch.setenv("LLM_BIN", str(fake_llm))
 
     assert cli.run_cli(review_arguments(tmp_path, "accepted")) == 5
@@ -3428,6 +3427,37 @@ def test_persisted_receipt_validation_rejects_nonstandard_or_malformed_json(
     receipt.write_text(contents)
 
     assert cli.persisted_receipt_valid(receipt) is False
+
+
+def test_persisted_receipt_validation_requires_the_expected_digest(tmp_path: Path) -> None:
+    receipt = tmp_path / "receipt.json"
+    unsigned = {"result": "accepted"}
+    digest = cli.sha256_bytes(cli.contract_canonical_json(unsigned))
+    receipt.write_bytes(cli.canonical_json({**unsigned, "sha256": digest}) + b"\n")
+
+    assert cli.persisted_receipt_valid(receipt, expected_sha256=digest) is True
+    assert cli.persisted_receipt_valid(receipt, expected_sha256="0" * 64) is False
+
+
+def test_run_rejects_a_receipt_path_replaced_with_a_symlink(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    external = tmp_path / "external.json"
+    external.write_text("outside")
+    real_write_private_exclusive = cli.write_private_exclusive
+
+    def replace_receipt_path(path: Path, contents: bytes, **kwargs: object) -> None:
+        if path.name == "receipt.json":
+            path.symlink_to(external)
+        real_write_private_exclusive(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "write_private_exclusive", replace_receipt_path)
+    monkeypatch.setenv("LLM_BIN", str(fake_llm))
+
+    assert cli.run_cli(review_arguments(tmp_path, "accepted")) == 1
+    assert external.read_text() == "outside"
+    assert "review receipt evidence collision" in capsys.readouterr().err
 
 
 def test_findings_contract_rejects_a_severity_outside_the_shared_taxonomy() -> None:

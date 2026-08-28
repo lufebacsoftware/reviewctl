@@ -352,15 +352,25 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def write_private_exclusive(path: Path, contents: bytes) -> None:
+def write_private_exclusive(
+    path: Path, contents: bytes, *, label: str = "raw response evidence"
+) -> None:
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
     except FileExistsError as error:
-        raise RuntimeError(
-            f"raw response evidence collision at {path}: "
-            "the adapter already created the reserved raw-response.txt path; "
-            "configure the adapter to use a different evidence path"
-        ) from error
+        if label == "raw response evidence":
+            message = (
+                f"{label} collision at {path}: "
+                "the adapter already created the reserved raw-response.txt path; "
+                "configure the adapter to use a different evidence path"
+            )
+        else:
+            message = f"{label} collision at {path}: the reserved path already exists"
+        raise RuntimeError(message) from error
     try:
         remaining = memoryview(contents)
         while remaining:
@@ -3803,7 +3813,7 @@ def findings_validation_error(response: str, evaluation: ContractEvaluation) -> 
     return "findings-json: findings do not satisfy the required schema or verdict invariant"
 
 
-def persisted_receipt_valid(path: Path) -> bool:
+def persisted_receipt_valid(path: Path, *, expected_sha256: str | None = None) -> bool:
     """Verify the digest of the exact receipt bytes persisted by a review run."""
 
     def reject_nonstandard_constant(value: str) -> None:
@@ -3818,8 +3828,10 @@ def persisted_receipt_valid(path: Path) -> bool:
         if not isinstance(receipt, dict):
             return False
         recorded = receipt.pop("sha256", None)
-        return isinstance(recorded, str) and recorded == sha256_bytes(
-            contract_canonical_json(receipt)
+        return (
+            isinstance(recorded, str)
+            and (expected_sha256 is None or recorded == expected_sha256)
+            and recorded == sha256_bytes(contract_canonical_json(receipt))
         )
     except OSError, UnicodeError, TypeError, ValueError, OverflowError:
         return False
@@ -4505,9 +4517,14 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             }
 
         receipt["sha256"] = sha256_bytes(contract_canonical_json(receipt))
+        expected_receipt_sha256 = receipt["sha256"]
         receipt_path = turn_dir / "receipt.json"
-        receipt_path.write_bytes(canonical_json(receipt) + b"\n")
-        if not persisted_receipt_valid(receipt_path):
+        write_private_exclusive(
+            receipt_path,
+            canonical_json(receipt) + b"\n",
+            label="review receipt evidence",
+        )
+        if not persisted_receipt_valid(receipt_path, expected_sha256=expected_receipt_sha256):
             log_event(
                 logger,
                 "review_finished",

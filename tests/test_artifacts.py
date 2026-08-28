@@ -177,3 +177,32 @@ def test_artifact_write_never_follows_nested_directory_replaced_after_open(
     assert swapped
     assert list(external.iterdir()) == []
     assert (displaced / "packet.json").read_text() == "private prompt"
+
+
+def test_artifact_write_rejects_project_root_replaced_before_anchor_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = ArtifactStore(project / ".reviewctl" / "reviews" / "r1")
+    displaced = tmp_path / "project-displaced"
+    external_project = tmp_path / "external-project"
+    (external_project / ".reviewctl" / "reviews" / "r1").mkdir(parents=True)
+    real_open = artifacts_module.os.open
+    swapped = False
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == store._anchor and not swapped:
+            swapped = True
+            project.rename(displaced)
+            project.symlink_to(external_project, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(artifacts_module.os, "open", raced_open)
+
+    with pytest.raises(OSError):
+        store.write_text("packet.json", "private prompt")
+
+    assert swapped
+    assert list((external_project / ".reviewctl" / "reviews" / "r1").iterdir()) == []

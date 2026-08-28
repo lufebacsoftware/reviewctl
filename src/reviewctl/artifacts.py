@@ -21,8 +21,8 @@ class ArtifactStore:
         self._root_parts = (self.root.name,)
         for candidate in (self.root, *self.root.parents):
             if candidate.name == ".reviewctl":
-                self._anchor = candidate
-                self._root_parts = self.root.relative_to(candidate).parts
+                self._anchor = candidate.parent
+                self._root_parts = (candidate.name, *self.root.relative_to(candidate).parts)
                 break
         with self._directory_descriptor(()):
             pass

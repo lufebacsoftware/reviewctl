@@ -523,10 +523,10 @@ def test_review_prompt_file_client_errors_and_exit_rules(
 
         def review(self, request):
             seen.append(request)
-            return ReviewResult("accepted", "r", Path("receipt"), ())
+            return ReviewResult("accepted", "r", Path("receipt"), (), receipt_sha256="expected")
 
     monkeypatch.setattr(project_cli, "ReviewClient", Client)
-    monkeypatch.setattr(project_cli, "verify_project_receipt", lambda path: None)
+    monkeypatch.setattr(project_cli, "verify_project_receipt", lambda path, **kwargs: None)
     args = SimpleNamespace(
         project=str(tmp_path),
         prompt=None,
@@ -576,6 +576,7 @@ def test_review_prompt_file_client_errors_and_exit_rules(
                         reproduction="r",
                     ),
                 ),
+                receipt_sha256="expected",
             )
 
     monkeypatch.setattr(project_cli, "ReviewClient", ResultClient)
@@ -602,13 +603,19 @@ def test_project_review_rejects_an_unverified_persisted_receipt(
             return cls()
 
         def review(self, request):
-            return ReviewResult("accepted", "r", tmp_path / "receipt.json", ())
+            return ReviewResult(
+                "accepted",
+                "r",
+                tmp_path / "receipt.json",
+                (),
+                receipt_sha256="expected",
+            )
 
     monkeypatch.setattr(project_cli, "ReviewClient", Client)
     monkeypatch.setattr(
         project_cli,
         "verify_project_receipt",
-        lambda path: Diagnostic("receipt_invalid", "persisted receipt is invalid"),
+        lambda path, **kwargs: Diagnostic("receipt_invalid", "persisted receipt is invalid"),
     )
     args = SimpleNamespace(
         project=str(tmp_path),
@@ -624,6 +631,74 @@ def test_project_review_rejects_an_unverified_persisted_receipt(
 
     assert project_cli.review_project(args) == 5
     assert "receipt_invalid" in capsys.readouterr().out
+
+
+def test_project_review_binds_verification_to_the_expected_receipt_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result = ReviewResult(
+        "accepted",
+        "r",
+        tmp_path / "receipt.json",
+        (),
+        receipt_sha256="expected-digest",
+    )
+
+    class Client:
+        @classmethod
+        def from_project(cls, project_dir):
+            return cls()
+
+        def review(self, request):
+            return result
+
+    def verify(path, *, expected_sha256=None):
+        if expected_sha256 is not None:
+            return Diagnostic("receipt_invalid", "receipt digest does not match this review")
+        return None
+
+    monkeypatch.setattr(project_cli, "ReviewClient", Client)
+    monkeypatch.setattr(project_cli, "verify_project_receipt", verify)
+    args = SimpleNamespace(
+        project=str(tmp_path),
+        prompt="review",
+        prompt_file=None,
+        files=[],
+        profile="default",
+        review_id=None,
+        dimensions=[],
+        format="json",
+        fail_on=None,
+    )
+
+    assert project_cli.review_project(args) == 5
+
+
+def test_project_review_rejects_an_accepted_result_without_a_receipt_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class Client:
+        @classmethod
+        def from_project(cls, project_dir):
+            return cls()
+
+        def review(self, request):
+            return ReviewResult("accepted", "r", tmp_path / "receipt.json", ())
+
+    monkeypatch.setattr(project_cli, "ReviewClient", Client)
+    args = SimpleNamespace(
+        project=str(tmp_path),
+        prompt="review",
+        prompt_file=None,
+        files=[],
+        profile="default",
+        review_id=None,
+        dimensions=[],
+        format="json",
+        fail_on=None,
+    )
+
+    assert project_cli.review_project(args) == 5
 
 
 def test_findings_status_text_and_client_error_paths(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -843,10 +918,11 @@ def test_review_front_door_renders_typed_result_as_json(
                 review_id="review-1",
                 receipt_path=tmp_path / ".reviewctl/reviews/review-1/receipt.json",
                 findings=(),
+                receipt_sha256="expected",
             )
 
     monkeypatch.setattr("reviewctl.project_cli.ReviewClient", FakeClient)
-    monkeypatch.setattr("reviewctl.project_cli.verify_project_receipt", lambda path: None)
+    monkeypatch.setattr("reviewctl.project_cli.verify_project_receipt", lambda path, **kwargs: None)
 
     result = run_cli(
         [

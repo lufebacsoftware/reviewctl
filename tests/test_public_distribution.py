@@ -44,6 +44,7 @@ def test_python_tooling_targets_314_consistently() -> None:
     )
     assert all('python-version: "3.14"' in workflow for workflow in workflows)
     assert 'python-version: "3.12"' not in "\n".join(workflows)
+    assert "Python 3.14 or newer" in (ROOT / "README.md").read_text()
 
 
 def test_public_package_uses_apache_license() -> None:

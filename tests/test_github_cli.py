@@ -103,6 +103,7 @@ class FakeClient:
                     reproduction="private reproduction",
                 ),
             ),
+            receipt_sha256=digest,
         )
 
     def journal(self):

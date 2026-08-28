@@ -23,6 +23,7 @@ from reviewctl.contracts import (
     ContractContext,
     EvaluationContext,
     EvaluationStatus,
+    exact_json_object,
     get_contract,
 )
 from reviewctl.dimensions import DIMENSION_SCHEMA_VERSION, merge_dimensions, normalize_dimensions
@@ -130,6 +131,7 @@ class ReviewResult:
     receipt_path: Path
     findings: tuple[Finding, ...]
     diagnostic: Diagnostic | None = None
+    receipt_sha256: str | None = None
 
 
 def _now() -> str:
@@ -434,7 +436,7 @@ class ReviewClient:
                 "contract_failed",
                 f"could not prepare response contract: {error}",
             )
-            receipt_path = self._write_receipt(
+            receipt_path, receipt_sha256 = self._write_receipt(
                 artifacts,
                 review_id=review_id,
                 route="",
@@ -443,7 +445,9 @@ class ReviewClient:
                 dimensions=dimensions,
                 source_context=source_context,
             )
-            return ReviewResult("contract_failed", review_id, receipt_path, (), diagnostic)
+            return ReviewResult(
+                "contract_failed", review_id, receipt_path, (), diagnostic, receipt_sha256
+            )
         routes = tuple(
             route for route in profile.parsed_routes for _ in range(profile.max_attempts)
         )
@@ -633,7 +637,7 @@ class ReviewClient:
                     findings = self._merge_findings(partial_findings, current_findings)
                     record_attempt({"attempt": index, "route": route_label, "status": "accepted"})
                     self._record_findings(review_id, findings, dimensions=dimensions)
-                    receipt_path = self._write_receipt(
+                    receipt_path, receipt_sha256 = self._write_receipt(
                         artifacts,
                         review_id=review_id,
                         route=route_label,
@@ -655,7 +659,9 @@ class ReviewClient:
                             "dimensions": list(dimensions),
                         }
                     )
-                    return ReviewResult("accepted", review_id, receipt_path, findings)
+                    return ReviewResult(
+                        "accepted", review_id, receipt_path, findings, None, receipt_sha256
+                    )
             if evaluation is not None and evaluation.status is EvaluationStatus.INCOMPLETE:
                 try:
                     retained = tuple(
@@ -710,7 +716,7 @@ class ReviewClient:
             )
         findings = self._merge_findings(partial_findings)
         self._record_findings(review_id, findings, dimensions=dimensions)
-        receipt_path = self._write_receipt(
+        receipt_path, receipt_sha256 = self._write_receipt(
             artifacts,
             review_id=review_id,
             route=last_usage_route or (attempts[-1]["route"] if attempts else ""),
@@ -733,7 +739,7 @@ class ReviewClient:
                 "dimensions": list(dimensions),
             }
         )
-        return ReviewResult(status, review_id, receipt_path, findings, diagnostic)
+        return ReviewResult(status, review_id, receipt_path, findings, diagnostic, receipt_sha256)
 
     @staticmethod
     def _merge_findings(*groups: Sequence[Finding]) -> tuple[Finding, ...]:
@@ -793,7 +799,7 @@ class ReviewClient:
         fallback_relationships: Sequence[dict[str, Any]] = (),
         dimensions: Sequence[str] = (),
         source_context: Mapping[str, Any] | None = None,
-    ) -> Path:
+    ) -> tuple[Path, str]:
         receipt: dict[str, Any] = {
             "reviewId": review_id,
             "route": route,
@@ -838,18 +844,20 @@ class ReviewClient:
             separators=(",", ":"),
             allow_nan=False,
         ).encode()
-        receipt["sha256"] = _digest(unsigned)
+        receipt_sha256 = _digest(unsigned)
+        receipt["sha256"] = receipt_sha256
         contents = json.dumps(
             receipt, ensure_ascii=True, sort_keys=True, indent=2, allow_nan=False
         ).encode()
-        return artifacts.write_bytes("receipt.json", contents + b"\n")
+        return artifacts.write_bytes("receipt.json", contents + b"\n"), receipt_sha256
 
 
-def verify_project_receipt(path: Path) -> Diagnostic | None:
+def verify_project_receipt(path: Path, *, expected_sha256: str | None = None) -> Diagnostic | None:
     """Verify the digest of a receipt produced by the project API."""
     try:
         value = json.loads(
             path.read_text(encoding="utf-8"),
+            object_pairs_hook=exact_json_object,
             parse_constant=_reject_nonstandard_json_number,
             parse_float=_parse_finite_json_float,
         )
@@ -858,6 +866,10 @@ def verify_project_receipt(path: Path) -> Diagnostic | None:
     if not isinstance(value, dict) or not isinstance(value.get("sha256"), str):
         return Diagnostic("receipt_invalid", "receipt is missing its sha256 digest")
     recorded = value["sha256"]
+    if expected_sha256 is not None and recorded != expected_sha256:
+        return Diagnostic(
+            "receipt_invalid", "receipt digest does not match the accepted review result"
+        )
     unsigned = {key: item for key, item in value.items() if key != "sha256"}
     canonical = json.dumps(
         unsigned,

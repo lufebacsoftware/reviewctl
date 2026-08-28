@@ -8,6 +8,8 @@ repository. It uses `llm` as a transport, not as the source of review governance
 
 ## Install
 
+Python 3.14 or newer is required.
+
 ```bash
 uv tool install git+https://github.com/lufebacsoftware/reviewctl.git
 ```

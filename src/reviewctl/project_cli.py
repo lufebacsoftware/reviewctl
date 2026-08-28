@@ -270,7 +270,14 @@ def review_project(args: Any) -> int:
         )
     )
     if result.status == "accepted":
-        receipt_diagnostic = verify_project_receipt(result.receipt_path)
+        if result.receipt_sha256 is None:
+            receipt_diagnostic = Diagnostic(
+                "receipt_invalid", "accepted review result is missing its receipt digest"
+            )
+        else:
+            receipt_diagnostic = verify_project_receipt(
+                result.receipt_path, expected_sha256=result.receipt_sha256
+            )
         if receipt_diagnostic is not None:
             return _diagnostic_result(receipt_diagnostic, args.format)
     _print_result(result, args.format)
@@ -430,7 +437,14 @@ def github_review_project(args: Any) -> int:
 
     receipt_diagnostic = None
     if result.status == "accepted":
-        receipt_diagnostic = verify_project_receipt(result.receipt_path)
+        if result.receipt_sha256 is None:
+            receipt_diagnostic = Diagnostic(
+                "receipt_invalid", "accepted review result is missing its receipt digest"
+            )
+        else:
+            receipt_diagnostic = verify_project_receipt(
+                result.receipt_path, expected_sha256=result.receipt_sha256
+            )
     plan_status = result.status if receipt_diagnostic is None else "receipt_invalid"
     findings = (
         tuple(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -292,10 +293,33 @@ def test_project_receipt_verification_detects_tampering(tmp_path: Path) -> None:
     result = client.review(ReviewRequest(prompt="review"))
 
     assert verify_project_receipt(result.receipt_path) is None
+    assert result.receipt_sha256 is not None
+    assert (
+        verify_project_receipt(result.receipt_path, expected_sha256=result.receipt_sha256) is None
+    )
+    mismatched = verify_project_receipt(result.receipt_path, expected_sha256="another-review")
+    assert mismatched is not None
+    assert mismatched.code == "receipt_invalid"
     receipt = json.loads(result.receipt_path.read_text())
     receipt["status"] = "tampered"
     result.receipt_path.write_text(json.dumps(receipt))
     diagnostic = verify_project_receipt(result.receipt_path)
+    assert diagnostic is not None
+    assert diagnostic.code == "receipt_invalid"
+
+
+def test_project_receipt_verification_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    unsigned = {"status": "accepted"}
+    digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(
+        '{"status":"tampered","status":"accepted","sha256":' + json.dumps(digest) + "}"
+    )
+
+    diagnostic = verify_project_receipt(receipt)
+
     assert diagnostic is not None
     assert diagnostic.code == "receipt_invalid"
 
