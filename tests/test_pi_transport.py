@@ -325,6 +325,7 @@ def test_normalize_response_preserves_noncanonical_fences() -> None:
         ({"cost": "invalid", "input": True, "output": -1}, (None, None, None)),
         ({"cost": float("nan"), "input": -1, "output": 1.5}, (None, None, None)),
         ({"cost": float("inf"), "input": 1, "output": 0}, (None, 1, 0)),
+        ({"cost": 10**1000, "input": 1, "output": 0}, (None, 1, 0)),
     ],
 )
 def test_usage_rejects_nonmappings_and_invalid_numbers(

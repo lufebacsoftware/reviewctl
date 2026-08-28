@@ -128,14 +128,19 @@ def _execution_diagnostic(execution: BackendExecution) -> Diagnostic:
     return Diagnostic("empty_response", "review transport returned no usable response")
 
 
+def _cost_valid(cost: Any) -> bool:
+    if cost is None:
+        return True
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+        return False
+    try:
+        return math.isfinite(cost) and cost >= 0
+    except OverflowError:
+        return False
+
+
 def _response_metadata_valid(response: Any) -> bool:
-    cost = response.cost_usd
-    cost_valid = cost is None or (
-        isinstance(cost, (int, float))
-        and not isinstance(cost, bool)
-        and math.isfinite(cost)
-        and cost >= 0
-    )
+    cost_valid = _cost_valid(response.cost_usd)
     counts_valid = all(
         value is None or (type(value) is int and value >= 0)
         for value in (response.duration_ms, response.input_tokens, response.output_tokens)

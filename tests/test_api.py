@@ -549,6 +549,9 @@ def test_private_api_helpers_cover_ids_and_execution_diagnostics() -> None:
     [
         {"cost_usd": float("nan")},
         {"cost_usd": -1.0},
+        {"cost_usd": 10**1000},
+        {"cost_usd": True},
+        {"cost_usd": "invalid"},
         {"duration_ms": -1},
         {"input_tokens": True},
         {"output_tokens": -1},

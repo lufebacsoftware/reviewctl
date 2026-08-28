@@ -107,14 +107,16 @@ def _usage(value: object) -> tuple[float | None, int | None, int | None]:
         return None, None, None
     cost = value.get("cost")
     cost_value = cost.get("total") if isinstance(cost, dict) else cost
-    cost_result = (
-        float(cost_value)
-        if isinstance(cost_value, (int, float))
-        and not isinstance(cost_value, bool)
-        and math.isfinite(float(cost_value))
-        and cost_value >= 0
-        else None
-    )
+    cost_result = None
+    if isinstance(cost_value, (int, float)) and not isinstance(cost_value, bool):
+        try:
+            numeric_cost = float(cost_value)
+        except OverflowError:
+            pass
+        else:
+            cost_result = (
+                numeric_cost if math.isfinite(numeric_cost) and numeric_cost >= 0 else None
+            )
     input_tokens = value.get("input")
     output_tokens = value.get("output")
     return (
