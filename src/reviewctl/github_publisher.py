@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,19 +92,27 @@ class GitHubPublisher:
         command: Sequence[str],
         *,
         input_bytes: bytes | None = None,
+        deadline: float | None = None,
     ) -> bytes:
+        timeout_seconds = self.timeout_seconds
+        if deadline is not None:
+            timeout_seconds = deadline - time.monotonic()
+            if timeout_seconds <= 0:
+                raise _failure(
+                    "github_publication_timeout", f"{operation} timed out", retryable=True
+                )
         try:
             if input_bytes is None:
                 result = self.runner(
                     command,
                     cwd=self.project_dir,
-                    timeout_seconds=self.timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                 )
             else:
                 result = self.runner(
                     command,
                     cwd=self.project_dir,
-                    timeout_seconds=self.timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                     input_bytes=input_bytes,
                 )
         except (OSError, UnicodeError, ValueError) as error:
@@ -118,9 +127,11 @@ class GitHubPublisher:
             )
         return result.stdout
 
-    def _head(self, plan: ReviewPublicationPlan) -> str:
+    def _head(self, plan: ReviewPublicationPlan, *, deadline: float | None = None) -> str:
         endpoint = f"repos/{plan.repository}/pulls/{plan.pull_number}"
-        raw = self._run("GitHub pull-request head lookup", ["gh", "api", endpoint])
+        raw = self._run(
+            "GitHub pull-request head lookup", ["gh", "api", endpoint], deadline=deadline
+        )
         try:
             value = json.loads(raw.decode("utf-8"))
             head = value["head"]["sha"]
@@ -136,7 +147,9 @@ class GitHubPublisher:
             )
         return head.lower()
 
-    def _page(self, endpoint: str, page: int) -> list[dict[str, Any]]:
+    def _page(
+        self, endpoint: str, page: int, *, deadline: float | None = None
+    ) -> list[dict[str, Any]]:
         command = [
             "gh",
             "api",
@@ -151,6 +164,7 @@ class GitHubPublisher:
         raw = self._run(
             "GitHub publication reconciliation",
             command,
+            deadline=deadline,
         )
         try:
             value = json.loads(raw.decode("utf-8"))
@@ -166,7 +180,9 @@ class GitHubPublisher:
             )
         return value
 
-    def _existing_bodies(self, plan: ReviewPublicationPlan) -> tuple[str, ...]:
+    def _existing_bodies(
+        self, plan: ReviewPublicationPlan, *, deadline: float | None = None
+    ) -> tuple[str, ...]:
         bodies: list[str] = []
         endpoints = (
             f"repos/{plan.repository}/pulls/{plan.pull_number}/comments",
@@ -174,7 +190,7 @@ class GitHubPublisher:
         )
         for endpoint in endpoints:
             for page in range(1, self.max_pages + 1):
-                values = self._page(endpoint, page)
+                values = self._page(endpoint, page, deadline=deadline)
                 for value in values:
                     body = value.get("body")
                     if body is None:
@@ -195,12 +211,16 @@ class GitHubPublisher:
         return tuple(bodies)
 
     def _published_comment_ids(
-        self, plan: ReviewPublicationPlan, review_id: object
+        self,
+        plan: ReviewPublicationPlan,
+        review_id: object,
+        *,
+        deadline: float | None = None,
     ) -> tuple[str, ...]:
         endpoint = f"repos/{plan.repository}/pulls/{plan.pull_number}/reviews/{review_id}/comments"
         comment_ids: list[str] = []
         for page in range(1, self.max_pages + 1):
-            values = self._page(endpoint, page)
+            values = self._page(endpoint, page, deadline=deadline)
             for value in values:
                 comment_id = value.get("id")
                 if type(comment_id) is not int or comment_id <= 0:
@@ -222,7 +242,13 @@ class GitHubPublisher:
         heading = f"reviewctl review {plan.review_id} at head {plan.head_sha}"
         return heading if not summary_items else heading + "\n\n" + "\n\n".join(summary_items)
 
-    def _post(self, plan: ReviewPublicationPlan, items: Sequence[Any]) -> str:
+    def _post(
+        self,
+        plan: ReviewPublicationPlan,
+        items: Sequence[Any],
+        *,
+        deadline: float | None = None,
+    ) -> str:
         endpoint = f"repos/{plan.repository}/pulls/{plan.pull_number}/reviews"
         command = [
             "gh",
@@ -252,6 +278,7 @@ class GitHubPublisher:
             "GitHub comment publication",
             command,
             input_bytes=json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8"),
+            deadline=deadline,
         )
         try:
             value = json.loads(raw.decode("utf-8"))
@@ -286,8 +313,9 @@ class GitHubPublisher:
             return PublicationResult(key, plan.head_sha, "plan_invalid", diagnostic=diagnostic)
         if not plan.items:
             return PublicationResult(key, plan.head_sha, "no_findings")
+        deadline = time.monotonic() + self.timeout_seconds
         try:
-            initial_head = self._head(plan)
+            initial_head = self._head(plan, deadline=deadline)
             if initial_head != plan.head_sha.lower():
                 diagnostic = Diagnostic(
                     "github_publication_stale_head",
@@ -301,7 +329,7 @@ class GitHubPublisher:
                     observed_head_sha=initial_head,
                     diagnostic=diagnostic,
                 )
-            existing = self._existing_bodies(plan)
+            existing = self._existing_bodies(plan, deadline=deadline)
             pending = tuple(
                 item for item in plan.items if not any(item.marker in body for body in existing)
             )
@@ -313,7 +341,7 @@ class GitHubPublisher:
                     "skipped_duplicate",
                     skipped_finding_ids=skipped,
                 )
-            prepost_head = self._head(plan)
+            prepost_head = self._head(plan, deadline=deadline)
             if prepost_head != plan.head_sha.lower():
                 diagnostic = Diagnostic(
                     "github_publication_stale_head",
@@ -328,10 +356,10 @@ class GitHubPublisher:
                     observed_head_sha=prepost_head,
                     diagnostic=diagnostic,
                 )
-            review_id = self._post(plan, pending)
+            review_id = self._post(plan, pending, deadline=deadline)
             posted = {"summaryCommentId": review_id, "commentIds": ()}
-            posted["commentIds"] = self._published_comment_ids(plan, review_id)
-            observed_head = self._head(plan)
+            posted["commentIds"] = self._published_comment_ids(plan, review_id, deadline=deadline)
+            observed_head = self._head(plan, deadline=deadline)
             if observed_head != plan.head_sha.lower():
                 diagnostic = Diagnostic(
                     "github_publication_stale_head_race",

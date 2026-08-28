@@ -80,7 +80,7 @@ class FakeRunner:
         self.reviews = reviews or {1: []}
         self.calls: list[tuple[str, ...]] = []
         self.cwds: list[Path] = []
-        self.timeouts: list[int] = []
+        self.timeouts: list[float] = []
         self.inputs: list[bytes | None] = []
         self.post_payload = None
 
@@ -151,8 +151,25 @@ def test_publisher_reconciles_both_comment_and_review_bodies_and_posts_one_group
     assert runner.post_payload["comments"][0]["path"] == "src/app.py"
     assert "finding-summary" in runner.post_payload["body"]
     assert runner.cwds and all(cwd == tmp_path.resolve() for cwd in runner.cwds)
-    assert runner.timeouts and set(runner.timeouts) == {19}
+    assert runner.timeouts and all(0 < timeout <= 19 for timeout in runner.timeouts)
+    assert runner.timeouts == sorted(runner.timeouts, reverse=True)
     assert any(input_bytes is not None for input_bytes in runner.inputs)
+
+
+def test_publisher_enforces_one_deadline_across_all_requests(tmp_path: Path, monkeypatch) -> None:
+    runner = FakeRunner()
+    moments = iter([100.0, 100.0, 104.0, 109.25, 110.0])
+    monkeypatch.setattr(publisher_module.time, "monotonic", lambda: next(moments))
+
+    result = GitHubPublisher(tmp_path, runner=runner, timeout_seconds=10, page_size=100).publish(
+        make_plan()
+    )
+
+    assert result.status == "failed"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "github_publication_timeout"
+    assert runner.timeouts == [10, 6, 0.75]
+    assert len(runner.calls) == 3
 
 
 def test_publisher_recovers_inline_comment_ids_from_review_comments_endpoint() -> None:
