@@ -4882,9 +4882,15 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     plan_path = Path(args.plan)
     plan = load_policy(str(plan_path))
     budget = numeric_value(plan.get("budget_usd", 0))
-    max_output_tokens = int(plan.get("max_output_tokens", 4096))
+    max_output_tokens = plan.get("max_output_tokens", 4096)
     timeout_seconds = plan.get("timeout_seconds", 90)
-    if budget is None or budget <= 0 or max_output_tokens <= 0:
+    if (
+        budget is None
+        or budget <= 0
+        or not isinstance(max_output_tokens, int)
+        or isinstance(max_output_tokens, bool)
+        or max_output_tokens <= 0
+    ):
         parser.error("tournament plan requires positive budget_usd and max_output_tokens")
     if (
         not isinstance(timeout_seconds, int)

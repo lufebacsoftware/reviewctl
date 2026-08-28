@@ -7345,6 +7345,38 @@ files = ["{source}"]
     assert not artifact_root.exists()
 
 
+@pytest.mark.parametrize("max_output_tokens", ["8.5", "true", '"8"', "nan", "+inf"])
+def test_tournament_rejects_invalid_global_output_cap_before_running(
+    tmp_path: Path, max_output_tokens: str
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    source = tmp_path / "synthetic.py"
+    source.write_text("pass\n")
+    artifact_root = tmp_path / "tournament-artifacts"
+    tournament = tmp_path / "invalid-output-cap.toml"
+    tournament.write_text(
+        f'''budget_usd = 1
+max_output_tokens = {max_output_tokens}
+artifact_root = "{artifact_root}"
+
+[models.accepted]
+input_per_million_usd = 0
+output_per_million_usd = 0
+
+[[cases]]
+id = "synthetic-case"
+prompt = "Review."
+files = ["{source}"]
+'''
+    )
+
+    result = run_cli("tournament", "--plan", str(tournament), env={"LLM_BIN": str(fake_llm)})
+
+    assert result.returncode == 2
+    assert "positive budget_usd and max_output_tokens" in result.stderr
+    assert not artifact_root.exists()
+
+
 @pytest.mark.parametrize(
     ("field", "price"),
     [
