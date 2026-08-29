@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from reviewctl import range_review
 from reviewctl.range_review import RangeReviewError, build_range_manifest
 
 
@@ -169,3 +170,17 @@ def test_manifest_is_insensitive_to_diff_driver_hunk_headers(tmp_path: Path) -> 
     configured = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
 
     assert configured == baseline
+
+
+def test_bounded_git_capture_keeps_only_limit_plus_one_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_run(command: list[str], *, stdout, stderr, check: bool):
+        stdout.write(b"x" * 1024)
+        return subprocess.CompletedProcess(command, 0, None, None)
+
+    monkeypatch.setattr(range_review.subprocess, "run", fake_run)
+
+    result = range_review._run_git_bounded(tmp_path, "diff", max_stdout_bytes=32)
+
+    assert len(result.stdout) == 33

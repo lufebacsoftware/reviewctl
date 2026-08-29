@@ -11,6 +11,7 @@ import base64
 import hashlib
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ CHUNKING_VERSION = "file-sections-v1"
 DEFAULT_CONTEXT_LINES = 3
 DEFAULT_MAX_CHUNK_BYTES = 128 * 1024
 MAX_DIFF_BYTES = 4 * 1024 * 1024
+MAX_GIT_STDERR_BYTES = 100 * 1024
 _DIFF_HEADER = re.compile(rb"(?m)^diff --git ")
 _HUNK_HEADER = re.compile(
     rb"(?m)^(@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@)[^\r\n]*(\r?\n|$)"
@@ -34,6 +36,28 @@ def _run_git(repository: Path, *arguments: str) -> subprocess.CompletedProcess[b
         capture_output=True,
         check=False,
     )
+
+
+def _run_git_bounded(
+    repository: Path, *arguments: str, max_stdout_bytes: int
+) -> subprocess.CompletedProcess[bytes]:
+    """Run Git while keeping captured stdout/stderr bounded in memory."""
+    if max_stdout_bytes <= 0:
+        raise ValueError("max_stdout_bytes must be positive")
+    command = ["git", "-C", str(repository), *arguments]
+    with (
+        tempfile.SpooledTemporaryFile(max_size=max_stdout_bytes + 1) as stdout,
+        tempfile.SpooledTemporaryFile(max_size=MAX_GIT_STDERR_BYTES + 1) as stderr,
+    ):
+        completed = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
+        stdout.seek(0)
+        stderr.seek(0)
+        return subprocess.CompletedProcess(
+            command,
+            completed.returncode,
+            stdout=stdout.read(max_stdout_bytes + 1),
+            stderr=stderr.read(MAX_GIT_STDERR_BYTES + 1),
+        )
 
 
 def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:
@@ -111,7 +135,7 @@ def _canonical_diff_arguments(context_lines: int, *options: str) -> tuple[str, .
 
 
 def _canonical_diff(repository: Path, base: str, head: str, context_lines: int) -> bytes:
-    result = _run_git(
+    result = _run_git_bounded(
         repository,
         *_canonical_diff_arguments(
             context_lines,
@@ -120,6 +144,7 @@ def _canonical_diff(repository: Path, base: str, head: str, context_lines: int) 
         base,
         head,
         "--",
+        max_stdout_bytes=MAX_DIFF_BYTES,
     )
     if result.returncode != 0:
         raise RangeReviewError(f"could not compute canonical diff: {_git_error(result)}")
@@ -133,12 +158,13 @@ def _canonical_diff(repository: Path, base: str, head: str, context_lines: int) 
 
 
 def _canonical_paths(repository: Path, base: str, head: str) -> list[str]:
-    result = _run_git(
+    result = _run_git_bounded(
         repository,
         *_canonical_diff_arguments(0, "--name-only", "-z"),
         base,
         head,
         "--",
+        max_stdout_bytes=MAX_DIFF_BYTES,
     )
     if result.returncode != 0:
         raise RangeReviewError(f"could not capture canonical paths: {_git_error(result)}")
