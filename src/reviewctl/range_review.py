@@ -11,7 +11,7 @@ import base64
 import hashlib
 import re
 import subprocess
-import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -45,19 +45,48 @@ def _run_git_bounded(
     if max_stdout_bytes <= 0:
         raise ValueError("max_stdout_bytes must be positive")
     command = ["git", "-C", str(repository), *arguments]
-    with (
-        tempfile.SpooledTemporaryFile(max_size=max_stdout_bytes + 1) as stdout,
-        tempfile.SpooledTemporaryFile(max_size=MAX_GIT_STDERR_BYTES + 1) as stderr,
-    ):
-        completed = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
-        stdout.seek(0)
-        stderr.seek(0)
-        return subprocess.CompletedProcess(
-            command,
-            completed.returncode,
-            stdout=stdout.read(max_stdout_bytes + 1),
-            stderr=stderr.read(MAX_GIT_STDERR_BYTES + 1),
-        )
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if process.stdout is None or process.stderr is None:  # pragma: no cover - Popen contract
+        raise RuntimeError("Git pipes were not created")
+    stdout = bytearray()
+    stderr = bytearray()
+
+    def drain_stderr() -> None:
+        while True:
+            chunk = process.stderr.read(64 * 1024)
+            if not chunk:
+                return
+            remaining = MAX_GIT_STDERR_BYTES + 1 - len(stderr)
+            if remaining > 0:
+                stderr.extend(chunk[:remaining])
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+    oversized = False
+    try:
+        while True:
+            chunk = process.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            remaining = max_stdout_bytes + 1 - len(stdout)
+            if remaining <= 0:
+                oversized = True
+                break
+            stdout.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                oversized = True
+                break
+    finally:
+        if oversized:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        process.wait()
+        stderr_thread.join()
+        process.stdout.close()
+        process.stderr.close()
+    return subprocess.CompletedProcess(command, process.returncode, bytes(stdout), bytes(stderr))
 
 
 def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:
@@ -125,6 +154,7 @@ def _canonical_diff_arguments(context_lines: int, *options: str) -> tuple[str, .
         "--dst-prefix=b/",
         "--no-relative",
         "--ignore-submodules=none",
+        "--submodule=short",
         "-O/dev/null",
         "--no-ext-diff",
         "--no-textconv",

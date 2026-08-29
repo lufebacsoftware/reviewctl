@@ -175,12 +175,42 @@ def test_manifest_is_insensitive_to_diff_driver_hunk_headers(tmp_path: Path) -> 
 def test_bounded_git_capture_keeps_only_limit_plus_one_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fake_run(command: list[str], *, stdout, stderr, check: bool):
-        stdout.write(b"x" * 1024)
-        return subprocess.CompletedProcess(command, 0, None, None)
+    class FakeStream:
+        def __init__(self, payload: bytes):
+            self.payload = payload
 
-    monkeypatch.setattr(range_review.subprocess, "run", fake_run)
+        def read(self, _size: int = -1) -> bytes:
+            payload, self.payload = self.payload, b""
+            return payload
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = FakeStream(b"x" * 1024)
+            self.stderr = FakeStream(b"")
+            self.returncode = None
+            self.killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self) -> int:
+            self.returncode = self.returncode or 0
+            return self.returncode
+
+    process = FakeProcess()
+
+    def fake_popen(command: list[str], *, stdout, stderr):
+        assert stdout is subprocess.PIPE
+        assert stderr is subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(range_review.subprocess, "Popen", fake_popen)
 
     result = range_review._run_git_bounded(tmp_path, "diff", max_stdout_bytes=32)
 
     assert len(result.stdout) == 33
+    assert process.killed
