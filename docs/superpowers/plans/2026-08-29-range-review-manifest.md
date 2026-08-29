@@ -16,15 +16,15 @@
 - Create: `src/reviewctl/range_review.py`
 - Test: `tests/test_range_review.py`
 
-- [ ] **Step 1: Write the failing unit tests** for a three-file diff: the builder must record repository root, exact base/head, merge base, `base..head`, context lines, `chunkingVersion`, canonical diff digest, ordered chunks, and a digest for each chunk. Add tests that reject a missing commit, a non-positive context value, an empty range when `allow_empty` is false, and a chunk whose payload exceeds the configured byte limit.
+- [x] **Step 1: Write the failing unit tests** for a three-file diff: the builder must record repository root, exact base/head, merge base, `base..head`, context lines, `chunkingVersion`, canonical diff digest, ordered chunks, and a digest for each chunk. Add tests that reject a missing commit, a non-positive context value, an empty range when `allow_empty` is false, and a chunk whose payload exceeds the configured byte limit.
 
-- [ ] **Step 2: Run the focused tests and confirm RED** with `uv run pytest -q tests/test_range_review.py`.
+- [x] **Step 2: Run the focused tests and confirm RED** with `uv run pytest -q tests/test_range_review.py`.
 
-- [ ] **Step 3: Implement the minimal pure API.** Define `RangeReviewError`, immutable `RangeIdentity`, `RangeChunk`, and `RangeManifest` dataclasses plus `build_range_manifest(repository, base, head, context_lines=3, max_chunk_bytes=128*1024, allow_empty=False)`. Resolve each revision using `git rev-parse --verify <revision>^{commit}`, compute `git merge-base`, and capture one canonical `git diff --binary --full-index --no-ext-diff --unified=<context> <base> <head>` byte stream. Hash the exact bytes with SHA-256, split only at complete `diff --git` file sections, reject a single section larger than `max_chunk_bytes`, and assign stable zero-based indices and SHA-256 chunk IDs. Sort no paths after Git emits them; the canonical command output is the ordering authority.
+- [x] **Step 3: Implement the minimal pure API.** Define `RangeReviewError` and `build_range_manifest(repository, base, head, context_lines=3, max_chunk_bytes=128*1024, allow_empty=False)`. Resolve each revision using `git rev-parse --verify <revision>^{commit}`, compute `git merge-base`, and capture one canonical, configuration-pinned `git diff --text --full-index --no-ext-diff --unified=<context> <base> <head>` byte stream with a bounded pipe reader. Hash the exact bytes with SHA-256, split only at complete `diff --git` file sections, reject a single section larger than `max_chunk_bytes`, and assign stable zero-based indices and SHA-256 chunk IDs. Capture paths separately with `--name-only -z` so quoting cannot corrupt metadata.
 
-- [ ] **Step 4: Run the focused tests and confirm GREEN** with the same pytest command.
+- [x] **Step 4: Run the focused tests and confirm GREEN** with the same pytest command.
 
-- [ ] **Step 5: Commit** `git add src/reviewctl/range_review.py tests/test_range_review.py && git commit -m "feat: add deterministic range manifest builder"`.
+- [x] **Step 5: Commit** `git add src/reviewctl/range_review.py tests/test_range_review.py && git commit -m "feat: add deterministic range manifest builder"`.
 
 ### Task 2: Expose a manifest-only CLI mode
 
@@ -32,15 +32,15 @@
 - Modify: `src/reviewctl/cli.py` near parser construction and command handlers
 - Modify: `tests/test_run.py` for subprocess and failure-mode coverage
 
-- [ ] **Step 1: Write failing CLI tests** asserting `reviewctl range-review --repository <repo> --base <sha> --head <sha> --output <path>` writes canonical JSON with `status: "manifest-created"`, the exact identity fields, and no `receipt` or approval field. Add tests for changed head and oversized-file failures; the command must return a non-zero status and not write a misleading manifest.
+- [x] **Step 1: Write failing CLI tests** asserting `reviewctl range-review --repository <repo> --base <sha> --head <sha> --output <path>` writes canonical JSON with `status: "manifest-created"`, the exact identity fields, and no `receipt` or approval field. Add tests for changed head and oversized-file failures; the command must return a non-zero status and not write a misleading manifest.
 
-- [ ] **Step 2: Run those tests and confirm RED** with `uv run pytest -q tests/test_run.py -k range_review`.
+- [x] **Step 2: Run those tests and confirm RED** with `uv run pytest -q tests/test_run.py -k range_review`.
 
-- [ ] **Step 3: Implement `write_range_manifest` and parser arguments.** Validate repository as a directory, require `--base`, `--head`, and `--output`, accept `--context-lines` and `--max-chunk-bytes` with positive-integer validation, call the module builder, add `generatedAt` only outside the hashed identity, and write via the existing confined/private writer. Emit the output path only on success. Map builder errors to an actionable `reviewctl: ...` diagnostic and never invoke a model transport.
+- [x] **Step 3: Implement `write_range_manifest` and parser arguments.** Validate repository as a directory, require `--base`, `--head`, and `--output`, accept `--context-lines` and `--max-chunk-bytes` with positive-integer validation, call the module builder, add only the deterministic `evidenceStatus: planning-only` marker, and write via the existing confined/private writer. Emit the output path only on success. Map builder errors to an actionable `reviewctl: ...` diagnostic and never invoke a model transport.
 
-- [ ] **Step 4: Run targeted tests and confirm GREEN** with `uv run pytest -q tests/test_run.py -k range_review`.
+- [x] **Step 4: Run targeted tests and confirm GREEN** with `uv run pytest -q tests/test_run.py -k range_review`.
 
-- [ ] **Step 5: Commit** `git add src/reviewctl/cli.py tests/test_run.py && git commit -m "feat: expose range review manifest command"`.
+- [x] **Step 5: Commit** `git add src/reviewctl/cli.py tests/test_run.py && git commit -m "feat: expose range review manifest command"`.
 
 ### Task 3: Lock the contract with fixtures and documentation
 
@@ -49,24 +49,23 @@
 - Create: `tests/fixtures/range-review/README.md`
 - Test: `tests/test_range_review.py`
 
-- [ ] **Step 1: Add fixture-driven tests** for a three-commit range, an unchanged empty range, and a changed-head retry. Assert that two invocations over the same commits have equal identity and chunk digests even if their output files differ.
+- [x] **Step 1: Add fixture-driven tests** for a three-file range, an unchanged empty range, an invalid head, and an oversized file. Assert that two invocations over the same commits have equal identity, chunk digests, and serialized output bytes.
 
-- [ ] **Step 2: Update the operating-modes spec** to mark only “manifest builder” as implemented, retain full per-chunk transport and aggregate receipt verification as pending, and document that `status: manifest-created` is planning evidence—not review evidence.
+- [x] **Step 2: Update the operating-modes spec** to mark only “manifest builder” as implemented, retain full per-chunk transport and aggregate receipt verification as pending, and document that `status: manifest-created` is planning evidence—not review evidence.
 
-- [ ] **Step 3: Run `uv run pytest -q tests/test_range_review.py tests/test_run.py -k range_review` and `uv run ruff check src tests`**.
+- [x] **Step 3: Run `uv run pytest -q tests/test_range_review.py tests/test_run.py -k range_review` and `uv run ruff check src tests`**.
 
-- [ ] **Step 4: Commit** `git add docs/superpowers/specs/2026-08-29-reviewctl-operating-modes.md tests/fixtures/range-review tests/test_range_review.py && git commit -m "docs: define range manifest evidence boundary"`.
+- [x] **Step 4: Commit** `git add docs/superpowers/specs/2026-08-29-reviewctl-operating-modes.md tests/fixtures/range-review tests/test_range_review.py && git commit -m "docs: define range manifest evidence boundary"`.
 
 ### Task 4: Verify the exact change and stop before model routing
 
 **Files:**
 - No additional source changes unless a review finding is independently reproduced.
 
-- [ ] **Step 1: Run the complete checks:** `uv run pytest -q`, `uv run ruff check src tests`, and `git diff --check`.
+- [x] **Step 1: Run the complete checks:** `uv run pytest -q`, `uv run ruff check src tests`, and `git diff --check`.
 
-- [ ] **Step 2: Run an exact-head Codex review through the workspace `reviewctl` checkout**, attaching only the new module, focused tests, CLI excerpt, and spec; persist and verify the receipt with `reviewctl verify`.
+- [x] **Step 2: Run an exact-head Codex review through the workspace `reviewctl` checkout**, attaching only the new module, focused tests, CLI excerpt, and spec; persist and verify the receipt with `reviewctl verify`.
 
-- [ ] **Step 3: Adjudicate findings against source/tests.** Fix only reproduced issues, rerun the complete checks, and repeat the exact-head review if the commit changes.
+- [x] **Step 3: Adjudicate findings against source/tests.** Fix only reproduced issues, rerun the complete checks, and repeat the exact-head review if the commit changes.
 
-- [ ] **Step 4: Report the manifest command and evidence, explicitly leaving chunk model execution and aggregate approval unimplemented.**
-
+- [x] **Step 4: Report the manifest command and evidence, explicitly leaving chunk model execution and aggregate approval unimplemented.**
