@@ -109,3 +109,32 @@ def test_manifest_chunks_are_ordered_non_overlapping_and_reassemble_diff(
     payload = b"".join(base64.b64decode(chunk["patch"]) for chunk in chunks)
     assert hashlib.sha256(payload).hexdigest() == manifest["canonicalDiffSha256"]
     assert all(chunk["byteLength"] <= 300 for chunk in chunks)
+
+
+def test_manifest_is_insensitive_to_ambient_git_diff_configuration(tmp_path: Path) -> None:
+    repository, base, head = make_repository(tmp_path)
+    baseline = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
+
+    for key, value in (
+        ("color.ui", "always"),
+        ("diff.algorithm", "patience"),
+        ("diff.indentHeuristic", "true"),
+        ("diff.noprefix", "true"),
+    ):
+        git(repository, "config", key, value)
+
+    configured = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
+    assert configured == baseline
+
+
+def test_manifest_preserves_git_paths_with_c_quoted_characters(tmp_path: Path) -> None:
+    repository, base, _ = make_repository(tmp_path)
+    special_name = "tab\tname.txt"
+    (repository / special_name).write_text("special\n")
+    git(repository, "add", special_name)
+    git(repository, "commit", "--quiet", "-m", "special path")
+    head = git(repository, "rev-parse", "HEAD")
+
+    manifest = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
+
+    assert any(special_name in chunk["paths"] for chunk in manifest["chunks"])

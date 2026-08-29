@@ -81,16 +81,34 @@ def _merge_base(repository: Path, base: str, head: str) -> str | None:
     return value.lower()
 
 
+def _canonical_diff_arguments(context_lines: int, *options: str) -> tuple[str, ...]:
+    """Pin diff output knobs that otherwise come from user or repository config."""
+    return (
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--no-color",
+        "--diff-algorithm=myers",
+        "--no-indent-heuristic",
+        "--inter-hunk-context=0",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        *options,
+        f"--unified={context_lines}",
+    )
+
+
 def _canonical_diff(repository: Path, base: str, head: str, context_lines: int) -> bytes:
     result = _run_git(
         repository,
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--binary",
-        "--full-index",
-        "--no-renames",
-        f"--unified={context_lines}",
+        *_canonical_diff_arguments(
+            context_lines,
+            "--binary",
+            "--full-index",
+        ),
         base,
         head,
         "--",
@@ -104,36 +122,21 @@ def _canonical_diff(repository: Path, base: str, head: str, context_lines: int) 
     return result.stdout
 
 
-def _decode_git_path(value: bytes) -> str:
-    path = value.decode("utf-8", errors="surrogateescape")
-    if path == "/dev/null":
-        return ""
-    if path.startswith(("a/", "b/")):
-        return path[2:]
-    return path
-
-
-def _section_paths(section: bytes) -> list[str]:
-    paths: list[str] = []
-    for line in section.splitlines():
-        if line.startswith((b"--- ", b"+++ ")):
-            value = _decode_git_path(line[4:])
-            if value and value not in paths:
-                paths.append(value)
-        elif line.startswith((b"rename from ", b"rename to ")):
-            value = line.split(b" ", 2)[-1].decode("utf-8", errors="surrogateescape")
-            if value and value not in paths:
-                paths.append(value)
-    if paths:
-        return paths
-    header = section.splitlines()[0] if section else b""
-    if header.startswith(b"diff --git "):
-        values = header[len(b"diff --git ") :].split()
-        for value in values[:2]:
-            decoded = _decode_git_path(value)
-            if decoded and decoded not in paths:
-                paths.append(decoded)
-    return paths
+def _canonical_paths(repository: Path, base: str, head: str) -> list[str]:
+    result = _run_git(
+        repository,
+        *_canonical_diff_arguments(0, "--name-only", "-z"),
+        base,
+        head,
+        "--",
+    )
+    if result.returncode != 0:
+        raise RangeReviewError(f"could not capture canonical paths: {_git_error(result)}")
+    return [
+        value.decode("utf-8", errors="surrogateescape")
+        for value in result.stdout.split(b"\0")
+        if value
+    ]
 
 
 def _diff_sections(diff: bytes) -> list[bytes]:
@@ -145,44 +148,45 @@ def _diff_sections(diff: bytes) -> list[bytes]:
     return [diff[start:end] for start, end in zip(starts, (*starts[1:], len(diff)), strict=True)]
 
 
-def _chunks(sections: list[bytes], max_chunk_bytes: int) -> list[dict[str, Any]]:
+def _chunks(sections: list[bytes], paths: list[str], max_chunk_bytes: int) -> list[dict[str, Any]]:
+    if len(sections) != len(paths):
+        raise RangeReviewError(
+            "canonical path count does not match canonical diff file-section count"
+        )
     chunks: list[dict[str, Any]] = []
-    current: list[bytes] = []
+    current: list[tuple[bytes, str]] = []
     current_size = 0
 
     def flush() -> None:
         nonlocal current, current_size
         if not current:
             return
-        payload = b"".join(current)
-        paths: list[str] = []
-        for section in current:
-            for path in _section_paths(section):
-                if path not in paths:
-                    paths.append(path)
+        payload = b"".join(section for section, _ in current)
+        chunk_paths: list[str] = []
+        for _, path in current:
+            if path not in chunk_paths:
+                chunk_paths.append(path)
         chunks.append(
             {
                 "index": len(chunks),
                 "patchSha256": hashlib.sha256(payload).hexdigest(),
                 "byteLength": len(payload),
-                "fileCount": len(paths),
-                "paths": paths,
+                "fileCount": len(chunk_paths),
+                "paths": chunk_paths,
                 "patch": base64.b64encode(payload).decode("ascii"),
             }
         )
         current = []
         current_size = 0
 
-    for section in sections:
+    for section, path in zip(sections, paths, strict=True):
         if len(section) > max_chunk_bytes:
-            paths = _section_paths(section)
-            label = paths[0] if paths else "one file"
             raise RangeReviewError(
-                f"single file diff exceeds {max_chunk_bytes} bytes: {label}"
+                f"single file diff exceeds {max_chunk_bytes} bytes: {path or 'one file'}"
             )
         if current and current_size + len(section) > max_chunk_bytes:
             flush()
-        current.append(section)
+        current.append((section, path))
         current_size += len(section)
     flush()
     return chunks
@@ -210,7 +214,8 @@ def build_range_manifest(
     if not diff and not allow_empty:
         raise RangeReviewError("range has no changes; pass allow_empty to manifest it")
     sections = _diff_sections(diff)
-    chunks = _chunks(sections, max_chunk_bytes)
+    paths = _canonical_paths(root, resolved_base, resolved_head)
+    chunks = _chunks(sections, paths, max_chunk_bytes)
     return {
         "schemaVersion": 1,
         "status": "manifest-created",
