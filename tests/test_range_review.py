@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -92,3 +94,18 @@ def test_manifest_rejects_non_positive_context_and_oversized_file_chunk(tmp_path
 def test_manifest_rejects_non_repository_path(tmp_path: Path) -> None:
     with pytest.raises(RangeReviewError, match="not a Git repository"):
         build_range_manifest(tmp_path, "HEAD", "HEAD")
+
+
+def test_manifest_chunks_are_ordered_non_overlapping_and_reassemble_diff(
+    tmp_path: Path,
+) -> None:
+    repository, base, head = make_repository(tmp_path)
+
+    manifest = build_range_manifest(repository, base, head, max_chunk_bytes=300)
+
+    assert manifest["chunkCount"] > 1
+    chunks = manifest["chunks"]
+    assert [chunk["index"] for chunk in chunks] == list(range(len(chunks)))
+    payload = b"".join(base64.b64decode(chunk["patch"]) for chunk in chunks)
+    assert hashlib.sha256(payload).hexdigest() == manifest["canonicalDiffSha256"]
+    assert all(chunk["byteLength"] <= 300 for chunk in chunks)

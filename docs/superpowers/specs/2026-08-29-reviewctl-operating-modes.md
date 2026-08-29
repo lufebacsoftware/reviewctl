@@ -1,8 +1,9 @@
 # reviewctl operating modes
 
-Status: proposed design. This document records the boundary between the modes
-that exist today and a future range-review mode; it is not evidence that the
-future mode is implemented.
+Status: manifest phase implemented. This document records the boundary between
+the modes that exist today and the still-pending formal range-review transport.
+`reviewctl range-review` currently freezes a planning-only manifest; it does
+not invoke a model or produce approval evidence.
 
 ## Why separate modes
 
@@ -23,7 +24,7 @@ into bounded chunks. It must never aggregate findings from different heads.
 | --- | --- | --- | --- | --- | --- |
 | `explore` | `reviewctl explore start/resume` | Pi (optionally another interactive model) | Working question and optional context | Session, notes, promoted prompt | Advisory only; no merge approval |
 | `review` | `reviewctl run` | Codex, OpenRouter, Gemini, Kiro, LLM, Pi | Explicit frozen files and prompt | Verified receipt for one bounded snapshot | Merge-gate evidence only after receipt verification and project policy |
-| `range-review` | Proposed `reviewctl range-review` | Same formal transports as `review` | Repository, `base`, `head`, prompt, bounded context policy | Per-chunk receipts plus one aggregate receipt | Formal evidence only when every chunk shares one range identity |
+| `range-review` | `reviewctl range-review` (manifest phase) | None yet; no model is invoked | Repository, `base`, `head`, bounded context and chunk limits | Planning-only manifest with frozen patch chunks | Not review evidence; formal evidence requires the pending per-chunk and aggregate receipts |
 | `tournament` | `reviewctl tournament` | Synthetic candidate routes | Synthetic cases, candidate roster, token and spend budget | Private tournament report and receipts | Qualification/decision support, not source approval |
 
 Pi output can inform a later prompt, but it cannot be promoted into approval
@@ -59,10 +60,11 @@ transport or model, but it may not recompute the range. A changed `headSha`,
 ID. The aggregate must retain the exact reviewed head even when the branch has
 advanced afterwards.
 
-The first implementation should use a deterministic patch splitter with hard
-byte/file limits and a manifest written before the first request. It should
-not try to infer a semantic dependency graph or silently widen a chunk when a
-file is large; those are separate design questions.
+The implemented manifest phase uses a deterministic patch splitter with hard
+byte/file limits and writes the manifest before any request. It does not try
+to infer a semantic dependency graph or silently widen a chunk when a file is
+large. The manifest stores the exact chunk bytes so later transports do not
+recompute the range.
 
 ## Routing policy
 
@@ -79,7 +81,7 @@ file is large; those are separate design questions.
 
 ## Smallest safe backlog
 
-1. Add a range manifest builder that records repository identity, base/head,
+1. ✅ Add a range manifest builder that records repository identity, base/head,
    merge-base semantics, canonical diff digest, and deterministic chunk IDs.
 2. Add a bounded chunk packet writer and a receipt contract carrying the range
    identity on every attempt.
