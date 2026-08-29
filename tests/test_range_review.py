@@ -125,6 +125,7 @@ def test_manifest_is_insensitive_to_ambient_git_diff_configuration(tmp_path: Pat
         ("diff.indentHeuristic", "true"),
         ("diff.noprefix", "true"),
         ("diff.orderFile", str(order_file)),
+        ("diff.suppressBlankEmpty", "true"),
     ):
         git(repository, "config", key, value)
 

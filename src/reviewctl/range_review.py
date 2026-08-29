@@ -89,6 +89,8 @@ def _canonical_diff_arguments(context_lines: int, *options: str) -> tuple[str, .
     return (
         "-c",
         "core.quotePath=false",
+        "-c",
+        "diff.suppressBlankEmpty=false",
         "diff",
         "--no-color",
         "--text",
