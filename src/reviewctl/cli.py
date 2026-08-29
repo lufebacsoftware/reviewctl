@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import logging
@@ -78,7 +79,12 @@ from reviewctl.range_review import (
     DEFAULT_CONTEXT_LINES,
     DEFAULT_MAX_CHUNK_BYTES,
     RangeReviewError,
+    build_range_aggregate,
     build_range_manifest,
+    manifest_sha256,
+    range_identity,
+    validate_range_manifest,
+    verify_range_aggregate,
 )
 from reviewctl.review_flow import (
     FallbackRelationship,
@@ -111,6 +117,8 @@ MAX_PI_LEGACY_STDERR_BYTES = 100_000
 MAX_CODEX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDERR_BYTES = 100_000
+MAX_RANGE_CHILD_STDOUT_BYTES = 256 * 1024
+MAX_RANGE_CHILD_STDERR_BYTES = 100_000
 DEFAULT_MAX_OUTPUT_TOKENS = 16_384
 GLM_REASONING_MIN_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
@@ -1599,6 +1607,286 @@ def write_range_manifest(parser: argparse.ArgumentParser, args: argparse.Namespa
         parser.error(str(error))
     print(output)
     return 0
+
+
+def load_range_json(path: Path) -> tuple[bytes, object]:
+    """Load one range artifact with duplicate-key and non-standard JSON rejection."""
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    raw = read_confined_bytes(path)
+    value = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=exact_json_object,
+        parse_constant=reject_nonstandard_constant,
+    )
+    return raw, value
+
+
+def _range_child_process(
+    command: list[str], *, timeout_seconds: int
+) -> tuple[int, bytes, bytes]:
+    """Run a child review with bounded stdout/stderr capture."""
+    checkout_root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            cwd=checkout_root,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+        )
+        try:
+            process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(process)
+            return 124, b"", b"range chunk review timed out"
+        stdout_file.seek(0)
+        stdout = stdout_file.read(MAX_RANGE_CHILD_STDOUT_BYTES + 1)
+        stderr_file.seek(0)
+        stderr = stderr_file.read(MAX_RANGE_CHILD_STDERR_BYTES + 1)
+        if len(stdout) > MAX_RANGE_CHILD_STDOUT_BYTES or len(stderr) > MAX_RANGE_CHILD_STDERR_BYTES:
+            return 502, stdout[:MAX_RANGE_CHILD_STDOUT_BYTES], stderr[:MAX_RANGE_CHILD_STDERR_BYTES]
+        return process.returncode, stdout, stderr
+
+
+def _range_chunk_record(
+    *, index: int, chunk: dict[str, Any], review_id: str, receipt_path: Path | None
+) -> dict[str, Any]:
+    """Create a complete aggregate record, including an explicit missing state."""
+    expected_review_id = f"{review_id}.chunk-{index}"
+    record: dict[str, Any] = {
+        "index": index,
+        "chunkId": chunk.get("patchSha256"),
+        "patchSha256": chunk.get("patchSha256"),
+        "reviewId": expected_review_id,
+        "receipt": "",
+        "receiptFileSha256": "",
+        "receiptSha256": "",
+        "result": "missing",
+        "verdict": None,
+        "findings": [],
+    }
+    if receipt_path is None:
+        return record
+    try:
+        raw, receipt = load_range_json(receipt_path)
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return record
+    if not isinstance(receipt, dict):
+        return record
+    record.update(
+        {
+            "receipt": str(receipt_path),
+            "receiptFileSha256": sha256_bytes(raw),
+            "receiptSha256": receipt.get("sha256", ""),
+            "result": receipt.get("result", "missing"),
+            "verdict": receipt.get("verdict"),
+            "findings": receipt.get("findings", []),
+        }
+    )
+    return record
+
+
+def run_range_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Review every frozen manifest chunk through the normal formal run command."""
+    if not args.review_id:
+        parser.error("formal range-review requires --review-id")
+    if not args.model:
+        parser.error("formal range-review requires --model")
+    if not args.aggregate_output:
+        parser.error("formal range-review requires --aggregate-output")
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    aggregate_path = Path(args.aggregate_output).expanduser().resolve()
+    try:
+        _, manifest = load_range_json(manifest_path)
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        parser.error(f"could not read range manifest: {error}")
+    manifest_violations = validate_range_manifest(manifest)
+    if manifest_violations:
+        parser.error("invalid range manifest: " + ", ".join(manifest_violations))
+    if not isinstance(manifest, dict):  # pragma: no cover - validator returns above
+        parser.error("range manifest must be a JSON object")
+    if not REVIEW_ID.fullmatch(args.review_id):
+        parser.error("invalid range review id")
+    if args.prompt and args.prompt_file:
+        parser.error("use either --prompt or --prompt-file")
+    if not args.prompt and not args.prompt_file:
+        parser.error("one of --prompt or --prompt-file is required")
+    try:
+        prompt = Path(args.prompt_file).read_text() if args.prompt_file else args.prompt
+    except (OSError, UnicodeError) as error:
+        parser.error(f"could not read review prompt: {error}")
+    if not prompt or not prompt.strip():
+        parser.error("review prompt must not be empty")
+    if args.response_contract != "findings-json":
+        parser.error("range-review formal mode requires --response-contract findings-json")
+    if not 1 <= args.max_attempts <= 3:
+        parser.error("max attempts must be an integer from 1 to 3")
+    if args.max_output_tokens <= 0:
+        parser.error("max output tokens must be positive")
+    chunks = manifest["chunks"]
+    if not chunks:
+        parser.error("formal range-review requires a manifest with at least one chunk")
+    artifact_root = Path(args.artifact_root).expanduser().resolve()
+    timeout_seconds = args.timeout_seconds or DEFAULT_REVIEW_TIMEOUT_SECONDS
+    records: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="reviewctl-range-") as directory:
+        root = Path(directory)
+        for index, chunk in enumerate(chunks):
+            if not isinstance(chunk, dict):  # pragma: no cover - validator above
+                parser.error(f"invalid range chunk {index}")
+            try:
+                patch = base64.b64decode(chunk["patch"].encode("ascii"), validate=True)
+            except (KeyError, UnicodeEncodeError, ValueError) as error:  # pragma: no cover
+                parser.error(f"invalid range chunk {index}: {error}")
+            if len(patch) > MAX_FRAGMENT_BYTES:
+                parser.error(
+                    f"range chunk {index} exceeds {MAX_FRAGMENT_BYTES} bytes; rebuild with a "
+                    "smaller --max-chunk-bytes"
+                )
+            patch_path = root / f"chunk-{index:04d}.patch"
+            prompt_path = root / f"chunk-{index:04d}.prompt.txt"
+            context_path = root / f"chunk-{index:04d}.context.json"
+            patch_path.write_bytes(patch)
+            context_path.write_bytes(
+                canonical_json(
+                    {
+                        "rangeReviewSchemaVersion": 1,
+                        "manifestSha256": manifest_sha256(manifest),
+                        "range": range_identity(manifest),
+                        "chunkIndex": index,
+                        "chunkCount": len(chunks),
+                        "chunkId": chunk["patchSha256"],
+                    }
+                )
+                + b"\n"
+            )
+            identity_text = json.dumps(
+                range_identity(manifest), sort_keys=True, separators=(",", ":")
+            )
+            chunk_prompt = (
+                f"{prompt}\n\n"
+                "This is a formal review of one immutable chunk from a larger Git range. "
+                "Review only the supplied patch and do not infer facts outside it.\n"
+                f"Range identity: {identity_text}\n"
+                f"Manifest SHA-256: {manifest_sha256(manifest)}\n"
+                f"Chunk index: {index}\n"
+                f"Chunk SHA-256: {chunk['patchSha256']}\n"
+                f"Chunk paths: {json.dumps(chunk['paths'], ensure_ascii=True)}\n"
+                "Return the findings-json contract. The reviewedFiles value must be exactly "
+                f"[\"chunk-{index:04d}.patch\"]."
+            )
+            prompt_path.write_text(chunk_prompt)
+            command = [
+                sys.executable,
+                "-m",
+                "reviewctl",
+                "run",
+                "--review-id",
+                f"{args.review_id}.chunk-{index}",
+                "--prompt-file",
+                str(prompt_path),
+                "--file",
+                str(patch_path),
+                "--range-context-file",
+                str(context_path),
+                "--model",
+                args.model,
+                "--transport",
+                args.transport,
+                "--source-class",
+                args.source_class,
+                "--response-contract",
+                "findings-json",
+                "--artifact-root",
+                str(artifact_root),
+                "--timeout-seconds",
+                str(timeout_seconds),
+                "--max-output-tokens",
+                str(args.max_output_tokens),
+                "--max-attempts",
+                str(args.max_attempts),
+            ]
+            if args.policy:
+                command.extend(("--policy", str(Path(args.policy).expanduser().resolve())))
+            return_code, stdout, _ = _range_child_process(
+                command, timeout_seconds=timeout_seconds + 10
+            )
+            receipt_path: Path | None = None
+            for line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
+                candidate = Path(line.strip())
+                if candidate.is_dir() and (candidate / "receipt.json").is_file():
+                    receipt_path = candidate / "receipt.json"
+                    break
+            record = _range_chunk_record(
+                index=index,
+                chunk=chunk,
+                review_id=args.review_id,
+                receipt_path=receipt_path,
+            )
+            if return_code != 0 and record["result"] == "missing":
+                record["result"] = "unavailable"
+            records.append(record)
+    aggregate = build_range_aggregate(manifest, args.review_id, records)
+    try:
+        aggregate_path.parent.mkdir(parents=True, exist_ok=True)
+        write_private_exclusive(
+            aggregate_path,
+            canonical_json(aggregate) + b"\n",
+            label="range aggregate evidence",
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
+    print(aggregate_path)
+    return 0 if aggregate["result"] == "accepted" else 1
+
+
+def range_review_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Dispatch the backward-compatible manifest mode or formal execution mode."""
+    if args.manifest is not None:
+        if args.repository or args.base or args.head or args.output:
+            parser.error("formal range-review cannot combine --manifest with builder arguments")
+        return run_range_review(parser, args)
+    if args.review_id or args.aggregate_output or args.model:
+        parser.error("formal range-review requires --manifest")
+    if not args.repository or not args.base or not args.head or not args.output:
+        parser.error("manifest builder requires --repository, --base, --head, and --output")
+    return write_range_manifest(parser, args)
+
+
+def verify_range_aggregate_command(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> int:
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    aggregate_path = Path(args.aggregate).expanduser().resolve()
+    try:
+        _, manifest = load_range_json(manifest_path)
+        _, aggregate = load_range_json(aggregate_path)
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        parser.error(f"could not read range evidence: {error}")
+
+    def load_receipt(path: str) -> tuple[bytes, object] | None:
+        try:
+            return load_range_json(Path(path).expanduser().resolve())
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    violations = verify_range_aggregate(
+        manifest,
+        aggregate,
+        load_receipt,
+        receipt_validator=validate_v2_receipt,
+    )
+    payload = {
+        "manifest": str(manifest_path),
+        "aggregate": str(aggregate_path),
+        "valid": not violations,
+        "violations": list(violations),
+    }
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if not violations else exit_code_for("receipt_invalid")
 
 
 @contextmanager
@@ -4583,6 +4871,29 @@ def seal(
 
 def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     prompt, files = validate_request(parser, args)
+    range_context: dict[str, Any] | None = None
+    range_context_path = getattr(args, "range_context_file", None)
+    if range_context_path:
+        try:
+            _, loaded_context = load_range_json(
+                Path(range_context_path).expanduser().resolve()
+            )
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+            parser.error(f"could not read range receipt context: {error}")
+        if (
+            type(loaded_context) is not dict
+            or set(loaded_context)
+            != {
+                "rangeReviewSchemaVersion",
+                "manifestSha256",
+                "range",
+                "chunkIndex",
+                "chunkCount",
+                "chunkId",
+            }
+        ):
+            parser.error("range receipt context has an invalid shape")
+        range_context = loaded_context
     routes, route_profile = review_routes(parser, args)
     if any(route.transport == "pi" and "/" not in route.model for route in routes):
         parser.error("pi review models must use provider/model identity")
@@ -5231,6 +5542,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     }
     if kiro_identity_waiver:
         receipt["extension.kiroUnresolvedIdentityWaiver"] = True
+    if range_context is not None:
+        receipt["extension.rangeReview"] = range_context
     if accepted_attempt is not None and attempts[accepted_attempt - 1]["transport"] == "kiro":
         receipt["extension.backendQualification"] = "unqualified"
         receipt["extension.mergeGateEligible"] = False
@@ -6084,6 +6397,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-file",
         help="write the accepted model response to this document path",
     )
+    run.add_argument(
+        "--range-context-file",
+        help="internal immutable range identity to embed in the v2 receipt",
+    )
     run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
     run.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     run.add_argument("--max-attempts", type=int, default=None)
@@ -6116,12 +6433,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     range_review = commands.add_parser(
         "range-review",
-        help="freeze a Git base..head range into a planning-only manifest",
+        help="freeze a Git range or formally review its immutable manifest",
     )
-    range_review.add_argument("--repository", required=True)
-    range_review.add_argument("--base", required=True)
-    range_review.add_argument("--head", required=True)
-    range_review.add_argument("--output", required=True)
+    range_review.add_argument("--repository")
+    range_review.add_argument("--base")
+    range_review.add_argument("--head")
+    range_review.add_argument("--output")
     range_review.add_argument(
         "--context-lines",
         type=positive_integer,
@@ -6139,7 +6456,47 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write a zero-chunk manifest when base and head have no diff",
     )
-    range_review.set_defaults(handler=lambda namespace: write_range_manifest(parser, namespace))
+    range_review.add_argument("--manifest", help="consume a previously frozen range manifest")
+    range_review.add_argument("--review-id", help="parent review id for formal chunk receipts")
+    range_review.add_argument("--prompt")
+    range_review.add_argument("--prompt-file")
+    range_review.add_argument("--model", help="model identifier for each chunk review")
+    range_review.add_argument(
+        "--transport",
+        choices=("llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"),
+        default="llm",
+    )
+    range_review.add_argument("--policy")
+    range_review.add_argument(
+        "--source-class",
+        choices=("proprietary", "synthetic"),
+        default="proprietary",
+    )
+    range_review.add_argument(
+        "--response-contract",
+        choices=sorted(RESPONSE_CONTRACTS),
+        default="findings-json",
+    )
+    range_review.add_argument("--aggregate-output")
+    range_review.add_argument("--artifact-root", default="~/.cache/reviewctl/range-reviews")
+    range_review.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
+    range_review.add_argument(
+        "--max-output-tokens", type=positive_integer, default=DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    range_review.add_argument("--max-attempts", type=positive_integer, default=1)
+    range_review.set_defaults(
+        handler=lambda namespace: range_review_command(parser, namespace)
+    )
+
+    range_verify = commands.add_parser(
+        "range-verify",
+        help="fail-closed verification of a formal range aggregate and its chunk receipts",
+    )
+    range_verify.add_argument("--manifest", required=True)
+    range_verify.add_argument("--aggregate", required=True)
+    range_verify.set_defaults(
+        handler=lambda namespace: verify_range_aggregate_command(parser, namespace)
+    )
 
     explore = commands.add_parser(
         "explore", help="run resumable Pi conversations and prepare formal review handoffs"

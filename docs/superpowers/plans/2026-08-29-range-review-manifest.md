@@ -4,7 +4,7 @@
 
 **Goal:** Add a fail-closed, deterministic `reviewctl range-review` manifest phase that freezes a `base..head` Git range and emits bounded, auditable chunks before any model request.
 
-**Architecture:** A focused `reviewctl.range_review` module owns Git identity resolution, canonical diff capture, and deterministic chunk manifests. The CLI only validates arguments, writes the manifest as a private artifact, and prints its path; it does not imply that a model reviewed the range. Full chunk transports and aggregate receipts remain a later phase and must consume this immutable manifest.
+**Architecture:** A focused `reviewctl.range_review` module owns Git identity resolution, canonical diff capture, and deterministic chunk manifests. The CLI validates arguments and writes the manifest as a private artifact before any model request. Formal chunk transport and aggregate receipts are implemented separately in [the formal range-review plan](2026-08-29-range-review-formal.md) and consume this immutable manifest.
 
 **Tech Stack:** Python 3.14, `argparse`, `subprocess` with argument arrays, SHA-256, canonical JSON, pytest, Ruff.
 
@@ -57,7 +57,7 @@
 
 - [x] **Step 4: Commit** `git add docs/superpowers/specs/2026-08-29-reviewctl-operating-modes.md tests/fixtures/range-review tests/test_range_review.py && git commit -m "docs: define range manifest evidence boundary"`.
 
-### Task 4: Verify the exact change and stop before model routing
+### Task 4: Verify the exact manifest change
 
 **Files:**
 - No additional source changes unless a review finding is independently reproduced.
@@ -68,4 +68,4 @@
 
 - [x] **Step 3: Adjudicate findings against source/tests.** Fix only reproduced issues, rerun the complete checks, and repeat the exact-head review if the commit changes.
 
-- [x] **Step 4: Report the manifest command and evidence, explicitly leaving chunk model execution and aggregate approval unimplemented.**
+- [x] **Step 4: Report the manifest command and evidence. Formal execution and aggregate approval are tracked in the separate formal range-review plan.**

@@ -2,13 +2,58 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from reviewctl import range_review
-from reviewctl.range_review import RangeReviewError, build_range_manifest
+from reviewctl.range_review import (
+    RangeReviewError,
+    build_range_aggregate,
+    build_range_manifest,
+    manifest_sha256,
+    range_identity,
+    verify_range_aggregate,
+)
+
+
+def make_fake_receipt(
+    path: Path,
+    review_id: str,
+    chunk: dict[str, object],
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    receipt = {
+        "reviewId": review_id,
+        "result": "accepted",
+        "verdict": "approved",
+        "findings": [],
+        "source": {
+            "files": [
+                {
+                    "name": f"chunk-{chunk['index']:04d}.patch",
+                    "path": str(path),
+                    "sha256": chunk["patchSha256"],
+                }
+            ]
+        },
+        "extension.rangeReview": {
+            "rangeReviewSchemaVersion": 1,
+            "manifestSha256": manifest_sha256(manifest),
+            "range": range_identity(manifest),
+            "chunkIndex": chunk["index"],
+            "chunkCount": manifest["chunkCount"],
+            "chunkId": chunk["patchSha256"],
+        },
+    }
+    receipt["sha256"] = hashlib.sha256(
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    raw = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    path.write_bytes(raw + b"\n")
+    return receipt
 
 
 def git(repository: Path, *arguments: str) -> str:
@@ -214,3 +259,140 @@ def test_bounded_git_capture_keeps_only_limit_plus_one_bytes(
 
     assert len(result.stdout) == 33
     assert process.killed
+
+
+def test_range_aggregate_verifies_every_chunk_and_receipt_identity(tmp_path: Path) -> None:
+    repository, base, head = make_repository(tmp_path)
+    manifest = build_range_manifest(repository, base, head, max_chunk_bytes=300)
+    receipt_dir = tmp_path / "receipts"
+    receipt_dir.mkdir()
+    records = []
+    receipts: dict[str, dict[str, object]] = {}
+    for chunk in manifest["chunks"]:
+        receipt_path = receipt_dir / f"receipt-{chunk['index']}.json"
+        receipt = make_fake_receipt(
+            receipt_path,
+            f"range.chunk-{chunk['index']}",
+            chunk,
+            manifest,
+        )
+        receipts[str(receipt_path)] = receipt
+        records.append(
+            {
+                "index": chunk["index"],
+                "chunkId": chunk["patchSha256"],
+                "patchSha256": chunk["patchSha256"],
+                "reviewId": f"range.chunk-{chunk['index']}",
+                "receipt": str(receipt_path),
+                "receiptFileSha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                "receiptSha256": receipt["sha256"],
+                "result": receipt["result"],
+                "verdict": receipt["verdict"],
+                "findings": receipt["findings"],
+            }
+        )
+
+    aggregate = build_range_aggregate(manifest, "range", records)
+
+    assert aggregate["result"] == "accepted"
+    assert aggregate["aggregate"] == {
+        "approved": True,
+        "verdict": "approved",
+        "findings": [],
+    }
+    assert verify_range_aggregate(
+        manifest,
+        aggregate,
+        lambda path: (Path(path).read_bytes(), receipts[path]),
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    "mutation, expected",
+    [
+        (lambda records: records.pop(), "chunk-count"),
+        (lambda records: records.reverse(), "chunk-order"),
+        (lambda records: records.__setitem__(0, {**records[0], "chunkId": "f" * 64}), "chunk-id"),
+    ],
+)
+def test_range_aggregate_rejects_missing_reordered_or_mixed_chunks(
+    tmp_path: Path, mutation: object, expected: str
+) -> None:
+    repository, base, head = make_repository(tmp_path)
+    manifest = build_range_manifest(repository, base, head, max_chunk_bytes=300)
+    receipt_dir = tmp_path / "receipts"
+    receipt_dir.mkdir()
+    records = []
+    for chunk in manifest["chunks"]:
+        receipt_path = receipt_dir / f"receipt-{chunk['index']}.json"
+        receipt = make_fake_receipt(
+            receipt_path, f"range.chunk-{chunk['index']}", chunk, manifest
+        )
+        records.append(
+            {
+                "index": chunk["index"],
+                "chunkId": chunk["patchSha256"],
+                "patchSha256": chunk["patchSha256"],
+                "reviewId": f"range.chunk-{chunk['index']}",
+                "receipt": str(receipt_path),
+                "receiptFileSha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                "receiptSha256": receipt["sha256"],
+                "result": receipt["result"],
+                "verdict": receipt["verdict"],
+                "findings": receipt["findings"],
+            }
+        )
+    aggregate = build_range_aggregate(manifest, "range", records)
+    mutation(aggregate["chunks"])
+    aggregate["sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in aggregate.items() if key != "sha256"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    violations = verify_range_aggregate(
+        manifest,
+        aggregate,
+        lambda path: (Path(path).read_bytes(), json.loads(Path(path).read_text())),
+    )
+
+    assert expected in violations
+
+
+def test_range_aggregate_fails_closed_when_receipt_file_changes(tmp_path: Path) -> None:
+    repository, base, head = make_repository(tmp_path)
+    manifest = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
+    receipt_path = tmp_path / "receipt.json"
+    chunk = manifest["chunks"][0]
+    receipt = make_fake_receipt(receipt_path, "range.chunk-0", chunk, manifest)
+    record = {
+        "index": 0,
+        "chunkId": chunk["patchSha256"],
+        "patchSha256": chunk["patchSha256"],
+        "reviewId": "range.chunk-0",
+        "receipt": str(receipt_path),
+        "receiptFileSha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "receiptSha256": receipt["sha256"],
+        "result": receipt["result"],
+        "verdict": receipt["verdict"],
+        "findings": receipt["findings"],
+    }
+    aggregate = build_range_aggregate(manifest, "range", [record])
+    receipt_path.write_bytes(receipt_path.read_bytes() + b"tampered")
+
+    assert "receipt-file-digest" in verify_range_aggregate(
+        manifest,
+        aggregate,
+        lambda path: (Path(path).read_bytes(), receipt),
+    )
+
+
+def test_range_aggregate_does_not_turn_an_empty_range_into_approval(tmp_path: Path) -> None:
+    repository, base, _ = make_repository(tmp_path)
+    manifest = build_range_manifest(repository, base, base, allow_empty=True)
+    aggregate = build_range_aggregate(manifest, "empty-range", [])
+
+    assert "range-empty" in verify_range_aggregate(manifest, aggregate, lambda _: None)

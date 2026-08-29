@@ -212,6 +212,128 @@ def test_range_review_cli_fails_closed_for_invalid_head_and_oversized_chunk(
     assert not oversized_output.exists()
 
 
+def test_range_review_formal_mode_runs_each_frozen_chunk_and_verifies_aggregate(
+    tmp_path: Path,
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    aggregate_path = tmp_path / "aggregate.json"
+    artifacts = tmp_path / "artifacts"
+    fake_llm = write_fake_llm(tmp_path)
+
+    manifest_result = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--output",
+        str(manifest_path),
+    )
+    assert manifest_result.returncode == 0, manifest_result.stderr
+
+    formal_result = run_cli(
+        "range-review",
+        "--manifest",
+        str(manifest_path),
+        "--review-id",
+        "range-formal",
+        "--prompt",
+        "Review this frozen patch.",
+        "--model",
+        "accepted",
+        "--transport",
+        "llm",
+        "--source-class",
+        "synthetic",
+        "--artifact-root",
+        str(artifacts),
+        "--aggregate-output",
+        str(aggregate_path),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert formal_result.returncode == 0, formal_result.stderr
+    aggregate = json.loads(aggregate_path.read_text())
+    assert aggregate["result"] == "accepted"
+    assert aggregate["aggregate"]["approved"] is True
+    assert len(aggregate["chunks"]) == 1
+    assert aggregate["chunks"][0]["reviewId"] == "range-formal.chunk-0"
+    receipt_path = Path(aggregate["chunks"][0]["receipt"])
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["extension.rangeReview"]["chunkIndex"] == 0
+    assert receipt["extension.rangeReview"]["manifestSha256"] == aggregate["manifestSha256"]
+
+    verified = run_cli(
+        "range-verify",
+        "--manifest",
+        str(manifest_path),
+        "--aggregate",
+        str(aggregate_path),
+    )
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["valid"] is True
+
+
+def test_range_review_formal_mode_persists_incomplete_aggregate_on_failed_chunk(
+    tmp_path: Path,
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    aggregate_path = tmp_path / "aggregate.json"
+    fake_llm = write_fake_llm(tmp_path)
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(manifest_path),
+        ).returncode
+        == 0
+    )
+
+    formal_result = run_cli(
+        "range-review",
+        "--manifest",
+        str(manifest_path),
+        "--review-id",
+        "range-incomplete",
+        "--prompt",
+        "Review this frozen patch.",
+        "--model",
+        "missing",
+        "--transport",
+        "llm",
+        "--source-class",
+        "synthetic",
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+        "--aggregate-output",
+        str(aggregate_path),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert formal_result.returncode != 0
+    aggregate = json.loads(aggregate_path.read_text())
+    assert aggregate["result"] == "incomplete"
+    verified = run_cli(
+        "range-verify",
+        "--manifest",
+        str(manifest_path),
+        "--aggregate",
+        str(aggregate_path),
+    )
+    assert verified.returncode != 0
+    assert json.loads(verified.stdout)["valid"] is False
+
+
 def test_cli_imports_without_the_posix_resource_module() -> None:
     script = """
 import builtins
