@@ -114,12 +114,15 @@ def test_manifest_chunks_are_ordered_non_overlapping_and_reassemble_diff(
 def test_manifest_is_insensitive_to_ambient_git_diff_configuration(tmp_path: Path) -> None:
     repository, base, head = make_repository(tmp_path)
     baseline = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
+    order_file = tmp_path / "order.txt"
+    order_file.write_text("notes.txt\nREADME.md\nledger.txt\n")
 
     for key, value in (
         ("color.ui", "always"),
         ("diff.algorithm", "patience"),
         ("diff.indentHeuristic", "true"),
         ("diff.noprefix", "true"),
+        ("diff.orderFile", str(order_file)),
     ):
         git(repository, "config", key, value)
 
