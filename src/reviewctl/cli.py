@@ -1587,7 +1587,6 @@ def write_range_manifest(parser: argparse.ArgumentParser, args: argparse.Namespa
     manifest = {
         **manifest,
         "evidenceStatus": "planning-only",
-        "generatedAt": utc_now(),
     }
     try:
         output.parent.mkdir(parents=True, exist_ok=True)

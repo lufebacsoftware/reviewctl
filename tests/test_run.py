@@ -130,6 +130,7 @@ def make_range_cli_repository(tmp_path: Path) -> tuple[Path, str, str]:
 def test_range_review_cli_writes_manifest_without_approval_fields(tmp_path: Path) -> None:
     repository, base, head = make_range_cli_repository(tmp_path)
     output = tmp_path / "manifest.json"
+    repeated_output = tmp_path / "manifest-repeated.json"
 
     result = run_cli(
         "range-review",
@@ -152,6 +153,21 @@ def test_range_review_cli_writes_manifest_without_approval_fields(tmp_path: Path
     assert "receipt" not in manifest
     assert "approved" not in manifest
     assert str(output) in result.stdout
+
+    time.sleep(1.1)
+    repeated = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--output",
+        str(repeated_output),
+    )
+    assert repeated.returncode == 0, repeated.stderr
+    assert output.read_bytes() == repeated_output.read_bytes()
 
 
 def test_range_review_cli_fails_closed_for_invalid_head_and_oversized_chunk(
