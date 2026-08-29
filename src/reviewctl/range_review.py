@@ -19,6 +19,9 @@ DEFAULT_CONTEXT_LINES = 3
 DEFAULT_MAX_CHUNK_BYTES = 128 * 1024
 MAX_DIFF_BYTES = 4 * 1024 * 1024
 _DIFF_HEADER = re.compile(rb"(?m)^diff --git ")
+_HUNK_HEADER = re.compile(
+    rb"(?m)^(@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@)[^\r\n]*(\r?\n|$)"
+)
 
 
 class RangeReviewError(ValueError):
@@ -122,7 +125,9 @@ def _canonical_diff(repository: Path, base: str, head: str, context_lines: int) 
         raise RangeReviewError(
             f"canonical diff exceeds {MAX_DIFF_BYTES} bytes; narrow the range before reviewing"
         )
-    return result.stdout
+    # Diff-driver xfuncname only adds a human-oriented suffix to hunk headers.
+    # Strip it so repository attributes cannot change the frozen patch digest.
+    return _HUNK_HEADER.sub(rb"\1\2", result.stdout)
 
 
 def _canonical_paths(repository: Path, base: str, head: str) -> list[str]:

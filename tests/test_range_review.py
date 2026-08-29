@@ -143,3 +143,28 @@ def test_manifest_preserves_git_paths_with_c_quoted_characters(tmp_path: Path) -
     manifest = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
 
     assert any(special_name in chunk["paths"] for chunk in manifest["chunks"])
+
+
+def test_manifest_is_insensitive_to_diff_driver_hunk_headers(tmp_path: Path) -> None:
+    repository = tmp_path / "driver-repository"
+    repository.mkdir()
+    git(repository, "init", "--quiet")
+    git(repository, "config", "user.email", "reviewctl@example.invalid")
+    git(repository, "config", "user.name", "reviewctl tests")
+    (repository / ".gitattributes").write_text("source.txt diff=custom\n")
+    (repository / "source.txt").write_text("FUNC alpha\n" + "line\n" * 12)
+    git(repository, "add", ".gitattributes", "source.txt")
+    git(repository, "commit", "--quiet", "-m", "attributes")
+    base = git(repository, "rev-parse", "HEAD")
+    lines = (repository / "source.txt").read_text().splitlines()
+    lines[8] = "changed"
+    (repository / "source.txt").write_text("\n".join(lines) + "\n")
+    git(repository, "add", "source.txt")
+    git(repository, "commit", "--quiet", "-m", "hunk")
+    head = git(repository, "rev-parse", "HEAD")
+    baseline = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
+    git(repository, "config", "diff.custom.xfuncname", "^FUNC")
+
+    configured = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
+
+    assert configured == baseline
