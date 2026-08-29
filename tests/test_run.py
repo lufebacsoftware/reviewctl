@@ -4253,12 +4253,117 @@ files = ["{brief}"]
     ]
     assert report["actualSpendUsd"] == 0.125
     assert observed_max_output_tokens == [400]
+    assert [run["requestedMaxOutputTokens"] for run in report["runs"]] == [400, 200, 200]
+    assert [run["outputTokenLimitEnforced"] for run in report["runs"]] == [
+        True,
+        False,
+        False,
+    ]
     assert report["runs"][0]["maxOutputTokens"] == 400
     assert report["runs"][1]["maxOutputTokens"] == 200
     assert report["runs"][2]["maxOutputTokens"] == 200
     assert report["runs"][0]["estimatedCostUsd"] == pytest.approx(0.0000859)
     assert report["runs"][1]["estimatedCostUsd"] is None
     assert report["runs"][2]["estimatedCostUsd"] is None
+
+
+def test_product_tournament_records_a_missing_receipt_without_crashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "brief.md"
+    source.write_text("Synthetic product brief.\n")
+    candidate = cli.parse_tournament_candidates(
+        {
+            "candidates": [
+                {
+                    "id": "metered",
+                    "family": "test",
+                    "model": "openrouter/test/model",
+                    "transport": "openrouter",
+                    "cost_mode": "metered",
+                    "pricing": {"input_per_million_usd": 0.1, "output_per_million_usd": 0.2},
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(cli, "run_review", lambda *_args, **_kwargs: 502)
+    parser = cli.build_parser()
+    report_root = tmp_path / "artifacts"
+
+    assert (
+        cli.run_candidate_tournament(
+            parser,
+            __import__("argparse").Namespace(),
+            plan={"response_contract": "product-review-json", "artifact_root": str(report_root)},
+            plan_path=tmp_path / "product.toml",
+            budget=1,
+            cases=[{"id": "flow", "prompt": "Design.", "files": [str(source)]}],
+            candidates=candidate,
+            max_output_tokens=128,
+        )
+        == 1
+    )
+
+    report = json.loads((report_root / "tournament.json").read_text())
+    assert report["result"] == "incomplete"
+    run = report["runs"][0]
+    assert run["actualCostUsd"] is None
+    assert run["candidate"] == "metered"
+    assert run["case"] == "flow"
+    assert run["councilEligible"] is True
+    assert run["costMode"] == "metered"
+    assert run["estimatedCostUsd"] == pytest.approx(0.0000305)
+    assert run["exitCode"] == 502
+    assert run["family"] == "test"
+    assert run["maxOutputTokens"] == 128
+    assert run["model"] == "openrouter/test/model"
+    assert run["receipt"] is None
+    assert run["requestedMaxOutputTokens"] == 128
+    assert run["result"] == "missing-receipt"
+    assert run["transport"] == "openrouter"
+
+
+def test_tournament_receipt_identity_detects_overwritten_paths(tmp_path: Path) -> None:
+    receipt_root = tmp_path / "receipts" / "run"
+    receipt_root.mkdir(parents=True)
+    receipt = receipt_root / "receipt.json"
+    receipt.write_text('{"result":"old"}\n')
+
+    before = cli.receipt_fingerprints(tmp_path / "receipts")
+    receipt.write_text('{"result":"new"}\n')
+
+    assert cli.changed_receipt_paths(tmp_path / "receipts", before) == [receipt]
+
+
+def test_tournament_receipt_selection_fails_closed_on_mixed_receipts(tmp_path: Path) -> None:
+    receipt_root = tmp_path / "receipts"
+    receipt_root.mkdir()
+    valid = {"result": "accepted", "reviewId": "target"}
+    valid["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(valid))
+    valid_dir = receipt_root / "valid"
+    foreign_dir = receipt_root / "foreign"
+    valid_dir.mkdir()
+    foreign_dir.mkdir()
+    (valid_dir / "receipt.json").write_text(json.dumps(valid))
+    (foreign_dir / "receipt.json").write_text('{"result":"accepted","reviewId":"other"}\n')
+
+    assert cli.tournament_receipt_path(receipt_root, {}, "target") is None
+
+
+def test_tournament_receipt_selection_fails_closed_on_unreadable_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt_root = tmp_path / "receipts"
+    valid_dir = receipt_root / "valid"
+    broken_dir = receipt_root / "broken"
+    valid_dir.mkdir(parents=True)
+    broken_dir.mkdir()
+    valid = {"result": "accepted", "reviewId": "target"}
+    valid["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(valid))
+    (valid_dir / "receipt.json").write_text(json.dumps(valid))
+    (broken_dir / "receipt.json").symlink_to(broken_dir / "missing.json")
+
+    assert cli.tournament_receipt_path(receipt_root, {}, "target") is None
 
 
 def test_product_tournament_retries_only_an_incomplete_delivery(
@@ -5404,12 +5509,89 @@ def test_invoke_codex_passes_an_explicit_allowlisted_environment(
     assert response.response == "VERDICT: approved."
 
 
+def test_invoke_codex_does_not_limit_unrelated_child_files(
+    tmp_path: Path,
+) -> None:
+    fake_codex = write_fake_python_executable(
+        tmp_path,
+        "codex",
+        """from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+output = Path(arguments[arguments.index('--output-last-message') + 1])
+output.with_name('codex-auxiliary.bin').write_bytes(
+    b'x' * (4 * 1024 * 1024 + 1024)
+)
+output.write_text('VERDICT: approved.')
+sys.stdout.write('x' * (4 * 1024 * 1024 + 1024))
+print('session id: codex-conversation')
+print('model: gpt-test')
+""",
+    )
+
+    exit_code, error, response = cli.invoke_codex(
+        codex_bin=str(fake_codex),
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=5,
+        workspace=tmp_path,
+    )
+
+    assert (exit_code, response.response) == (0, "VERDICT: approved.")
+    assert (response.conversation_id, response.model) == ("codex-conversation", "gpt-test")
+    assert error == "Codex transport output truncated: stdout"
+
+
+def test_invoke_codex_stops_a_runaway_final_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_codex = write_fake_python_executable(
+        tmp_path,
+        "codex",
+        """from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+output = Path(arguments[arguments.index('--output-last-message') + 1])
+with output.open('wb') as stream:
+    while True:
+        stream.write(b'x' * 65536)
+        stream.flush()
+""",
+    )
+    monkeypatch.setattr(cli, "MAX_CODEX_RESPONSE_BYTES", 128 * 1024)
+
+    exit_code, error, response = cli.invoke_codex(
+        codex_bin=str(fake_codex),
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=5,
+        workspace=tmp_path,
+    )
+
+    assert (exit_code, response.response) == (502, "")
+    assert error == "Codex final response exceeded bounded capture"
+
+
 @pytest.mark.parametrize(
-    ("stdout", "stderr", "final_response", "expected_error"),
+    (
+        "stdout",
+        "stderr",
+        "final_response",
+        "expected_exit",
+        "expected_error",
+        "expected_response",
+    ),
     [
-        (b"12345", b"", b"ok", "Codex transport output exceeded bounded capture"),
-        (b"", b"12345", b"ok", "Codex transport output exceeded bounded capture"),
-        (b"", b"", b"12345", "Codex final response exceeded bounded capture"),
+        (b"12345", b"", b"ok", 0, "Codex transport output truncated: stdout", "ok"),
+        (b"", b"12345", b"ok", 0, "Codex transport output truncated: stderr", "ok"),
+        (b"", b"", b"12345", 502, "Codex final response exceeded bounded capture", ""),
+        (b"", b"", b"\xff", 502, "Codex final response is not valid UTF-8", ""),
     ],
 )
 def test_invoke_codex_rejects_oversized_output(
@@ -5418,7 +5600,9 @@ def test_invoke_codex_rejects_oversized_output(
     stdout: bytes,
     stderr: bytes,
     final_response: bytes,
+    expected_exit: int,
     expected_error: str,
+    expected_response: str,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -5450,21 +5634,18 @@ def test_invoke_codex_rejects_oversized_output(
         workspace=tmp_path,
     )
 
-    assert (exit_code, error, response.response) == (502, expected_error, "")
+    assert (exit_code, response.response) == (expected_exit, expected_response)
+    assert error.endswith(expected_error)
 
 
-def test_invoke_codex_fails_closed_without_bounded_capture_support(
+def test_invoke_codex_does_not_require_resource_module_for_bounded_capture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    fake_codex = write_fake_codex(tmp_path)
     monkeypatch.setattr(cli, "resource", None)
-    monkeypatch.setattr(
-        cli.subprocess,
-        "Popen",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
-    )
 
     exit_code, error, response = cli.invoke_codex(
-        codex_bin="codex",
+        codex_bin=str(fake_codex),
         prompt="Review",
         model="gpt-test",
         response_contract="verdict",
@@ -5474,9 +5655,9 @@ def test_invoke_codex_fails_closed_without_bounded_capture_support(
     )
 
     assert (exit_code, error, response.response) == (
-        126,
-        "Codex bounded output capture unsupported on this platform",
+        0,
         "",
+        "VERDICT: approved without blocking findings.",
     )
 
 
@@ -6045,6 +6226,7 @@ files = ["{source}"]
     assert result.returncode == 0, result.stderr
     report = json.loads((tmp_path / "tournament-artifacts" / "tournament.json").read_text())
     assert report["runs"][0]["maxOutputTokens"] == 300
+    assert report["runs"][0]["outputTokenLimitEnforced"] is True
 
 
 def test_legacy_tournament_defaults_to_one_attempt_and_reserves_declared_retries(
@@ -7051,16 +7233,15 @@ files = ["{source}"]
         artifact_root = Path(args.artifact_root)
         turn = artifact_root / "turn"
         turn.mkdir(parents=True)
-        (turn / "receipt.json").write_text(
-            json.dumps(
-                {
-                    "result": "accepted",
-                    "findings": [],
-                    "response": {"costUsd": 0.0},
-                    "transport": transport,
-                }
-            )
-        )
+        receipt = {
+            "result": "accepted",
+            "findings": [],
+            "response": {"costUsd": 0.0},
+            "reviewId": args.review_id,
+            "transport": transport,
+        }
+        receipt["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(receipt))
+        (turn / "receipt.json").write_text(json.dumps(receipt))
         transports.append((transport, args.provider_only, args.provider_allow_fallbacks))
         return 0
 
@@ -7188,16 +7369,14 @@ files = ["{source}"]
     def fake_run_review(parser: object, args: object) -> int:
         turn = Path(args.artifact_root) / "turn"
         turn.mkdir(parents=True)
-        (turn / "receipt.json").write_text(
-            json.dumps(
-                {
-                    "result": "accepted",
-                    "findings": [],
-                    "attempts": [{"costUsd": 0.1}, {"costUsd": 0.2}],
-                    "response": {"costUsd": 0.2},
-                }
-            )
-        )
+        receipt = {
+            "result": "accepted",
+            "attempts": [{"costUsd": 0.1}, {"costUsd": 0.2}],
+            "response": {"costUsd": 0.2},
+            "reviewId": args.review_id,
+        }
+        receipt["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(receipt))
+        (turn / "receipt.json").write_text(json.dumps(receipt))
         return 0
 
     monkeypatch.setattr(cli, "run_review", fake_run_review)
@@ -8279,19 +8458,20 @@ def test_invoke_openrouter_persists_a_portable_structured_response(
 
 
 @pytest.mark.parametrize(
-    "model",
+    ("model", "expected_reasoning"),
     [
-        "google/gemini-3.6-flash",
-        "google/gemini-3.7-flash",
-        "z-ai/glm-5.2",
-        "z-ai/glm-5.3-flash",
-        "meta/muse-spark-1.2-contributor",
+        ("google/gemini-3.6-flash", None),
+        ("google/gemini-3.7-flash", None),
+        ("z-ai/glm-5.2", None),
+        ("z-ai/glm-5.3-flash", {"effort": "max"}),
+        ("meta/muse-spark-1.2-contributor", None),
     ],
 )
-def test_invoke_openrouter_leaves_reasoning_to_the_provider(
+def test_invoke_openrouter_sets_model_specific_reasoning_parameters(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     model: str,
+    expected_reasoning: dict[str, str] | None,
 ) -> None:
     source = tmp_path / "source.py"
     source.write_text("pass\n")
@@ -8318,7 +8498,89 @@ def test_invoke_openrouter_leaves_reasoning_to_the_provider(
     )
 
     assert (exit_code, error) == (0, "")
-    assert "reasoning" not in json.loads((tmp_path / "request.json").read_text())
+    request = json.loads((tmp_path / "request.json").read_text())
+    if expected_reasoning is None:
+        assert "reasoning" not in request
+    else:
+        assert request["reasoning"] == expected_reasoning
+
+
+def test_invoke_openrouter_reserves_a_reasoning_budget_for_glm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(
+        monkeypatch,
+        body=json.dumps(
+            {
+                "model": "z-ai/glm-5.3-flash",
+                "choices": [{"message": {"content": "VERDICT: approved"}}],
+            }
+        ).encode(),
+    )
+
+    exit_code, error, _ = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Return JSON.",
+        model="z-ai/glm-5.3-flash",
+        files=[source],
+        max_output_tokens=64,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert (exit_code, error) == (0, "")
+    request = json.loads((tmp_path / "request.json").read_text())
+    assert request["reasoning"] == {"effort": "max"}
+    assert request["max_tokens"] == cli.DEFAULT_MAX_OUTPUT_TOKENS
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("z-ai/glm-5.3-flash", cli.DEFAULT_MAX_OUTPUT_TOKENS),
+        ("openrouter/z-ai/glm-5.3-flash", cli.DEFAULT_MAX_OUTPUT_TOKENS),
+        ("z-ai/glm-5.3-flash:free", cli.DEFAULT_MAX_OUTPUT_TOKENS),
+        ("google/gemini-3.7-flash", 64),
+    ],
+)
+def test_openrouter_reasoning_floor_normalizes_model_routes(model: str, expected: int) -> None:
+    assert cli.openrouter_output_token_budget(model, 64) == expected
+
+
+def test_invoke_openrouter_normalizes_route_prefix_in_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(
+        monkeypatch,
+        body=json.dumps(
+            {
+                "model": "z-ai/glm-5.3-flash",
+                "choices": [{"message": {"content": "VERDICT: approved"}}],
+            }
+        ).encode(),
+    )
+
+    exit_code, error, _ = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Return a verdict.",
+        model="openrouter/z-ai/glm-5.3-flash",
+        files=[source],
+        max_output_tokens=64,
+        response_contract="verdict",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert (exit_code, error) == (0, "")
+    request = json.loads((tmp_path / "request.json").read_text())
+    assert request["model"] == "z-ai/glm-5.3-flash"
 
 
 def test_invoke_openrouter_rejects_a_malformed_choice_shape(

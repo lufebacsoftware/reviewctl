@@ -106,6 +106,7 @@ MAX_CODEX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDERR_BYTES = 100_000
 DEFAULT_MAX_OUTPUT_TOKENS = 16_384
+GLM_REASONING_MIN_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
@@ -1107,6 +1108,21 @@ def resolved_provider_matches(
 def openrouter_model_id(model: str) -> str:
     """Remove the local transport prefix before addressing an OpenRouter endpoint."""
     return model.removeprefix("openrouter/")
+
+
+def openrouter_reasoning_parameters(model: str) -> dict[str, str] | None:
+    """Keep GLM-5.3-Flash on its native maximum reasoning setting."""
+    model_id = openrouter_model_id(model)
+    if model_id == "z-ai/glm-5.3-flash" or model_id.startswith("z-ai/glm-5.3-flash:"):
+        return {"effort": "max"}
+    return None
+
+
+def openrouter_output_token_budget(model: str, requested: int) -> int:
+    """Keep small manual caps from starving native reasoning models of answer space."""
+    if openrouter_reasoning_parameters(model):
+        return max(requested, GLM_REASONING_MIN_OUTPUT_TOKENS)
+    return requested
 
 
 def endpoint_price_per_million(endpoint: dict[str, object], field: str) -> float | None:
@@ -2454,14 +2470,17 @@ def invoke_openrouter(
     blank = PersistedResponse("", None, None, None, "", None, None, "")
     if not api_key:
         return 127, "OPENROUTER_API_KEY is not configured", blank
+    model_id = openrouter_model_id(model)
     payload: dict[str, object] = {
-        "model": model,
-        "max_tokens": max_output_tokens,
+        "model": model_id,
         "temperature": 0,
         "messages": [
             {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
         ],
     }
+    payload["max_tokens"] = openrouter_output_token_budget(model, max_output_tokens)
+    if reasoning := openrouter_reasoning_parameters(model):
+        payload["reasoning"] = reasoning
     if schema := response_schema(response_contract):
         payload["response_format"] = {
             "type": "json_schema",
@@ -3004,10 +3023,15 @@ def invoke_pi(
                 communicated_stdout, communicated_stderr = process.communicate()
 
             def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
-                if not isinstance(value, bytes):
-                    stream.seek(0)
-                    value = stream.read(limit + 1)
-                return value[:limit], len(value) > limit
+                if isinstance(value, bytes):
+                    return value[:limit], len(value) > limit
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                if size > limit:
+                    stream.seek(size - limit)
+                    return stream.read(limit), True
+                stream.seek(0)
+                return stream.read(limit), False
 
             stdout, stdout_truncated = bounded_output(
                 communicated_stdout, stdout_file, MAX_PI_LEGACY_STDOUT_BYTES
@@ -3444,12 +3468,6 @@ def invoke_codex(
     workspace: Path,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Codex against the isolated snapshots and recover its final response."""
-    if resource is None:
-        return (
-            126,
-            "Codex bounded output capture unsupported on this platform",
-            PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
-        )
     isolation: CodexIsolation | None = None
     try:
         if source_roots:
@@ -3512,27 +3530,90 @@ def invoke_codex(
             {"HOME": os.environ.get("HOME") or str(account_home())},
         )
     )
-    capture_file_limit = (
-        max(MAX_CODEX_RESPONSE_BYTES, MAX_CODEX_STDOUT_BYTES, MAX_CODEX_STDERR_BYTES) + 1
-    )
-
-    def limit_output_files() -> None:
-        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
-            resource.RLIMIT_FSIZE,
-            (capture_file_limit, capture_file_limit),
-        )
 
     try:
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-            process = subprocess.Popen(
-                command,
-                cwd=workspace,
-                env=process_environment,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                start_new_session=True,
-                preexec_fn=limit_output_files,
+        process = subprocess.Popen(
+            command,
+            cwd=workspace,
+            env=process_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        response_oversized = threading.Event()
+        response_monitor_stop = threading.Event()
+
+        def monitor_response_file() -> None:
+            """Stop a Codex process before its final-response file fills the disk."""
+            while not response_monitor_stop.wait(0.05):
+                try:
+                    oversized = output_path.stat().st_size > MAX_CODEX_RESPONSE_BYTES
+                except FileNotFoundError:
+                    continue
+                if not oversized:
+                    continue
+                response_oversized.set()
+                process_pid = getattr(process, "pid", None)
+                if isinstance(process_pid, int):
+                    terminate_process_group(process)
+                return
+
+        response_monitor = threading.Thread(
+            target=monitor_response_file,
+            daemon=True,
+            name="reviewctl-codex-response",
+        )
+        response_monitor.start()
+
+        def bounded_pipe_capture(stream: object, limit: int, captured: dict[str, object]) -> None:
+            """Drain a child pipe while retaining bounded head and tail context."""
+            head_limit = min(64 * 1024, limit // 2)
+            tail_limit = limit - head_limit
+            head = bytearray()
+            tail = bytearray()
+            total = 0
+            if stream is None:
+                captured.update(value=b"", truncated=False)
+                return
+            while True:
+                chunk = stream.read(64 * 1024)  # type: ignore[union-attr]
+                if not chunk:
+                    break
+                total += len(chunk)
+                if len(head) < head_limit:
+                    take = min(head_limit - len(head), len(chunk))
+                    head.extend(chunk[:take])
+                    chunk = chunk[take:]
+                if chunk:
+                    tail.extend(chunk)
+                    if len(tail) > tail_limit:
+                        del tail[: len(tail) - tail_limit]
+            captured.update(
+                value=bytes(head + tail),
+                truncated=total > limit,
             )
+
+        stdout_stream = getattr(process, "stdout", None)
+        stderr_stream = getattr(process, "stderr", None)
+        pipe_mode = stdout_stream is not None and stderr_stream is not None
+        stdout_capture: dict[str, object] = {}
+        stderr_capture: dict[str, object] = {}
+        if pipe_mode:
+            stdout_reader = threading.Thread(
+                target=bounded_pipe_capture,
+                args=(stdout_stream, MAX_CODEX_STDOUT_BYTES, stdout_capture),
+                daemon=True,
+                name="reviewctl-codex-stdout",
+            )
+            stderr_reader = threading.Thread(
+                target=bounded_pipe_capture,
+                args=(stderr_stream, MAX_CODEX_STDERR_BYTES, stderr_capture),
+                daemon=True,
+                name="reviewctl-codex-stderr",
+            )
+            stdout_reader.start()
+            stderr_reader.start()
+        if not pipe_mode:
             try:
                 communicated_stdout, communicated_stderr = process.communicate(
                     timeout=timeout_seconds
@@ -3544,26 +3625,51 @@ def invoke_codex(
                 communicated_stderr = b""
                 exit_code = 124
                 timed_out = True
+        else:
+            try:
+                process.wait(timeout=timeout_seconds)
+                exit_code = process.returncode
+            except subprocess.TimeoutExpired:
+                terminate_process_group(process)
+                exit_code = 124
+                timed_out = True
+        if pipe_mode:
+            stdout_reader.join(timeout=5)
+            stderr_reader.join(timeout=5)
+            communicated_stdout = cast(bytes, stdout_capture.get("value", b""))
+            stdout_capture_truncated = bool(stdout_capture.get("truncated"))
+            communicated_stderr = cast(bytes, stderr_capture.get("value", b""))
+            stderr_capture_truncated = bool(stderr_capture.get("truncated"))
+        else:
+            stdout_capture_truncated = False
+            stderr_capture_truncated = False
+        response_monitor_stop.set()
+        response_monitor.join(timeout=5)
 
-            def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
-                if not isinstance(value, bytes):
-                    stream.seek(0)
-                    value = stream.read(limit + 1)
-                return value[:limit], len(value) > limit
+        def bounded_output(
+            value: object, limit: int, truncated: bool = False
+        ) -> tuple[bytes, bool]:
+            if isinstance(value, bytes):
+                return value[:limit], truncated or len(value) > limit
+            return b"", truncated
 
-            stdout, stdout_truncated = bounded_output(
-                communicated_stdout, stdout_file, MAX_CODEX_STDOUT_BYTES
-            )
-            stderr, stderr_truncated = bounded_output(
-                communicated_stderr, stderr_file, MAX_CODEX_STDERR_BYTES
-            )
-        if stdout_truncated or stderr_truncated:
-            return (
-                502,
-                "Codex transport output exceeded bounded capture",
-                PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
-            )
+        stdout, stdout_truncated = bounded_output(
+            communicated_stdout, MAX_CODEX_STDOUT_BYTES, stdout_capture_truncated
+        )
+        stderr, stderr_truncated = bounded_output(
+            communicated_stderr, MAX_CODEX_STDERR_BYTES, stderr_capture_truncated
+        )
         stderr_text = "review attempt timed out" if timed_out else stderr.decode(errors="replace")
+        truncated_streams = [
+            name
+            for name, truncated in (("stdout", stdout_truncated), ("stderr", stderr_truncated))
+            if truncated
+        ]
+        if truncated_streams:
+            truncation_note = (
+                "Codex transport output truncated: " + ", ".join(truncated_streams)
+            )
+            stderr_text = f"{stderr_text}\n{truncation_note}".strip()
         transport_output = f"{stdout.decode(errors='replace')}\n{stderr_text}"
         session = re.search(r"session id:\s*([^\s]+)", transport_output)
         resolved_model = re.search(r"^model:\s*([^\s]+)", transport_output, flags=re.MULTILINE)
@@ -3572,13 +3678,20 @@ def invoke_codex(
             with confined_regular_descriptor(output_path, os.O_RDONLY) as descriptor:
                 with os.fdopen(os.dup(descriptor), "rb") as stream:
                     raw_response = stream.read(MAX_CODEX_RESPONSE_BYTES + 1)
-            if len(raw_response) > MAX_CODEX_RESPONSE_BYTES:
+            if response_oversized.is_set() or len(raw_response) > MAX_CODEX_RESPONSE_BYTES:
                 return (
                     502,
                     "Codex final response exceeded bounded capture",
                     PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
                 )
-            response_text = raw_response.decode("utf-8")
+            try:
+                response_text = raw_response.decode("utf-8")
+            except UnicodeDecodeError:
+                return (
+                    502,
+                    "Codex final response is not valid UTF-8",
+                    PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+                )
         return (
             exit_code,
             stderr_text,
@@ -5419,6 +5532,58 @@ def tournament_case_files(case: dict[str, Any], plan_path: Path) -> list[Path]:
     ]
 
 
+def receipt_fingerprints(root: Path) -> dict[Path, str]:
+    """Capture safe content identities for receipts already present in a run root."""
+    if not root.exists():
+        return {}
+    fingerprints: dict[Path, str] = {}
+    for path in root.glob("**/receipt.json"):
+        try:
+            fingerprints[path] = sha256_bytes(read_confined_bytes(path))
+        except OSError:
+            continue
+    return fingerprints
+
+
+def changed_receipt_paths(root: Path, before: dict[Path, str]) -> list[Path]:
+    """Return receipts created or changed by one tournament invocation."""
+    paths: list[Path] = []
+    for path in root.glob("**/receipt.json") if root.exists() else ():
+        try:
+            fingerprint = sha256_bytes(read_confined_bytes(path))
+        except OSError:
+            paths.append(path)
+            continue
+        if before.get(path) != fingerprint:
+            paths.append(path)
+    return sorted(paths)
+
+
+def tournament_receipt_path(
+    root: Path, before: dict[Path, str], review_id: str
+) -> Path | None:
+    """Select exactly one valid receipt belonging to the current tournament run."""
+    changed = changed_receipt_paths(root, before)
+    if len(changed) != 1:
+        return None
+    path = changed[0]
+    try:
+        receipt = json.loads(
+            read_confined_text(path),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+        )
+    except OSError, UnicodeError, ValueError:
+        return None
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("reviewId") != review_id
+        or not persisted_receipt_valid(path)
+    ):
+        return None
+    return path
+
+
 def run_candidate_tournament(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
@@ -5446,6 +5611,7 @@ def run_candidate_tournament(
     runs: list[dict[str, Any]] = []
     estimated_spend = 0.0
     actual_spend = 0.0
+    missing_receipt = False
     for case in cases:
         if not isinstance(case, dict) or not isinstance(case.get("id"), str):
             parser.error("tournament cases require an id")
@@ -5455,7 +5621,12 @@ def run_candidate_tournament(
             parser.error("tournament cases require a prompt")
         input_tokens = estimate_tokens(packet_prompt(prompt, files, response_contract), files)
         for candidate in candidates:
-            candidate_max_output_tokens = candidate.max_output_tokens or max_output_tokens
+            requested_max_output_tokens = candidate.max_output_tokens or max_output_tokens
+            candidate_max_output_tokens = (
+                openrouter_output_token_budget(candidate.model, requested_max_output_tokens)
+                if candidate.transport == "openrouter"
+                else requested_max_output_tokens
+            )
             estimate: float | None = None
             if candidate.cost_mode == "metered":
                 assert candidate.pricing is not None
@@ -5522,10 +5693,41 @@ def run_candidate_tournament(
                 timeout_seconds=timeout_seconds,
                 transport=candidate.transport,
             )
-            before = set(case_root.glob("**/receipt.json")) if case_root.exists() else set()
+            before = receipt_fingerprints(case_root)
             exit_code = run_review(parser, namespace)
-            receipt_paths = sorted(set(case_root.glob("**/receipt.json")) - before)
-            receipt_path = receipt_paths[0]
+            receipt_path = tournament_receipt_path(
+                case_root, before, str(namespace.review_id)
+            )
+            if receipt_path is None:
+                missing_receipt = True
+                runs.append(
+                    {
+                        "actualCostUsd": None,
+                        "candidate": candidate.identifier,
+                        "case": case["id"],
+                        "councilEligible": candidate.council_eligible,
+                        "costMode": candidate.cost_mode,
+                        "estimatedCostUsd": estimate,
+                        "exitCode": exit_code,
+                        "family": candidate.family,
+                        "maxOutputTokens": candidate_max_output_tokens,
+                        "model": candidate.model,
+                        "outputTokenLimitEnforced": candidate.transport in {"llm", "openrouter"},
+                        "receipt": None,
+                        "requestedMaxOutputTokens": requested_max_output_tokens,
+                        "result": "missing-receipt",
+                        "transport": candidate.transport,
+                    }
+                )
+                write_tournament_report(
+                    report_path,
+                    budget=budget,
+                    estimated_spend=estimated_spend,
+                    actual_spend=actual_spend,
+                    result="running",
+                    runs=runs,
+                )
+                continue
             receipt = json.loads(read_confined_text(receipt_path))
             actual_cost = receipt_attempt_cost(receipt)
             if candidate.cost_mode == "metered" and actual_cost is not None:
@@ -5542,6 +5744,8 @@ def run_candidate_tournament(
                     "family": candidate.family,
                     "maxOutputTokens": candidate_max_output_tokens,
                     "model": candidate.model,
+                    "outputTokenLimitEnforced": candidate.transport in {"llm", "openrouter"},
+                    "requestedMaxOutputTokens": requested_max_output_tokens,
                     "receipt": str(receipt_path),
                     "result": str(receipt["result"]),
                     "transport": candidate.transport,
@@ -5555,16 +5759,17 @@ def run_candidate_tournament(
                 result="running",
                 runs=runs,
             )
+    aggregate_result = "incomplete" if missing_receipt else "completed"
     write_tournament_report(
         report_path,
         budget=budget,
         estimated_spend=estimated_spend,
         actual_spend=actual_spend,
-        result="completed",
+        result=aggregate_result,
         runs=runs,
     )
     print(report_path)
-    return 0
+    return 1 if missing_receipt else 0
 
 
 def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
@@ -5620,7 +5825,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     legacy_max_attempts = plan.get("max_attempts", 1)
     if not isinstance(legacy_max_attempts, int) or not 1 <= legacy_max_attempts <= 3:
         parser.error("tournament plan max_attempts must be an integer from 1 to 3")
-    legacy_models: list[tuple[str, float, float, int]] = []
+    legacy_models: list[tuple[str, float, float, int, int]] = []
     for model, pricing in models.items():
         if not isinstance(pricing, dict):
             parser.error("tournament model pricing must be an object")
@@ -5635,12 +5840,19 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             or raw_candidate_max_output_tokens <= 0
         ):
             parser.error("tournament model max_output_tokens must be a positive integer")
+        requested_max_output_tokens = raw_candidate_max_output_tokens or max_output_tokens
+        effective_max_output_tokens = (
+            openrouter_output_token_budget(model, requested_max_output_tokens)
+            if transport == "openrouter"
+            else requested_max_output_tokens
+        )
         legacy_models.append(
             (
                 model,
                 input_price,
                 output_price,
-                raw_candidate_max_output_tokens or max_output_tokens,
+                requested_max_output_tokens,
+                effective_max_output_tokens,
             )
         )
 
@@ -5648,6 +5860,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     runs: list[dict[str, Any]] = []
     estimated_spend = 0.0
     actual_spend = 0.0
+    missing_receipt = False
     for case in cases:
         files = [
             (Path(item) if Path(item).is_absolute() else plan_path.parent / item).resolve()
@@ -5655,7 +5868,13 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         ]
         prompt = str(case["prompt"])
         input_tokens = estimate_tokens(packet_prompt(prompt, files), files)
-        for model, input_price, output_price, candidate_max_output_tokens in legacy_models:
+        for (
+            model,
+            input_price,
+            output_price,
+            requested_max_output_tokens,
+            candidate_max_output_tokens,
+        ) in legacy_models:
             estimate = (
                 input_tokens * input_price / 1_000_000
                 + candidate_max_output_tokens * output_price / 1_000_000
@@ -5705,11 +5924,37 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                 timeout_seconds=timeout_seconds,
                 transport=transport,
             )
-            before = set(case_root.glob("**/receipt.json")) if case_root.exists() else set()
+            before = receipt_fingerprints(case_root)
             result = run_review(parser, namespace)
-            after = set(case_root.glob("**/receipt.json"))
-            receipt_paths = sorted(after - before)
-            receipt_path = receipt_paths[0]
+            receipt_path = tournament_receipt_path(
+                case_root, before, str(namespace.review_id)
+            )
+            if receipt_path is None:
+                missing_receipt = True
+                runs.append(
+                    {
+                        "case": case["id"],
+                        "actualCostUsd": None,
+                        "estimatedCostUsd": estimate,
+                        "exitCode": result,
+                        "maxOutputTokens": candidate_max_output_tokens,
+                        "model": model,
+                        "outputTokenLimitEnforced": transport in {"llm", "openrouter"},
+                        "receipt": None,
+                        "requestedMaxOutputTokens": requested_max_output_tokens,
+                        "result": "missing-receipt",
+                        "score": None,
+                    }
+                )
+                write_tournament_report(
+                    report_path,
+                    budget=budget,
+                    estimated_spend=estimated_spend,
+                    actual_spend=actual_spend,
+                    result="running",
+                    runs=runs,
+                )
+                continue
             receipt = json.loads(read_confined_text(receipt_path))
             receipt_result = str(receipt["result"])
             actual_cost = receipt_attempt_cost(receipt)
@@ -5727,6 +5972,8 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                     "exitCode": result,
                     "maxOutputTokens": candidate_max_output_tokens,
                     "model": model,
+                    "outputTokenLimitEnforced": transport in {"llm", "openrouter"},
+                    "requestedMaxOutputTokens": requested_max_output_tokens,
                     "receipt": str(receipt_path),
                     "result": receipt_result,
                     "score": score_findings(
@@ -5743,16 +5990,17 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                 result="running",
                 runs=runs,
             )
+    aggregate_result = "incomplete" if missing_receipt else "completed"
     write_tournament_report(
         report_path,
         budget=budget,
         estimated_spend=estimated_spend,
         actual_spend=actual_spend,
-        result="completed",
+        result=aggregate_result,
         runs=runs,
     )
     print(report_path)
-    return 0
+    return 1 if missing_receipt else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
