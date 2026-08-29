@@ -100,6 +100,102 @@ def run_cli(*arguments: str, env: dict[str, str] | None = None) -> subprocess.Co
     )
 
 
+def make_range_cli_repository(tmp_path: Path) -> tuple[Path, str, str]:
+    repository = tmp_path / "range-repository"
+    repository.mkdir()
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "--quiet")
+    git("config", "user.email", "reviewctl@example.invalid")
+    git("config", "user.name", "reviewctl tests")
+    (repository / "ledger.txt").write_text("base\n")
+    git("add", "ledger.txt")
+    git("commit", "--quiet", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    (repository / "ledger.txt").write_text("base\nchanged\n")
+    git("add", "ledger.txt")
+    git("commit", "--quiet", "-m", "change")
+    return repository, base, git("rev-parse", "HEAD")
+
+
+def test_range_review_cli_writes_manifest_without_approval_fields(tmp_path: Path) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    output = tmp_path / "manifest.json"
+
+    result = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(output.read_text())
+    assert manifest["status"] == "manifest-created"
+    assert manifest["baseSha"] == base
+    assert manifest["headSha"] == head
+    assert manifest["chunkCount"] == 1
+    assert "receipt" not in manifest
+    assert "approved" not in manifest
+    assert str(output) in result.stdout
+
+
+def test_range_review_cli_fails_closed_for_invalid_head_and_oversized_chunk(
+    tmp_path: Path,
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    invalid_output = tmp_path / "invalid.json"
+
+    invalid = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        "missing-head",
+        "--output",
+        str(invalid_output),
+    )
+
+    assert invalid.returncode != 0
+    assert "could not resolve head" in invalid.stderr
+    assert not invalid_output.exists()
+
+    oversized_output = tmp_path / "oversized.json"
+    oversized = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--max-chunk-bytes",
+        "32",
+        "--output",
+        str(oversized_output),
+    )
+
+    assert oversized.returncode != 0
+    assert "single file diff exceeds" in oversized.stderr
+    assert not oversized_output.exists()
+
+
 def test_cli_imports_without_the_posix_resource_module() -> None:
     script = """
 import builtins

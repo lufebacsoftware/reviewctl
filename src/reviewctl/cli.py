@@ -74,6 +74,12 @@ from reviewctl.filesystem import (
     read_confined_text,
 )
 from reviewctl.project_cli import add_project_commands
+from reviewctl.range_review import (
+    DEFAULT_CONTEXT_LINES,
+    DEFAULT_MAX_CHUNK_BYTES,
+    RangeReviewError,
+    build_range_manifest,
+)
 from reviewctl.review_flow import (
     FallbackRelationship,
     PromotedFragment,
@@ -381,6 +387,17 @@ class CodexIsolation:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def positive_integer(value: str) -> int:
+    """Parse a CLI integer that must be strictly positive."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be an integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
 
 
 def write_private_exclusive(
@@ -1550,6 +1567,38 @@ def write_product_council_plan(parser: argparse.ArgumentParser, args: argparse.N
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(canonical_json(council_plan) + b"\n")
     print(output_path)
+    return 0
+
+
+def write_range_manifest(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Freeze one Git range without invoking a model or granting approval."""
+    output = Path(args.output).expanduser().resolve()
+    try:
+        manifest = build_range_manifest(
+            Path(args.repository),
+            args.base,
+            args.head,
+            context_lines=args.context_lines,
+            max_chunk_bytes=args.max_chunk_bytes,
+            allow_empty=args.allow_empty,
+        )
+    except RangeReviewError as error:
+        parser.error(str(error))
+    manifest = {
+        **manifest,
+        "evidenceStatus": "planning-only",
+        "generatedAt": utc_now(),
+    }
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_private_exclusive(
+            output,
+            canonical_json(manifest) + b"\n",
+            label="range manifest",
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
+    print(output)
     return 0
 
 
@@ -6065,6 +6114,33 @@ def build_parser() -> argparse.ArgumentParser:
         default="llm",
     )
     run.set_defaults(handler=lambda namespace: run_review(parser, namespace))
+
+    range_review = commands.add_parser(
+        "range-review",
+        help="freeze a Git base..head range into a planning-only manifest",
+    )
+    range_review.add_argument("--repository", required=True)
+    range_review.add_argument("--base", required=True)
+    range_review.add_argument("--head", required=True)
+    range_review.add_argument("--output", required=True)
+    range_review.add_argument(
+        "--context-lines",
+        type=positive_integer,
+        default=DEFAULT_CONTEXT_LINES,
+        help="unified diff context lines (default: 3)",
+    )
+    range_review.add_argument(
+        "--max-chunk-bytes",
+        type=positive_integer,
+        default=DEFAULT_MAX_CHUNK_BYTES,
+        help="maximum bytes per complete-file chunk (default: 131072)",
+    )
+    range_review.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="write a zero-chunk manifest when base and head have no diff",
+    )
+    range_review.set_defaults(handler=lambda namespace: write_range_manifest(parser, namespace))
 
     explore = commands.add_parser(
         "explore", help="run resumable Pi conversations and prepare formal review handoffs"
