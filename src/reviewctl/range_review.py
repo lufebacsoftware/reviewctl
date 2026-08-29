@@ -88,6 +88,7 @@ def _canonical_diff_arguments(context_lines: int, *options: str) -> tuple[str, .
         "core.quotePath=false",
         "diff",
         "--no-color",
+        "--text",
         "--diff-algorithm=myers",
         "--no-indent-heuristic",
         "--inter-hunk-context=0",
@@ -109,7 +110,6 @@ def _canonical_diff(repository: Path, base: str, head: str, context_lines: int) 
         repository,
         *_canonical_diff_arguments(
             context_lines,
-            "--binary",
             "--full-index",
         ),
         base,

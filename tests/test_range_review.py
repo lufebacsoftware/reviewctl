@@ -116,6 +116,8 @@ def test_manifest_is_insensitive_to_ambient_git_diff_configuration(tmp_path: Pat
     baseline = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
     order_file = tmp_path / "order.txt"
     order_file.write_text("notes.txt\nREADME.md\nledger.txt\n")
+    info_attributes = repository / ".git" / "info" / "attributes"
+    info_attributes.write_text("README.md binary\n")
 
     for key, value in (
         ("color.ui", "always"),
