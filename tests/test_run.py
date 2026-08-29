@@ -1672,6 +1672,14 @@ def test_native_data_decode_failure_emits_stable_invalid_attempt_and_receipt(
     assert cli.validate_v2_receipt(receipt) == ()
 
 
+def test_findings_validation_reports_duplicate_json_key() -> None:
+    response = '{"verdict":"approved","findings":[],"findings":[]}'
+
+    assert cli.review_validation_error(response, "findings-json") == (
+        "findings-json: duplicate JSON key 'findings'"
+    )
+
+
 def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8271,17 +8279,19 @@ def test_invoke_openrouter_persists_a_portable_structured_response(
 
 
 @pytest.mark.parametrize(
-    ("model", "expected_reasoning"),
+    "model",
     [
-        ("google/gemini-3.6-flash", {"effort": "minimal"}),
-        ("z-ai/glm-5.2", {"effort": "none"}),
+        "google/gemini-3.6-flash",
+        "google/gemini-3.7-flash",
+        "z-ai/glm-5.2",
+        "z-ai/glm-5.3-flash",
+        "meta/muse-spark-1.2-contributor",
     ],
 )
-def test_invoke_openrouter_configures_reasoning_models(
+def test_invoke_openrouter_leaves_reasoning_to_the_provider(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     model: str,
-    expected_reasoning: dict[str, object],
 ) -> None:
     source = tmp_path / "source.py"
     source.write_text("pass\n")
@@ -8308,7 +8318,7 @@ def test_invoke_openrouter_configures_reasoning_models(
     )
 
     assert (exit_code, error) == (0, "")
-    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == expected_reasoning
+    assert "reasoning" not in json.loads((tmp_path / "request.json").read_text())
 
 
 def test_invoke_openrouter_rejects_a_malformed_choice_shape(
@@ -8683,7 +8693,7 @@ def test_invoke_openrouter_forwards_requested_provider_preferences(
     assert json.loads((tmp_path / "request.json").read_text())["provider"] == preferences
 
 
-def test_invoke_openrouter_limits_gemini_36_flash_reasoning_for_fallback(
+def test_invoke_openrouter_leaves_gemini_reasoning_to_the_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "source.py"
@@ -8710,7 +8720,13 @@ def test_invoke_openrouter_limits_gemini_36_flash_reasoning_for_fallback(
 
     assert exit_code == 0
     assert response.response == "hola desde OpenRouter"
-    assert json.loads((tmp_path / "request.json").read_text())["reasoning"] == {"effort": "minimal"}
+    assert "reasoning" not in json.loads((tmp_path / "request.json").read_text())
+
+
+def test_run_defaults_to_a_large_output_budget_for_native_reasoning() -> None:
+    args = cli.build_parser().parse_args(["run", "--review-id", "native-reasoning"])
+
+    assert args.max_output_tokens == 16_384
 
 
 def test_invoke_openrouter_requires_an_api_key(tmp_path: Path) -> None:

@@ -113,8 +113,8 @@ For provider outages or account quotas, declare an ordered fallback route explic
 reviewctl run \
   --review-id ledger-review \
   --prompt-file review-request.md \
-  --route agy:gemini-3.6-flash-high \
-  --route openrouter:google/gemini-2.5-flash \
+  --route agy:gemini-3.7-flash-high \
+  --route openrouter:google/gemini-3.6-flash \
   --route llm:openrouter/deepseek/deepseek-v4-flash \
   --file src/posting.py \
   --source-class proprietary \
@@ -132,8 +132,8 @@ command. The default file is `~/.config/reviewctl/config.toml`:
 ```toml
 [profiles.gemini]
 routes = [
-  "agy:gemini-3.6-flash-high",
-  "openrouter:google/gemini-2.5-flash",
+  "agy:gemini-3.7-flash-high",
+  "openrouter:google/gemini-3.6-flash",
 ]
 
 [profiles.code]
@@ -206,7 +206,7 @@ therefore records the requested value separately with
 reviewctl run \
   --review-id obc-product-gemini \
   --transport agy \
-  --model gemini-3.6-flash-high \
+  --model gemini-3.7-flash-high \
   --prompt-file product-review.md \
   --file product-brief.md \
   --source-class proprietary \
@@ -222,7 +222,7 @@ configure OpenRouter routing only.
 reviewctl run \
   --review-id product-ideas \
   --transport agy \
-  --model gemini-3.6-flash-high \
+  --model gemini-3.7-flash-high \
   --prompt-file product-review.md \
   --source-class synthetic \
   --response-contract product-review-json

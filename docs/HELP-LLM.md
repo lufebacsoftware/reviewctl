@@ -222,6 +222,12 @@ over standard input; inventory, invocation, and session recovery share one
 total timeout. Those controls are advisory read-only and tool controls with
 source isolation unavailable; they are not OS sandbox enforcement.
 
+If Kiro reports `Tool approval required but --no-interactive was specified`,
+do not retry with `--trust-all-tools`. That would expand the formal review
+boundary. Use the native `reviewctl run --transport kiro` path, which sends the
+frozen packet inline and explicitly trusts no Kiro tools; then inspect the new
+`attempt.json` and verify its new receipt.
+
 Proprietary Kiro source requires both policy decisions below for the requested
 model before bytes are sent:
 

@@ -105,6 +105,7 @@ MAX_PI_LEGACY_STDERR_BYTES = 100_000
 MAX_CODEX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDERR_BYTES = 100_000
+DEFAULT_MAX_OUTPUT_TOKENS = 16_384
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
@@ -2461,13 +2462,6 @@ def invoke_openrouter(
             {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
         ],
     }
-    # Gemini 3.6 Flash accepts effort levels. GLM 5.2 may spend the entire
-    # completion cap reasoning even when a small budget is requested, so
-    # formal JSON reviews disable reasoning and reserve the cap for the answer.
-    if model == "google/gemini-3.6-flash":
-        payload["reasoning"] = {"effort": "minimal"}
-    elif model == "z-ai/glm-5.2":
-        payload["reasoning"] = {"effort": "none"}
     if schema := response_schema(response_contract):
         payload["response_format"] = {
             "type": "json_schema",
@@ -4322,12 +4316,39 @@ def review_validation_error(
     return f"{contract}: response does not satisfy the required schema"
 
 
+def first_duplicate_json_key(response: str) -> str | None:
+    """Return the first duplicate object key without weakening strict decoding."""
+    duplicate: str | None = None
+
+    def collect(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        nonlocal duplicate
+        seen: set[str] = set()
+        for key, _ in pairs:
+            if key in seen and duplicate is None:
+                duplicate = key
+            seen.add(key)
+        return dict(pairs)
+
+    try:
+        json.loads(
+            response,
+            object_pairs_hook=collect,
+            parse_constant=reject_nonstandard_json_constant,
+        )
+    except (ValueError, RecursionError):
+        return None
+    return duplicate
+
+
 def findings_validation_error(response: str, evaluation: ContractEvaluation) -> str | None:
     """Render one native findings evaluation using the stable CLI diagnostics."""
     if not evaluation.violations:
         return None
     violation = evaluation.violations[0]
     if violation == "invalid-json":
+        duplicate = first_duplicate_json_key(response)
+        if duplicate is not None:
+            return f"findings-json: duplicate JSON key {duplicate!r}"
         return "findings-json: invalid JSON"
     if violation == "top-level-not-object":
         return "findings-json: top-level response must be an object"
@@ -5550,7 +5571,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     plan_path = Path(args.plan)
     plan = load_policy(str(plan_path))
     budget = numeric_value(plan.get("budget_usd", 0))
-    max_output_tokens = plan.get("max_output_tokens", 4096)
+    max_output_tokens = plan.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
     timeout_seconds = plan.get("timeout_seconds", 90)
     if (
         budget is None
@@ -5768,7 +5789,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the accepted model response to this document path",
     )
     run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
-    run.add_argument("--max-output-tokens", type=int, default=4096)
+    run.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     run.add_argument("--max-attempts", type=int, default=None)
     run.add_argument("--policy")
     run.add_argument("--provider-only", action="append", default=[])
