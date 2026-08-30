@@ -110,9 +110,7 @@ def make_fake_receipt(
             "chunkId": chunk["patchSha256"],
         },
     }
-    receipt["sha256"] = hashlib.sha256(
-        canonical_json(receipt)
-    ).hexdigest()
+    receipt["sha256"] = hashlib.sha256(canonical_json(receipt)).hexdigest()
     raw = canonical_json(receipt)
     path.write_bytes(raw + b"\n")
     return receipt
@@ -471,9 +469,10 @@ def test_range_validator_and_digest_helpers_cover_unusual_inputs(tmp_path: Path)
     assert range_review._canonical_digest({1: "unsupported"}) is None
     with pytest.raises(RangeReviewError, match="not canonical JSON"):
         range_review.manifest_sha256({1: "unsupported"})  # type: ignore[dict-item]
-    assert range_review._git_error(
-        subprocess.CompletedProcess([], 7, b"", b"")
-    ) == "git exited with status 7"
+    assert (
+        range_review._git_error(subprocess.CompletedProcess([], 7, b"", b""))
+        == "git exited with status 7"
+    )
 
 
 def test_range_git_edge_errors_are_reported(
@@ -569,12 +568,16 @@ def test_range_diff_and_aggregate_edge_errors(
     assert not range_review._same_json({1: "bad"}, {1: "bad"})
 
     incomplete_record = {"result": "unavailable", "findings": None}
-    assert range_review.build_range_aggregate(valid, "incomplete", [incomplete_record])[
-        "result"
-    ] == "incomplete"
-    assert range_review.build_range_aggregate(
-        valid, "range", [{"result": "accepted", "findings": []}]
-    )["result"] == "incomplete"
+    assert (
+        range_review.build_range_aggregate(valid, "incomplete", [incomplete_record])["result"]
+        == "incomplete"
+    )
+    assert (
+        range_review.build_range_aggregate(
+            valid, "range", [{"result": "accepted", "findings": []}]
+        )["result"]
+        == "incomplete"
+    )
 
 
 def test_range_aggregate_verifies_every_chunk_and_receipt_identity(tmp_path: Path) -> None:
@@ -622,12 +625,15 @@ def test_range_aggregate_verifies_every_chunk_and_receipt_identity(tmp_path: Pat
         "verdict": "approved",
         "findings": [],
     }
-    assert verify_range_aggregate(
-        manifest,
-        aggregate,
-        lambda path: (Path(path).read_bytes(), receipts[path]),
-        lambda _: (),
-    ) == ()
+    assert (
+        verify_range_aggregate(
+            manifest,
+            aggregate,
+            lambda path: (Path(path).read_bytes(), receipts[path]),
+            lambda _: (),
+        )
+        == ()
+    )
     unverified = build_range_aggregate(
         manifest,
         "range",
@@ -670,9 +676,7 @@ def test_range_aggregate_rejects_missing_reordered_or_mixed_chunks(
     records = []
     for chunk in manifest["chunks"]:
         receipt_path = receipt_dir / f"receipt-{chunk['index']}.json"
-        receipt = make_fake_receipt(
-            receipt_path, f"range.chunk-{chunk['index']}", chunk, manifest
-        )
+        receipt = make_fake_receipt(receipt_path, f"range.chunk-{chunk['index']}", chunk, manifest)
         records.append(
             {
                 "index": chunk["index"],
@@ -819,9 +823,7 @@ def test_range_aggregate_rejects_every_identity_and_receipt_corruption_shape(
             receipt_validator=validator or (lambda _: ()),  # type: ignore[arg-type]
         )
 
-    assert "manifest-object" in verify_range_aggregate(
-        None, baseline, lambda _: None, lambda _: ()
-    )
+    assert "manifest-object" in verify_range_aggregate(None, baseline, lambda _: None, lambda _: ())
     assert "aggregate-object" in run(None)
 
     aggregate_mutations = [

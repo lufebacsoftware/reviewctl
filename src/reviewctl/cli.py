@@ -1624,9 +1624,7 @@ def load_range_json(path: Path) -> tuple[bytes, object]:
     return raw, value
 
 
-def _range_child_process(
-    command: list[str], *, timeout_seconds: int
-) -> tuple[int, bytes, bytes]:
+def _range_child_process(command: list[str], *, timeout_seconds: int) -> tuple[int, bytes, bytes]:
     """Run a child review with bounded stdout/stderr capture."""
     checkout_root = Path(__file__).resolve().parents[2]
     process = subprocess.Popen(
@@ -1708,7 +1706,7 @@ def _range_chunk_record(
         return record
     try:
         raw, receipt = load_range_json(receipt_path)
-    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+    except OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError:
         return record
     if not isinstance(receipt, dict):
         return record
@@ -1812,7 +1810,7 @@ def run_range_review(parser: argparse.ArgumentParser, args: argparse.Namespace) 
                 f"Chunk SHA-256: {chunk['patchSha256']}\n"
                 f"Chunk paths: {json.dumps(chunk['paths'], ensure_ascii=True)}\n"
                 "Return the findings-json contract. The reviewedFiles value must be exactly "
-                f"[\"chunk-{index:04d}.patch\"]."
+                f'["chunk-{index:04d}.patch"].'
             )
             prompt_path.write_text(chunk_prompt)
             command = [
@@ -1911,7 +1909,7 @@ def verify_range_aggregate_command(
     def load_receipt(path: str) -> tuple[bytes, object] | None:
         try:
             return load_range_json(Path(path).expanduser().resolve())
-        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        except OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError:
             return None
 
     violations = verify_range_aggregate(
@@ -4043,9 +4041,7 @@ def invoke_codex(
             if truncated
         ]
         if truncated_streams:
-            truncation_note = (
-                "Codex transport output truncated: " + ", ".join(truncated_streams)
-            )
+            truncation_note = "Codex transport output truncated: " + ", ".join(truncated_streams)
             stderr_text = f"{stderr_text}\n{truncation_note}".strip()
         transport_output = f"{stdout.decode(errors='replace')}\n{stderr_text}"
         session = re.search(r"session id:\s*([^\s]+)", transport_output)
@@ -4825,7 +4821,7 @@ def first_duplicate_json_key(response: str) -> str | None:
             object_pairs_hook=collect,
             parse_constant=reject_nonstandard_json_constant,
         )
-    except (ValueError, RecursionError):
+    except ValueError, RecursionError:
         return None
     return duplicate
 
@@ -4916,23 +4912,17 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     range_context_path = getattr(args, "range_context_file", None)
     if range_context_path:
         try:
-            _, loaded_context = load_range_json(
-                Path(range_context_path).expanduser().resolve()
-            )
+            _, loaded_context = load_range_json(Path(range_context_path).expanduser().resolve())
         except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
             parser.error(f"could not read range receipt context: {error}")
-        if (
-            type(loaded_context) is not dict
-            or set(loaded_context)
-            != {
-                "rangeReviewSchemaVersion",
-                "manifestSha256",
-                "range",
-                "chunkIndex",
-                "chunkCount",
-                "chunkId",
-            }
-        ):
+        if type(loaded_context) is not dict or set(loaded_context) != {
+            "rangeReviewSchemaVersion",
+            "manifestSha256",
+            "range",
+            "chunkIndex",
+            "chunkCount",
+            "chunkId",
+        }:
             parser.error("range receipt context has an invalid shape")
         range_context = loaded_context
     routes, route_profile = review_routes(parser, args)
@@ -5961,9 +5951,7 @@ def changed_receipt_paths(root: Path, before: dict[Path, str]) -> list[Path]:
     return sorted(paths)
 
 
-def tournament_receipt_path(
-    root: Path, before: dict[Path, str], review_id: str
-) -> Path | None:
+def tournament_receipt_path(root: Path, before: dict[Path, str], review_id: str) -> Path | None:
     """Select exactly one valid receipt belonging to the current tournament run."""
     changed = changed_receipt_paths(root, before)
     if len(changed) != 1:
@@ -6097,9 +6085,7 @@ def run_candidate_tournament(
             )
             before = receipt_fingerprints(case_root)
             exit_code = run_review(parser, namespace)
-            receipt_path = tournament_receipt_path(
-                case_root, before, str(namespace.review_id)
-            )
+            receipt_path = tournament_receipt_path(case_root, before, str(namespace.review_id))
             if receipt_path is None:
                 missing_receipt = True
                 runs.append(
@@ -6328,9 +6314,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             )
             before = receipt_fingerprints(case_root)
             result = run_review(parser, namespace)
-            receipt_path = tournament_receipt_path(
-                case_root, before, str(namespace.review_id)
-            )
+            receipt_path = tournament_receipt_path(case_root, before, str(namespace.review_id))
             if receipt_path is None:
                 missing_receipt = True
                 runs.append(
@@ -6525,9 +6509,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-output-tokens", type=positive_integer, default=DEFAULT_MAX_OUTPUT_TOKENS
     )
     range_review.add_argument("--max-attempts", type=positive_integer, default=1)
-    range_review.set_defaults(
-        handler=lambda namespace: range_review_command(parser, namespace)
-    )
+    range_review.set_defaults(handler=lambda namespace: range_review_command(parser, namespace))
 
     range_verify = commands.add_parser(
         "range-verify",

@@ -393,12 +393,8 @@ def test_range_cli_error_and_capture_helpers_are_bounded(
         returncode = 0
 
         def __init__(self):
-            self.stdout = Stream(
-                [b"x" * (cli.MAX_RANGE_CHILD_STDOUT_BYTES + 1), b"x"]
-            )
-            self.stderr = Stream(
-                [b"y" * (cli.MAX_RANGE_CHILD_STDERR_BYTES + 1), b"y"]
-            )
+            self.stdout = Stream([b"x" * (cli.MAX_RANGE_CHILD_STDOUT_BYTES + 1), b"x"])
+            self.stderr = Stream([b"y" * (cli.MAX_RANGE_CHILD_STDERR_BYTES + 1), b"y"])
 
         def wait(self, *, timeout: int) -> int:
             return self.returncode
@@ -411,17 +407,26 @@ def test_range_cli_error_and_capture_helpers_are_bounded(
     assert cli._range_child_process(["reviewctl"], timeout_seconds=1)[0] == 502
 
     chunk = {"patchSha256": "f" * 64}
-    assert cli._range_chunk_record(index=0, chunk=chunk, review_id="range", receipt_path=None)[
-        "result"
-    ] == "missing"
+    assert (
+        cli._range_chunk_record(index=0, chunk=chunk, review_id="range", receipt_path=None)[
+            "result"
+        ]
+        == "missing"
+    )
     monkeypatch.setattr(cli, "load_range_json", lambda path: (_ for _ in ()).throw(ValueError()))
-    assert cli._range_chunk_record(
-        index=0, chunk=chunk, review_id="range", receipt_path=tmp_path / "receipt.json"
-    )["result"] == "missing"
+    assert (
+        cli._range_chunk_record(
+            index=0, chunk=chunk, review_id="range", receipt_path=tmp_path / "receipt.json"
+        )["result"]
+        == "missing"
+    )
     monkeypatch.setattr(cli, "load_range_json", lambda path: (b"{}", []))
-    assert cli._range_chunk_record(
-        index=0, chunk=chunk, review_id="range", receipt_path=tmp_path / "receipt.json"
-    )["result"] == "missing"
+    assert (
+        cli._range_chunk_record(
+            index=0, chunk=chunk, review_id="range", receipt_path=tmp_path / "receipt.json"
+        )["result"]
+        == "missing"
+    )
 
 
 def test_range_cli_formal_validation_and_dispatch_errors(tmp_path: Path) -> None:
@@ -463,17 +468,20 @@ def test_range_cli_formal_validation_and_dispatch_errors(tmp_path: Path) -> None
         cli.run_range_review(parser, args())
     valid_manifest = tmp_path / "valid.json"
     repository, base, head = make_range_cli_repository(tmp_path)
-    assert run_cli(
-        "range-review",
-        "--repository",
-        str(repository),
-        "--base",
-        base,
-        "--head",
-        head,
-        "--output",
-        str(valid_manifest),
-    ).returncode == 0
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(valid_manifest),
+        ).returncode
+        == 0
+    )
 
     checks = (
         ({"manifest": str(tmp_path / "bad.json")}, "could not read range manifest"),
@@ -536,9 +544,7 @@ def test_range_cli_formal_validation_and_dispatch_errors(tmp_path: Path) -> None
         cli.run_range_review(parser, args(manifest=str(empty_manifest)))
 
     malformed = json.loads(valid_manifest.read_text())
-    malformed["chunks"][0]["patch"] = base64.b64encode(
-        b"x" * (cli.MAX_FRAGMENT_BYTES + 1)
-    ).decode()
+    malformed["chunks"][0]["patch"] = base64.b64encode(b"x" * (cli.MAX_FRAGMENT_BYTES + 1)).decode()
     oversized = tmp_path / "oversized.json"
     oversized.write_text(json.dumps(malformed))
     original_validate = cli.validate_range_manifest
@@ -627,17 +633,20 @@ def test_range_formal_mode_handles_missing_child_output_and_aggregate_write_erro
 ) -> None:
     repository, base, head = make_range_cli_repository(tmp_path)
     manifest_path = tmp_path / "manifest.json"
-    assert run_cli(
-        "range-review",
-        "--repository",
-        str(repository),
-        "--base",
-        base,
-        "--head",
-        head,
-        "--output",
-        str(manifest_path),
-    ).returncode == 0
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(manifest_path),
+        ).returncode
+        == 0
+    )
     candidate = tmp_path / "candidate"
     candidate.mkdir()
     args = argparse.Namespace(

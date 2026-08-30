@@ -173,7 +173,7 @@ def _is_object_id(value: object) -> bool:
 def _canonical_digest(value: object) -> str | None:
     try:
         return hashlib.sha256(contract_canonical_json(value)).hexdigest()
-    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+    except TypeError, ValueError, UnicodeError, OverflowError, RecursionError:
         return None
 
 
@@ -198,7 +198,7 @@ def _manifest_chunk_payload(chunk: object) -> bytes | None:
         return None
     try:
         decoded = base64.b64decode(payload.encode("ascii"), validate=True)
-    except (UnicodeEncodeError, ValueError):
+    except UnicodeEncodeError, ValueError:
         return None
     if base64.b64encode(decoded).decode("ascii") != payload:
         return None
@@ -282,9 +282,11 @@ def validate_range_manifest(manifest: object) -> tuple[str, ...]:
             reject("chunk-sha")
         elif hashlib.sha256(payload).hexdigest() != chunk["patchSha256"]:
             reject("chunk-sha")
-        if type(chunk.get("byteLength")) is not int or isinstance(
-            chunk.get("byteLength"), bool
-        ) or chunk.get("byteLength") != len(payload):
+        if (
+            type(chunk.get("byteLength")) is not int
+            or isinstance(chunk.get("byteLength"), bool)
+            or chunk.get("byteLength") != len(payload)
+        ):
             reject("chunk-length")
         paths = chunk.get("paths")
         if (
@@ -299,10 +301,10 @@ def validate_range_manifest(manifest: object) -> tuple[str, ...]:
             if duplicate_paths:
                 reject("chunk-overlap")
             all_paths.update(paths)
-        if type(chunk.get("fileCount")) is not int or isinstance(
-            chunk.get("fileCount"), bool
-        ) or (
-            type(paths) is list and chunk.get("fileCount") != len(paths)
+        if (
+            type(chunk.get("fileCount")) is not int
+            or isinstance(chunk.get("fileCount"), bool)
+            or (type(paths) is list and chunk.get("fileCount") != len(paths))
         ):
             reject("chunk-file-count")
 
@@ -614,7 +616,7 @@ def _receipt_digest(receipt: object) -> str | None:
 def _same_json(left: object, right: object) -> bool:
     try:
         return contract_canonical_json(left) == contract_canonical_json(right)
-    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+    except TypeError, ValueError, UnicodeError, OverflowError, RecursionError:
         return False
 
 
@@ -712,7 +714,7 @@ def verify_range_aggregate(
             continue
         try:
             loaded = receipt_loader(receipt_path)
-        except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+        except OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError:
             loaded = None
         if loaded is None:
             reject("receipt-missing")
@@ -804,11 +806,7 @@ def verify_range_aggregate(
     else:
         expected_approved = all_receipts_valid and not normalized_findings
         expected_verdict = (
-            "approved"
-            if expected_approved
-            else "changes-requested"
-            if all_receipts_valid
-            else None
+            "approved" if expected_approved else "changes-requested" if all_receipts_valid else None
         )
         if aggregate_section.get("approved") is not expected_approved:
             reject("aggregate-approval")
