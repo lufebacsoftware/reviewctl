@@ -699,6 +699,17 @@ def llm_help_payload() -> dict[str, object]:
                 "show": "reviewctl setup show --format json",
                 "check": "reviewctl setup check --backend NAME --format json",
             },
+            "github": {
+                "review": (
+                    "reviewctl github review --repo OWNER/REPO --pr NUMBER "
+                    "--project PATH --profile default"
+                ),
+                "projectTransport": "pi",
+                "note": (
+                    "The project-scoped GitHub flow currently registers Pi only; "
+                    "use reviewctl run --transport codex for a formal Codex review."
+                ),
+            },
             "help-llm": "reviewctl help-llm --format json",
         },
         "backendSemantics": {
@@ -852,6 +863,14 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "A formal result requires receipt.result=accepted, a non-null acceptedAttempt, "
         "successful receipt verification, and independent checking of material findings. "
         "Hash verification alone proves integrity, not acceptance.\n\n"
+        "## GitHub pull-request review\n\n"
+        "The project-scoped GitHub flow currently registers the Pi transport only:\n\n"
+        "```bash\n"
+        "reviewctl github review --repo OWNER/REPO --pr NUMBER --project PATH "
+        "--profile default\n"
+        "```\n\n"
+        "For a formal review through Codex or another direct backend, use "
+        "`reviewctl run --transport TRANSPORT`; an unavailable receipt is not an approval.\n\n"
         "## Diagnose failures\n\n"
         "Do not retry blindly. A run that exits 1 still persists a receipt and attempt evidence. "
         "Read `attempt.json` fields `result`, `diagnostic`, `validationError`, and "
