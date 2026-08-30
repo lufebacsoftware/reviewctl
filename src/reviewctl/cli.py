@@ -3512,17 +3512,11 @@ def invoke_codex(
             {"HOME": os.environ.get("HOME") or str(account_home())},
         )
     )
-    capture_file_limit = (
-        max(MAX_CODEX_RESPONSE_BYTES, MAX_CODEX_STDOUT_BYTES, MAX_CODEX_STDERR_BYTES) + 1
-    )
-
-    def limit_output_files() -> None:
-        resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
-            resource.RLIMIT_FSIZE,
-            (capture_file_limit, capture_file_limit),
-        )
-
     try:
+        # Codex writes its own ephemeral state while it runs.  RLIMIT_FSIZE applies to
+        # every file descriptor in the child, not just these capture files, and causes
+        # otherwise healthy CLI runs to die with SIGXFSZ.  Bound the captured streams
+        # and final response after the process exits instead.
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
             process = subprocess.Popen(
                 command,
@@ -3531,7 +3525,6 @@ def invoke_codex(
                 stdout=stdout_file,
                 stderr=stderr_file,
                 start_new_session=True,
-                preexec_fn=limit_output_files,
             )
             try:
                 communicated_stdout, communicated_stderr = process.communicate(

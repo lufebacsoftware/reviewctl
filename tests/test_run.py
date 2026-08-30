@@ -5404,6 +5404,42 @@ def test_invoke_codex_passes_an_explicit_allowlisted_environment(
     assert response.response == "VERDICT: approved."
 
 
+def test_invoke_codex_does_not_apply_file_size_limit_to_cli_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, timeout: int) -> tuple[bytes, bytes]:
+            command = captured["command"]
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("VERDICT: approved.")
+            return b"session id: test-session\nmodel: gpt-5.6-terra\n", b""
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return Process()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+
+    exit_code, _, response = cli.invoke_codex(
+        codex_bin="codex",
+        prompt="Review",
+        model="gpt-5.6-terra",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=1,
+        workspace=tmp_path,
+    )
+
+    assert exit_code == 0
+    assert response.response == "VERDICT: approved."
+    assert "preexec_fn" not in captured["kwargs"]
+
+
 @pytest.mark.parametrize(
     ("stdout", "stderr", "final_response", "expected_error"),
     [
