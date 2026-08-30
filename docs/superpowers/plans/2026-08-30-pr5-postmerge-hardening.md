@@ -254,7 +254,7 @@ git commit -m "fix: limit project source snapshots to transport lifetime"
 - Modify: `tests/test_cli_front_door.py:1130-1160`
 - Modify: `docs/EVIDENCE.md`
 
-- [ ] **Step 1: Specify the marker and internal verifier**
+- [x] **Step 1: Specify the marker and internal verifier**
 
 ```python
 assert receipt["artifactKind"] == "project-review-checkpoint"
@@ -279,7 +279,7 @@ assert verify_project_receipt(path).code == "receipt_invalid"
 
 Keep a copied historical unmarked project checkpoint and assert direct digest inspection succeeds.
 
-- [ ] **Step 2: Specify rejection-only global classification**
+- [x] **Step 2: Specify rejection-only global classification**
 
 ```python
 PROJECT_ONLY_FIELDS = {
@@ -305,7 +305,7 @@ def test_verify_rejects_historical_project_checkpoint_shape(
     path = tmp_path / "checkpoint.json"
     path.write_bytes(cli.canonical_json(receipt) + b"\n")
     verified = run_cli("verify", str(path))
-    assert verified.returncode == 5
+    assert verified.returncode == 1
     assert json.loads(verified.stdout)["violations"] == [
         "project-checkpoint-not-review-receipt"
     ]
@@ -313,7 +313,7 @@ def test_verify_rejects_historical_project_checkpoint_shape(
 
 For each representative checkpoint, add `result`, `receiptSchemaVersion`, and an unrelated key in isolation; rejection must be unchanged. Preserve a generic V1 fixture augmented only with `configDigest` as a passing control, plus existing V2 controls.
 
-- [ ] **Step 3: Run the receipt tests and confirm RED**
+- [x] **Step 3: Run the receipt tests and confirm RED**
 
 ```bash
 uv run --python 3.14 pytest -q tests/test_api.py -k receipt
@@ -323,7 +323,7 @@ uv run --python 3.14 pytest -q tests/test_cli_front_door.py -k verify
 
 Expected: marker assertions fail and global verify still accepts a self-consistent project digest.
 
-- [ ] **Step 4: Mark checkpoints and add a rejection-only classifier**
+- [x] **Step 4: Mark checkpoints and add a rejection-only classifier**
 
 Add marker fields in `_write_receipt`. In `verify_project_receipt`, when either marker field is present require exactly `artifactKind == "project-review-checkpoint"` and integer schema version `1`; otherwise retain direct legacy digest inspection.
 
@@ -354,7 +354,7 @@ def project_checkpoint_shape(value: object) -> bool:
 
 Call it before V1/V2 validation and emit `project-checkpoint-not-review-receipt`. Delete global delegation to `verify_project_receipt`.
 
-- [ ] **Step 5: Correct evidence documentation**
+- [x] **Step 5: Correct evidence documentation**
 
 Document in `docs/EVIDENCE.md` that project `receipt.json` is a compatibility checkpoint, `verify_project_receipt` checks internal digest consistency only, global `reviewctl verify` rejects recognizable checkpoints, and legacy V1 cannot authenticate a fully rewritten document.
 

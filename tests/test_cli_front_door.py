@@ -1168,20 +1168,23 @@ def test_review_front_door_maps_transport_diagnostic_to_exit_code(
     assert payload["diagnostic"]["code"] == "timeout"
 
 
-def test_verify_accepts_project_receipt_and_rejects_tampering(tmp_path: Path, capsys) -> None:
-    unsigned = {"reviewId": "review-1", "configDigest": "config", "status": "accepted"}
+def test_verify_rejects_a_project_checkpoint_as_noncanonical(tmp_path: Path, capsys) -> None:
+    unsigned = {
+        "reviewId": "review-1",
+        "configDigest": "config",
+        "projectId": "project-1",
+        "status": "accepted",
+    }
     canonical = json.dumps(unsigned, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     receipt = tmp_path / "receipt.json"
     receipt.write_text(
         json.dumps({**unsigned, "sha256": hashlib.sha256(canonical.encode()).hexdigest()})
     )
 
-    assert run_cli(["verify", str(receipt)]) == 0
-    assert json.loads(capsys.readouterr().out)["valid"] is True
-
-    receipt.write_text(receipt.read_text().replace("accepted", "tampered"))
-    assert run_cli(["verify", str(receipt)]) == 5
-    assert json.loads(capsys.readouterr().out)["valid"] is False
+    assert run_cli(["verify", str(receipt)]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is False
+    assert payload["violations"] == ["project-checkpoint-not-review-receipt"]
 
 
 def test_findings_set_status_appends_a_status_event(tmp_path: Path, capsys) -> None:

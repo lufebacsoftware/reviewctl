@@ -42,6 +42,8 @@ class ReviewTransport(Protocol):
 
 
 _REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+PROJECT_CHECKPOINT_KIND = "project-review-checkpoint"
+PROJECT_CHECKPOINT_SCHEMA_VERSION = 1
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_FILES = 100
 MAX_SOURCE_SET_BYTES = 8 * 1024 * 1024
@@ -948,6 +950,8 @@ class ReviewClient:
         source_context: Mapping[str, Any] | None = None,
     ) -> tuple[Path, str]:
         receipt: dict[str, Any] = {
+            "artifactKind": PROJECT_CHECKPOINT_KIND,
+            "projectCheckpointSchemaVersion": PROJECT_CHECKPOINT_SCHEMA_VERSION,
             "reviewId": review_id,
             "route": route,
             "status": status,
@@ -1000,7 +1004,7 @@ class ReviewClient:
 
 
 def verify_project_receipt(path: Path, *, expected_sha256: str | None = None) -> Diagnostic | None:
-    """Verify the digest of a receipt produced by the project API."""
+    """Check project checkpoint integrity; this is not canonical receipt verification."""
     try:
         value = json.loads(
             read_confined_text(path),
@@ -1012,6 +1016,13 @@ def verify_project_receipt(path: Path, *, expected_sha256: str | None = None) ->
         return Diagnostic("receipt_invalid", f"could not read receipt: {error}")
     if not isinstance(value, dict) or not isinstance(value.get("sha256"), str):
         return Diagnostic("receipt_invalid", "receipt is missing its sha256 digest")
+    marker_present = "artifactKind" in value or "projectCheckpointSchemaVersion" in value
+    if marker_present and (
+        value.get("artifactKind") != PROJECT_CHECKPOINT_KIND
+        or type(value.get("projectCheckpointSchemaVersion")) is not int
+        or value["projectCheckpointSchemaVersion"] != PROJECT_CHECKPOINT_SCHEMA_VERSION
+    ):
+        return Diagnostic("receipt_invalid", "project checkpoint marker is invalid")
     recorded = value["sha256"]
     if expected_sha256 is not None and recorded != expected_sha256:
         return Diagnostic(

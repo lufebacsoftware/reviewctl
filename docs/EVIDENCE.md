@@ -26,6 +26,15 @@ V2 verification is structural and offline: after checking the digest, it validat
 contract identity, gates and evaluation state, fallback relationships, promoted-fragment identity, the
 accepted attempt, and consolidation without calling a provider or model.
 
+The project-oriented API also writes a file named `receipt.json` for caller compatibility, but that
+artifact is a `project-review-checkpoint`, not a canonical V1/V2 receipt or merge-grade evidence.
+`verify_project_receipt` checks its internal digest and can bind it to the expected digest returned in
+the same process; it does not establish canonical receipt structure. Global `reviewctl verify` rejects
+marked and recognizable historical project checkpoints instead of selecting that weaker checker from
+their fields. A completely rewritten unsigned document can still masquerade as legacy V1 after its
+author removes project-only fields and recomputes the digest; this is another reason V1 is integrity
+compatibility, not provenance or authentication.
+
 The receipt SHA-256 is tamper detection, not a digital signature and not a trust root. Structural
 verification detects internally incompatible facts, including mixing native findings state into a legacy
 contract receipt. It does not prove who authored the receipt or defend against an actor authorized to

@@ -7661,6 +7661,81 @@ def test_immutable_v1_receipt_fixtures_verify_by_embedded_digest(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("projectId", "project-1"),
+        ("originId", "origin-1"),
+        ("journalSequence", 1),
+        ("privacyMode", "private"),
+        ("dimensionCoverage", {}),
+        ("fallbackRelationships", []),
+    ],
+)
+def test_verify_rejects_historical_project_checkpoint_shapes(
+    field: str, value: object, tmp_path: Path
+) -> None:
+    receipt = {
+        "reviewId": "review-1",
+        "configDigest": "config",
+        field: value,
+        "status": "accepted",
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"result": "accepted"},
+        {"receiptSchemaVersion": 2},
+        {"unrelated": "value"},
+    ],
+)
+def test_project_checkpoint_rejection_ignores_attacker_added_fields(
+    extra: dict[str, object], tmp_path: Path
+) -> None:
+    receipt = {
+        "reviewId": "review-1",
+        "configDigest": "config",
+        "projectId": "project-1",
+        "status": "accepted",
+        **extra,
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
+def test_verify_rejects_an_explicitly_marked_project_checkpoint(tmp_path: Path) -> None:
+    receipt = {
+        "artifactKind": "project-review-checkpoint",
+        "projectCheckpointSchemaVersion": 1,
+        "reviewId": "review-1",
+        "status": "accepted",
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
+@pytest.mark.parametrize(
     "mutate_transport",
     [
         lambda receipt: receipt.__setitem__("transport", "kiro"),
@@ -12849,8 +12924,8 @@ def test_cli_task8_remaining_helper_and_receipt_edges(tmp_path: Path, monkeypatc
     assert cli.verify_receipt(SimpleNamespace(receipt=str(modern))) == 0
     assert json.loads(capsys.readouterr().out)["valid"] is True
     modern.write_text(json.dumps({**modern_value, "sha256": "wrong"}))
-    assert cli.verify_receipt(SimpleNamespace(receipt=str(modern))) == 5
-    assert json.loads(capsys.readouterr().out)["violations"] == ["receipt_invalid"]
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(modern))) == 1
+    assert json.loads(capsys.readouterr().out)["violations"] == ["receipt-digest"]
 
 
 def test_cli_task8_kiro_normalization_and_exploration_fallback_edges(

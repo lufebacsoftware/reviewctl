@@ -392,11 +392,55 @@ def test_project_receipt_verification_detects_tampering(tmp_path: Path) -> None:
     assert mismatched is not None
     assert mismatched.code == "receipt_invalid"
     receipt = json.loads(result.receipt_path.read_text())
+    assert receipt["artifactKind"] == "project-review-checkpoint"
+    assert receipt["projectCheckpointSchemaVersion"] == 1
     receipt["status"] = "tampered"
     result.receipt_path.write_text(json.dumps(receipt))
     diagnostic = verify_project_receipt(result.receipt_path)
     assert diagnostic is not None
     assert diagnostic.code == "receipt_invalid"
+
+
+def test_project_receipt_verifier_rejects_a_mutated_marker_but_accepts_legacy(
+    tmp_path: Path,
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review"))
+    receipt = json.loads(result.receipt_path.read_text())
+
+    receipt["artifactKind"] = "canonical-review-receipt"
+    receipt.pop("sha256")
+    receipt["sha256"] = api_module._digest(
+        json.dumps(
+            receipt,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    )
+    result.receipt_path.write_text(json.dumps(receipt))
+    marker_diagnostic = verify_project_receipt(result.receipt_path)
+
+    assert marker_diagnostic is not None
+    assert marker_diagnostic.code == "receipt_invalid"
+
+    receipt.pop("artifactKind")
+    receipt.pop("projectCheckpointSchemaVersion")
+    receipt.pop("sha256")
+    receipt["sha256"] = api_module._digest(
+        json.dumps(
+            receipt,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    )
+    result.receipt_path.write_text(json.dumps(receipt))
+
+    assert verify_project_receipt(result.receipt_path) is None
 
 
 def test_project_receipt_verification_rejects_duplicate_json_keys(tmp_path: Path) -> None:
