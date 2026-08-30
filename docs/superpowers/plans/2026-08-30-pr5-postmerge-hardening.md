@@ -360,7 +360,7 @@ Call it before V1/V2 validation and emit `project-checkpoint-not-review-receipt`
 
 Document in `docs/EVIDENCE.md` that project `receipt.json` is a compatibility checkpoint, `verify_project_receipt` checks internal digest consistency only, global `reviewctl verify` rejects recognizable checkpoints, and legacy V1 cannot authenticate a fully rewritten document.
 
-- [ ] **Step 6: Verify, commit, and request a bounded security review**
+- [x] **Step 6: Verify, commit, and request a bounded security review**
 
 ```bash
 uv run --python 3.14 pytest -q tests/test_api.py -k receipt
@@ -375,13 +375,17 @@ git commit -m "fix: reject project checkpoints as review receipts"
 
 Run a commit-bound `reviewctl` security/spec review over no more than three bounded source/test files. Verify its receipt and independently reproduce every material finding.
 
+Execution evidence: Sol approved exact repair range `3bec7ef..d79c4cb` with no findings;
+`range-verify` returned `valid: true` for
+`~/Code/reviews/reviewctl-pr5-hardening-code-review/range-repair2-sol/{manifest,aggregate}.json`.
+
 ### Task 4: Fail closed on malformed present Antigravity structured output
 
 **Files:**
 - Modify: `src/reviewctl/cli.py:3135-3200`
 - Modify: `tests/test_run.py:10220-10420`
 
-- [ ] **Step 1: Add a type matrix plus absence/object controls**
+- [x] **Step 1: Add a type matrix plus absence/object controls**
 
 ```python
 @pytest.mark.parametrize("structured_output", [None, "text", 7, [], True])
@@ -414,9 +418,9 @@ def test_invoke_agy_rejects_present_non_object_structured_output(
     assert response.response == ""
 ```
 
-Add separate controls: absent field uses legacy `response`; valid object is canonical. Retain duplicate-key, non-finite, and large sandbox-file packet tests. A runner-level malformed contract object must become `contract_failed`, not accepted.
+Add separate controls: absent field uses legacy `response`; valid object is canonical. Retain duplicate-key, non-finite, and large sandbox-file packet tests. A runner-level malformed contract object must leave the receipt `unavailable`, the attempt `incomplete`, and no accepted attempt; it cannot be accepted.
 
-- [ ] **Step 2: Run the matrix and confirm RED**
+- [x] **Step 2: Run the matrix and confirm RED**
 
 ```bash
 uv run --python 3.14 pytest -q tests/test_run.py -k 'invoke_agy and structured_output'
@@ -424,7 +428,7 @@ uv run --python 3.14 pytest -q tests/test_run.py -k 'invoke_agy and structured_o
 
 Expected: present non-dict values fall back to `response` and fail the new assertions.
 
-- [ ] **Step 3: Distinguish absence from present invalid value**
+- [x] **Step 3: Distinguish absence from present invalid value**
 
 ```python
 if "structured_output" not in payload:
@@ -438,7 +442,7 @@ else:
 
 Do not alter the parser, raw response write, sandbox-file path, or contract evaluator.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 uv run --python 3.14 pytest -q tests/test_run.py -k agy
@@ -449,12 +453,16 @@ git add src/reviewctl/cli.py tests/test_run.py
 git commit -m "fix: reject malformed Antigravity structured output"
 ```
 
+Execution evidence: Muse 1.2 Contributor approved exact task range `d79c4cb..3fc3527` with no
+findings; `range-verify` returned `valid: true` for
+`~/Code/reviews/reviewctl-pr5-hardening-code-review/range-agy-muse/{manifest,aggregate}.json`.
+
 ### Task 5: Final evidence, package verification, and PR gate
 
 **Files:**
 - Modify only if verification exposes a mismatch: `README.md`, `docs/EVIDENCE.md`, `docs/PROJECT-INTEGRATION.md`
 
-- [ ] **Step 1: Run the exact-candidate local gate**
+- [x] **Step 1: Run the exact-candidate local gate**
 
 ```bash
 uv run --python 3.14 pytest -q
@@ -467,9 +475,14 @@ git status --short
 
 Expected: full suite reaches 100% with no failures; Ruff and build pass; tracked worktree is clean.
 
-- [ ] **Step 2: Test the built wheel in a fresh temporary environment**
+- [x] **Step 2: Test the built wheel in a fresh temporary environment**
 
 Create a temporary virtual environment, install only the wheel, run `reviewctl --help`, initialize a temporary project, assert `routes = []` and `execution = "local"`, verify canonical V1/V2 fixtures, and verify rejection of a marked checkpoint. Remove the environment afterward.
+
+Execution evidence: the wheel `reviewctl-0.3.3-py3-none-any.whl` installed into a fresh
+environment, top-level `reviewctl init` emitted the inert template, canonical V1 and V2 receipts
+verified, and a marked project checkpoint was rejected with
+`project-checkpoint-not-review-receipt`. The temporary environment was moved recoverably to Trash.
 
 - [ ] **Step 3: Run final exact-commit review packets**
 
