@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -261,6 +262,257 @@ def test_bounded_git_capture_keeps_only_limit_plus_one_bytes(
     assert process.killed
 
 
+def test_bounded_git_capture_handles_second_read_and_process_exit_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class QueueStream:
+        def __init__(self, payloads: list[bytes]):
+            self.payloads = payloads
+
+        def read(self, _size: int = -1) -> bytes:
+            return self.payloads.pop(0) if self.payloads else b""
+
+        def close(self) -> None:
+            return None
+
+    class RaceProcess:
+        def __init__(self):
+            self.stdout = QueueStream([b"x" * 33, b"y"])
+            self.stderr = QueueStream([b"diagnostic"])
+            self.returncode = None
+
+        def kill(self) -> None:
+            raise ProcessLookupError
+
+        def wait(self) -> int:
+            self.returncode = -9
+            return self.returncode
+
+    process = RaceProcess()
+    monkeypatch.setattr(
+        range_review.subprocess,
+        "Popen",
+        lambda command, *, stdout, stderr: process,
+    )
+
+    result = range_review._run_git_bounded(tmp_path, "diff", max_stdout_bytes=32)
+
+    assert len(result.stdout) == 33
+    assert result.stderr == b"diagnostic"
+
+
+def test_bounded_git_capture_caps_stderr_after_multiple_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Stream:
+        def __init__(self, values: list[bytes]):
+            self.values = values
+
+        def read(self, _size: int = -1) -> bytes:
+            return self.values.pop(0) if self.values else b""
+
+        def close(self) -> None:
+            return None
+
+    class Process:
+        stdout = Stream([b""])
+        stderr = Stream([b"x" * (range_review.MAX_GIT_STDERR_BYTES + 1), b"y"])
+        returncode = 0
+
+        def wait(self) -> int:
+            return self.returncode
+
+    monkeypatch.setattr(
+        range_review.subprocess,
+        "Popen",
+        lambda command, *, stdout, stderr: Process(),
+    )
+
+    result = range_review._run_git_bounded(tmp_path, "diff", max_stdout_bytes=32)
+
+    assert len(result.stderr) == range_review.MAX_GIT_STDERR_BYTES + 1
+
+
+def test_bounded_git_capture_rejects_non_positive_limit(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="max_stdout_bytes must be positive"):
+        range_review._run_git_bounded(tmp_path, "diff", max_stdout_bytes=0)
+
+
+def test_manifest_validator_rejects_malformed_identity_and_chunks(tmp_path: Path) -> None:
+    repository, base, head = make_repository(tmp_path)
+    valid = build_range_manifest(repository, base, head, max_chunk_bytes=300)
+
+    malformed: list[tuple[object, str]] = [(None, "manifest-object")]
+    for key, value, code in (
+        ("unexpected", True, "manifest-fields"),
+        ("schemaVersion", 2, "manifest-schema-version"),
+        ("status", "formal", "manifest-status"),
+        ("evidenceStatus", "formal", "manifest-evidence-status"),
+        ("repository", "", "manifest-repository"),
+        ("baseSha", "bad", "manifest-base-sha"),
+        ("headSha", "bad", "manifest-head-sha"),
+        ("mergeBaseSha", "bad", "manifest-merge-base-sha"),
+        ("comparison", "other", "manifest-comparison"),
+        ("contextLines", 0, "manifest-context"),
+        ("chunkingVersion", "other", "manifest-chunking-version"),
+        ("canonicalDiffSha256", "bad", "manifest-diff-sha"),
+        ("chunks", {}, "manifest-chunks"),
+        ("chunkCount", -1, "manifest-chunk-count"),
+        ("chunkCount", 1, "manifest-chunk-count"),
+    ):
+        candidate = deepcopy(valid)
+        candidate[key] = value
+        malformed.append((candidate, code))
+    for candidate, expected in malformed:
+        assert expected in range_review.validate_range_manifest(candidate)
+
+    chunk = valid["chunks"][0]
+    candidates = [
+        (["not-a-chunk"], "chunk-object"),
+        ([{**chunk, "extra": True}], "chunk-fields"),
+        ([{**chunk, "index": -1}], "chunk-index"),
+        ([{**chunk, "patch": "not-base64"}], "chunk-payload"),
+        ([{**chunk, "patchSha256": "bad"}], "chunk-sha"),
+        ([{**chunk, "patchSha256": "0" * 64}], "chunk-sha"),
+        ([{**chunk, "byteLength": 0}], "chunk-length"),
+        ([{**chunk, "paths": []}], "chunk-paths"),
+        ([{**chunk, "paths": ["same", "same"]}], "chunk-paths"),
+        ([{**chunk, "fileCount": 0}], "chunk-file-count"),
+        ([{**chunk, "index": 1}], "chunk-order"),
+        ([{**chunk, "paths": ["README.md"]}], "manifest-diff-sha"),
+    ]
+    for chunks, expected in candidates:
+        candidate = deepcopy(valid)
+        candidate["chunks"] = chunks
+        candidate["chunkCount"] = len(chunks)
+        assert expected in range_review.validate_range_manifest(candidate)
+
+    overlap = deepcopy(valid)
+    overlap["chunks"][1]["paths"] = overlap["chunks"][0]["paths"]
+    overlap["chunks"][1]["fileCount"] = len(overlap["chunks"][1]["paths"])
+    assert "chunk-overlap" in range_review.validate_range_manifest(overlap)
+
+
+def test_range_validator_and_digest_helpers_cover_unusual_inputs(tmp_path: Path) -> None:
+    repository, base, head = make_repository(tmp_path)
+    manifest = build_range_manifest(repository, base, head)
+    assert range_review.validate_range_manifest(manifest) == ()
+    assert range_review._manifest_chunk_payload(None) is None
+    assert range_review._manifest_chunk_payload({"patch": 1}) is None
+    assert range_review._manifest_chunk_payload({"patch": "@@@"}) is None
+    assert range_review._manifest_chunk_payload({"patch": "YQ"}) is None
+    original_b64encode = range_review.base64.b64encode
+    range_review.base64.b64encode = lambda _value: b"different"  # type: ignore[assignment]
+    try:
+        assert range_review._manifest_chunk_payload({"patch": "YQ=="}) is None
+    finally:
+        range_review.base64.b64encode = original_b64encode  # type: ignore[assignment]
+    assert range_review._canonical_digest({1: "unsupported"}) is None
+    with pytest.raises(RangeReviewError, match="not canonical JSON"):
+        range_review.manifest_sha256({1: "unsupported"})  # type: ignore[dict-item]
+    assert range_review._git_error(
+        subprocess.CompletedProcess([], 7, b"", b"")
+    ) == "git exited with status 7"
+
+
+def test_range_git_edge_errors_are_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, base, head = make_repository(tmp_path)
+    file_path = tmp_path / "not-a-directory"
+    file_path.write_text("x")
+    with pytest.raises(RangeReviewError, match="repository is not a directory"):
+        build_range_manifest(file_path, base, head)
+    for revision in ("", "-bad"):
+        with pytest.raises(RangeReviewError, match="invalid revision"):
+            range_review._resolve_revision(repository, revision, "base")
+    with pytest.raises(RangeReviewError, match="max_chunk_bytes must be positive"):
+        build_range_manifest(repository, base, head, max_chunk_bytes=0)
+    with pytest.raises(RangeReviewError, match="canonical diff has no file sections"):
+        range_review._diff_sections(b"not-a-diff")
+    with pytest.raises(RangeReviewError, match="path count"):
+        range_review._chunks([b"x"], [], 10)
+    assert len(range_review._chunks([b"x", b"y"], ["same", "same"], 10)[0]["paths"]) == 1
+
+    def fake_git(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 1, b"", b"failure")
+
+    monkeypatch.setattr(range_review, "_run_git", fake_git)
+    with pytest.raises(RangeReviewError, match="not a Git repository"):
+        range_review._repository_root(repository)
+
+    def invalid_root_git(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 0, b"\xff", b"")
+
+    monkeypatch.setattr(range_review, "_run_git", invalid_root_git)
+    with pytest.raises(RangeReviewError, match="not valid UTF-8"):
+        range_review._repository_root(repository)
+
+    def invalid_revision_git(
+        *_args: object, **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 0, b"invalid", b"")
+
+    monkeypatch.setattr(range_review, "_run_git", invalid_revision_git)
+    with pytest.raises(RangeReviewError, match="invalid object id"):
+        range_review._resolve_revision(repository, "HEAD", "head")
+
+    def merge_base_status(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 2, b"", b"merge failure")
+
+    monkeypatch.setattr(range_review, "_run_git", merge_base_status)
+    with pytest.raises(RangeReviewError, match="could not compute merge base"):
+        range_review._merge_base(repository, base, head)
+
+    def disconnected(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 1, b"", b"")
+
+    monkeypatch.setattr(range_review, "_run_git", disconnected)
+    assert range_review._merge_base(repository, base, head) is None
+
+    def merge_base_invalid(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 0, b"invalid", b"")
+
+    monkeypatch.setattr(range_review, "_run_git", merge_base_invalid)
+    with pytest.raises(RangeReviewError, match="invalid object id"):
+        range_review._merge_base(repository, base, head)
+
+
+def test_range_diff_and_aggregate_edge_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, base, head = make_repository(tmp_path)
+    valid = build_range_manifest(repository, base, head)
+
+    def failed_capture(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 2, b"", b"diff failure")
+
+    monkeypatch.setattr(range_review, "_run_git_bounded", failed_capture)
+    with pytest.raises(RangeReviewError, match="could not compute canonical diff"):
+        range_review._canonical_diff(repository, base, head, 3)
+    with pytest.raises(RangeReviewError, match="could not capture canonical paths"):
+        range_review._canonical_paths(repository, base, head)
+
+    def oversized_capture(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 0, b"x" * (range_review.MAX_DIFF_BYTES + 1), b"")
+
+    monkeypatch.setattr(range_review, "_run_git_bounded", oversized_capture)
+    with pytest.raises(RangeReviewError, match="canonical diff exceeds"):
+        range_review._canonical_diff(repository, base, head, 3)
+
+    with pytest.raises(RangeReviewError, match="invalid range manifest"):
+        range_review.build_range_aggregate({}, "range", [])
+    with pytest.raises(RangeReviewError, match="invalid range review id"):
+        range_review.build_range_aggregate(valid, "bad/id", [])
+    assert range_review._receipt_digest([]) is None
+    assert not range_review._same_json({1: "bad"}, {1: "bad"})
+
+    incomplete_record = {"result": "unavailable", "findings": None}
+    assert range_review.build_range_aggregate(valid, "incomplete", [incomplete_record])[
+        "result"
+    ] == "incomplete"
+
+
 def test_range_aggregate_verifies_every_chunk_and_receipt_identity(tmp_path: Path) -> None:
     repository, base, head = make_repository(tmp_path)
     manifest = build_range_manifest(repository, base, head, max_chunk_bytes=300)
@@ -396,3 +648,202 @@ def test_range_aggregate_does_not_turn_an_empty_range_into_approval(tmp_path: Pa
     aggregate = build_range_aggregate(manifest, "empty-range", [])
 
     assert "range-empty" in verify_range_aggregate(manifest, aggregate, lambda _: None)
+
+
+def test_range_aggregate_rejects_every_identity_and_receipt_corruption_shape(
+    tmp_path: Path,
+) -> None:
+    repository, base, head = make_repository(tmp_path)
+    manifest = build_range_manifest(repository, base, head, max_chunk_bytes=4096)
+    receipt_path = tmp_path / "aggregate-receipt.json"
+    chunk = manifest["chunks"][0]
+    receipt = make_fake_receipt(receipt_path, "range.chunk-0", chunk, manifest)
+    record = {
+        "index": 0,
+        "chunkId": chunk["patchSha256"],
+        "patchSha256": chunk["patchSha256"],
+        "reviewId": "range.chunk-0",
+        "receipt": str(receipt_path),
+        "receiptFileSha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "receiptSha256": receipt["sha256"],
+        "result": receipt["result"],
+        "verdict": receipt["verdict"],
+        "findings": receipt["findings"],
+    }
+    baseline = build_range_aggregate(manifest, "range", [record])
+    raw = receipt_path.read_bytes()
+
+    def redigest(aggregate: dict[str, object]) -> None:
+        aggregate["sha256"] = hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in aggregate.items() if key != "sha256"},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+    def run(
+        aggregate: object,
+        *,
+        loaded: object = receipt,
+        raw_value: object = raw,
+        validator: object = None,
+    ) -> tuple[str, ...]:
+        def loader(_path: str) -> tuple[bytes, object] | None:
+            if isinstance(loaded, BaseException):
+                raise loaded
+            if loaded == "__missing__":
+                return None
+            return raw_value, loaded  # type: ignore[return-value]
+
+        return verify_range_aggregate(
+            manifest,
+            aggregate,
+            loader,
+            receipt_validator=validator,  # type: ignore[arg-type]
+        )
+
+    assert "manifest-object" in verify_range_aggregate(None, baseline, lambda _: None)
+    assert "aggregate-object" in run(None)
+
+    aggregate_mutations = [
+        (lambda value: value.update({"extra": True}), "aggregate-fields"),
+        (lambda value: value.update({"sha256": "bad"}), "aggregate-digest"),
+        (lambda value: value.update({"rangeReviewSchemaVersion": 2}), "aggregate-schema-version"),
+        (lambda value: value.update({"reviewId": "bad/id"}), "aggregate-review-id"),
+        (
+            lambda value: value.update({"evidenceStatus": "planning-only"}),
+            "aggregate-evidence-status",
+        ),
+        (lambda value: value.update({"manifestSha256": "f" * 64}), "manifest-digest"),
+        (lambda value: value.update({"range": {}}), "range-identity"),
+    ]
+    for mutation, expected in aggregate_mutations:
+        candidate = deepcopy(baseline)
+        mutation(candidate)
+        if expected != "aggregate-digest":
+            redigest(candidate)
+        assert expected in run(candidate)
+
+    chunks_candidate = deepcopy(baseline)
+    chunks_candidate["chunks"] = {}
+    redigest(chunks_candidate)
+    assert "chunk-count" in run(chunks_candidate)
+
+    record_mutations = [
+        (lambda value: value["chunks"].__setitem__(0, None), "chunk-object"),
+        (
+            lambda value: value["chunks"][0].update({"extra": True}),
+            "chunk-fields",
+        ),
+        (
+            lambda value: value["chunks"][0].update({"index": 99}),
+            "chunk-index",
+        ),
+        (
+            lambda value: value["chunks"][0].update({"reviewId": "other"}),
+            "chunk-review-id",
+        ),
+        (
+            lambda value: value["chunks"][0].update({"receipt": ""}),
+            "receipt-missing",
+        ),
+        (
+            lambda value: value["chunks"][0].update({"receiptFileSha256": "bad"}),
+            "receipt-file-digest",
+        ),
+        (
+            lambda value: value["chunks"][0].update({"receiptSha256": "bad"}),
+            "receipt-digest",
+        ),
+        (
+            lambda value: value["chunks"][0].update({"result": "unavailable"}),
+            "chunk-result",
+        ),
+        (
+            lambda value: value["chunks"][0].update({"verdict": "changes-requested"}),
+            "chunk-verdict",
+        ),
+        (
+            lambda value: value["chunks"][0].update({"findings": ["different"]}),
+            "chunk-findings",
+        ),
+    ]
+    for mutation, expected in record_mutations:
+        candidate = deepcopy(baseline)
+        mutation(candidate)
+        redigest(candidate)
+        assert expected in run(candidate)
+
+    assert "receipt-missing" in run(baseline, loaded="__missing__")
+    assert "receipt-missing" in run(baseline, loaded=ValueError("bad loader"))
+    assert "receipt-bytes" in run(baseline, raw_value="not bytes")
+    assert "receipt-object" in run(baseline, loaded=[])
+
+    receipt_mutations = [
+        (lambda value: value.update({"reviewId": "other"}), "receipt-review-id"),
+        (lambda value: value.update({"extension.rangeReview": {}}), "receipt-range-identity"),
+        (lambda value: value.update({"result": "unavailable"}), "receipt-result"),
+        (lambda value: value.update({"source": {}}), "receipt-source"),
+    ]
+    for mutation, expected in receipt_mutations:
+        changed = deepcopy(receipt)
+        mutation(changed)
+        assert expected in run(baseline, loaded=changed)
+    changed_findings = deepcopy(receipt)
+    changed_findings["findings"] = "not-a-list"
+    assert "chunk-findings" in run(baseline, loaded=changed_findings)
+    changed_source = deepcopy(receipt)
+    changed_source["source"]["files"][0]["name"] = "other.patch"  # type: ignore[index]
+    assert "receipt-source" in run(baseline, loaded=changed_source)
+    assert "receipt-invalid" in run(baseline, validator=lambda _: ("invalid",))
+
+    malformed_section = deepcopy(baseline)
+    malformed_section["aggregate"] = []
+    redigest(malformed_section)
+    assert "aggregate-section" in run(malformed_section)
+    mismatched_findings = deepcopy(baseline)
+    mismatched_findings["aggregate"]["findings"] = ["unexpected"]  # type: ignore[index]
+    redigest(mismatched_findings)
+    assert "aggregate-findings" in run(mismatched_findings)
+
+    finding = {"severity": "low"}
+    finding_receipt = deepcopy(receipt)
+    finding_receipt["findings"] = [finding]
+    finding_record = deepcopy(record)
+    finding_record["findings"] = [finding]
+    finding_aggregate = build_range_aggregate(manifest, "range", [finding_record])
+    assert "changes-requested" not in run(finding_aggregate, loaded=finding_receipt)
+
+    multi_manifest = build_range_manifest(repository, base, head, max_chunk_bytes=300)
+    multi_records = []
+    multi_receipts = {}
+    for multi_chunk in multi_manifest["chunks"]:
+        multi_path = tmp_path / f"multi-{multi_chunk['index']}.json"
+        multi_receipt = make_fake_receipt(
+            multi_path,
+            f"multi.chunk-{multi_chunk['index']}",
+            multi_chunk,
+            multi_manifest,
+        )
+        multi_receipts[str(multi_path)] = (multi_path.read_bytes(), multi_receipt)
+        multi_records.append(
+            {
+                **record,
+                "index": multi_chunk["index"],
+                "chunkId": multi_chunk["patchSha256"],
+                "patchSha256": multi_chunk["patchSha256"],
+                "reviewId": f"multi.chunk-{multi_chunk['index']}",
+                "receipt": str(multi_path),
+                "receiptFileSha256": hashlib.sha256(multi_path.read_bytes()).hexdigest(),
+                "receiptSha256": multi_receipt["sha256"],
+            }
+        )
+    multi_aggregate = build_range_aggregate(multi_manifest, "multi", multi_records)
+    multi_aggregate["chunks"][1]["index"] = 0
+    multi_aggregate["chunks"][0]["chunkId"] = "f" * 64
+    redigest(multi_aggregate)
+    assert "chunk-order" in verify_range_aggregate(
+        multi_manifest, multi_aggregate, lambda path: multi_receipts[path]
+    )

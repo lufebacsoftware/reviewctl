@@ -3908,9 +3908,6 @@ def invoke_codex(
             head = bytearray()
             tail = bytearray()
             total = 0
-            if stream is None:
-                captured.update(value=b"", truncated=False)
-                return
             while True:
                 chunk = stream.read(64 * 1024)  # type: ignore[union-attr]
                 if not chunk:

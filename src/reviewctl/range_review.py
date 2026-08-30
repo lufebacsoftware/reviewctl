@@ -656,10 +656,6 @@ def verify_range_aggregate(
             all_receipts_valid = False
             continue
         manifest_chunk = manifest_chunks[index]
-        if type(manifest_chunk) is not dict:
-            reject("chunk-id")
-            all_receipts_valid = False
-            continue
         patch_sha = manifest_chunk.get("patchSha256")
         if record.get("chunkId") != patch_sha or record.get("patchSha256") != patch_sha:
             reject("chunk-id")
