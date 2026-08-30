@@ -30,6 +30,14 @@ from reviewctl.setup import BackendInstallation, LocalExecutionTopology
 
 REPOSITORY = Path(__file__).parents[1]
 V1_RECEIPT_FIXTURES = REPOSITORY / "tests" / "fixtures" / "receipts"
+HISTORICAL_PROJECT_CHECKPOINT_FIELDS = {
+    "projectId": "project-1",
+    "originId": "origin-1",
+    "journalSequence": 1,
+    "privacyMode": "private",
+    "dimensionCoverage": {},
+    "fallbackRelationships": [],
+}
 
 
 def test_review_root_does_not_create_through_replaced_artifact_ancestor(
@@ -7660,25 +7668,12 @@ def test_immutable_v1_receipt_fixtures_verify_by_embedded_digest(
     assert json.loads(verified.stdout)["valid"] is True
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("projectId", "project-1"),
-        ("originId", "origin-1"),
-        ("journalSequence", 1),
-        ("privacyMode", "private"),
-        ("dimensionCoverage", {}),
-        ("fallbackRelationships", []),
-    ],
-)
-def test_verify_rejects_historical_project_checkpoint_shapes(
-    field: str, value: object, tmp_path: Path
-) -> None:
+def test_verify_rejects_historical_project_checkpoint_shape(tmp_path: Path) -> None:
     receipt = {
         "reviewId": "review-1",
         "configDigest": "config",
-        field: value,
         "status": "accepted",
+        **HISTORICAL_PROJECT_CHECKPOINT_FIELDS,
     }
     receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
     receipt_path = tmp_path / "checkpoint.json"
@@ -7690,21 +7685,14 @@ def test_verify_rejects_historical_project_checkpoint_shapes(
     assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("projectId", "project-1"),
-        ("originId", "origin-1"),
-        ("journalSequence", 1),
-        ("privacyMode", "private"),
-        ("dimensionCoverage", {}),
-        ("fallbackRelationships", []),
-    ],
-)
-def test_verify_rejects_project_fields_without_config_digest(
-    field: str, value: object, tmp_path: Path
+def test_verify_rejects_full_project_signature_without_config_digest(
+    tmp_path: Path,
 ) -> None:
-    receipt = {"reviewId": "review-1", field: value, "status": "accepted"}
+    receipt = {
+        "reviewId": "review-1",
+        "status": "accepted",
+        **HISTORICAL_PROJECT_CHECKPOINT_FIELDS,
+    }
     receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
     receipt_path = tmp_path / "checkpoint.json"
     receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
@@ -7713,6 +7701,23 @@ def test_verify_rejects_project_fields_without_config_digest(
 
     assert verified.returncode == 1
     assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
+@pytest.mark.parametrize(("field", "value"), HISTORICAL_PROJECT_CHECKPOINT_FIELDS.items())
+def test_generic_v1_with_one_project_like_field_retains_v1_compatibility(
+    field: str, value: object, tmp_path: Path
+) -> None:
+    receipt = json.loads((V1_RECEIPT_FIXTURES / "accepted-findings-v1.json").read_text())
+    receipt[field] = value
+    receipt.pop("sha256")
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "generic-v1.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 0
+    assert json.loads(verified.stdout)["violations"] == []
 
 
 @pytest.mark.parametrize(
@@ -7728,8 +7733,8 @@ def test_project_checkpoint_rejection_ignores_attacker_added_fields(
     receipt = {
         "reviewId": "review-1",
         "configDigest": "config",
-        "projectId": "project-1",
         "status": "accepted",
+        **HISTORICAL_PROJECT_CHECKPOINT_FIELDS,
         **extra,
     }
     receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))

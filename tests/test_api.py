@@ -1556,6 +1556,7 @@ def test_client_never_accepts_when_snapshot_cleanup_fails(
     result = client.review(ReviewRequest(prompt="review", files=(source,)))
 
     assert result.status == "transport_unavailable"
+    assert not external.exists()
     assert not list((tmp_path / ".reviewctl").glob("**/source"))
     assert str(external) not in result.receipt_path.read_text()
 
