@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -663,6 +664,7 @@ class ReviewClient:
                     "findings if they remain relevant and return one complete response: "
                     + json.dumps([asdict(finding) for finding in partial_findings], sort_keys=True)
                 )
+            temporary_root: Path | None = None
             try:
                 with tempfile.TemporaryDirectory(prefix="reviewctl-project-source-") as directory:
                     temporary_root = Path(directory).resolve()
@@ -690,6 +692,11 @@ class ReviewClient:
                     )
                     execution = transport.execute(backend_request)
             except OSError, UnicodeError, ValueError:
+                if temporary_root is not None and temporary_root.exists():
+                    try:
+                        shutil.rmtree(temporary_root)
+                    except OSError as cleanup_error:
+                        raise RuntimeError("temporary source cleanup failed") from cleanup_error
                 diagnostic = Diagnostic(
                     "transport_unavailable", "review transport failed", retryable=True
                 )
