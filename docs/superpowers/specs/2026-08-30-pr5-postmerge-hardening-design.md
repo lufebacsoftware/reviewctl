@@ -139,9 +139,10 @@ execution = "local"
 for every privacy mode. It contains no model, provider, route, price, score, or qualification.
 Organization policy or an explicit project-local configuration step supplies the operating route.
 
-An empty route list must not trigger `routes[0]`. `ReviewClient.review` returns a controlled
-`route_invalid` result and project checkpoint explaining that the selected profile has no routes.
-It performs no transport call and cannot be interpreted as approval.
+An empty route list must not trigger `routes[0]`. `ReviewClient.review` retains its current early
+controlled `route_invalid` result explaining that the selected profile has no routes. Because no
+attempt starts, it creates no checkpoint, review directory, or journal event and performs no
+transport call; the result cannot be interpreted as approval.
 
 ### 4. Strict Antigravity structured output
 
@@ -199,8 +200,8 @@ Every production change follows red-green-refactor.
    subset classifier. A `RuntimeError` transport probe also demonstrates cleanup before the
    unexpected exception propagates.
 3. **Template:** all init modes generate empty routes and local execution with no provider/model
-   text. Reviewing immediately after initialization returns `route_invalid`, writes no accepted
-   attempt, and invokes no transport.
+   text. Reviewing immediately after initialization returns `route_invalid`, creates no review
+   artifact or journal event, and invokes no transport.
 4. **Antigravity:** separate `null`, string, number, array, and boolean structured outputs fail
    closed while preserving raw response evidence. An absent structured-output field still permits
    legacy response fallback, a valid object remains canonical, duplicate/non-finite nested values
