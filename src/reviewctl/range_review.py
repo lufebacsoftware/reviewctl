@@ -518,9 +518,20 @@ def build_range_manifest(
 
 
 def build_range_aggregate(
-    manifest: dict[str, Any], review_id: str, chunk_records: list[dict[str, Any]]
+    manifest: dict[str, Any],
+    review_id: str,
+    chunk_records: list[dict[str, Any]],
+    *,
+    receipt_loader: Callable[[str], tuple[bytes, object] | None] | None = None,
+    receipt_validator: Callable[[object], Iterable[str]] | None = None,
 ) -> dict[str, Any]:
-    """Build a deterministic aggregate from the persisted per-chunk results."""
+    """Build a deterministic aggregate from verified persisted chunk results.
+
+    A complete aggregate is never emitted unless the caller supplies both a
+    receipt loader and the schema-v2 validator used to verify every receipt.
+    Callers that only need a deterministic incomplete progress artifact may
+    omit those callbacks.
+    """
     manifest_violations = validate_range_manifest(manifest)
     if manifest_violations:
         raise RangeReviewError(
@@ -529,9 +540,23 @@ def build_range_aggregate(
     if type(review_id) is not str or not _REVIEW_ID.fullmatch(review_id):
         raise RangeReviewError("invalid range review id")
     expected_count = manifest["chunkCount"]
-    complete = len(chunk_records) == expected_count and all(
-        type(record) is dict and record.get("result") == "accepted" for record in chunk_records
+    structurally_complete = len(chunk_records) == expected_count and all(
+        type(record) is dict
+        and set(record) == _AGGREGATE_CHUNK_FIELDS
+        and record.get("index") == index
+        and record.get("chunkId") == manifest["chunks"][index].get("patchSha256")
+        and record.get("patchSha256") == manifest["chunks"][index].get("patchSha256")
+        and record.get("reviewId") == f"{review_id}.chunk-{index}"
+        and type(record.get("receipt")) is str
+        and bool(record.get("receipt"))
+        and _is_sha256(record.get("receiptFileSha256"))
+        and _is_sha256(record.get("receiptSha256"))
+        and record.get("result") == "accepted"
+        and type(record.get("verdict")) is str
+        and type(record.get("findings")) is list
+        for index, record in enumerate(chunk_records)
     )
+    complete = structurally_complete and callable(receipt_loader) and callable(receipt_validator)
     findings: list[dict[str, Any]] = []
     for record in chunk_records:
         if type(record) is not dict or type(record.get("findings")) is not list:
@@ -558,6 +583,21 @@ def build_range_aggregate(
     unsigned["sha256"] = _canonical_digest(unsigned)
     if unsigned["sha256"] is None:  # pragma: no cover - canonical JSON is required above
         raise RangeReviewError("could not digest range aggregate")
+    if complete:
+        violations = verify_range_aggregate(
+            manifest,
+            unsigned,
+            receipt_loader,
+            receipt_validator,
+        )
+        if violations:
+            complete = False
+            aggregate = {"approved": False, "verdict": None, "findings": findings}
+            unsigned["result"] = "incomplete"
+            unsigned["aggregate"] = aggregate
+            unsigned["sha256"] = _canonical_digest(unsigned)
+            if unsigned["sha256"] is None:  # pragma: no cover - canonical JSON is required above
+                raise RangeReviewError("could not digest range aggregate")
     return unsigned
 
 
@@ -581,7 +621,7 @@ def verify_range_aggregate(
     manifest: object,
     aggregate: object,
     receipt_loader: Callable[[str], tuple[bytes, object] | None],
-    receipt_validator: Callable[[object], Iterable[str]] | None = None,
+    receipt_validator: Callable[[object], Iterable[str]],
 ) -> tuple[str, ...]:
     """Verify range identity, chunk coverage, and every referenced receipt.
 
@@ -728,10 +768,9 @@ def verify_range_aggregate(
             ):
                 reject("receipt-source")
                 all_receipts_valid = False
-        if receipt_validator is not None:
-            for violation in receipt_validator(receipt):
-                reject(f"receipt-{violation}")
-                all_receipts_valid = False
+        for violation in receipt_validator(receipt):
+            reject(f"receipt-{violation}")
+            all_receipts_valid = False
         if record.get("result") != receipt.get("result"):
             reject("chunk-result")
             all_receipts_valid = False

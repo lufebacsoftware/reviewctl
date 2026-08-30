@@ -1829,7 +1829,13 @@ def run_range_review(parser: argparse.ArgumentParser, args: argparse.Namespace) 
             if return_code != 0 and record["result"] == "missing":
                 record["result"] = "unavailable"
             records.append(record)
-    aggregate = build_range_aggregate(manifest, args.review_id, records)
+    aggregate = build_range_aggregate(
+        manifest,
+        args.review_id,
+        records,
+        receipt_loader=lambda path: load_range_json(Path(path).expanduser().resolve()),
+        receipt_validator=validate_v2_receipt,
+    )
     try:
         aggregate_path.parent.mkdir(parents=True, exist_ok=True)
         write_private_exclusive(

@@ -511,6 +511,9 @@ def test_range_diff_and_aggregate_edge_errors(
     assert range_review.build_range_aggregate(valid, "incomplete", [incomplete_record])[
         "result"
     ] == "incomplete"
+    assert range_review.build_range_aggregate(
+        valid, "range", [{"result": "accepted", "findings": []}]
+    )["result"] == "incomplete"
 
 
 def test_range_aggregate_verifies_every_chunk_and_receipt_identity(tmp_path: Path) -> None:
@@ -544,7 +547,13 @@ def test_range_aggregate_verifies_every_chunk_and_receipt_identity(tmp_path: Pat
             }
         )
 
-    aggregate = build_range_aggregate(manifest, "range", records)
+    aggregate = build_range_aggregate(
+        manifest,
+        "range",
+        records,
+        receipt_loader=lambda path: (Path(path).read_bytes(), receipts[path]),
+        receipt_validator=lambda _: (),
+    )
 
     assert aggregate["result"] == "accepted"
     assert aggregate["aggregate"] == {
@@ -556,7 +565,16 @@ def test_range_aggregate_verifies_every_chunk_and_receipt_identity(tmp_path: Pat
         manifest,
         aggregate,
         lambda path: (Path(path).read_bytes(), receipts[path]),
+        lambda _: (),
     ) == ()
+    unverified = build_range_aggregate(
+        manifest,
+        "range",
+        records,
+        receipt_loader=lambda path: (Path(path).read_bytes(), receipts[path]),
+        receipt_validator=lambda _: ("invalid",),
+    )
+    assert unverified["result"] == "incomplete"
 
 
 @pytest.mark.parametrize(
@@ -594,7 +612,13 @@ def test_range_aggregate_rejects_missing_reordered_or_mixed_chunks(
                 "findings": receipt["findings"],
             }
         )
-    aggregate = build_range_aggregate(manifest, "range", records)
+    aggregate = build_range_aggregate(
+        manifest,
+        "range",
+        records,
+        receipt_loader=lambda path: (Path(path).read_bytes(), json.loads(Path(path).read_text())),
+        receipt_validator=lambda _: (),
+    )
     mutation(aggregate["chunks"])
     aggregate["sha256"] = hashlib.sha256(
         json.dumps(
@@ -609,6 +633,7 @@ def test_range_aggregate_rejects_missing_reordered_or_mixed_chunks(
         manifest,
         aggregate,
         lambda path: (Path(path).read_bytes(), json.loads(Path(path).read_text())),
+        lambda _: (),
     )
 
     assert expected in violations
@@ -632,13 +657,20 @@ def test_range_aggregate_fails_closed_when_receipt_file_changes(tmp_path: Path) 
         "verdict": receipt["verdict"],
         "findings": receipt["findings"],
     }
-    aggregate = build_range_aggregate(manifest, "range", [record])
+    aggregate = build_range_aggregate(
+        manifest,
+        "range",
+        [record],
+        receipt_loader=lambda path: (Path(path).read_bytes(), receipt),
+        receipt_validator=lambda _: (),
+    )
     receipt_path.write_bytes(receipt_path.read_bytes() + b"tampered")
 
     assert "receipt-file-digest" in verify_range_aggregate(
         manifest,
         aggregate,
         lambda path: (Path(path).read_bytes(), receipt),
+        lambda _: (),
     )
 
 
@@ -647,7 +679,9 @@ def test_range_aggregate_does_not_turn_an_empty_range_into_approval(tmp_path: Pa
     manifest = build_range_manifest(repository, base, base, allow_empty=True)
     aggregate = build_range_aggregate(manifest, "empty-range", [])
 
-    assert "range-empty" in verify_range_aggregate(manifest, aggregate, lambda _: None)
+    assert "range-empty" in verify_range_aggregate(
+        manifest, aggregate, lambda _: None, lambda _: ()
+    )
 
 
 def test_range_aggregate_rejects_every_identity_and_receipt_corruption_shape(
@@ -670,7 +704,13 @@ def test_range_aggregate_rejects_every_identity_and_receipt_corruption_shape(
         "verdict": receipt["verdict"],
         "findings": receipt["findings"],
     }
-    baseline = build_range_aggregate(manifest, "range", [record])
+    baseline = build_range_aggregate(
+        manifest,
+        "range",
+        [record],
+        receipt_loader=lambda path: (Path(path).read_bytes(), receipt),
+        receipt_validator=lambda _: (),
+    )
     raw = receipt_path.read_bytes()
 
     def redigest(aggregate: dict[str, object]) -> None:
@@ -701,10 +741,12 @@ def test_range_aggregate_rejects_every_identity_and_receipt_corruption_shape(
             manifest,
             aggregate,
             loader,
-            receipt_validator=validator,  # type: ignore[arg-type]
+            receipt_validator=validator or (lambda _: ()),  # type: ignore[arg-type]
         )
 
-    assert "manifest-object" in verify_range_aggregate(None, baseline, lambda _: None)
+    assert "manifest-object" in verify_range_aggregate(
+        None, baseline, lambda _: None, lambda _: ()
+    )
     assert "aggregate-object" in run(None)
 
     aggregate_mutations = [
@@ -813,7 +855,13 @@ def test_range_aggregate_rejects_every_identity_and_receipt_corruption_shape(
     finding_receipt["findings"] = [finding]
     finding_record = deepcopy(record)
     finding_record["findings"] = [finding]
-    finding_aggregate = build_range_aggregate(manifest, "range", [finding_record])
+    finding_aggregate = build_range_aggregate(
+        manifest,
+        "range",
+        [finding_record],
+        receipt_loader=lambda path: (Path(path).read_bytes(), finding_receipt),
+        receipt_validator=lambda _: (),
+    )
     assert "changes-requested" not in run(finding_aggregate, loaded=finding_receipt)
 
     multi_manifest = build_range_manifest(repository, base, head, max_chunk_bytes=300)
@@ -840,10 +888,16 @@ def test_range_aggregate_rejects_every_identity_and_receipt_corruption_shape(
                 "receiptSha256": multi_receipt["sha256"],
             }
         )
-    multi_aggregate = build_range_aggregate(multi_manifest, "multi", multi_records)
+    multi_aggregate = build_range_aggregate(
+        multi_manifest,
+        "multi",
+        multi_records,
+        receipt_loader=lambda path: multi_receipts[path],
+        receipt_validator=lambda _: (),
+    )
     multi_aggregate["chunks"][1]["index"] = 0
     multi_aggregate["chunks"][0]["chunkId"] = "f" * 64
     redigest(multi_aggregate)
     assert "chunk-order" in verify_range_aggregate(
-        multi_manifest, multi_aggregate, lambda path: multi_receipts[path]
+        multi_manifest, multi_aggregate, lambda path: multi_receipts[path], lambda _: ()
     )

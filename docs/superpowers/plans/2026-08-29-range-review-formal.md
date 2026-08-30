@@ -24,6 +24,9 @@ aggregate.
   and retry settings are forwarded to each child `reviewctl run`.
 - Every child receipt embeds the frozen manifest digest, range identity, chunk
   index/count, and patch digest in `extension.rangeReview`.
+- The aggregate builder remains fail-closed for library callers: it emits
+  `accepted` only when given both a receipt loader and the schema-v2 validator;
+  otherwise it emits an incomplete progress artifact.
 - The aggregate is `result: accepted` only when every chunk has an accepted,
   verified schema-v2 receipt. A child failure is persisted as `incomplete` and
   the command exits non-zero.
