@@ -106,7 +106,7 @@ git commit -m "fix: make project initialization inert"
 - Modify: `src/reviewctl/api.py:1-20,600-680`
 - Modify: `tests/test_api.py:1360-1495`
 
-- [ ] **Step 1: Strengthen the fallback test before production changes**
+- [x] **Step 1: Strengthen the fallback test before production changes**
 
 Extend `test_client_freezes_source_bytes_across_fallback_attempts` with:
 
@@ -127,7 +127,7 @@ assert all(path.parent == roots[-1] for path, roots in zip(staged_paths, seen_ro
 assert not list((tmp_path / ".reviewctl" / "reviews").glob("**/source"))
 ```
 
-- [ ] **Step 2: Add unexpected-exception and cleanup-failure pressure**
+- [x] **Step 2: Add unexpected-exception and cleanup-failure pressure**
 
 ```python
 def test_client_cleans_snapshot_before_unexpected_transport_error(tmp_path: Path) -> None:
@@ -172,7 +172,7 @@ def test_client_never_accepts_when_snapshot_cleanup_fails(
     assert str(external) not in result.receipt_path.read_text()
 ```
 
-- [ ] **Step 3: Run the focused tests and confirm RED**
+- [x] **Step 3: Run the focused tests and confirm RED**
 
 ```bash
 uv run --python 3.14 pytest -q \
@@ -183,7 +183,7 @@ uv run --python 3.14 pytest -q \
 
 Expected: durable `attempt-XX/source` paths fail lifecycle assertions and `api_module.tempfile` is absent.
 
-- [ ] **Step 4: Wrap each transport call in a new system temporary directory**
+- [x] **Step 4: Wrap each transport call in a new system temporary directory**
 
 Import `tempfile`. Replace original-file passthrough and durable attempt-source creation with:
 
@@ -233,7 +233,7 @@ except (OSError, UnicodeError, ValueError):
 
 Keep response persistence and contract evaluation after successful context exit. Never persist the temporary path.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 uv run --python 3.14 pytest -q tests/test_api.py -k 'source or transport or fallback or cleanup'

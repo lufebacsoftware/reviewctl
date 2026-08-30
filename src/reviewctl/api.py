@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -660,32 +661,32 @@ class ReviewClient:
                     "findings if they remain relevant and return one complete response: "
                     + json.dumps([asdict(finding) for finding in partial_findings], sort_keys=True)
                 )
-            if request.source_root is not None:
-                transport_files_tuple = source_files_tuple
-            else:
-                source_artifacts = ArtifactStore(attempt_artifacts.root / "source")
-                transport_files_tuple = tuple(
-                    source_artifacts.write_bytes(name, contents)
-                    for name, contents in zip(source_names, source_contents, strict=True)
-                )
-            transport_source_roots = (self.project_dir,)
-            if source_root != self.project_dir.resolve():
-                transport_source_roots += (source_root,)
-            backend_request = BackendRequest(
-                prompt=prompt,
-                model=route.model,
-                response_contract=profile.response_contract,
-                files=transport_files_tuple,
-                attempt_dir=attempt_root / f"attempt-{index:02d}",
-                timeout_seconds=profile.timeout_seconds,
-                max_output_tokens=profile.max_output_tokens or 0,
-                source_class=self.config.project.privacy_mode,
-                source_roots=transport_source_roots,
-                provider_preferences=None,
-                tools=profile.tools,
-            )
             try:
-                execution = transport.execute(backend_request)
+                with tempfile.TemporaryDirectory(prefix="reviewctl-project-source-") as directory:
+                    temporary_root = Path(directory).resolve()
+                    source_artifacts = ArtifactStore(temporary_root)
+                    transport_files_tuple = tuple(
+                        source_artifacts.write_bytes(name, contents)
+                        for name, contents in zip(source_names, source_contents, strict=True)
+                    )
+                    transport_source_roots = (self.project_dir,)
+                    if source_root != self.project_dir.resolve():
+                        transport_source_roots += (source_root,)
+                    transport_source_roots += (temporary_root,)
+                    backend_request = BackendRequest(
+                        prompt=prompt,
+                        model=route.model,
+                        response_contract=profile.response_contract,
+                        files=transport_files_tuple,
+                        attempt_dir=attempt_artifacts.root,
+                        timeout_seconds=profile.timeout_seconds,
+                        max_output_tokens=profile.max_output_tokens or 0,
+                        source_class=self.config.project.privacy_mode,
+                        source_roots=transport_source_roots,
+                        provider_preferences=None,
+                        tools=profile.tools,
+                    )
+                    execution = transport.execute(backend_request)
             except OSError, UnicodeError, ValueError:
                 diagnostic = Diagnostic(
                     "transport_unavailable", "review transport failed", retryable=True
