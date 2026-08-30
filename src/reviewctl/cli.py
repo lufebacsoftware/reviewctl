@@ -1641,6 +1641,7 @@ def _range_child_process(
             process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             terminate_process_group(process)
+            reap_process_without_blocking(process)
             return 124, b"", b"range chunk review timed out"
         stdout_file.seek(0)
         stdout = stdout_file.read(MAX_RANGE_CHILD_STDOUT_BYTES + 1)
@@ -3914,6 +3915,9 @@ def invoke_codex(
             head = bytearray()
             tail = bytearray()
             total = 0
+            if stream is None:  # pragma: no cover - pipe mode starts only with both streams
+                captured.update(value=b"", truncated=False)
+                return
             while True:
                 chunk = stream.read(64 * 1024)  # type: ignore[union-attr]
                 if not chunk:

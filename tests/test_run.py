@@ -372,6 +372,10 @@ def test_range_cli_error_and_capture_helpers_are_bounded(
         def communicate(self, *, timeout: int) -> None:
             raise subprocess.TimeoutExpired([], timeout)
 
+        def wait(self, **kwargs: object) -> int:
+            self.returncode = -15
+            return self.returncode
+
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: TimeoutProcess())
     monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
     assert cli._range_child_process(["reviewctl"], timeout_seconds=1)[0] == 124
