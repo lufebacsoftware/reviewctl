@@ -108,17 +108,20 @@ Global `reviewctl verify` no longer delegates to `verify_project_receipt`. Befor
 handling, it rejects:
 
 - a marked project checkpoint; and
-- the historical project-checkpoint signature: no `receiptSchemaVersion`, no canonical V1
-  `result`, and the complete stable project-only field set `status`, `configDigest`, `projectId`,
-  `originId`, `journalSequence`, `privacyMode`, `dimensionSchemaVersion`, `dimensionCoverage`, and
-  `fallbackRelationships`.
+- a recognizable historical project-checkpoint signature: `configDigest` plus any one of the
+  project-only fields `projectId`, `originId`, `journalSequence`, `privacyMode`,
+  `dimensionCoverage`, or `fallbackRelationships`. This is a subset test, not exact-key equality,
+  and it runs regardless of extra `result` or `receiptSchemaVersion` fields.
 
 The violation is `project-checkpoint-not-review-receipt`. Canonical V2 receipts continue through
-`validate_v2_receipt`; historical generic V1 receipts—including one augmented with project-like
-identity or config fields but still carrying canonical `result`—retain their documented
-digest-only path.
+`validate_v2_receipt`; a historical generic V1 receipt augmented only with `configDigest` retains
+its documented digest-only path. Project-like fields may cause rejection but can never select the
+weaker project verifier or bypass V2 validation.
 This is classification, not authentication: neither checkpoint nor receipt digest becomes a
-signature or trust root.
+signature or trust root. An attacker can completely rewrite an unsigned checkpoint, remove every
+project-only field, add a V1 shape, and recompute its digest; at that point global verification can
+only apply the already-weak V1 integrity contract. The CLI and documentation must therefore never
+present legacy V1 verification as provenance or merge-grade review evidence.
 
 The project CLI may still report an accepted model result after its same-process checkpoint check,
 but its help and evidence documentation must not describe that checkpoint as merge-grade. A future
@@ -162,8 +165,9 @@ rejected attempt.
 
 ## Error and Compatibility Boundaries
 
-- Temporary-source cleanup is attempted even if a transport raises `OSError`, `UnicodeError`, or
-  `ValueError`.
+- The temporary-directory context attempts cleanup after normal return and after any exception.
+  Known transport `OSError`, `UnicodeError`, and `ValueError` failures become controlled attempt
+  diagnostics; an unexpected exception propagates only after the cleanup boundary runs.
 - Temporary-source cleanup failure invalidates the attempt and must never be masked as acceptance
   or move source bytes/path metadata into durable artifacts. Physical deletion after an
   operating-system removal failure is outside the process guarantee.
@@ -188,9 +192,12 @@ Every production change follows red-green-refactor.
 2. **Checkpoint classification:** a self-consistent marked checkpoint and a historical unmarked
    project checkpoint both fail global verification with
    `project-checkpoint-not-review-receipt`; direct internal verification still detects tampering
-   and expected-digest mismatch. Canonical V1 and V2 controls retain their existing outcomes, and
-   a recomputed generic V1 control augmented with `configDigest`, `projectId`, and `originId` still
-   follows the V1 path rather than the project-checkpoint path.
+   and expected-digest mismatch. Canonical V1 and V2 controls retain their existing outcomes. A
+   recomputed generic V1 control augmented only with `configDigest` still follows the V1 path;
+   adding any project-only field makes it a rejected checkpoint even if `result`, extra keys, or a
+   schema-version key are also present. Deleting or adding one unrelated key cannot evade the
+   subset classifier. A `RuntimeError` transport probe also demonstrates cleanup before the
+   unexpected exception propagates.
 3. **Template:** all init modes generate empty routes and local execution with no provider/model
    text. Reviewing immediately after initialization returns `route_invalid`, writes no accepted
    attempt, and invokes no transport.
