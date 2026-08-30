@@ -1561,6 +1561,52 @@ def test_client_never_accepts_when_snapshot_cleanup_fails(
     assert str(external) not in result.receipt_path.read_text()
 
 
+def test_client_aborts_fallback_when_snapshot_cleanup_cannot_be_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:first/model", "pi:second/model"]\n'
+    )
+    source = tmp_path / "source.py"
+    source.write_text("secret = 1\n")
+    external = tmp_path.parent / f"{tmp_path.name}-undeletable"
+    transport = FakeTransport()
+    requests = []
+    real_execute = transport.execute
+    real_rmtree = api_module.shutil.rmtree
+
+    class CleanupFailure:
+        def __init__(self, **kwargs: object) -> None:
+            external.mkdir()
+
+        def __enter__(self) -> str:
+            return str(external)
+
+        def __exit__(self, *args: object) -> None:
+            raise OSError("cleanup refused")
+
+    def execute(request):
+        requests.append(request)
+        return real_execute(request)
+
+    def refuse_rescue(path: Path) -> None:
+        raise OSError(f"rescue refused for {path}")
+
+    transport.execute = execute
+    monkeypatch.setattr(api_module.tempfile, "TemporaryDirectory", CleanupFailure)
+    monkeypatch.setattr(api_module.shutil, "rmtree", refuse_rescue)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    with pytest.raises(RuntimeError, match="temporary source cleanup failed"):
+        client.review(ReviewRequest(prompt="review", files=(source,)))
+
+    assert len(requests) == 1
+    assert external.exists()
+    real_rmtree(external)
+
+
 @pytest.mark.parametrize(
     ("conversation_id", "resolved_model"),
     [(None, "fake/model"), ("", "fake/model"), ("conversation", "other/model")],

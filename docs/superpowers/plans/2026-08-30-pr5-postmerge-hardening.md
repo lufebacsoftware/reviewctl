@@ -168,6 +168,7 @@ def test_client_never_accepts_when_snapshot_cleanup_fails(
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
     result = client.review(ReviewRequest(prompt="review", files=(source,)))
     assert result.status == "transport_unavailable"
+    assert not external.exists()
     assert not list((tmp_path / ".reviewctl").glob("**/source"))
     assert str(external) not in result.receipt_path.read_text()
 ```
@@ -232,6 +233,9 @@ except (OSError, UnicodeError, ValueError):
 ```
 
 Keep response persistence and contract evaluation after successful context exit. Never persist the temporary path.
+If the context exits with a known failure while its resolved temporary root still exists, make one
+explicit `shutil.rmtree` rescue attempt. A second removal failure raises `RuntimeError` and stops the
+review rather than starting a fallback route.
 
 - [x] **Step 5: Verify and commit**
 
@@ -291,15 +295,12 @@ PROJECT_ONLY_FIELDS = {
     "fallbackRelationships": [],
 }
 
-@pytest.mark.parametrize(("field", "value"), PROJECT_ONLY_FIELDS.items())
-def test_verify_rejects_historical_project_checkpoint_shape(
-    field: str, value: object, tmp_path: Path
-) -> None:
+def test_verify_rejects_historical_project_checkpoint_shape(tmp_path: Path) -> None:
     receipt = {
         "reviewId": "r",
         "configDigest": "c",
-        field: value,
         "status": "accepted",
+        **PROJECT_ONLY_FIELDS,
     }
     receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
     path = tmp_path / "checkpoint.json"
@@ -311,7 +312,9 @@ def test_verify_rejects_historical_project_checkpoint_shape(
     ]
 ```
 
-For each representative checkpoint, add `result`, `receiptSchemaVersion`, and an unrelated key in isolation; rejection must be unchanged. Preserve a generic V1 fixture augmented only with `configDigest` as a passing control, plus existing V2 controls.
+Preserve generic V1 fixtures augmented only with `configDigest` or each individual project-like
+field as passing controls. The complete historical signature remains rejected without
+`configDigest` and with extra fields. Preserve existing V2 controls.
 
 - [x] **Step 3: Run the receipt tests and confirm RED**
 
@@ -351,7 +354,7 @@ def project_checkpoint_shape(value: object) -> bool:
         return True
     if "receiptSchemaVersion" in value:
         return False
-    return bool(PROJECT_CHECKPOINT_FIELDS.intersection(value))
+    return PROJECT_CHECKPOINT_FIELDS.issubset(value)
 ```
 
 Call it before V1/V2 validation and emit `project-checkpoint-not-review-receipt`. Delete global delegation to `verify_project_receipt`.

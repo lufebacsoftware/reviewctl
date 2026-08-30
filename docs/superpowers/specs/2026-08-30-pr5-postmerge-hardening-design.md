@@ -108,21 +108,22 @@ Global `reviewctl verify` no longer delegates to `verify_project_receipt`. Befor
 handling, it rejects:
 
 - a marked project checkpoint; and
-- a recognizable historical project-checkpoint signature: any one of the project-only fields
-  `projectId`, `originId`, `journalSequence`, `privacyMode`, `dimensionCoverage`, or
-  `fallbackRelationships`. This is a subset test, not exact-key equality, for unversioned input and
-  it runs regardless of a missing `configDigest` or extra `result` fields. An input claiming
+- a recognizable historical project-checkpoint signature: the complete set of project-owned fields
+  `projectId`, `originId`, `journalSequence`, `privacyMode`, `dimensionCoverage`, and
+  `fallbackRelationships`. This is a required-subset test, not exact-key equality, for unversioned
+  input and it runs regardless of a missing `configDigest` or extra `result` fields. One coincidentally
+  named field remains on the legacy V1 path. An input claiming
   canonical `receiptSchemaVersion: 2` follows strict V2 validation; any other schema-version value
   is rejected as unsupported. Neither branch can fall through to V1.
 
 The violation is `project-checkpoint-not-review-receipt`. Canonical V2 receipts continue through
-`validate_v2_receipt`; a historical generic V1 receipt augmented only with `configDigest` retains
-its documented digest-only path. Project-like fields may cause rejection but can never select the
-weaker project verifier or bypass V2 validation.
+`validate_v2_receipt`; a historical generic V1 receipt augmented only with `configDigest` or one
+project-like field retains its documented digest-only path. The complete historical signature can
+cause rejection but can never select the weaker project verifier or bypass V2 validation.
 This is classification, not authentication: neither checkpoint nor receipt digest becomes a
-signature or trust root. An attacker can completely rewrite an unsigned checkpoint, remove every
-project-only field, add a V1 shape, and recompute its digest; at that point global verification can
-only apply the already-weak V1 integrity contract. The CLI and documentation must therefore never
+signature or trust root. An attacker can completely rewrite an unsigned checkpoint, remove at least
+one required project-owned field, add a V1 shape, and recompute its digest; at that point global
+verification can only apply the already-weak V1 integrity contract. The CLI and documentation must therefore never
 present legacy V1 verification as provenance or merge-grade review evidence.
 
 The project CLI may still report an accepted model result after its same-process checkpoint check,
@@ -172,8 +173,10 @@ rejected attempt.
   Known transport `OSError`, `UnicodeError`, and `ValueError` failures become controlled attempt
   diagnostics; an unexpected exception propagates only after the cleanup boundary runs.
 - Temporary-source cleanup failure invalidates the attempt and must never be masked as acceptance
-  or move source bytes/path metadata into durable artifacts. Physical deletion after an
-  operating-system removal failure is outside the process guarantee.
+  or move source bytes/path metadata into durable artifacts. If context cleanup raises while the
+  temporary path still exists, the client makes one explicit recursive removal attempt; a second
+  operating-system refusal aborts the review with `RuntimeError` rather than continuing fallback.
+  Physical deletion after that repeated removal failure is outside the process guarantee.
 - Existing project checkpoint paths and `ReviewResult` fields remain available.
 - Old project checkpoints remain directly digest-checkable through `verify_project_receipt`, but
   global `reviewctl verify` rejects them as noncanonical.
@@ -189,19 +192,19 @@ Every production change follows red-green-refactor.
    root, and keeps the project root first. Success, nonzero execution, fallback, and exception
    paths remove every normally cleanable observed path and create no durable `source` directory.
    Fallback attempts receive distinct temporary directories. An original-file mutation does not
-   alter staged bytes. An injected cleanup failure prevents acceptance and still leaves no source
-   copy or temporary path below `.reviewctl`; the test does not claim the hostile filesystem
-   removed the external directory.
+   alter staged bytes. An injected first cleanup failure exercises the explicit rescue removal and
+   leaves neither the staged external directory nor a source copy/path below `.reviewctl`. A repeated
+   operating-system refusal is a propagated hard failure, not an acceptance or fallback path.
 2. **Checkpoint classification:** a self-consistent marked checkpoint and a historical unmarked
    project checkpoint both fail global verification with
    `project-checkpoint-not-review-receipt`; direct internal verification still detects tampering
    and expected-digest mismatch. Canonical V1 and V2 controls retain their existing outcomes. A
-   recomputed generic V1 control augmented only with `configDigest` still follows the V1 path;
-   adding any project-only field makes an unversioned document a rejected checkpoint even if
-   `result` or extra keys are present. A forged V2 schema claim must fail V2 validation rather than
-   fall through to V1. Removing `configDigest` or adding/deleting an unrelated key cannot evade the
-   subset classifier. A `RuntimeError` transport probe also demonstrates cleanup before the
-   unexpected exception propagates.
+   recomputed generic V1 controls augmented only with `configDigest` or one project-like field still
+   follow the V1 path; the complete historical field signature is rejected even if `configDigest`
+   is absent or `result`/unrelated keys are present. A forged V2 schema claim must fail V2 validation
+   rather than fall through to V1. Removing one field from an unsigned legacy checkpoint can make it
+   indistinguishable from weak V1 and is not claimed as detectable. A `RuntimeError` transport probe
+   also demonstrates cleanup before the unexpected exception propagates.
 3. **Template:** all init modes generate empty routes and local execution with no provider/model
    text. Reviewing immediately after initialization returns `route_invalid`, creates no review
    artifact or journal event, and invokes no transport.
