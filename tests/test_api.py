@@ -21,7 +21,14 @@ from reviewctl.api import (
     verify_project_receipt,
 )
 from reviewctl.backends import BackendEvidence, BackendExecution, PersistedResponse
-from reviewctl.contracts import ContractFragment, EvaluationStatus, FragmentKind
+from reviewctl.codex_project_transport import CodexProjectTransport
+from reviewctl.contracts import (
+    ContractContext,
+    ContractFragment,
+    EvaluationStatus,
+    FragmentKind,
+    get_contract,
+)
 from reviewctl.errors import JournalOperationError
 from reviewctl.pi_transport import PiTransport
 
@@ -761,6 +768,138 @@ def test_from_project_constructs_default_pi_transport(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     client = ReviewClient.from_project(tmp_path)
     assert isinstance(client.transports["pi"], PiTransport)
+    assert isinstance(client.transports["codex"], CodexProjectTransport)
+
+
+def test_default_codex_project_route_executes_registered_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["codex:gpt-5.6-luna"]\n'
+        'execution = "remote"\n'
+    )
+    source = tmp_path / "src.py"
+    source.write_text("value = 1\n")
+    observed: dict[str, object] = {}
+
+    def fake_execute(request):
+        observed["request"] = request
+        return BackendExecution(
+            0,
+            "",
+            PersistedResponse(
+                "codex-session",
+                0.0,
+                1,
+                1,
+                request.model,
+                1,
+                "openai-codex",
+                '{"verdict":"approved","findings":[],"reviewedFiles":["src.py"]}',
+            ),
+            BackendEvidence(),
+        )
+
+    monkeypatch.setattr("reviewctl.cli.execute_codex_backend", fake_execute)
+    result = ReviewClient.from_project(tmp_path).review(
+        ReviewRequest(prompt="review", files=(source,))
+    )
+
+    assert result.status == "accepted"
+    request = observed["request"]
+    assert request.source_roots == (tmp_path.resolve(),)
+    assert request.files[0].parent != tmp_path
+    expected_digest = (
+        get_contract("findings-json")
+        .prepare(ContractContext(file_names=("src.py",), review_declaration_required=True))
+        .digest
+    )
+    packet = json.loads((result.receipt_path.parent / "packet.json").read_text())
+    receipt = json.loads(result.receipt_path.read_text())
+    assert packet["contractDigest"] == expected_digest
+    assert receipt["attempts"][0]["contractDigest"] == expected_digest
+
+
+def test_mixed_pi_codex_routes_keep_pi_contract_without_codex_read_proof(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:first/model", "codex:second-model"]\n'
+        'execution = "remote"\n'
+    )
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == "accepted"
+    assert result.findings == ()
+
+
+def test_project_review_can_confine_external_snapshot_root_for_github_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["codex:gpt-5.6-luna"]\n'
+        'execution = "remote"\n'
+    )
+    source_root = tmp_path.parent / "external-snapshot-root"
+    source_root.mkdir()
+    source = source_root / "src%2Ffile.py"
+    source.write_text("value = 1\n")
+    observed: dict[str, object] = {}
+
+    def fake_execute(request):
+        observed["request"] = request
+        return BackendExecution(
+            0,
+            "",
+            PersistedResponse(
+                "codex-session",
+                0.0,
+                1,
+                1,
+                request.model,
+                1,
+                "openai-codex",
+                '{"verdict":"approved","findings":[],"reviewedFiles":["src%2Ffile.py"]}',
+            ),
+            BackendEvidence(),
+        )
+
+    monkeypatch.setattr("reviewctl.cli.execute_codex_backend", fake_execute)
+    result = ReviewClient.from_project(tmp_path).review(
+        ReviewRequest(
+            prompt="review",
+            files=(source,),
+            source_names=("src/file.py",),
+            source_root=source_root,
+        )
+    )
+
+    assert result.status == "accepted"
+    request = observed["request"]
+    assert request.files[0].name == source.name
+    assert request.files[0].parent != source_root
+    assert request.files[0].parent != tmp_path
+    assert request.source_roots == (tmp_path.resolve(), source_root.resolve())
+    assert not (
+        tmp_path / ".reviewctl" / "reviews" / result.review_id / "attempt-01" / "source"
+    ).exists()
+
+
+def test_project_review_rejects_an_unsafe_external_snapshot_root(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    result = ReviewClient.from_project(tmp_path).review(
+        ReviewRequest(prompt="review", source_root=tmp_path / "missing-root")
+    )
+
+    assert result.status == "privacy_denied"
 
 
 def test_client_rejects_explicit_and_duplicate_review_ids(tmp_path: Path) -> None:

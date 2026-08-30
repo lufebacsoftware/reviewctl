@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from reviewctl.api import (
     Finding,
@@ -23,6 +24,7 @@ from reviewctl.api import (
     verify_project_receipt,
 )
 from reviewctl.artifacts import ArtifactStore
+from reviewctl.codex_project_transport import CodexProjectTransport
 from reviewctl.config import ReviewConfig, load_config
 from reviewctl.dimensions import normalize_dimensions
 from reviewctl.errors import Diagnostic, JournalOperationError, exit_code_for
@@ -319,14 +321,17 @@ def _github_prompt(snapshot: PullRequestSnapshot) -> str:
 
 @contextmanager
 def _materialized_github_files(project_dir: Path, snapshot: PullRequestSnapshot) -> Any:
-    staging_root = ensure_project_state_root(project_dir)
-    assert staging_root is not None
-    with tempfile.TemporaryDirectory(prefix="github-source-", dir=staging_root) as directory:
+    project_root = project_dir.expanduser().resolve()
+    with tempfile.TemporaryDirectory(prefix="github-source-") as directory:
+        root = Path(directory).resolve()
+        if root.is_relative_to(project_root):
+            raise OSError("GitHub source staging directory must be outside the project")
         paths: list[Path] = []
-        root = Path(directory)
         artifacts = ArtifactStore(root)
         for changed_file in snapshot.changed_files:
-            paths.append(artifacts.write_text(changed_file.path, changed_file.content))
+            paths.append(
+                artifacts.write_text(quote(changed_file.path, safe=""), changed_file.content)
+            )
         yield tuple(paths)
 
 
@@ -432,10 +437,12 @@ def github_review_project(args: Any) -> int:
 
     try:
         with _materialized_github_files(project, snapshot) as files:
+            source_root = files[0].parent if files else None
             result = client.review(
                 ReviewRequest(
                     prompt=_github_prompt(snapshot),
                     files=files,
+                    source_root=source_root,
                     source_names=tuple(item.path for item in snapshot.changed_files),
                     profile=args.profile,
                     review_id=args.review_id,
@@ -754,8 +761,7 @@ def verify_journal_project(args: Any) -> int:
     return 0 if payload["valid"] else 5
 
 
-def _capability_payload() -> dict[str, object]:
-    capabilities = PiTransport.capabilities()
+def _capability_payload(capabilities: Any) -> dict[str, object]:
     payload = {key: _json_default(value) for key, value in asdict(capabilities).items()}
     payload["output_token_limit_enforced"] = capabilities.output_token_limit_enforced
     return payload
@@ -789,9 +795,13 @@ def doctor_project(args: Any) -> int:
         "profiles": profiles,
         "transports": {
             "pi": {
-                "executable": bool(shutil.which("pi")),
-                "capabilities": _capability_payload(),
-            }
+                "executable": bool(shutil.which(os.environ.get("PI_BIN", "pi"))),
+                "capabilities": _capability_payload(PiTransport.capabilities()),
+            },
+            "codex": {
+                "executable": bool(shutil.which(os.environ.get("CODEX_BIN", "codex"))),
+                "capabilities": _capability_payload(CodexProjectTransport.capabilities()),
+            },
         },
     }
     if args.format == "json":
@@ -803,7 +813,8 @@ def doctor_project(args: Any) -> int:
         print(f"privacy: {config.project.privacy_mode}")
         for profile in profiles:
             print(f"profile {profile['name']}: {', '.join(profile['routes']) or '(no route)'}")
-        print(f"pi executable: {'yes' if payload['transports']['pi']['executable'] else 'no'}")
+        for name, transport in payload["transports"].items():
+            print(f"{name} executable: {'yes' if transport['executable'] else 'no'}")
     return 0
 
 
@@ -831,11 +842,11 @@ def add_project_commands(commands: Any) -> None:
     github_commands = github.add_subparsers(dest="github_command", required=True)
     github_review = github_commands.add_parser(
         "review",
-        help="review a pull request with the project-scoped Pi transport",
+        help="review a pull request with a registered project-scoped transport",
         description=(
             "Review a pull request and create a local publication plan. "
-            "The project-scoped GitHub flow currently registers Pi only; "
-            "use `reviewctl run --transport codex` for a formal Codex review."
+            "Pi is the default project transport; Codex is available for profiles "
+            "that select a codex route."
         ),
     )
     github_review.add_argument("--repo", required=True)

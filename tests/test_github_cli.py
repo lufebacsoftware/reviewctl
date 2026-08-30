@@ -52,35 +52,41 @@ def snapshot() -> PullRequestSnapshot:
     )
 
 
-def test_materialized_github_files_do_not_follow_a_racing_parent_symlink(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_materialized_github_files_use_external_encoded_snapshots(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    victim = outside / "app.py"
-    victim.write_text("outside\n")
     changed = replace(
         snapshot(),
         changed_files=(
             ChangedFileSnapshot(path="src/app.py", status="modified", content="reviewed\n"),
         ),
     )
-    original_write_text = Path.write_text
-
-    def redirect_path_write(path: Path, contents: str, *args, **kwargs) -> int:
-        if "github-source-" in str(path):
-            path.parent.rmdir()
-            path.parent.symlink_to(outside, target_is_directory=True)
-        return original_write_text(path, contents, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "write_text", redirect_path_write)
 
     with project_cli._materialized_github_files(project, changed) as paths:
         assert paths[0].read_text() == "reviewed\n"
+        assert not paths[0].is_relative_to(project)
+        assert paths[0].name == "src%2Fapp.py"
 
-    assert victim.read_text() == "outside\n"
+
+def test_materialized_github_files_reject_project_local_tempdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    class ProjectTemporaryDirectory:
+        def __enter__(self) -> str:
+            return str(project)
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        project_cli.tempfile, "TemporaryDirectory", lambda **_kwargs: ProjectTemporaryDirectory()
+    )
+    with pytest.raises(OSError, match="outside the project"):
+        with project_cli._materialized_github_files(project, snapshot()):
+            pass
 
 
 class FakeSource:
@@ -106,11 +112,13 @@ class FakeClient:
 
     def __init__(self) -> None:
         self._journal = self.Journal()
+        self.project_dir = None
 
     @classmethod
     def from_project(cls, project_dir: Path):
         assert project_dir.is_dir()
         cls.instance = cls()
+        cls.instance.project_dir = project_dir
         return cls.instance
 
     def review(self, request):
@@ -119,7 +127,9 @@ class FakeClient:
         digest = hashlib.sha256(
             json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        receipt = Path(request.files[0]).parents[2] / "receipt.json"
+        receipt_root = self.project_dir / ".reviewctl"
+        receipt_root.mkdir(parents=True, exist_ok=True)
+        receipt = receipt_root / "fake-receipt.json"
         receipt.write_text(json.dumps({**unsigned, "sha256": digest}))
         return ReviewResult(
             status="accepted",
@@ -213,9 +223,13 @@ def test_github_review_is_dry_run_and_passes_typed_context_to_existing_flow(
     assert Path(payload["publicationPlanArtifact"]).is_file()
     assert "Handle failure" in Path(payload["publicationPlanArtifact"]).read_text()
     assert "value = 2" not in output
-    assert FakeClient.request.source_context == snapshot().to_context()
-    assert all(str(path).startswith(str(tmp_path)) for path in FakeClient.request.files)
     assert FakeClient.request is not None
+    assert FakeClient.request.source_context == snapshot().to_context()
+    assert all(
+        path.name == "src%2Fapp.py" and not path.is_relative_to(tmp_path)
+        for path in FakeClient.request.files
+    )
+    assert FakeClient.request.source_root == FakeClient.request.files[0].parent
 
 
 def test_github_review_maps_unique_basename_to_snapshot_path_for_inline_target(
@@ -651,7 +665,9 @@ def test_github_front_door_invalid_receipt_nonexecutable_and_text_publication(
 
     class InvalidReceiptClient(FakeClient):
         def review(self, request):
-            receipt = Path(request.files[0]).parents[2] / "receipt.json"
+            receipt_root = self.project_dir / ".reviewctl"
+            receipt_root.mkdir(parents=True, exist_ok=True)
+            receipt = receipt_root / "fake-receipt.json"
             receipt.write_text("not json")
             return ReviewResult("accepted", "review-1", receipt, ())
 

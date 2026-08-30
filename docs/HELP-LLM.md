@@ -35,18 +35,19 @@ blindly.
 two routes and `max_attempts = 2` can therefore make at most four bounded
 attempts; each attempt and transition is recorded in the receipt.
 
-The project-scoped GitHub pull-request flow currently registers the Pi
-transport only. It freezes the PR snapshot, reuses the project profile, and
-creates a local publication plan; it does not make Codex, AGY, Gemini, or
-other direct backends available through `reviewctl github review`:
+The project-scoped GitHub pull-request flow uses Pi by default and also
+registers Codex. It freezes the PR snapshot, reuses the project profile, and
+creates a local publication plan. Select a profile with a `codex:MODEL` route
+to use Codex; its snapshots are staged outside the project and the Codex
+source-root sandbox proves the files it reviewed:
 
 ```bash
 reviewctl github review --repo OWNER/REPO --pr NUMBER --project PATH \
   --profile default --format json
 ```
 
-For a formal review through Codex or another direct backend, use the transport
-entry point explicitly and verify its receipt:
+For a formal review through another direct backend, use the transport entry
+point explicitly and verify its receipt:
 
 ```bash
 reviewctl run --review-id ID --transport codex --model MODEL \

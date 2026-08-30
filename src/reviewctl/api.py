@@ -118,6 +118,7 @@ class ReviewRequest:
     dimensions: tuple[str, ...] = ()
     source_context: Mapping[str, Any] | None = None
     source_names: tuple[str, ...] = ()
+    source_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -312,9 +313,13 @@ class ReviewClient:
                     project_dir, expected_project_identity=project_identity
                 ).ensure(config.project.project_id)
                 if transports is None:
+                    from reviewctl.codex_project_transport import CodexProjectTransport
                     from reviewctl.pi_transport import PiTransport
 
-                    transports = {"pi": PiTransport()}
+                    transports = {
+                        "codex": CodexProjectTransport(project_dir),
+                        "pi": PiTransport(),
+                    }
                 return cls(
                     project_dir,
                     config,
@@ -443,13 +448,28 @@ class ReviewClient:
         source_names: list[str] = []
         source_digests: dict[Path, str] = {}
         source_set_bytes = 0
+        source_root = self.project_dir.resolve()
+        source_root_identity = self._project_identity
+        if request.source_root is not None:
+            source_root = Path(os.path.abspath(request.source_root.expanduser())).resolve()
+            try:
+                with confined_directory_descriptor(source_root) as source_descriptor:
+                    source_metadata = os.fstat(source_descriptor)
+                    source_root_identity = (source_metadata.st_dev, source_metadata.st_ino)
+            except OSError:
+                diagnostic = Diagnostic(
+                    "privacy_denied",
+                    f"review source root is not a safe directory: {request.source_root}",
+                    next="select a confined temporary source root",
+                )
+                return ReviewResult("privacy_denied", review_id, Path(), (), diagnostic)
         for requested_path in request.files:
             candidate = requested_path.expanduser()
             if not candidate.is_absolute():
-                candidate = self.project_dir / candidate
+                candidate = source_root / candidate
             path = candidate.resolve()
             try:
-                path.relative_to(self.project_dir)
+                path.relative_to(source_root)
             except ValueError:
                 diagnostic = Diagnostic(
                     "privacy_denied",
@@ -467,8 +487,8 @@ class ReviewClient:
             try:
                 source_bytes = _read_source_bytes(
                     path,
-                    project_dir=self.project_dir,
-                    expected_root_identity=self._project_identity,
+                    project_dir=source_root,
+                    expected_root_identity=source_root_identity,
                 )
                 if source_bytes is None or len(source_bytes) > MAX_SOURCE_BYTES:
                     diagnostic = Diagnostic(
@@ -505,7 +525,7 @@ class ReviewClient:
             source_name = (
                 requested_source_names[len(source_files) - 1]
                 if requested_source_names
-                else _logical_source_name(path.relative_to(self.project_dir).as_posix())
+                else _logical_source_name(path.relative_to(source_root).as_posix())
             )
             source_names.append(_model_file_name(source_name))
             source_digests[path] = _digest(source_bytes)
@@ -522,13 +542,22 @@ class ReviewClient:
             name: (
                 requested_source_names[index]
                 if requested_source_names
-                else path.relative_to(self.project_dir).as_posix()
+                else path.relative_to(source_root).as_posix()
             )
             for index, (name, path) in enumerate(zip(source_names, source_files_tuple, strict=True))
         }
+        routes = tuple(
+            route for route in profile.parsed_routes for _ in range(profile.max_attempts)
+        )
         try:
             contract = get_contract(profile.response_contract)
-            context = ContractContext(file_names=tuple(sorted(source_names)))
+            # Bind the packet to the first attempt's contract.  Codex adds a
+            # reviewedFiles declaration for its source-root sandbox; later
+            # fallback attempts record their own contract digest below.
+            context = ContractContext(
+                file_names=tuple(sorted(source_names)),
+                review_declaration_required=routes[0].transport == "codex",
+            )
             prepared = contract.prepare(context)
         except (KeyError, TypeError, ValueError) as error:
             diagnostic = Diagnostic(
@@ -547,9 +576,6 @@ class ReviewClient:
             return ReviewResult(
                 "contract_failed", review_id, receipt_path, (), diagnostic, receipt_sha256
             )
-        routes = tuple(
-            route for route in profile.parsed_routes for _ in range(profile.max_attempts)
-        )
         packet = {
             "promptDigest": _digest(request.prompt.encode()),
             "contractDigest": prepared.digest,
@@ -591,6 +617,7 @@ class ReviewClient:
         saw_partial = False
 
         def record_attempt(attempt: dict[str, Any]) -> None:
+            attempt.setdefault("contractDigest", attempt_prepared.digest)
             attempts.append(attempt)
             self._journal.append(
                 {
@@ -602,6 +629,11 @@ class ReviewClient:
 
         for index, route in enumerate(routes, start=1):
             route_label = f"{route.transport}:{route.model}"
+            attempt_context = replace(
+                context,
+                review_declaration_required=route.transport == "codex",
+            )
+            attempt_prepared = contract.prepare(attempt_context)
             transport = self.transports.get(route.transport)
             attempt_artifacts = ArtifactStore(attempt_root / f"attempt-{index:02d}")
             if transport is None:
@@ -621,18 +653,24 @@ class ReviewClient:
                         }
                     )
                 continue
-            prompt = request.prompt + "\n\n" + prepared.output_instructions
+            prompt = request.prompt + "\n\n" + attempt_prepared.output_instructions
             if partial_findings:
                 prompt += (
                     "\n\nA prior bounded attempt was incomplete. Preserve these validated "
                     "findings if they remain relevant and return one complete response: "
                     + json.dumps([asdict(finding) for finding in partial_findings], sort_keys=True)
                 )
-            source_artifacts = ArtifactStore(attempt_artifacts.root / "source")
-            transport_files_tuple = tuple(
-                source_artifacts.write_bytes(name, contents)
-                for name, contents in zip(source_names, source_contents, strict=True)
-            )
+            if request.source_root is not None:
+                transport_files_tuple = source_files_tuple
+            else:
+                source_artifacts = ArtifactStore(attempt_artifacts.root / "source")
+                transport_files_tuple = tuple(
+                    source_artifacts.write_bytes(name, contents)
+                    for name, contents in zip(source_names, source_contents, strict=True)
+                )
+            transport_source_roots = (self.project_dir,)
+            if source_root != self.project_dir.resolve():
+                transport_source_roots += (source_root,)
             backend_request = BackendRequest(
                 prompt=prompt,
                 model=route.model,
@@ -642,7 +680,7 @@ class ReviewClient:
                 timeout_seconds=profile.timeout_seconds,
                 max_output_tokens=profile.max_output_tokens or 0,
                 source_class=self.config.project.privacy_mode,
-                source_roots=(self.project_dir,),
+                source_roots=transport_source_roots,
                 provider_preferences=None,
                 tools=profile.tools,
             )
@@ -714,8 +752,8 @@ class ReviewClient:
             try:
                 evaluation = contract.evaluate(
                     execution.response.response,
-                    prepared,
-                    context,
+                    attempt_prepared,
+                    attempt_context,
                     evidence=EvaluationContext(packet_digest=packet_digest),
                 )
             except (TypeError, ValueError) as error:
