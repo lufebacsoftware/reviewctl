@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import logging
@@ -10,7 +11,6 @@ import math
 import os
 import re
 import secrets
-import selectors
 import shutil
 import signal
 import sqlite3
@@ -75,6 +75,17 @@ from reviewctl.filesystem import (
     read_confined_text,
 )
 from reviewctl.project_cli import add_project_commands
+from reviewctl.range_review import (
+    DEFAULT_CONTEXT_LINES,
+    DEFAULT_MAX_CHUNK_BYTES,
+    RangeReviewError,
+    build_range_aggregate,
+    build_range_manifest,
+    manifest_sha256,
+    range_identity,
+    validate_range_manifest,
+    verify_range_aggregate,
+)
 from reviewctl.review_flow import (
     FallbackRelationship,
     PromotedFragment,
@@ -106,7 +117,10 @@ MAX_PI_LEGACY_STDERR_BYTES = 100_000
 MAX_CODEX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDERR_BYTES = 100_000
+MAX_RANGE_CHILD_STDOUT_BYTES = 256 * 1024
+MAX_RANGE_CHILD_STDERR_BYTES = 100_000
 DEFAULT_MAX_OUTPUT_TOKENS = 16_384
+GLM_REASONING_MIN_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
@@ -381,6 +395,17 @@ class CodexIsolation:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def positive_integer(value: str) -> int:
+    """Parse a CLI integer that must be strictly positive."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be an integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
 
 
 def write_private_exclusive(
@@ -1110,6 +1135,21 @@ def openrouter_model_id(model: str) -> str:
     return model.removeprefix("openrouter/")
 
 
+def openrouter_reasoning_parameters(model: str) -> dict[str, str] | None:
+    """Keep GLM-5.3-Flash on its native maximum reasoning setting."""
+    model_id = openrouter_model_id(model)
+    if model_id == "z-ai/glm-5.3-flash" or model_id.startswith("z-ai/glm-5.3-flash:"):
+        return {"effort": "max"}
+    return None
+
+
+def openrouter_output_token_budget(model: str, requested: int) -> int:
+    """Keep small manual caps from starving native reasoning models of answer space."""
+    if openrouter_reasoning_parameters(model):
+        return max(requested, GLM_REASONING_MIN_OUTPUT_TOKENS)
+    return requested
+
+
 def endpoint_price_per_million(endpoint: dict[str, object], field: str) -> float | None:
     """Read one OpenRouter endpoint price, expressed in USD per million tokens."""
     pricing = endpoint.get("pricing")
@@ -1536,6 +1576,356 @@ def write_product_council_plan(parser: argparse.ArgumentParser, args: argparse.N
     output_path.write_bytes(canonical_json(council_plan) + b"\n")
     print(output_path)
     return 0
+
+
+def write_range_manifest(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Freeze one Git range without invoking a model or granting approval."""
+    output = Path(args.output).expanduser().resolve()
+    try:
+        manifest = build_range_manifest(
+            Path(args.repository),
+            args.base,
+            args.head,
+            context_lines=args.context_lines,
+            max_chunk_bytes=args.max_chunk_bytes,
+            allow_empty=args.allow_empty,
+        )
+    except RangeReviewError as error:
+        parser.error(str(error))
+    manifest = {
+        **manifest,
+        "evidenceStatus": "planning-only",
+    }
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_private_exclusive(
+            output,
+            canonical_json(manifest) + b"\n",
+            label="range manifest",
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
+    print(output)
+    return 0
+
+
+def load_range_json(path: Path) -> tuple[bytes, object]:
+    """Load one range artifact with duplicate-key and non-standard JSON rejection."""
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    raw = read_confined_bytes(path)
+    value = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=exact_json_object,
+        parse_constant=reject_nonstandard_constant,
+    )
+    return raw, value
+
+
+def _range_child_process(command: list[str], *, timeout_seconds: int) -> tuple[int, bytes, bytes]:
+    """Run a child review with bounded stdout/stderr capture."""
+    checkout_root = Path(__file__).resolve().parents[2]
+    process = subprocess.Popen(
+        command,
+        cwd=checkout_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    captures: dict[str, bytes] = {}
+
+    def drain(stream: object, name: str, limit: int) -> None:
+        if stream is None:  # pragma: no cover - Popen with PIPE always supplies both streams
+            captures[name] = b""
+            return
+        retained = bytearray()
+        while True:
+            chunk = stream.read(64 * 1024)  # type: ignore[union-attr]
+            if not chunk:
+                break
+            if len(retained) <= limit:
+                retained.extend(chunk[: limit + 1 - len(retained)])
+        captures[name] = bytes(retained)
+
+    stdout_reader = threading.Thread(
+        target=drain,
+        args=(process.stdout, "stdout", MAX_RANGE_CHILD_STDOUT_BYTES),
+        daemon=True,
+        name="reviewctl-range-stdout",
+    )
+    stderr_reader = threading.Thread(
+        target=drain,
+        args=(process.stderr, "stderr", MAX_RANGE_CHILD_STDERR_BYTES),
+        daemon=True,
+        name="reviewctl-range-stderr",
+    )
+    stdout_reader.start()
+    stderr_reader.start()
+    try:
+        process.wait(timeout=timeout_seconds)
+        exit_code = process.returncode
+    except subprocess.TimeoutExpired:
+        terminate_process_group(process)
+        reap_process_without_blocking(process)
+        exit_code = 124
+    stdout_reader.join(timeout=5)
+    stderr_reader.join(timeout=5)
+    stdout = captures.get("stdout", b"")
+    stderr = captures.get("stderr", b"")
+    if len(stdout) > MAX_RANGE_CHILD_STDOUT_BYTES or len(stderr) > MAX_RANGE_CHILD_STDERR_BYTES:
+        return (
+            502,
+            stdout[:MAX_RANGE_CHILD_STDOUT_BYTES],
+            stderr[:MAX_RANGE_CHILD_STDERR_BYTES],
+        )
+    if exit_code == 124:
+        return 124, stdout, stderr or b"range chunk review timed out"
+    return exit_code, stdout, stderr
+
+
+def _range_chunk_record(
+    *, index: int, chunk: dict[str, Any], review_id: str, receipt_path: Path | None
+) -> dict[str, Any]:
+    """Create a complete aggregate record, including an explicit missing state."""
+    expected_review_id = f"{review_id}.chunk-{index}"
+    record: dict[str, Any] = {
+        "index": index,
+        "chunkId": chunk.get("patchSha256"),
+        "patchSha256": chunk.get("patchSha256"),
+        "reviewId": expected_review_id,
+        "receipt": "",
+        "receiptFileSha256": "",
+        "receiptSha256": "",
+        "result": "missing",
+        "verdict": None,
+        "findings": [],
+    }
+    if receipt_path is None:
+        return record
+    try:
+        raw, receipt = load_range_json(receipt_path)
+    except OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError:
+        return record
+    if not isinstance(receipt, dict):
+        return record
+    record.update(
+        {
+            "receipt": str(receipt_path),
+            "receiptFileSha256": sha256_bytes(raw),
+            "receiptSha256": receipt.get("sha256", ""),
+            "result": receipt.get("result", "missing"),
+            "verdict": receipt.get("verdict"),
+            "findings": receipt.get("findings", []),
+        }
+    )
+    return record
+
+
+def run_range_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Review every frozen manifest chunk through the normal formal run command."""
+    if not args.review_id:
+        parser.error("formal range-review requires --review-id")
+    if not args.model:
+        parser.error("formal range-review requires --model")
+    if not args.aggregate_output:
+        parser.error("formal range-review requires --aggregate-output")
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    aggregate_path = Path(args.aggregate_output).expanduser().resolve()
+    try:
+        _, manifest = load_range_json(manifest_path)
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        parser.error(f"could not read range manifest: {error}")
+    manifest_violations = validate_range_manifest(manifest)
+    if manifest_violations:
+        parser.error("invalid range manifest: " + ", ".join(manifest_violations))
+    if not isinstance(manifest, dict):  # pragma: no cover - validator returns above
+        parser.error("range manifest must be a JSON object")
+    if not REVIEW_ID.fullmatch(args.review_id):
+        parser.error("invalid range review id")
+    if args.prompt and args.prompt_file:
+        parser.error("use either --prompt or --prompt-file")
+    if not args.prompt and not args.prompt_file:
+        parser.error("one of --prompt or --prompt-file is required")
+    try:
+        prompt = Path(args.prompt_file).read_text() if args.prompt_file else args.prompt
+    except (OSError, UnicodeError) as error:
+        parser.error(f"could not read review prompt: {error}")
+    if not prompt or not prompt.strip():
+        parser.error("review prompt must not be empty")
+    if args.response_contract != "findings-json":
+        parser.error("range-review formal mode requires --response-contract findings-json")
+    if not 1 <= args.max_attempts <= 3:
+        parser.error("max attempts must be an integer from 1 to 3")
+    if args.max_output_tokens <= 0:
+        parser.error("max output tokens must be positive")
+    chunks = manifest["chunks"]
+    if not chunks:
+        parser.error("formal range-review requires a manifest with at least one chunk")
+    artifact_root = Path(args.artifact_root).expanduser().resolve()
+    timeout_seconds = args.timeout_seconds or DEFAULT_REVIEW_TIMEOUT_SECONDS
+    records: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="reviewctl-range-") as directory:
+        root = Path(directory)
+        for index, chunk in enumerate(chunks):
+            if not isinstance(chunk, dict):  # pragma: no cover - validator above
+                parser.error(f"invalid range chunk {index}")
+            try:
+                patch = base64.b64decode(chunk["patch"].encode("ascii"), validate=True)
+            except (KeyError, UnicodeEncodeError, ValueError) as error:  # pragma: no cover
+                parser.error(f"invalid range chunk {index}: {error}")
+            if len(patch) > MAX_FRAGMENT_BYTES:
+                parser.error(
+                    f"range chunk {index} exceeds {MAX_FRAGMENT_BYTES} bytes; rebuild with a "
+                    "smaller --max-chunk-bytes"
+                )
+            patch_path = root / f"chunk-{index:04d}.patch"
+            prompt_path = root / f"chunk-{index:04d}.prompt.txt"
+            context_path = root / f"chunk-{index:04d}.context.json"
+            patch_path.write_bytes(patch)
+            context_path.write_bytes(
+                canonical_json(
+                    {
+                        "rangeReviewSchemaVersion": 1,
+                        "manifestSha256": manifest_sha256(manifest),
+                        "range": range_identity(manifest),
+                        "chunkIndex": index,
+                        "chunkCount": len(chunks),
+                        "chunkId": chunk["patchSha256"],
+                    }
+                )
+                + b"\n"
+            )
+            identity_text = json.dumps(
+                range_identity(manifest), sort_keys=True, separators=(",", ":")
+            )
+            chunk_prompt = (
+                f"{prompt}\n\n"
+                "This is a formal review of one immutable chunk from a larger Git range. "
+                "Review only the supplied patch and do not infer facts outside it.\n"
+                f"Range identity: {identity_text}\n"
+                f"Manifest SHA-256: {manifest_sha256(manifest)}\n"
+                f"Chunk index: {index}\n"
+                f"Chunk SHA-256: {chunk['patchSha256']}\n"
+                f"Chunk paths: {json.dumps(chunk['paths'], ensure_ascii=True)}\n"
+                "Return the findings-json contract. The reviewedFiles value must be exactly "
+                f'["chunk-{index:04d}.patch"].'
+            )
+            prompt_path.write_text(chunk_prompt)
+            command = [
+                sys.executable,
+                "-m",
+                "reviewctl",
+                "run",
+                "--review-id",
+                f"{args.review_id}.chunk-{index}",
+                "--prompt-file",
+                str(prompt_path),
+                "--file",
+                str(patch_path),
+                "--range-context-file",
+                str(context_path),
+                "--model",
+                args.model,
+                "--transport",
+                args.transport,
+                "--source-class",
+                args.source_class,
+                "--response-contract",
+                "findings-json",
+                "--artifact-root",
+                str(artifact_root),
+                "--timeout-seconds",
+                str(timeout_seconds),
+                "--max-output-tokens",
+                str(args.max_output_tokens),
+                "--max-attempts",
+                str(args.max_attempts),
+            ]
+            if args.policy:
+                command.extend(("--policy", str(Path(args.policy).expanduser().resolve())))
+            before_receipts = receipt_fingerprints(artifact_root)
+            return_code, _, _ = _range_child_process(command, timeout_seconds=timeout_seconds + 10)
+            receipt_path = tournament_receipt_path(
+                artifact_root,
+                before_receipts,
+                f"{args.review_id}.chunk-{index}",
+            )
+            record = _range_chunk_record(
+                index=index,
+                chunk=chunk,
+                review_id=args.review_id,
+                receipt_path=receipt_path,
+            )
+            if return_code != 0:
+                record["result"] = "unavailable"
+                record["verdict"] = None
+                record["findings"] = []
+            records.append(record)
+    aggregate = build_range_aggregate(
+        manifest,
+        args.review_id,
+        records,
+        receipt_loader=lambda path: load_range_json(Path(path).expanduser().resolve()),
+    )
+    try:
+        aggregate_path.parent.mkdir(parents=True, exist_ok=True)
+        write_private_exclusive(
+            aggregate_path,
+            canonical_json(aggregate) + b"\n",
+            label="range aggregate evidence",
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
+    print(aggregate_path)
+    return 0 if aggregate["result"] == "accepted" else 1
+
+
+def range_review_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Dispatch the backward-compatible manifest mode or formal execution mode."""
+    if args.manifest is not None:
+        if args.repository or args.base or args.head or args.output:
+            parser.error("formal range-review cannot combine --manifest with builder arguments")
+        return run_range_review(parser, args)
+    if args.review_id or args.aggregate_output or args.model:
+        parser.error("formal range-review requires --manifest")
+    if not args.repository or not args.base or not args.head or not args.output:
+        parser.error("manifest builder requires --repository, --base, --head, and --output")
+    return write_range_manifest(parser, args)
+
+
+def verify_range_aggregate_command(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> int:
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    aggregate_path = Path(args.aggregate).expanduser().resolve()
+    try:
+        _, manifest = load_range_json(manifest_path)
+        _, aggregate = load_range_json(aggregate_path)
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        parser.error(f"could not read range evidence: {error}")
+
+    def load_receipt(path: str) -> tuple[bytes, object] | None:
+        try:
+            return load_range_json(Path(path).expanduser().resolve())
+        except OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError:
+            return None
+
+    violations = verify_range_aggregate(
+        manifest,
+        aggregate,
+        load_receipt,
+        receipt_validator=validate_v2_receipt,
+    )
+    payload = {
+        "manifest": str(manifest_path),
+        "aggregate": str(aggregate_path),
+        "valid": not violations,
+        "violations": list(violations),
+    }
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if not violations else exit_code_for("receipt_invalid")
 
 
 @contextmanager
@@ -2455,14 +2845,17 @@ def invoke_openrouter(
     blank = PersistedResponse("", None, None, None, "", None, None, "")
     if not api_key:
         return 127, "OPENROUTER_API_KEY is not configured", blank
+    model_id = openrouter_model_id(model)
     payload: dict[str, object] = {
-        "model": model,
-        "max_tokens": max_output_tokens,
+        "model": model_id,
         "temperature": 0,
         "messages": [
             {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
         ],
     }
+    payload["max_tokens"] = openrouter_output_token_budget(model, max_output_tokens)
+    if reasoning := openrouter_reasoning_parameters(model):
+        payload["reasoning"] = reasoning
     if schema := response_schema(response_contract):
         payload["response_format"] = {
             "type": "json_schema",
@@ -3015,10 +3408,15 @@ def invoke_pi(
                 communicated_stdout, communicated_stderr = process.communicate()
 
             def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
-                if not isinstance(value, bytes):
-                    stream.seek(0)
-                    value = stream.read(limit + 1)
-                return value[:limit], len(value) > limit
+                if isinstance(value, bytes):
+                    return value[:limit], len(value) > limit
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                if size > limit:
+                    stream.seek(size - limit)
+                    return stream.read(limit), True
+                stream.seek(0)
+                return stream.read(limit), False
 
             stdout, stdout_truncated = bounded_output(
                 communicated_stdout, stdout_file, MAX_PI_LEGACY_STDOUT_BYTES
@@ -3444,87 +3842,6 @@ def codex_prompt(
     return f"{prompt}\n\n{contract} Read only the supplied review files."
 
 
-def communicate_bounded(
-    process: subprocess.Popen[bytes],
-    *,
-    timeout_seconds: int,
-    stdout_limit: int,
-    stderr_limit: int,
-) -> tuple[bytes, bytes, bool, bool]:
-    """Drain a process without allowing either captured stream to grow unbounded."""
-    streams = (
-        (getattr(process, "stdout", None), stdout_limit),
-        (getattr(process, "stderr", None), stderr_limit),
-    )
-    if any(stream is None for stream, _ in streams):
-        raise RuntimeError("Codex bounded capture requires stdout and stderr pipes")
-
-    selector = selectors.DefaultSelector()
-    buffers: dict[int, bytearray] = {}
-    limits: dict[int, int] = {}
-    for stream, limit in streams:
-        assert stream is not None
-        selector.register(stream, selectors.EVENT_READ)
-        descriptor = stream.fileno()
-        buffers[descriptor] = bytearray()
-        limits[descriptor] = limit
-
-    deadline = time.monotonic() + timeout_seconds
-    timed_out = False
-    exceeded = False
-    terminated = False
-
-    def terminate() -> None:
-        nonlocal terminated
-        if not terminated:
-            terminate_process_group(process, grace_seconds=0)
-            terminated = True
-
-    try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if not timed_out and remaining <= 0:
-                timed_out = True
-                terminate()
-                break
-            events = selector.select(max(0, min(remaining, 0.1)))
-            if not events:
-                if process.poll() is not None and not terminated:
-                    terminated = True
-                continue
-            for key, _ in events:
-                descriptor = key.fileobj.fileno()
-                chunk = os.read(descriptor, 64 * 1024)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                buffer = buffers[descriptor]
-                limit = limits[descriptor]
-                if len(buffer) <= limit:
-                    buffer.extend(chunk[: limit + 1 - len(buffer)])
-                if len(buffer) > limit and not exceeded:
-                    exceeded = True
-                    terminate()
-                    break
-            if terminated:
-                break
-    finally:
-        selector.close()
-        if process.poll() is None:
-            terminate()
-        try:
-            process.wait()
-        except (ChildProcessError, OSError):
-            pass
-
-    return (
-        bytes(buffers[streams[0][0].fileno()][:stdout_limit]),
-        bytes(buffers[streams[1][0].fileno()][:stderr_limit]),
-        timed_out,
-        exceeded,
-    )
-
-
 def invoke_codex(
     *,
     codex_bin: str,
@@ -3536,12 +3853,6 @@ def invoke_codex(
     workspace: Path,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Codex against the isolated snapshots and recover its final response."""
-    if resource is None:
-        return (
-            126,
-            "Codex bounded output capture unsupported on this platform",
-            PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
-        )
     isolation: CodexIsolation | None = None
     try:
         if source_roots:
@@ -3604,6 +3915,7 @@ def invoke_codex(
             {"HOME": os.environ.get("HOME") or str(account_home())},
         )
     )
+
     try:
         process = subprocess.Popen(
             command,
@@ -3613,20 +3925,134 @@ def invoke_codex(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        stdout, stderr, timed_out, output_exceeded = communicate_bounded(
-            process,
-            timeout_seconds=timeout_seconds,
-            stdout_limit=MAX_CODEX_STDOUT_BYTES,
-            stderr_limit=MAX_CODEX_STDERR_BYTES,
+        response_oversized = threading.Event()
+        response_monitor_stop = threading.Event()
+
+        def monitor_response_file() -> None:
+            """Stop a Codex process before its final-response file fills the disk."""
+            while not response_monitor_stop.wait(0.05):
+                try:
+                    oversized = output_path.stat().st_size > MAX_CODEX_RESPONSE_BYTES
+                except FileNotFoundError:
+                    continue
+                if not oversized:
+                    continue
+                response_oversized.set()
+                process_pid = getattr(process, "pid", None)
+                if isinstance(process_pid, int):
+                    terminate_process_group(process)
+                return
+
+        response_monitor = threading.Thread(
+            target=monitor_response_file,
+            daemon=True,
+            name="reviewctl-codex-response",
         )
-        exit_code = 124 if timed_out else process.returncode
-        if output_exceeded:
-            return (
-                502,
-                "Codex transport output exceeded bounded capture",
-                PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+        response_monitor.start()
+
+        def bounded_pipe_capture(stream: object, limit: int, captured: dict[str, object]) -> None:
+            """Drain a child pipe while retaining bounded head and tail context."""
+            head_limit = min(64 * 1024, limit // 2)
+            tail_limit = limit - head_limit
+            head = bytearray()
+            tail = bytearray()
+            total = 0
+            if stream is None:  # pragma: no cover - pipe mode starts only with both streams
+                captured.update(value=b"", truncated=False)
+                return
+            while True:
+                chunk = stream.read(64 * 1024)  # type: ignore[union-attr]
+                if not chunk:
+                    break
+                total += len(chunk)
+                if len(head) < head_limit:
+                    take = min(head_limit - len(head), len(chunk))
+                    head.extend(chunk[:take])
+                    chunk = chunk[take:]
+                if chunk:
+                    tail.extend(chunk)
+                    if len(tail) > tail_limit:
+                        del tail[: len(tail) - tail_limit]
+            captured.update(
+                value=bytes(head + tail),
+                truncated=total > limit,
             )
+
+        stdout_stream = getattr(process, "stdout", None)
+        stderr_stream = getattr(process, "stderr", None)
+        pipe_mode = stdout_stream is not None and stderr_stream is not None
+        stdout_capture: dict[str, object] = {}
+        stderr_capture: dict[str, object] = {}
+        if pipe_mode:
+            stdout_reader = threading.Thread(
+                target=bounded_pipe_capture,
+                args=(stdout_stream, MAX_CODEX_STDOUT_BYTES, stdout_capture),
+                daemon=True,
+                name="reviewctl-codex-stdout",
+            )
+            stderr_reader = threading.Thread(
+                target=bounded_pipe_capture,
+                args=(stderr_stream, MAX_CODEX_STDERR_BYTES, stderr_capture),
+                daemon=True,
+                name="reviewctl-codex-stderr",
+            )
+            stdout_reader.start()
+            stderr_reader.start()
+        if not pipe_mode:
+            try:
+                communicated_stdout, communicated_stderr = process.communicate(
+                    timeout=timeout_seconds
+                )
+                exit_code = process.returncode
+            except subprocess.TimeoutExpired:
+                terminate_process_group(process)
+                communicated_stdout = b""
+                communicated_stderr = b""
+                exit_code = 124
+                timed_out = True
+        else:
+            try:
+                process.wait(timeout=timeout_seconds)
+                exit_code = process.returncode
+            except subprocess.TimeoutExpired:
+                terminate_process_group(process)
+                exit_code = 124
+                timed_out = True
+        if pipe_mode:
+            stdout_reader.join(timeout=5)
+            stderr_reader.join(timeout=5)
+            communicated_stdout = cast(bytes, stdout_capture.get("value", b""))
+            stdout_capture_truncated = bool(stdout_capture.get("truncated"))
+            communicated_stderr = cast(bytes, stderr_capture.get("value", b""))
+            stderr_capture_truncated = bool(stderr_capture.get("truncated"))
+        else:
+            stdout_capture_truncated = False
+            stderr_capture_truncated = False
+        response_monitor_stop.set()
+        response_monitor.join(timeout=5)
+
+        def bounded_output(
+            value: object, limit: int, truncated: bool = False
+        ) -> tuple[bytes, bool]:
+            if isinstance(value, bytes):
+                return value[:limit], truncated or len(value) > limit
+            return b"", truncated
+
+        stdout, stdout_truncated = bounded_output(
+            communicated_stdout, MAX_CODEX_STDOUT_BYTES, stdout_capture_truncated
+        )
+        stderr, stderr_truncated = bounded_output(
+            communicated_stderr, MAX_CODEX_STDERR_BYTES, stderr_capture_truncated
+        )
         stderr_text = "review attempt timed out" if timed_out else stderr.decode(errors="replace")
+        truncated_streams = [
+            name
+            for name, truncated in (("stdout", stdout_truncated), ("stderr", stderr_truncated))
+            if truncated
+        ]
+        if truncated_streams:
+            truncation_note = "Codex transport output truncated: " + ", ".join(truncated_streams)
+            stderr_text = f"{stderr_text}\n{truncation_note}".strip()
         transport_output = f"{stdout.decode(errors='replace')}\n{stderr_text}"
         session = re.search(r"session id:\s*([^\s]+)", transport_output)
         resolved_model = re.search(r"^model:\s*([^\s]+)", transport_output, flags=re.MULTILINE)
@@ -3635,13 +4061,20 @@ def invoke_codex(
             with confined_regular_descriptor(output_path, os.O_RDONLY) as descriptor:
                 with os.fdopen(os.dup(descriptor), "rb") as stream:
                     raw_response = stream.read(MAX_CODEX_RESPONSE_BYTES + 1)
-            if len(raw_response) > MAX_CODEX_RESPONSE_BYTES:
+            if response_oversized.is_set() or len(raw_response) > MAX_CODEX_RESPONSE_BYTES:
                 return (
                     502,
                     "Codex final response exceeded bounded capture",
                     PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
                 )
-            response_text = raw_response.decode("utf-8")
+            try:
+                response_text = raw_response.decode("utf-8")
+            except UnicodeDecodeError:
+                return (
+                    502,
+                    "Codex final response is not valid UTF-8",
+                    PersistedResponse("", None, None, None, "", None, "openai-codex", ""),
+                )
         return (
             exit_code,
             stderr_text,
@@ -4398,7 +4831,7 @@ def first_duplicate_json_key(response: str) -> str | None:
             object_pairs_hook=collect,
             parse_constant=reject_nonstandard_json_constant,
         )
-    except (ValueError, RecursionError):
+    except ValueError, RecursionError:
         return None
     return duplicate
 
@@ -4485,6 +4918,23 @@ def seal(
 
 def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     prompt, files = validate_request(parser, args)
+    range_context: dict[str, Any] | None = None
+    range_context_path = getattr(args, "range_context_file", None)
+    if range_context_path:
+        try:
+            _, loaded_context = load_range_json(Path(range_context_path).expanduser().resolve())
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+            parser.error(f"could not read range receipt context: {error}")
+        if type(loaded_context) is not dict or set(loaded_context) != {
+            "rangeReviewSchemaVersion",
+            "manifestSha256",
+            "range",
+            "chunkIndex",
+            "chunkCount",
+            "chunkId",
+        }:
+            parser.error("range receipt context has an invalid shape")
+        range_context = loaded_context
     routes, route_profile = review_routes(parser, args)
     if any(route.transport == "pi" and "/" not in route.model for route in routes):
         parser.error("pi review models must use provider/model identity")
@@ -5133,6 +5583,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     }
     if kiro_identity_waiver:
         receipt["extension.kiroUnresolvedIdentityWaiver"] = True
+    if range_context is not None:
+        receipt["extension.rangeReview"] = range_context
     if accepted_attempt is not None and attempts[accepted_attempt - 1]["transport"] == "kiro":
         receipt["extension.backendQualification"] = "unqualified"
         receipt["extension.mergeGateEligible"] = False
@@ -5482,6 +5934,56 @@ def tournament_case_files(case: dict[str, Any], plan_path: Path) -> list[Path]:
     ]
 
 
+def receipt_fingerprints(root: Path) -> dict[Path, str]:
+    """Capture safe content identities for receipts already present in a run root."""
+    if not root.exists():
+        return {}
+    fingerprints: dict[Path, str] = {}
+    for path in root.glob("**/receipt.json"):
+        try:
+            fingerprints[path] = sha256_bytes(read_confined_bytes(path))
+        except OSError:
+            continue
+    return fingerprints
+
+
+def changed_receipt_paths(root: Path, before: dict[Path, str]) -> list[Path]:
+    """Return receipts created or changed by one tournament invocation."""
+    paths: list[Path] = []
+    for path in root.glob("**/receipt.json") if root.exists() else ():
+        try:
+            fingerprint = sha256_bytes(read_confined_bytes(path))
+        except OSError:
+            paths.append(path)
+            continue
+        if before.get(path) != fingerprint:
+            paths.append(path)
+    return sorted(paths)
+
+
+def tournament_receipt_path(root: Path, before: dict[Path, str], review_id: str) -> Path | None:
+    """Select exactly one valid receipt belonging to the current tournament run."""
+    changed = changed_receipt_paths(root, before)
+    if len(changed) != 1:
+        return None
+    path = changed[0]
+    try:
+        receipt = json.loads(
+            read_confined_text(path),
+            object_pairs_hook=exact_json_object,
+            parse_constant=reject_nonstandard_json_constant,
+        )
+    except OSError, UnicodeError, ValueError:
+        return None
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("reviewId") != review_id
+        or not persisted_receipt_valid(path)
+    ):
+        return None
+    return path
+
+
 def run_candidate_tournament(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
@@ -5509,6 +6011,7 @@ def run_candidate_tournament(
     runs: list[dict[str, Any]] = []
     estimated_spend = 0.0
     actual_spend = 0.0
+    missing_receipt = False
     for case in cases:
         if not isinstance(case, dict) or not isinstance(case.get("id"), str):
             parser.error("tournament cases require an id")
@@ -5518,7 +6021,12 @@ def run_candidate_tournament(
             parser.error("tournament cases require a prompt")
         input_tokens = estimate_tokens(packet_prompt(prompt, files, response_contract), files)
         for candidate in candidates:
-            candidate_max_output_tokens = candidate.max_output_tokens or max_output_tokens
+            requested_max_output_tokens = candidate.max_output_tokens or max_output_tokens
+            candidate_max_output_tokens = (
+                openrouter_output_token_budget(candidate.model, requested_max_output_tokens)
+                if candidate.transport == "openrouter"
+                else requested_max_output_tokens
+            )
             estimate: float | None = None
             if candidate.cost_mode == "metered":
                 assert candidate.pricing is not None
@@ -5585,10 +6093,39 @@ def run_candidate_tournament(
                 timeout_seconds=timeout_seconds,
                 transport=candidate.transport,
             )
-            before = set(case_root.glob("**/receipt.json")) if case_root.exists() else set()
+            before = receipt_fingerprints(case_root)
             exit_code = run_review(parser, namespace)
-            receipt_paths = sorted(set(case_root.glob("**/receipt.json")) - before)
-            receipt_path = receipt_paths[0]
+            receipt_path = tournament_receipt_path(case_root, before, str(namespace.review_id))
+            if receipt_path is None:
+                missing_receipt = True
+                runs.append(
+                    {
+                        "actualCostUsd": None,
+                        "candidate": candidate.identifier,
+                        "case": case["id"],
+                        "councilEligible": candidate.council_eligible,
+                        "costMode": candidate.cost_mode,
+                        "estimatedCostUsd": estimate,
+                        "exitCode": exit_code,
+                        "family": candidate.family,
+                        "maxOutputTokens": candidate_max_output_tokens,
+                        "model": candidate.model,
+                        "outputTokenLimitEnforced": candidate.transport in {"llm", "openrouter"},
+                        "receipt": None,
+                        "requestedMaxOutputTokens": requested_max_output_tokens,
+                        "result": "missing-receipt",
+                        "transport": candidate.transport,
+                    }
+                )
+                write_tournament_report(
+                    report_path,
+                    budget=budget,
+                    estimated_spend=estimated_spend,
+                    actual_spend=actual_spend,
+                    result="running",
+                    runs=runs,
+                )
+                continue
             receipt = json.loads(read_confined_text(receipt_path))
             actual_cost = receipt_attempt_cost(receipt)
             if candidate.cost_mode == "metered" and actual_cost is not None:
@@ -5605,6 +6142,8 @@ def run_candidate_tournament(
                     "family": candidate.family,
                     "maxOutputTokens": candidate_max_output_tokens,
                     "model": candidate.model,
+                    "outputTokenLimitEnforced": candidate.transport in {"llm", "openrouter"},
+                    "requestedMaxOutputTokens": requested_max_output_tokens,
                     "receipt": str(receipt_path),
                     "result": str(receipt["result"]),
                     "transport": candidate.transport,
@@ -5618,16 +6157,17 @@ def run_candidate_tournament(
                 result="running",
                 runs=runs,
             )
+    aggregate_result = "incomplete" if missing_receipt else "completed"
     write_tournament_report(
         report_path,
         budget=budget,
         estimated_spend=estimated_spend,
         actual_spend=actual_spend,
-        result="completed",
+        result=aggregate_result,
         runs=runs,
     )
     print(report_path)
-    return 0
+    return 1 if missing_receipt else 0
 
 
 def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
@@ -5683,7 +6223,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     legacy_max_attempts = plan.get("max_attempts", 1)
     if not isinstance(legacy_max_attempts, int) or not 1 <= legacy_max_attempts <= 3:
         parser.error("tournament plan max_attempts must be an integer from 1 to 3")
-    legacy_models: list[tuple[str, float, float, int]] = []
+    legacy_models: list[tuple[str, float, float, int, int]] = []
     for model, pricing in models.items():
         if not isinstance(pricing, dict):
             parser.error("tournament model pricing must be an object")
@@ -5698,12 +6238,19 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             or raw_candidate_max_output_tokens <= 0
         ):
             parser.error("tournament model max_output_tokens must be a positive integer")
+        requested_max_output_tokens = raw_candidate_max_output_tokens or max_output_tokens
+        effective_max_output_tokens = (
+            openrouter_output_token_budget(model, requested_max_output_tokens)
+            if transport == "openrouter"
+            else requested_max_output_tokens
+        )
         legacy_models.append(
             (
                 model,
                 input_price,
                 output_price,
-                raw_candidate_max_output_tokens or max_output_tokens,
+                requested_max_output_tokens,
+                effective_max_output_tokens,
             )
         )
 
@@ -5711,6 +6258,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     runs: list[dict[str, Any]] = []
     estimated_spend = 0.0
     actual_spend = 0.0
+    missing_receipt = False
     for case in cases:
         files = [
             (Path(item) if Path(item).is_absolute() else plan_path.parent / item).resolve()
@@ -5718,7 +6266,13 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         ]
         prompt = str(case["prompt"])
         input_tokens = estimate_tokens(packet_prompt(prompt, files), files)
-        for model, input_price, output_price, candidate_max_output_tokens in legacy_models:
+        for (
+            model,
+            input_price,
+            output_price,
+            requested_max_output_tokens,
+            candidate_max_output_tokens,
+        ) in legacy_models:
             estimate = (
                 input_tokens * input_price / 1_000_000
                 + candidate_max_output_tokens * output_price / 1_000_000
@@ -5768,11 +6322,35 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                 timeout_seconds=timeout_seconds,
                 transport=transport,
             )
-            before = set(case_root.glob("**/receipt.json")) if case_root.exists() else set()
+            before = receipt_fingerprints(case_root)
             result = run_review(parser, namespace)
-            after = set(case_root.glob("**/receipt.json"))
-            receipt_paths = sorted(after - before)
-            receipt_path = receipt_paths[0]
+            receipt_path = tournament_receipt_path(case_root, before, str(namespace.review_id))
+            if receipt_path is None:
+                missing_receipt = True
+                runs.append(
+                    {
+                        "case": case["id"],
+                        "actualCostUsd": None,
+                        "estimatedCostUsd": estimate,
+                        "exitCode": result,
+                        "maxOutputTokens": candidate_max_output_tokens,
+                        "model": model,
+                        "outputTokenLimitEnforced": transport in {"llm", "openrouter"},
+                        "receipt": None,
+                        "requestedMaxOutputTokens": requested_max_output_tokens,
+                        "result": "missing-receipt",
+                        "score": None,
+                    }
+                )
+                write_tournament_report(
+                    report_path,
+                    budget=budget,
+                    estimated_spend=estimated_spend,
+                    actual_spend=actual_spend,
+                    result="running",
+                    runs=runs,
+                )
+                continue
             receipt = json.loads(read_confined_text(receipt_path))
             receipt_result = str(receipt["result"])
             actual_cost = receipt_attempt_cost(receipt)
@@ -5790,6 +6368,8 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                     "exitCode": result,
                     "maxOutputTokens": candidate_max_output_tokens,
                     "model": model,
+                    "outputTokenLimitEnforced": transport in {"llm", "openrouter"},
+                    "requestedMaxOutputTokens": requested_max_output_tokens,
                     "receipt": str(receipt_path),
                     "result": receipt_result,
                     "score": score_findings(
@@ -5806,16 +6386,17 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                 result="running",
                 runs=runs,
             )
+    aggregate_result = "incomplete" if missing_receipt else "completed"
     write_tournament_report(
         report_path,
         budget=budget,
         estimated_spend=estimated_spend,
         actual_spend=actual_spend,
-        result="completed",
+        result=aggregate_result,
         runs=runs,
     )
     print(report_path)
-    return 0
+    return 1 if missing_receipt else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -5851,6 +6432,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-file",
         help="write the accepted model response to this document path",
     )
+    run.add_argument(
+        "--range-context-file",
+        help="internal immutable range identity to embed in the v2 receipt",
+    )
     run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
     run.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     run.add_argument("--max-attempts", type=int, default=None)
@@ -5880,6 +6465,71 @@ def build_parser() -> argparse.ArgumentParser:
         default="llm",
     )
     run.set_defaults(handler=lambda namespace: run_review(parser, namespace))
+
+    range_review = commands.add_parser(
+        "range-review",
+        help="freeze a Git range or formally review its immutable manifest",
+    )
+    range_review.add_argument("--repository")
+    range_review.add_argument("--base")
+    range_review.add_argument("--head")
+    range_review.add_argument("--output")
+    range_review.add_argument(
+        "--context-lines",
+        type=positive_integer,
+        default=DEFAULT_CONTEXT_LINES,
+        help="unified diff context lines (default: 3)",
+    )
+    range_review.add_argument(
+        "--max-chunk-bytes",
+        type=positive_integer,
+        default=DEFAULT_MAX_CHUNK_BYTES,
+        help="maximum bytes per complete-file chunk (default: 131072)",
+    )
+    range_review.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="write a zero-chunk manifest when base and head have no diff",
+    )
+    range_review.add_argument("--manifest", help="consume a previously frozen range manifest")
+    range_review.add_argument("--review-id", help="parent review id for formal chunk receipts")
+    range_review.add_argument("--prompt")
+    range_review.add_argument("--prompt-file")
+    range_review.add_argument("--model", help="model identifier for each chunk review")
+    range_review.add_argument(
+        "--transport",
+        choices=("llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"),
+        default="llm",
+    )
+    range_review.add_argument("--policy")
+    range_review.add_argument(
+        "--source-class",
+        choices=("proprietary", "synthetic"),
+        default="proprietary",
+    )
+    range_review.add_argument(
+        "--response-contract",
+        choices=sorted(RESPONSE_CONTRACTS),
+        default="findings-json",
+    )
+    range_review.add_argument("--aggregate-output")
+    range_review.add_argument("--artifact-root", default="~/.cache/reviewctl/range-reviews")
+    range_review.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
+    range_review.add_argument(
+        "--max-output-tokens", type=positive_integer, default=DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    range_review.add_argument("--max-attempts", type=positive_integer, default=1)
+    range_review.set_defaults(handler=lambda namespace: range_review_command(parser, namespace))
+
+    range_verify = commands.add_parser(
+        "range-verify",
+        help="fail-closed verification of a formal range aggregate and its chunk receipts",
+    )
+    range_verify.add_argument("--manifest", required=True)
+    range_verify.add_argument("--aggregate", required=True)
+    range_verify.set_defaults(
+        handler=lambda namespace: verify_range_aggregate_command(parser, namespace)
+    )
 
     explore = commands.add_parser(
         "explore", help="run resumable Pi conversations and prepare formal review handoffs"

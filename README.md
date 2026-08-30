@@ -273,9 +273,12 @@ synthetic qualification before making a role mandatory.
 The tournament command accepts only synthetic cases by policy. It estimates the maximum spend from
 the assembled packet and attached file bytes before each request, then stops before crossing the
 configured budget. A candidate may override the plan's `max_output_tokens`; the runner reserves that
-candidate's effective cap and records it as `maxOutputTokens` alongside the estimate and actual provider
-cost when available. This allows reasoning-first models to receive enough completion budget without
-raising every candidate's spend ceiling.
+candidate's effective cap and records both `requestedMaxOutputTokens` and `maxOutputTokens` alongside
+the estimate and actual provider cost when available. `outputTokenLimitEnforced` makes clear whether the
+transport actually enforces that ceiling. For OpenRouter GLM-5.3-Flash, the runner requests native
+maximum reasoning (`reasoning.effort = "max"`) and applies the normal 16,384-token minimum completion budget so
+native reasoning cannot consume a tiny manual cap before the structured answer; the request remains
+bounded by the provider and review timeout.
 
 For an isolated OpenRouter provider comparison, run `provider-preflight` immediately before the
 tournament. It snapshots the live endpoint catalog, checks the pinned provider, declared price, active
