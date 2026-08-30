@@ -3172,12 +3172,13 @@ def invoke_agy(
     usage_values = usage if isinstance(usage, dict) else {}
     duration_seconds = numeric_value(payload.get("duration_seconds"))
     conversation_id = payload.get("conversation_id")
-    structured_output = payload.get("structured_output")
-    response = (
-        canonical_json(structured_output).decode()
-        if isinstance(structured_output, dict)
-        else payload.get("response")
-    )
+    if "structured_output" not in payload:
+        response = payload.get("response")
+    else:
+        structured_output = payload["structured_output"]
+        if not isinstance(structured_output, dict):
+            return 502, "agy returned invalid structured output", blank
+        response = canonical_json(structured_output).decode()
     return (
         0,
         "",
@@ -5752,6 +5753,32 @@ def legacy_receipt_declares_transport(receipt: dict[str, Any], transport: str) -
     return False
 
 
+PROJECT_CHECKPOINT_KIND = "project-review-checkpoint"
+PROJECT_CHECKPOINT_FIELDS = frozenset(
+    {
+        "projectId",
+        "originId",
+        "journalSequence",
+        "privacyMode",
+        "dimensionCoverage",
+        "fallbackRelationships",
+    }
+)
+
+
+def project_checkpoint_shape(value: object) -> bool:
+    """Recognize project checkpoints only to reject them from global verification."""
+    if type(value) is not dict:
+        return False
+    if value.get("artifactKind") == PROJECT_CHECKPOINT_KIND:
+        return True
+    if "projectCheckpointSchemaVersion" in value:
+        return True
+    if "receiptSchemaVersion" in value:
+        return False
+    return PROJECT_CHECKPOINT_FIELDS.issubset(value)
+
+
 def verify_receipt(args: argparse.Namespace) -> int:
     receipt_path = Path(args.receipt)
 
@@ -5767,29 +5794,9 @@ def verify_receipt(args: argparse.Namespace) -> int:
     except OSError, UnicodeError, ValueError:
         violations = ("json-receipt",)
     else:
-        if (
-            isinstance(receipt, dict)
-            and "reviewId" in receipt
-            and "configDigest" in receipt
-            and "sha256" in receipt
-        ):
-            from reviewctl.api import verify_project_receipt
-
-            diagnostic = verify_project_receipt(receipt_path)
-            violations = (diagnostic.code,) if diagnostic is not None else ()
-            valid = not violations
-            print(
-                json.dumps(
-                    {
-                        "receipt": str(receipt_path),
-                        "valid": valid,
-                        "violations": list(violations),
-                    },
-                    sort_keys=True,
-                )
-            )
-            return 0 if valid else exit_code_for("receipt_invalid")
-        if not isinstance(receipt, dict):
+        if project_checkpoint_shape(receipt):
+            violations = ("project-checkpoint-not-review-receipt",)
+        elif not isinstance(receipt, dict):
             violations = ("receipt-object",)
         elif "receiptSchemaVersion" not in receipt:
             if not valid_receipt(receipt):

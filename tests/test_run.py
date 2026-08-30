@@ -30,6 +30,14 @@ from reviewctl.setup import BackendInstallation, LocalExecutionTopology
 
 REPOSITORY = Path(__file__).parents[1]
 V1_RECEIPT_FIXTURES = REPOSITORY / "tests" / "fixtures" / "receipts"
+HISTORICAL_PROJECT_CHECKPOINT_FIELDS = {
+    "projectId": "project-1",
+    "originId": "origin-1",
+    "journalSequence": 1,
+    "privacyMode": "private",
+    "dimensionCoverage": {},
+    "fallbackRelationships": [],
+}
 
 
 def test_review_root_does_not_create_through_replaced_artifact_ancestor(
@@ -7660,6 +7668,158 @@ def test_immutable_v1_receipt_fixtures_verify_by_embedded_digest(
     assert json.loads(verified.stdout)["valid"] is True
 
 
+def test_verify_rejects_historical_project_checkpoint_shape(tmp_path: Path) -> None:
+    receipt = {
+        "reviewId": "review-1",
+        "configDigest": "config",
+        "status": "accepted",
+        **HISTORICAL_PROJECT_CHECKPOINT_FIELDS,
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
+def test_verify_rejects_full_project_signature_without_config_digest(
+    tmp_path: Path,
+) -> None:
+    receipt = {
+        "reviewId": "review-1",
+        "status": "accepted",
+        **HISTORICAL_PROJECT_CHECKPOINT_FIELDS,
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
+@pytest.mark.parametrize(("field", "value"), HISTORICAL_PROJECT_CHECKPOINT_FIELDS.items())
+def test_generic_v1_with_one_project_like_field_retains_v1_compatibility(
+    field: str, value: object, tmp_path: Path
+) -> None:
+    receipt = json.loads((V1_RECEIPT_FIXTURES / "accepted-findings-v1.json").read_text())
+    receipt[field] = value
+    receipt.pop("sha256")
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "generic-v1.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 0
+    assert json.loads(verified.stdout)["violations"] == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"result": "accepted"},
+        {"unrelated": "value"},
+    ],
+)
+def test_project_checkpoint_rejection_ignores_attacker_added_fields(
+    extra: dict[str, object], tmp_path: Path
+) -> None:
+    receipt = {
+        "reviewId": "review-1",
+        "configDigest": "config",
+        "status": "accepted",
+        **HISTORICAL_PROJECT_CHECKPOINT_FIELDS,
+        **extra,
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
+def test_project_checkpoint_with_forged_v2_schema_fails_v2_validation(tmp_path: Path) -> None:
+    receipt = {
+        "reviewId": "review-1",
+        "configDigest": "config",
+        "projectId": "project-1",
+        "status": "accepted",
+        "receiptSchemaVersion": 2,
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    payload = json.loads(verified.stdout)
+    assert payload["valid"] is False
+    assert payload["violations"]
+
+
+@pytest.mark.parametrize("schema_version", [None, 1, "2", True])
+def test_project_fields_with_noncanonical_schema_version_never_fall_to_v1(
+    schema_version: object, tmp_path: Path
+) -> None:
+    receipt = {
+        "reviewId": "review-1",
+        "projectId": "project-1",
+        "receiptSchemaVersion": schema_version,
+        "status": "accepted",
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["receipt-schema-version"]
+
+
+def test_verify_rejects_an_explicitly_marked_project_checkpoint(tmp_path: Path) -> None:
+    receipt = {
+        "artifactKind": "project-review-checkpoint",
+        "projectCheckpointSchemaVersion": 1,
+        "reviewId": "review-1",
+        "status": "accepted",
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
+def test_verify_rejects_checkpoint_schema_marker_without_artifact_kind(tmp_path: Path) -> None:
+    receipt = {
+        "projectCheckpointSchemaVersion": 1,
+        "reviewId": "review-1",
+        "status": "accepted",
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["project-checkpoint-not-review-receipt"]
+
+
 @pytest.mark.parametrize(
     "mutate_transport",
     [
@@ -10266,6 +10426,88 @@ def test_invoke_agy_prefers_schema_validated_structured_output(
     assert response.response == json.dumps(structured, separators=(",", ":"), sort_keys=True)
 
 
+def test_invoke_agy_uses_legacy_response_when_structured_output_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    legacy_response = '{"verdict":"approved","findings":[]}'
+    monkeypatch.setenv("AGY_RESPONSE", legacy_response)
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin=str(fake_agy),
+        prompt="Review synthetic source.",
+        model="gemini-3.7-flash-high",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert exit_code == 0
+    assert error == ""
+    assert response.response == legacy_response
+
+
+@pytest.mark.parametrize("structured_output", [None, "text", 7, [], True])
+def test_invoke_agy_rejects_present_non_object_structured_output(
+    structured_output: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "conversation_id": "agy-conversation",
+        "status": "SUCCESS",
+        "response": '{"verdict":"approved","findings":[]}',
+        "structured_output": structured_output,
+    }
+    monkeypatch.setenv("AGY_RAW_PAYLOAD", json.dumps(payload))
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin=str(fake_agy),
+        prompt="Review synthetic source.",
+        model="gemini-3.7-flash-high",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert exit_code == 502
+    assert error == "agy returned invalid structured output"
+    assert response.response == ""
+
+
+def test_agy_structured_object_still_requires_the_selected_response_contract(
+    tmp_path: Path,
+) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path, "gemini-3.7-flash-high"),
+        "--transport",
+        "agy",
+        "--response-contract",
+        "findings-json",
+        env={"AGY_BIN": str(fake_agy), "AGY_STRUCTURED_OUTPUT": "{}"},
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["result"] == "unavailable"
+    assert receipt["acceptedAttempt"] is None
+    assert receipt["attempts"][0]["result"] == "incomplete"
+    assert receipt["attempts"][0]["validationError"] == (
+        "findings-json: response fields do not match the required schema"
+    )
+
+
 def test_invoke_agy_rejects_duplicate_keys_in_structured_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -12849,8 +13091,8 @@ def test_cli_task8_remaining_helper_and_receipt_edges(tmp_path: Path, monkeypatc
     assert cli.verify_receipt(SimpleNamespace(receipt=str(modern))) == 0
     assert json.loads(capsys.readouterr().out)["valid"] is True
     modern.write_text(json.dumps({**modern_value, "sha256": "wrong"}))
-    assert cli.verify_receipt(SimpleNamespace(receipt=str(modern))) == 5
-    assert json.loads(capsys.readouterr().out)["violations"] == ["receipt_invalid"]
+    assert cli.verify_receipt(SimpleNamespace(receipt=str(modern))) == 1
+    assert json.loads(capsys.readouterr().out)["violations"] == ["receipt-digest"]
 
 
 def test_cli_task8_kiro_normalization_and_exploration_fallback_edges(

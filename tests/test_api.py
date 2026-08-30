@@ -392,11 +392,55 @@ def test_project_receipt_verification_detects_tampering(tmp_path: Path) -> None:
     assert mismatched is not None
     assert mismatched.code == "receipt_invalid"
     receipt = json.loads(result.receipt_path.read_text())
+    assert receipt["artifactKind"] == "project-review-checkpoint"
+    assert receipt["projectCheckpointSchemaVersion"] == 1
     receipt["status"] = "tampered"
     result.receipt_path.write_text(json.dumps(receipt))
     diagnostic = verify_project_receipt(result.receipt_path)
     assert diagnostic is not None
     assert diagnostic.code == "receipt_invalid"
+
+
+def test_project_receipt_verifier_rejects_a_mutated_marker_but_accepts_legacy(
+    tmp_path: Path,
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review"))
+    receipt = json.loads(result.receipt_path.read_text())
+
+    receipt["artifactKind"] = "canonical-review-receipt"
+    receipt.pop("sha256")
+    receipt["sha256"] = api_module._digest(
+        json.dumps(
+            receipt,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    )
+    result.receipt_path.write_text(json.dumps(receipt))
+    marker_diagnostic = verify_project_receipt(result.receipt_path)
+
+    assert marker_diagnostic is not None
+    assert marker_diagnostic.code == "receipt_invalid"
+
+    receipt.pop("artifactKind")
+    receipt.pop("projectCheckpointSchemaVersion")
+    receipt.pop("sha256")
+    receipt["sha256"] = api_module._digest(
+        json.dumps(
+            receipt,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    )
+    result.receipt_path.write_text(json.dumps(receipt))
+
+    assert verify_project_receipt(result.receipt_path) is None
 
 
 def test_project_receipt_verification_rejects_duplicate_json_keys(tmp_path: Path) -> None:
@@ -809,7 +853,10 @@ def test_default_codex_project_route_executes_registered_transport(
 
     assert result.status == "accepted"
     request = observed["request"]
-    assert request.source_roots == (tmp_path.resolve(),)
+    assert request.source_roots[0] == tmp_path.resolve()
+    assert request.source_roots[-1].name.startswith("reviewctl-project-source-")
+    assert not request.source_roots[-1].exists()
+    assert not request.files[0].exists()
     assert request.files[0].parent != tmp_path
     expected_digest = (
         get_contract("findings-json")
@@ -887,7 +934,10 @@ def test_project_review_can_confine_external_snapshot_root_for_github_sources(
     assert request.files[0].name == source.name
     assert request.files[0].parent != source_root
     assert request.files[0].parent != tmp_path
-    assert request.source_roots == (tmp_path.resolve(), source_root.resolve())
+    assert request.source_roots[:2] == (tmp_path.resolve(), source_root.resolve())
+    assert request.source_roots[-1].name.startswith("reviewctl-project-source-")
+    assert not request.source_roots[-1].exists()
+    assert not request.files[0].exists()
     assert not (
         tmp_path / ".reviewctl" / "reviews" / result.review_id / "attempt-01" / "source"
     ).exists()
@@ -1411,9 +1461,13 @@ def test_client_freezes_source_bytes_across_fallback_attempts(tmp_path: Path) ->
     initial = b"value = 1\n"
     source.write_bytes(initial)
     seen: list[bytes] = []
+    staged_paths: list[Path] = []
+    seen_roots: list[tuple[Path, ...]] = []
 
     class MutatingFallbackTransport:
         def execute(self, request):
+            staged_paths.append(request.files[0])
+            seen_roots.append(request.source_roots)
             seen.append(request.files[0].read_bytes())
             if len(seen) == 1:
                 source.write_bytes(b"value = 2\n")
@@ -1441,6 +1495,13 @@ def test_client_freezes_source_bytes_across_fallback_attempts(tmp_path: Path) ->
 
     assert result.status == "accepted"
     assert seen == [initial, initial]
+    assert staged_paths[0] != staged_paths[1]
+    assert all(not path.exists() for path in staged_paths)
+    assert all(roots[0] == tmp_path.resolve() for roots in seen_roots)
+    assert all(
+        path.parent == roots[-1] for path, roots in zip(staged_paths, seen_roots, strict=True)
+    )
+    assert not list((tmp_path / ".reviewctl" / "reviews").glob("**/source"))
     packet = json.loads(result.receipt_path.with_name("packet.json").read_text())
     assert packet["files"][0]["sha256"] == api_module._digest(initial)
     packet_digest = api_module._digest(
@@ -1449,6 +1510,101 @@ def test_client_freezes_source_bytes_across_fallback_attempts(tmp_path: Path) ->
     receipt = json.loads(result.receipt_path.read_text())
     assert receipt["packetDigest"] == packet_digest
     assert verify_project_receipt(result.receipt_path) is None
+
+
+def test_client_cleans_snapshot_before_unexpected_transport_error(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("secret = 1\n")
+    observed: list[Path] = []
+
+    class ExplodingTransport:
+        def execute(self, request):
+            observed.extend(request.files)
+            raise RuntimeError("unexpected")
+
+    client = ReviewClient.from_project(tmp_path, transports={"pi": ExplodingTransport()})
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        client.review(ReviewRequest(prompt="review", files=(source,)))
+
+    assert observed and all(not path.exists() for path in observed)
+    assert not list((tmp_path / ".reviewctl").glob("**/source"))
+
+
+def test_client_never_accepts_when_snapshot_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_default_config(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("secret = 1\n")
+    external = tmp_path.parent / f"{tmp_path.name}-undeletable"
+
+    class CleanupFailure:
+        def __init__(self, **kwargs: object) -> None:
+            external.mkdir()
+
+        def __enter__(self) -> str:
+            return str(external)
+
+        def __exit__(self, *args: object) -> None:
+            raise OSError("cleanup refused")
+
+    monkeypatch.setattr(api_module.tempfile, "TemporaryDirectory", CleanupFailure)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+
+    result = client.review(ReviewRequest(prompt="review", files=(source,)))
+
+    assert result.status == "transport_unavailable"
+    assert not external.exists()
+    assert not list((tmp_path / ".reviewctl").glob("**/source"))
+    assert str(external) not in result.receipt_path.read_text()
+
+
+def test_client_aborts_fallback_when_snapshot_cleanup_cannot_be_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:first/model", "pi:second/model"]\n'
+    )
+    source = tmp_path / "source.py"
+    source.write_text("secret = 1\n")
+    external = tmp_path.parent / f"{tmp_path.name}-undeletable"
+    transport = FakeTransport()
+    requests = []
+    real_execute = transport.execute
+    real_rmtree = api_module.shutil.rmtree
+
+    class CleanupFailure:
+        def __init__(self, **kwargs: object) -> None:
+            external.mkdir()
+
+        def __enter__(self) -> str:
+            return str(external)
+
+        def __exit__(self, *args: object) -> None:
+            raise OSError("cleanup refused")
+
+    def execute(request):
+        requests.append(request)
+        return real_execute(request)
+
+    def refuse_rescue(path: Path) -> None:
+        raise OSError(f"rescue refused for {path}")
+
+    transport.execute = execute
+    monkeypatch.setattr(api_module.tempfile, "TemporaryDirectory", CleanupFailure)
+    monkeypatch.setattr(api_module.shutil, "rmtree", refuse_rescue)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    with pytest.raises(RuntimeError, match="temporary source cleanup failed"):
+        client.review(ReviewRequest(prompt="review", files=(source,)))
+
+    assert len(requests) == 1
+    assert external.exists()
+    real_rmtree(external)
 
 
 @pytest.mark.parametrize(

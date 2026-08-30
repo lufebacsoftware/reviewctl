@@ -8,6 +8,8 @@ import math
 import os
 import re
 import secrets
+import shutil
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -41,6 +43,8 @@ class ReviewTransport(Protocol):
 
 
 _REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+PROJECT_CHECKPOINT_KIND = "project-review-checkpoint"
+PROJECT_CHECKPOINT_SCHEMA_VERSION = 1
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_FILES = 100
 MAX_SOURCE_SET_BYTES = 8 * 1024 * 1024
@@ -660,33 +664,39 @@ class ReviewClient:
                     "findings if they remain relevant and return one complete response: "
                     + json.dumps([asdict(finding) for finding in partial_findings], sort_keys=True)
                 )
-            if request.source_root is not None:
-                transport_files_tuple = source_files_tuple
-            else:
-                source_artifacts = ArtifactStore(attempt_artifacts.root / "source")
-                transport_files_tuple = tuple(
-                    source_artifacts.write_bytes(name, contents)
-                    for name, contents in zip(source_names, source_contents, strict=True)
-                )
-            transport_source_roots = (self.project_dir,)
-            if source_root != self.project_dir.resolve():
-                transport_source_roots += (source_root,)
-            backend_request = BackendRequest(
-                prompt=prompt,
-                model=route.model,
-                response_contract=profile.response_contract,
-                files=transport_files_tuple,
-                attempt_dir=attempt_root / f"attempt-{index:02d}",
-                timeout_seconds=profile.timeout_seconds,
-                max_output_tokens=profile.max_output_tokens or 0,
-                source_class=self.config.project.privacy_mode,
-                source_roots=transport_source_roots,
-                provider_preferences=None,
-                tools=profile.tools,
-            )
+            temporary_root: Path | None = None
             try:
-                execution = transport.execute(backend_request)
+                with tempfile.TemporaryDirectory(prefix="reviewctl-project-source-") as directory:
+                    temporary_root = Path(directory).resolve()
+                    source_artifacts = ArtifactStore(temporary_root)
+                    transport_files_tuple = tuple(
+                        source_artifacts.write_bytes(name, contents)
+                        for name, contents in zip(source_names, source_contents, strict=True)
+                    )
+                    transport_source_roots = (self.project_dir,)
+                    if source_root != self.project_dir.resolve():
+                        transport_source_roots += (source_root,)
+                    transport_source_roots += (temporary_root,)
+                    backend_request = BackendRequest(
+                        prompt=prompt,
+                        model=route.model,
+                        response_contract=profile.response_contract,
+                        files=transport_files_tuple,
+                        attempt_dir=attempt_artifacts.root,
+                        timeout_seconds=profile.timeout_seconds,
+                        max_output_tokens=profile.max_output_tokens or 0,
+                        source_class=self.config.project.privacy_mode,
+                        source_roots=transport_source_roots,
+                        provider_preferences=None,
+                        tools=profile.tools,
+                    )
+                    execution = transport.execute(backend_request)
             except OSError, UnicodeError, ValueError:
+                if temporary_root is not None and temporary_root.exists():
+                    try:
+                        shutil.rmtree(temporary_root)
+                    except OSError as cleanup_error:
+                        raise RuntimeError("temporary source cleanup failed") from cleanup_error
                 diagnostic = Diagnostic(
                     "transport_unavailable", "review transport failed", retryable=True
                 )
@@ -947,6 +957,8 @@ class ReviewClient:
         source_context: Mapping[str, Any] | None = None,
     ) -> tuple[Path, str]:
         receipt: dict[str, Any] = {
+            "artifactKind": PROJECT_CHECKPOINT_KIND,
+            "projectCheckpointSchemaVersion": PROJECT_CHECKPOINT_SCHEMA_VERSION,
             "reviewId": review_id,
             "route": route,
             "status": status,
@@ -999,7 +1011,7 @@ class ReviewClient:
 
 
 def verify_project_receipt(path: Path, *, expected_sha256: str | None = None) -> Diagnostic | None:
-    """Verify the digest of a receipt produced by the project API."""
+    """Check project checkpoint integrity; this is not canonical receipt verification."""
     try:
         value = json.loads(
             read_confined_text(path),
@@ -1011,6 +1023,13 @@ def verify_project_receipt(path: Path, *, expected_sha256: str | None = None) ->
         return Diagnostic("receipt_invalid", f"could not read receipt: {error}")
     if not isinstance(value, dict) or not isinstance(value.get("sha256"), str):
         return Diagnostic("receipt_invalid", "receipt is missing its sha256 digest")
+    marker_present = "artifactKind" in value or "projectCheckpointSchemaVersion" in value
+    if marker_present and (
+        value.get("artifactKind") != PROJECT_CHECKPOINT_KIND
+        or type(value.get("projectCheckpointSchemaVersion")) is not int
+        or value["projectCheckpointSchemaVersion"] != PROJECT_CHECKPOINT_SCHEMA_VERSION
+    ):
+        return Diagnostic("receipt_invalid", "project checkpoint marker is invalid")
     recorded = value["sha256"]
     if expected_sha256 is not None and recorded != expected_sha256:
         return Diagnostic(
