@@ -705,9 +705,10 @@ def llm_help_payload() -> dict[str, object]:
                     "--project PATH --profile default"
                 ),
                 "projectTransport": "pi",
+                "projectTransports": ["pi", "codex"],
                 "note": (
-                    "The project-scoped GitHub flow currently registers Pi only; "
-                    "use reviewctl run --transport codex for a formal Codex review."
+                    "Pi is the default project transport and Codex is available for a "
+                    "codex:MODEL profile route. Other direct backends use reviewctl run."
                 ),
             },
             "help-llm": "reviewctl help-llm --format json",
@@ -864,13 +865,14 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "successful receipt verification, and independent checking of material findings. "
         "Hash verification alone proves integrity, not acceptance.\n\n"
         "## GitHub pull-request review\n\n"
-        "The project-scoped GitHub flow currently registers the Pi transport only:\n\n"
+        "The project-scoped GitHub flow uses Pi by default and also registers Codex:\n\n"
         "```bash\n"
         "reviewctl github review --repo OWNER/REPO --pr NUMBER --project PATH "
         "--profile default\n"
         "```\n\n"
-        "For a formal review through Codex or another direct backend, use "
-        "`reviewctl run --transport TRANSPORT`; an unavailable receipt is not an approval.\n\n"
+        "Select `--profile` with a `codex:MODEL` route when the project should use Codex. "
+        "Other direct backends remain available through `reviewctl run --transport TRANSPORT`; "
+        "an unavailable receipt is not an approval.\n\n"
         "## Diagnose failures\n\n"
         "Do not retry blindly. A run that exits 1 still persists a receipt and attempt evidence. "
         "Read `attempt.json` fields `result`, `diagnostic`, `validationError`, and "

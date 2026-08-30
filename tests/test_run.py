@@ -3234,7 +3234,7 @@ def test_help_llm_describes_the_exploration_and_formal_review_boundary() -> None
     assert "turn.json:diagnostic" in result.stdout
     assert "not an approval" in result.stdout
     assert "reviewctl run" in result.stdout
-    assert "project-scoped GitHub flow currently registers the Pi transport only" in result.stdout
+    assert "project-scoped GitHub flow uses Pi by default and also registers Codex" in result.stdout
     assert "reviewctl github review" in result.stdout
 
 
@@ -3247,7 +3247,8 @@ def test_help_llm_json_is_machine_readable() -> None:
     assert "explore" in payload["commands"]
     assert payload["commands"]["explore"]["promote"]["approval"] == "never"
     assert payload["commands"]["github"]["projectTransport"] == "pi"
-    assert "reviewctl run --transport codex" in payload["commands"]["github"]["note"]
+    assert payload["commands"]["github"]["projectTransports"] == ["pi", "codex"]
+    assert "codex:MODEL" in payload["commands"]["github"]["note"]
     assert payload["commands"]["run"]["approval"] == (
         "only when receipt.result is accepted, acceptedAttempt names the accepted attempt, "
         "receipt verification succeeds, and material findings are independently checked"
