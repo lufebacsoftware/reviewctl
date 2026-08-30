@@ -830,7 +830,13 @@ def add_project_commands(commands: Any) -> None:
     github = commands.add_parser("github", help="run bounded GitHub pull-request workflows")
     github_commands = github.add_subparsers(dest="github_command", required=True)
     github_review = github_commands.add_parser(
-        "review", help="review a pull request and create a local publication plan"
+        "review",
+        help="review a pull request with the project-scoped Pi transport",
+        description=(
+            "Review a pull request and create a local publication plan. "
+            "The project-scoped GitHub flow currently registers Pi only; "
+            "use `reviewctl run --transport codex` for a formal Codex review."
+        ),
     )
     github_review.add_argument("--repo", required=True)
     github_review.add_argument("--pr", required=True, type=int)

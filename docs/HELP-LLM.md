@@ -35,6 +35,29 @@ blindly.
 two routes and `max_attempts = 2` can therefore make at most four bounded
 attempts; each attempt and transition is recorded in the receipt.
 
+The project-scoped GitHub pull-request flow currently registers the Pi
+transport only. It freezes the PR snapshot, reuses the project profile, and
+creates a local publication plan; it does not make Codex, AGY, Gemini, or
+other direct backends available through `reviewctl github review`:
+
+```bash
+reviewctl github review --repo OWNER/REPO --pr NUMBER --project PATH \
+  --profile default --format json
+```
+
+For a formal review through Codex or another direct backend, use the transport
+entry point explicitly and verify its receipt:
+
+```bash
+reviewctl run --review-id ID --transport codex --model MODEL \
+  --prompt-file FILE --file SOURCE
+reviewctl verify RECEIPT.json
+```
+
+An unavailable project-scoped receipt is a configuration/transport diagnostic,
+not an approval. Do not treat `reviewctl doctor`'s global profile listing as
+evidence that every profile is registered in the project API.
+
 Project findings are a rebuildable projection over the append-only journal.
 Repeated observations reuse a stable `findingId`; they do not create duplicate
 current findings or reopen a finding that is already `fixed`, `verified`,
