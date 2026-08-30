@@ -112,7 +112,8 @@ handling, it rejects:
   `projectId`, `originId`, `journalSequence`, `privacyMode`, `dimensionCoverage`, or
   `fallbackRelationships`. This is a subset test, not exact-key equality, for unversioned input and
   it runs regardless of a missing `configDigest` or extra `result` fields. An input claiming
-  `receiptSchemaVersion` follows strict V2 validation and cannot fall through to V1.
+  canonical `receiptSchemaVersion: 2` follows strict V2 validation; any other schema-version value
+  is rejected as unsupported. Neither branch can fall through to V1.
 
 The violation is `project-checkpoint-not-review-receipt`. Canonical V2 receipts continue through
 `validate_v2_receipt`; a historical generic V1 receipt augmented only with `configDigest` retains

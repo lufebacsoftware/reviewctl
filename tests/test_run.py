@@ -7762,6 +7762,26 @@ def test_project_checkpoint_with_forged_v2_schema_fails_v2_validation(tmp_path: 
     assert payload["violations"]
 
 
+@pytest.mark.parametrize("schema_version", [None, 1, "2", True])
+def test_project_fields_with_noncanonical_schema_version_never_fall_to_v1(
+    schema_version: object, tmp_path: Path
+) -> None:
+    receipt = {
+        "reviewId": "review-1",
+        "projectId": "project-1",
+        "receiptSchemaVersion": schema_version,
+        "status": "accepted",
+    }
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json(receipt))
+    receipt_path = tmp_path / "checkpoint.json"
+    receipt_path.write_bytes(cli.canonical_json(receipt) + b"\n")
+
+    verified = run_cli("verify", str(receipt_path))
+
+    assert verified.returncode == 1
+    assert json.loads(verified.stdout)["violations"] == ["receipt-schema-version"]
+
+
 def test_verify_rejects_an_explicitly_marked_project_checkpoint(tmp_path: Path) -> None:
     receipt = {
         "artifactKind": "project-review-checkpoint",
