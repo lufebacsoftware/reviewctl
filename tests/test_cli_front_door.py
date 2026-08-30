@@ -1173,6 +1173,11 @@ def test_verify_rejects_a_project_checkpoint_as_noncanonical(tmp_path: Path, cap
         "reviewId": "review-1",
         "configDigest": "config",
         "projectId": "project-1",
+        "originId": "origin-1",
+        "journalSequence": 1,
+        "privacyMode": "private",
+        "dimensionCoverage": {},
+        "fallbackRelationships": [],
         "status": "accepted",
     }
     canonical = json.dumps(unsigned, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
