@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import reviewctl.project_cli as project_cli
-from reviewctl.api import Finding, ReviewResult
+from reviewctl.api import Finding, ReviewClient, ReviewRequest, ReviewResult
 from reviewctl.cli import run_cli
 from reviewctl.config import load_config
 from reviewctl.errors import Diagnostic, JournalOperationError
@@ -147,6 +147,37 @@ def test_init_creates_private_project_config_and_refuses_accidental_overwrite(
 
     assert run_cli(["init", "--project", str(tmp_path)]) == 2
     assert "already exists" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode", ["private", "sensitive"])
+def test_init_generates_an_inert_roster_free_project(mode: str, tmp_path: Path) -> None:
+    assert run_cli(["init", "--project", str(tmp_path), "--mode", mode]) == 0
+
+    contents = (tmp_path / "reviewctl.toml").read_text()
+    profile = load_config(tmp_path / "reviewctl.toml", user_path=None).profile("default")
+
+    assert profile.routes == ()
+    assert profile.execution == "local"
+    for forbidden in ("openrouter", "ox-alpha", "pi:", 'execution = "remote"'):
+        assert forbidden not in contents
+
+
+def test_fresh_inert_project_refuses_without_attempt_or_transport(tmp_path: Path) -> None:
+    assert run_cli(["init", "--project", str(tmp_path)]) == 0
+
+    class UnreachableTransport:
+        def execute(self, request):
+            raise AssertionError("an empty route must not invoke a transport")
+
+    client = ReviewClient.from_project(tmp_path, transports={"pi": UnreachableTransport()})
+    before = tuple(client.journal().events())
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == "route_invalid"
+    assert result.receipt_path == Path()
+    assert tuple(client.journal().events()) == before
+    assert not (tmp_path / ".reviewctl" / "reviews").exists()
 
 
 def test_init_reuses_retained_identity_when_project_config_is_missing(tmp_path: Path) -> None:

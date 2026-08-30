@@ -23,6 +23,12 @@ The current operating roster is private evidence, not a permanent instruction.
 Consult the organization's evidence repository when selecting a specialized
 review lane.
 
+`reviewctl init` deliberately creates an inert default profile with no routes
+and local execution. Initialization is not model selection: organization policy
+or an explicit project-local configuration step must add an approved route
+before a review can run. The generated file is therefore never an operating
+roster and cannot send source remotely by default.
+
 Projects may state when review is required and which commands to run, but they
 must not embed Kiro model tables. Runtime model inventory, prices, credits,
 provider commands, qualification, and tournament evidence stay outside project

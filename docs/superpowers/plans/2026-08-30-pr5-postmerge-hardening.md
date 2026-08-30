@@ -28,7 +28,7 @@
 - Modify: `tests/test_cli_front_door.py:1080-1110`
 - Modify: `docs/PROJECT-INTEGRATION.md`
 
-- [ ] **Step 1: Replace the old init expectation with failing private/sensitive tests**
+- [x] **Step 1: Replace the old init expectation with failing private/sensitive tests**
 
 ```python
 @pytest.mark.parametrize("mode", ["private", "sensitive"])
@@ -62,7 +62,7 @@ def test_fresh_inert_project_refuses_without_attempt_or_transport(tmp_path: Path
     assert not (tmp_path / ".reviewctl" / "reviews").exists()
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 ```bash
 uv run --python 3.14 pytest -q \
@@ -72,7 +72,7 @@ uv run --python 3.14 pytest -q \
 
 Expected: the init test fails because the private template still names Ox and uses remote execution; the existing early refusal remains green.
 
-- [ ] **Step 3: Make the template unconditionally inert**
+- [x] **Step 3: Make the template unconditionally inert**
 
 ```toml
 [profiles.default]
@@ -87,7 +87,7 @@ max_output_tokens = 8000
 
 Delete the sensitive-mode string replacement; mode now changes only `privacy_mode`.
 
-- [ ] **Step 4: Document and verify the boundary**
+- [x] **Step 4: Document and verify the boundary**
 
 Add to `docs/PROJECT-INTEGRATION.md`: initialization is deliberately inert; organization policy or an explicit project-local edit supplies a route, and the template is not an operating roster. Then run:
 
