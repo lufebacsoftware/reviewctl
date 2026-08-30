@@ -108,10 +108,11 @@ Global `reviewctl verify` no longer delegates to `verify_project_receipt`. Befor
 handling, it rejects:
 
 - a marked project checkpoint; and
-- a recognizable historical project-checkpoint signature: `configDigest` plus any one of the
-  project-only fields `projectId`, `originId`, `journalSequence`, `privacyMode`,
-  `dimensionCoverage`, or `fallbackRelationships`. This is a subset test, not exact-key equality,
-  and it runs regardless of extra `result` or `receiptSchemaVersion` fields.
+- a recognizable historical project-checkpoint signature: any one of the project-only fields
+  `projectId`, `originId`, `journalSequence`, `privacyMode`, `dimensionCoverage`, or
+  `fallbackRelationships`. This is a subset test, not exact-key equality, for unversioned input and
+  it runs regardless of a missing `configDigest` or extra `result` fields. An input claiming
+  `receiptSchemaVersion` follows strict V2 validation and cannot fall through to V1.
 
 The violation is `project-checkpoint-not-review-receipt`. Canonical V2 receipts continue through
 `validate_v2_receipt`; a historical generic V1 receipt augmented only with `configDigest` retains
@@ -195,8 +196,9 @@ Every production change follows red-green-refactor.
    `project-checkpoint-not-review-receipt`; direct internal verification still detects tampering
    and expected-digest mismatch. Canonical V1 and V2 controls retain their existing outcomes. A
    recomputed generic V1 control augmented only with `configDigest` still follows the V1 path;
-   adding any project-only field makes it a rejected checkpoint even if `result`, extra keys, or a
-   schema-version key are also present. Deleting or adding one unrelated key cannot evade the
+   adding any project-only field makes an unversioned document a rejected checkpoint even if
+   `result` or extra keys are present. A forged V2 schema claim must fail V2 validation rather than
+   fall through to V1. Removing `configDigest` or adding/deleting an unrelated key cannot evade the
    subset classifier. A `RuntimeError` transport probe also demonstrates cleanup before the
    unexpected exception propagates.
 3. **Template:** all init modes generate empty routes and local execution with no provider/model

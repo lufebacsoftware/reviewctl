@@ -349,7 +349,9 @@ def project_checkpoint_shape(value: object) -> bool:
         return True
     if "projectCheckpointSchemaVersion" in value:
         return True
-    return "configDigest" in value and bool(PROJECT_CHECKPOINT_FIELDS.intersection(value))
+    if "receiptSchemaVersion" in value:
+        return False
+    return bool(PROJECT_CHECKPOINT_FIELDS.intersection(value))
 ```
 
 Call it before V1/V2 validation and emit `project-checkpoint-not-review-receipt`. Delete global delegation to `verify_project_receipt`.

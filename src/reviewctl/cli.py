@@ -5773,7 +5773,9 @@ def project_checkpoint_shape(value: object) -> bool:
         return True
     if "projectCheckpointSchemaVersion" in value:
         return True
-    return "configDigest" in value and bool(PROJECT_CHECKPOINT_FIELDS.intersection(value))
+    if "receiptSchemaVersion" in value:
+        return False
+    return bool(PROJECT_CHECKPOINT_FIELDS.intersection(value))
 
 
 def verify_receipt(args: argparse.Namespace) -> int:
