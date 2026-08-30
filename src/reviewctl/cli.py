@@ -3067,7 +3067,6 @@ def invoke_agy(
     ]
     if schema := response_schema(response_contract):
         command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
-    command.append("--print")
     capture_file_limit = max(MAX_AGY_STDOUT_BYTES, MAX_AGY_STDERR_BYTES) + 1
 
     def limit_output_files() -> None:
@@ -3078,11 +3077,22 @@ def invoke_agy(
 
     try:
         with tempfile.TemporaryDirectory(prefix="reviewctl-agy-") as sandbox:
+            packet_path = Path(sandbox) / "review-packet.txt"
+            packet_path.write_text(packet)
+            command.extend(
+                [
+                    "--add-dir",
+                    sandbox,
+                    "--print",
+                    "Read only the complete review packet from review-packet.txt in the current "
+                    "directory. Follow its review instructions and return only the requested "
+                    "response.",
+                ]
+            )
             with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
                 process = subprocess.Popen(
                     command,
                     cwd=sandbox,
-                    stdin=subprocess.PIPE,
                     stdout=stdout_file,
                     stderr=stderr_file,
                     start_new_session=True,
@@ -3090,7 +3100,7 @@ def invoke_agy(
                 )
                 try:
                     communicated_stdout, communicated_stderr = process.communicate(
-                        input=packet.encode(), timeout=timeout_seconds
+                        timeout=timeout_seconds
                     )
                 except subprocess.TimeoutExpired:
                     terminate_process_group(process)

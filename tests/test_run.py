@@ -1102,6 +1102,8 @@ from pathlib import Path
 
 arguments = sys.argv[1:]
 packet = sys.stdin.read()
+if not packet and Path('review-packet.txt').is_file():
+    packet = Path('review-packet.txt').read_text()
 if log := os.environ.get('AGY_ARGUMENTS_LOG'):
     Path(log).write_text(json.dumps(arguments))
 if stdin_log := os.environ.get('AGY_STDIN_LOG'):
@@ -10074,7 +10076,7 @@ def test_invoke_agy_persists_a_sandboxed_structured_response(tmp_path: Path) -> 
     assert json.loads(response_path.read_text())["conversation_id"] == "agy-conversation"
 
 
-def test_invoke_agy_sends_the_review_packet_over_standard_input(
+def test_invoke_agy_passes_the_review_packet_to_print_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_agy = write_fake_agy(tmp_path)
@@ -10099,8 +10101,10 @@ def test_invoke_agy_sends_the_review_packet_over_standard_input(
 
     arguments = json.loads(arguments_log.read_text())
     assert result[0] == 0
-    assert arguments[-1] == "--print"
+    assert arguments[-2] == "--print"
     assert max(map(len, arguments)) < 10_000
+    request = json.loads((tmp_path / "request.json").read_text())
+    assert stdin_log.read_text() == request["prompt"]
     assert len(stdin_log.read_bytes()) > cli.MAX_FRAGMENT_BYTES
 
 
