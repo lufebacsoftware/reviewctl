@@ -487,7 +487,7 @@ environment, top-level `reviewctl init` emitted the inert template, canonical V1
 verified, and a marked project checkpoint was rejected with
 `project-checkpoint-not-review-receipt`. The temporary environment was moved recoverably to Trash.
 
-- [ ] **Step 3: Run final exact-commit review packets**
+- [x] **Step 3: Run final exact-commit review packets**
 
 Use `reviewctl`, maximum three files per packet:
 
@@ -496,6 +496,21 @@ Use `reviewctl`, maximum three files per packet:
 - transport: Antigravity implementation, focused tests, design.
 
 Every accepted receipt must pass `reviewctl verify`. Unavailable reviewers remain unavailable. Reproduce every finding on the exact candidate SHA.
+
+Execution evidence for source/test head `bd0e2aa`:
+
+- Sol final range review `reviewctl-pr5-final-bd0e2aa-sol` is accepted, approved, has no findings,
+  and its manifest/aggregate verify at
+  `~/Code/reviews/reviewctl-pr5-hardening-final/sol-final/`.
+- Muse final range review `reviewctl-pr5-final-bd0e2aa-muse` is accepted with
+  `changes-requested`; its three findings were independently refuted. Python 3.14 imports both
+  modules despite the newly legal unparenthesized multi-exception syntax, and the exact cleanup,
+  AGY, and checkpoint probes pass. The rescue removal is intentionally reachable only when
+  `TemporaryDirectory.__exit__` fails; normal transport failures use the context manager's normal
+  cleanup. The receipt remains preserved as advisory dissent, not approval.
+- An earlier Muse retry was `unavailable` and is not approval. Earlier Sol findings about residual
+  cleanup, over-broad V1 classification, and the stale front-door fixture were reproduced and fixed
+  before the approved final Sol range.
 
 - [ ] **Step 4: Push and create or update the PR without merging**
 
