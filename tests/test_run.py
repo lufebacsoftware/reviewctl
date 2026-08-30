@@ -339,6 +339,106 @@ def test_range_review_formal_mode_persists_incomplete_aggregate_on_failed_chunk(
     assert json.loads(verified.stdout)["valid"] is False
 
 
+def test_range_review_formal_mode_rejects_stale_receipt_after_failed_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    first_aggregate_path = tmp_path / "first-aggregate.json"
+    second_aggregate_path = tmp_path / "second-aggregate.json"
+    third_aggregate_path = tmp_path / "third-aggregate.json"
+    artifacts = tmp_path / "artifacts"
+    fake_llm = write_fake_llm(tmp_path)
+    policy_path = tmp_path / "policy.toml"
+    policy_path.write_text("[models]\n")
+
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(manifest_path),
+        ).returncode
+        == 0
+    )
+    first_result = run_cli(
+        "range-review",
+        "--manifest",
+        str(manifest_path),
+        "--review-id",
+        "range-stale",
+        "--prompt",
+        "Review this frozen patch.",
+        "--model",
+        "accepted",
+        "--transport",
+        "llm",
+        "--source-class",
+        "synthetic",
+        "--policy",
+        str(policy_path),
+        "--artifact-root",
+        str(artifacts),
+        "--aggregate-output",
+        str(first_aggregate_path),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+    assert first_result.returncode == 0, first_result.stderr
+    old_receipt = Path(json.loads(first_aggregate_path.read_text())["chunks"][0]["receipt"])
+
+    args = argparse.Namespace(
+        manifest=str(manifest_path),
+        review_id="range-stale",
+        prompt="Review this frozen patch.",
+        prompt_file=None,
+        model="accepted",
+        transport="llm",
+        policy=str(policy_path),
+        source_class="synthetic",
+        response_contract="findings-json",
+        aggregate_output=str(second_aggregate_path),
+        artifact_root=str(artifacts),
+        timeout_seconds=1,
+        max_output_tokens=10,
+        max_attempts=1,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_range_child_process",
+        lambda command, *, timeout_seconds: (
+            17,
+            f"{old_receipt.parent}\n".encode(),
+            b"child failed",
+        ),
+    )
+
+    result = cli.run_range_review(cli.build_parser(), args)
+
+    assert result != 0
+    aggregate = json.loads(second_aggregate_path.read_text())
+    assert aggregate["result"] == "incomplete"
+    assert aggregate["aggregate"]["approved"] is False
+
+    args.aggregate_output = str(third_aggregate_path)
+    monkeypatch.setattr(
+        cli,
+        "_range_child_process",
+        lambda command, *, timeout_seconds: (0, f"{old_receipt.parent}\n".encode(), b""),
+    )
+
+    result = cli.run_range_review(cli.build_parser(), args)
+
+    assert result != 0
+    aggregate = json.loads(third_aggregate_path.read_text())
+    assert aggregate["result"] == "incomplete"
+    assert aggregate["aggregate"]["approved"] is False
+
+
 def test_range_cli_error_and_capture_helpers_are_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

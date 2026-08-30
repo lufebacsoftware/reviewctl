@@ -1845,23 +1845,23 @@ def run_range_review(parser: argparse.ArgumentParser, args: argparse.Namespace) 
             ]
             if args.policy:
                 command.extend(("--policy", str(Path(args.policy).expanduser().resolve())))
-            return_code, stdout, _ = _range_child_process(
-                command, timeout_seconds=timeout_seconds + 10
+            before_receipts = receipt_fingerprints(artifact_root)
+            return_code, _, _ = _range_child_process(command, timeout_seconds=timeout_seconds + 10)
+            receipt_path = tournament_receipt_path(
+                artifact_root,
+                before_receipts,
+                f"{args.review_id}.chunk-{index}",
             )
-            receipt_path: Path | None = None
-            for line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
-                candidate = Path(line.strip())
-                if candidate.is_dir() and (candidate / "receipt.json").is_file():
-                    receipt_path = candidate / "receipt.json"
-                    break
             record = _range_chunk_record(
                 index=index,
                 chunk=chunk,
                 review_id=args.review_id,
                 receipt_path=receipt_path,
             )
-            if return_code != 0 and record["result"] == "missing":
+            if return_code != 0:
                 record["result"] = "unavailable"
+                record["verdict"] = None
+                record["findings"] = []
             records.append(record)
     aggregate = build_range_aggregate(
         manifest,
