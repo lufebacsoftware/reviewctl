@@ -1629,27 +1629,62 @@ def _range_child_process(
 ) -> tuple[int, bytes, bytes]:
     """Run a child review with bounded stdout/stderr capture."""
     checkout_root = Path(__file__).resolve().parents[2]
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        process = subprocess.Popen(
-            command,
-            cwd=checkout_root,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            start_new_session=True,
+    process = subprocess.Popen(
+        command,
+        cwd=checkout_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    captures: dict[str, bytes] = {}
+
+    def drain(stream: object, name: str, limit: int) -> None:
+        if stream is None:  # pragma: no cover - Popen with PIPE always supplies both streams
+            captures[name] = b""
+            return
+        retained = bytearray()
+        while True:
+            chunk = stream.read(64 * 1024)  # type: ignore[union-attr]
+            if not chunk:
+                break
+            if len(retained) <= limit:
+                retained.extend(chunk[: limit + 1 - len(retained)])
+        captures[name] = bytes(retained)
+
+    stdout_reader = threading.Thread(
+        target=drain,
+        args=(process.stdout, "stdout", MAX_RANGE_CHILD_STDOUT_BYTES),
+        daemon=True,
+        name="reviewctl-range-stdout",
+    )
+    stderr_reader = threading.Thread(
+        target=drain,
+        args=(process.stderr, "stderr", MAX_RANGE_CHILD_STDERR_BYTES),
+        daemon=True,
+        name="reviewctl-range-stderr",
+    )
+    stdout_reader.start()
+    stderr_reader.start()
+    try:
+        process.wait(timeout=timeout_seconds)
+        exit_code = process.returncode
+    except subprocess.TimeoutExpired:
+        terminate_process_group(process)
+        reap_process_without_blocking(process)
+        exit_code = 124
+    stdout_reader.join(timeout=5)
+    stderr_reader.join(timeout=5)
+    stdout = captures.get("stdout", b"")
+    stderr = captures.get("stderr", b"")
+    if len(stdout) > MAX_RANGE_CHILD_STDOUT_BYTES or len(stderr) > MAX_RANGE_CHILD_STDERR_BYTES:
+        return (
+            502,
+            stdout[:MAX_RANGE_CHILD_STDOUT_BYTES],
+            stderr[:MAX_RANGE_CHILD_STDERR_BYTES],
         )
-        try:
-            process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            terminate_process_group(process)
-            reap_process_without_blocking(process)
-            return 124, b"", b"range chunk review timed out"
-        stdout_file.seek(0)
-        stdout = stdout_file.read(MAX_RANGE_CHILD_STDOUT_BYTES + 1)
-        stderr_file.seek(0)
-        stderr = stderr_file.read(MAX_RANGE_CHILD_STDERR_BYTES + 1)
-        if len(stdout) > MAX_RANGE_CHILD_STDOUT_BYTES or len(stderr) > MAX_RANGE_CHILD_STDERR_BYTES:
-            return 502, stdout[:MAX_RANGE_CHILD_STDOUT_BYTES], stderr[:MAX_RANGE_CHILD_STDERR_BYTES]
-        return process.returncode, stdout, stderr
+    if exit_code == 124:
+        return 124, stdout, stderr or b"range chunk review timed out"
+    return exit_code, stdout, stderr
 
 
 def _range_chunk_record(
@@ -1835,7 +1870,6 @@ def run_range_review(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         args.review_id,
         records,
         receipt_loader=lambda path: load_range_json(Path(path).expanduser().resolve()),
-        receipt_validator=validate_v2_receipt,
     )
     try:
         aggregate_path.parent.mkdir(parents=True, exist_ok=True)

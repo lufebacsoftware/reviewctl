@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from reviewctl.contracts import canonical_json as contract_canonical_json
+from reviewctl.review_flow import validate_v2_receipt
 
 CHUNKING_VERSION = "file-sections-v1"
 RANGE_REVIEW_SCHEMA_VERSION = 1
@@ -527,10 +528,10 @@ def build_range_aggregate(
 ) -> dict[str, Any]:
     """Build a deterministic aggregate from verified persisted chunk results.
 
-    A complete aggregate is never emitted unless the caller supplies both a
-    receipt loader and the schema-v2 validator used to verify every receipt.
-    Callers that only need a deterministic incomplete progress artifact may
-    omit those callbacks.
+    A complete aggregate is never emitted unless the caller supplies a receipt
+    loader and the built-in schema-v2 validator accepts every receipt. The
+    optional validator is an additional policy check. Callers that only need a
+    deterministic incomplete progress artifact may omit the loader.
     """
     manifest_violations = validate_range_manifest(manifest)
     if manifest_violations:
@@ -556,7 +557,7 @@ def build_range_aggregate(
         and type(record.get("findings")) is list
         for index, record in enumerate(chunk_records)
     )
-    complete = structurally_complete and callable(receipt_loader) and callable(receipt_validator)
+    complete = structurally_complete and callable(receipt_loader)
     findings: list[dict[str, Any]] = []
     for record in chunk_records:
         if type(record) is not dict or type(record.get("findings")) is not list:
@@ -768,9 +769,13 @@ def verify_range_aggregate(
             ):
                 reject("receipt-source")
                 all_receipts_valid = False
-        for violation in receipt_validator(receipt):
+        for violation in validate_v2_receipt(receipt):
             reject(f"receipt-{violation}")
             all_receipts_valid = False
+        if receipt_validator is not None:
+            for violation in receipt_validator(receipt):
+                reject(f"receipt-{violation}")
+                all_receipts_valid = False
         if record.get("result") != receipt.get("result"):
             reject("chunk-result")
             all_receipts_valid = False

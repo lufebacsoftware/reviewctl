@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from reviewctl import range_review
+from reviewctl.contracts import ContractContext, canonical_json, get_contract
 from reviewctl.range_review import (
     RangeReviewError,
     build_range_aggregate,
@@ -18,6 +19,7 @@ from reviewctl.range_review import (
     range_identity,
     verify_range_aggregate,
 )
+from reviewctl.review_flow import consolidate
 
 
 def make_fake_receipt(
@@ -26,20 +28,79 @@ def make_fake_receipt(
     chunk: dict[str, object],
     manifest: dict[str, object],
 ) -> dict[str, object]:
+    filename = f"chunk-{chunk['index']:04d}.patch"
+    context = ContractContext(file_names=(filename,))
+    contract = get_contract("findings-json")
+    payload = json.dumps({"verdict": "approved", "findings": []})
+    evaluation = contract.evaluate(payload, contract.prepare(context), context)
+    evaluation_dict = {
+        "name": evaluation.name,
+        "version": evaluation.version,
+        "preparedSha256": evaluation.prepared_digest,
+        "payloadSha256": evaluation.payload_digest,
+        "normalizedSha256": evaluation.normalized_digest,
+        "normalizedValue": evaluation.value,
+        "contractContext": {
+            "fileNames": [filename],
+            "reviewDeclarationRequired": False,
+        },
+        "violations": list(evaluation.violations),
+        "status": evaluation.status.value,
+        "fragments": [],
+        "coverage": {
+            "requiredFields": list(evaluation.coverage.required_fields),
+            "coveredFields": list(evaluation.coverage.covered_fields),
+            "missingFields": list(evaluation.coverage.missing_fields),
+        },
+        "completionRequest": None,
+    }
     receipt = {
+        "receiptSchemaVersion": 2,
         "reviewId": review_id,
         "result": "accepted",
+        "acceptedAttempt": 1,
+        "sourceClass": "synthetic",
         "verdict": "approved",
         "findings": [],
         "source": {
             "files": [
                 {
-                    "name": f"chunk-{chunk['index']:04d}.patch",
+                    "name": filename,
                     "path": str(path),
                     "sha256": chunk["patchSha256"],
                 }
             ]
         },
+        "transport": "llm",
+        "reviewContract": "findings-json",
+        "contract": {"name": "findings-json", "version": "1"},
+        "prompt": {"packetSha256": "b" * 64},
+        "routes": [{"model": "model", "transport": "llm"}],
+        "attempts": [
+            {
+                "number": 1,
+                "routeIndex": 0,
+                "route": {"model": "model", "transport": "llm"},
+                "transport": "llm",
+                "model": {"requested": "model", "resolved": "model"},
+                "result": "accepted",
+                "rawResponse": {
+                    "path": "attempts/01/raw-response.txt",
+                    "sha256": evaluation.payload_digest,
+                    "characters": len(payload),
+                },
+                "contractEvaluation": evaluation_dict,
+                "promotedFragments": [],
+                "findings": [],
+            }
+        ],
+        "fallbackRelationships": [],
+        "consolidatedReview": consolidate(
+            {"verdict": "approved", "findings": []},
+            (),
+            1,
+            contract_context=context,
+        ).to_dict(),
         "extension.rangeReview": {
             "rangeReviewSchemaVersion": 1,
             "manifestSha256": manifest_sha256(manifest),
@@ -50,9 +111,9 @@ def make_fake_receipt(
         },
     }
     receipt["sha256"] = hashlib.sha256(
-        json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        canonical_json(receipt)
     ).hexdigest()
-    raw = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    raw = canonical_json(receipt)
     path.write_bytes(raw + b"\n")
     return receipt
 
@@ -575,6 +636,20 @@ def test_range_aggregate_verifies_every_chunk_and_receipt_identity(tmp_path: Pat
         receipt_validator=lambda _: ("invalid",),
     )
     assert unverified["result"] == "incomplete"
+    minimal = {
+        "reviewId": "range.chunk-0",
+        "result": "accepted",
+        "verdict": "approved",
+        "findings": [],
+    }
+    forged = build_range_aggregate(
+        manifest,
+        "range",
+        records,
+        receipt_loader=lambda path: (canonical_json(minimal), minimal),
+        receipt_validator=lambda _: (),
+    )
+    assert forged["result"] == "incomplete"
 
 
 @pytest.mark.parametrize(

@@ -368,32 +368,45 @@ def test_range_cli_error_and_capture_helpers_are_bounded(
 
     class TimeoutProcess:
         returncode = None
+        stdout = BytesIO()
+        stderr = BytesIO()
 
-        def communicate(self, *, timeout: int) -> None:
-            raise subprocess.TimeoutExpired([], timeout)
-
-        def wait(self, **kwargs: object) -> int:
+        def wait(self, *, timeout: int | None = None) -> int:
+            if timeout is not None:
+                raise subprocess.TimeoutExpired([], timeout)
             self.returncode = -15
             return self.returncode
 
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: TimeoutProcess())
     monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
+    monkeypatch.setattr(cli, "reap_process_without_blocking", lambda process: None)
     assert cli._range_child_process(["reviewctl"], timeout_seconds=1)[0] == 124
+
+    class Stream:
+        def __init__(self, payloads: list[bytes]):
+            self.payloads = payloads
+
+        def read(self, _size: int) -> bytes:
+            return self.payloads.pop(0) if self.payloads else b""
 
     class OversizedProcess:
         returncode = 0
 
-        def __init__(self, stdout, stderr):
-            stdout.write(b"x" * (cli.MAX_RANGE_CHILD_STDOUT_BYTES + 1))
-            stderr.write(b"y" * (cli.MAX_RANGE_CHILD_STDERR_BYTES + 1))
+        def __init__(self):
+            self.stdout = Stream(
+                [b"x" * (cli.MAX_RANGE_CHILD_STDOUT_BYTES + 1), b"x"]
+            )
+            self.stderr = Stream(
+                [b"y" * (cli.MAX_RANGE_CHILD_STDERR_BYTES + 1), b"y"]
+            )
 
-        def communicate(self, *, timeout: int) -> None:
-            return None
+        def wait(self, *, timeout: int) -> int:
+            return self.returncode
 
     monkeypatch.setattr(
         cli.subprocess,
         "Popen",
-        lambda command, **kwargs: OversizedProcess(kwargs["stdout"], kwargs["stderr"]),
+        lambda command, **kwargs: OversizedProcess(),
     )
     assert cli._range_child_process(["reviewctl"], timeout_seconds=1)[0] == 502
 
