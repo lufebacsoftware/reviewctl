@@ -3172,12 +3172,13 @@ def invoke_agy(
     usage_values = usage if isinstance(usage, dict) else {}
     duration_seconds = numeric_value(payload.get("duration_seconds"))
     conversation_id = payload.get("conversation_id")
-    structured_output = payload.get("structured_output")
-    response = (
-        canonical_json(structured_output).decode()
-        if isinstance(structured_output, dict)
-        else payload.get("response")
-    )
+    if "structured_output" not in payload:
+        response = payload.get("response")
+    else:
+        structured_output = payload["structured_output"]
+        if not isinstance(structured_output, dict):
+            return 502, "agy returned invalid structured output", blank
+        response = canonical_json(structured_output).decode()
     return (
         0,
         "",

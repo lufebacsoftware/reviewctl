@@ -10483,7 +10483,7 @@ def test_agy_structured_object_still_requires_the_selected_response_contract(
     assert receipt["acceptedAttempt"] is None
     assert receipt["attempts"][0]["result"] == "incomplete"
     assert receipt["attempts"][0]["validationError"] == (
-        "findings-json: missing required field 'verdict'"
+        "findings-json: response fields do not match the required schema"
     )
 
 
