@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import errno
 import hashlib
@@ -100,6 +101,726 @@ def run_cli(*arguments: str, env: dict[str, str] | None = None) -> subprocess.Co
     )
 
 
+def make_range_cli_repository(tmp_path: Path) -> tuple[Path, str, str]:
+    repository = tmp_path / "range-repository"
+    repository.mkdir()
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "--quiet")
+    git("config", "user.email", "reviewctl@example.invalid")
+    git("config", "user.name", "reviewctl tests")
+    (repository / "ledger.txt").write_text("base\n")
+    git("add", "ledger.txt")
+    git("commit", "--quiet", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    (repository / "ledger.txt").write_text("base\nchanged\n")
+    git("add", "ledger.txt")
+    git("commit", "--quiet", "-m", "change")
+    return repository, base, git("rev-parse", "HEAD")
+
+
+def test_range_review_cli_writes_manifest_without_approval_fields(tmp_path: Path) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    output = tmp_path / "manifest.json"
+    repeated_output = tmp_path / "manifest-repeated.json"
+
+    result = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(output.read_text())
+    assert manifest["status"] == "manifest-created"
+    assert manifest["baseSha"] == base
+    assert manifest["headSha"] == head
+    assert manifest["chunkCount"] == 1
+    assert "receipt" not in manifest
+    assert "approved" not in manifest
+    assert str(output) in result.stdout
+
+    time.sleep(1.1)
+    repeated = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--output",
+        str(repeated_output),
+    )
+    assert repeated.returncode == 0, repeated.stderr
+    assert output.read_bytes() == repeated_output.read_bytes()
+
+
+def test_range_review_cli_fails_closed_for_invalid_head_and_oversized_chunk(
+    tmp_path: Path,
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    invalid_output = tmp_path / "invalid.json"
+
+    invalid = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        "missing-head",
+        "--output",
+        str(invalid_output),
+    )
+
+    assert invalid.returncode != 0
+    assert "could not resolve head" in invalid.stderr
+    assert not invalid_output.exists()
+
+    oversized_output = tmp_path / "oversized.json"
+    oversized = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--max-chunk-bytes",
+        "32",
+        "--output",
+        str(oversized_output),
+    )
+
+    assert oversized.returncode != 0
+    assert "single file diff exceeds" in oversized.stderr
+    assert not oversized_output.exists()
+
+
+def test_range_review_formal_mode_runs_each_frozen_chunk_and_verifies_aggregate(
+    tmp_path: Path,
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    aggregate_path = tmp_path / "aggregate.json"
+    artifacts = tmp_path / "artifacts"
+    fake_llm = write_fake_llm(tmp_path)
+    policy_path = tmp_path / "policy.toml"
+    policy_path.write_text("[models]\n")
+
+    manifest_result = run_cli(
+        "range-review",
+        "--repository",
+        str(repository),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--output",
+        str(manifest_path),
+    )
+    assert manifest_result.returncode == 0, manifest_result.stderr
+
+    formal_result = run_cli(
+        "range-review",
+        "--manifest",
+        str(manifest_path),
+        "--review-id",
+        "range-formal",
+        "--prompt",
+        "Review this frozen patch.",
+        "--model",
+        "accepted",
+        "--transport",
+        "llm",
+        "--source-class",
+        "synthetic",
+        "--policy",
+        str(policy_path),
+        "--artifact-root",
+        str(artifacts),
+        "--aggregate-output",
+        str(aggregate_path),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert formal_result.returncode == 0, formal_result.stderr
+    aggregate = json.loads(aggregate_path.read_text())
+    assert aggregate["result"] == "accepted"
+    assert aggregate["aggregate"]["approved"] is True
+    assert len(aggregate["chunks"]) == 1
+    assert aggregate["chunks"][0]["reviewId"] == "range-formal.chunk-0"
+    receipt_path = Path(aggregate["chunks"][0]["receipt"])
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["extension.rangeReview"]["chunkIndex"] == 0
+    assert receipt["extension.rangeReview"]["manifestSha256"] == aggregate["manifestSha256"]
+
+    verified = run_cli(
+        "range-verify",
+        "--manifest",
+        str(manifest_path),
+        "--aggregate",
+        str(aggregate_path),
+    )
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["valid"] is True
+
+
+def test_range_review_formal_mode_persists_incomplete_aggregate_on_failed_chunk(
+    tmp_path: Path,
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    aggregate_path = tmp_path / "aggregate.json"
+    fake_llm = write_fake_llm(tmp_path)
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(manifest_path),
+        ).returncode
+        == 0
+    )
+
+    formal_result = run_cli(
+        "range-review",
+        "--manifest",
+        str(manifest_path),
+        "--review-id",
+        "range-incomplete",
+        "--prompt",
+        "Review this frozen patch.",
+        "--model",
+        "missing",
+        "--transport",
+        "llm",
+        "--source-class",
+        "synthetic",
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+        "--aggregate-output",
+        str(aggregate_path),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert formal_result.returncode != 0
+    aggregate = json.loads(aggregate_path.read_text())
+    assert aggregate["result"] == "incomplete"
+    verified = run_cli(
+        "range-verify",
+        "--manifest",
+        str(manifest_path),
+        "--aggregate",
+        str(aggregate_path),
+    )
+    assert verified.returncode != 0
+    assert json.loads(verified.stdout)["valid"] is False
+
+
+def test_range_review_formal_mode_rejects_stale_receipt_after_failed_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    first_aggregate_path = tmp_path / "first-aggregate.json"
+    second_aggregate_path = tmp_path / "second-aggregate.json"
+    third_aggregate_path = tmp_path / "third-aggregate.json"
+    artifacts = tmp_path / "artifacts"
+    fake_llm = write_fake_llm(tmp_path)
+    policy_path = tmp_path / "policy.toml"
+    policy_path.write_text("[models]\n")
+
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(manifest_path),
+        ).returncode
+        == 0
+    )
+    first_result = run_cli(
+        "range-review",
+        "--manifest",
+        str(manifest_path),
+        "--review-id",
+        "range-stale",
+        "--prompt",
+        "Review this frozen patch.",
+        "--model",
+        "accepted",
+        "--transport",
+        "llm",
+        "--source-class",
+        "synthetic",
+        "--policy",
+        str(policy_path),
+        "--artifact-root",
+        str(artifacts),
+        "--aggregate-output",
+        str(first_aggregate_path),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+    assert first_result.returncode == 0, first_result.stderr
+    old_receipt = Path(json.loads(first_aggregate_path.read_text())["chunks"][0]["receipt"])
+
+    args = argparse.Namespace(
+        manifest=str(manifest_path),
+        review_id="range-stale",
+        prompt="Review this frozen patch.",
+        prompt_file=None,
+        model="accepted",
+        transport="llm",
+        policy=str(policy_path),
+        source_class="synthetic",
+        response_contract="findings-json",
+        aggregate_output=str(second_aggregate_path),
+        artifact_root=str(artifacts),
+        timeout_seconds=1,
+        max_output_tokens=10,
+        max_attempts=1,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_range_child_process",
+        lambda command, *, timeout_seconds: (
+            17,
+            f"{old_receipt.parent}\n".encode(),
+            b"child failed",
+        ),
+    )
+
+    result = cli.run_range_review(cli.build_parser(), args)
+
+    assert result != 0
+    aggregate = json.loads(second_aggregate_path.read_text())
+    assert aggregate["result"] == "incomplete"
+    assert aggregate["aggregate"]["approved"] is False
+
+    args.aggregate_output = str(third_aggregate_path)
+    monkeypatch.setattr(
+        cli,
+        "_range_child_process",
+        lambda command, *, timeout_seconds: (0, f"{old_receipt.parent}\n".encode(), b""),
+    )
+
+    result = cli.run_range_review(cli.build_parser(), args)
+
+    assert result != 0
+    aggregate = json.loads(third_aggregate_path.read_text())
+    assert aggregate["result"] == "incomplete"
+    assert aggregate["aggregate"]["approved"] is False
+
+
+def test_range_cli_error_and_capture_helpers_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(ValueError, match="non-standard JSON constant"):
+        path = tmp_path / "constant.json"
+        path.write_text("NaN")
+        cli.load_range_json(path)
+
+    manifest = {"status": "manifest-created"}
+    monkeypatch.setattr(cli, "build_range_manifest", lambda *args, **kwargs: manifest)
+
+    def fail_write(*args: object, **kwargs: object) -> None:
+        raise OSError("cannot write")
+
+    monkeypatch.setattr(cli, "write_private_exclusive", fail_write)
+    write_args = argparse.Namespace(
+        repository=str(tmp_path),
+        base="base",
+        head="head",
+        output=str(tmp_path / "manifest.json"),
+        context_lines=3,
+        max_chunk_bytes=128,
+        allow_empty=False,
+    )
+    with pytest.raises(SystemExit):
+        cli.write_range_manifest(cli.build_parser(), write_args)
+
+    class TimeoutProcess:
+        returncode = None
+        stdout = BytesIO()
+        stderr = BytesIO()
+
+        def wait(self, *, timeout: int | None = None) -> int:
+            if timeout is not None:
+                raise subprocess.TimeoutExpired([], timeout)
+            self.returncode = -15
+            return self.returncode
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: TimeoutProcess())
+    monkeypatch.setattr(cli, "terminate_process_group", lambda process: None)
+    monkeypatch.setattr(cli, "reap_process_without_blocking", lambda process: None)
+    assert cli._range_child_process(["reviewctl"], timeout_seconds=1)[0] == 124
+
+    class Stream:
+        def __init__(self, payloads: list[bytes]):
+            self.payloads = payloads
+
+        def read(self, _size: int) -> bytes:
+            return self.payloads.pop(0) if self.payloads else b""
+
+    class OversizedProcess:
+        returncode = 0
+
+        def __init__(self):
+            self.stdout = Stream([b"x" * (cli.MAX_RANGE_CHILD_STDOUT_BYTES + 1), b"x"])
+            self.stderr = Stream([b"y" * (cli.MAX_RANGE_CHILD_STDERR_BYTES + 1), b"y"])
+
+        def wait(self, *, timeout: int) -> int:
+            return self.returncode
+
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda command, **kwargs: OversizedProcess(),
+    )
+    assert cli._range_child_process(["reviewctl"], timeout_seconds=1)[0] == 502
+
+    chunk = {"patchSha256": "f" * 64}
+    assert (
+        cli._range_chunk_record(index=0, chunk=chunk, review_id="range", receipt_path=None)[
+            "result"
+        ]
+        == "missing"
+    )
+    monkeypatch.setattr(cli, "load_range_json", lambda path: (_ for _ in ()).throw(ValueError()))
+    assert (
+        cli._range_chunk_record(
+            index=0, chunk=chunk, review_id="range", receipt_path=tmp_path / "receipt.json"
+        )["result"]
+        == "missing"
+    )
+    monkeypatch.setattr(cli, "load_range_json", lambda path: (b"{}", []))
+    assert (
+        cli._range_chunk_record(
+            index=0, chunk=chunk, review_id="range", receipt_path=tmp_path / "receipt.json"
+        )["result"]
+        == "missing"
+    )
+
+
+def test_range_cli_formal_validation_and_dispatch_errors(tmp_path: Path) -> None:
+    parser = cli.build_parser()
+
+    def args(**overrides: object) -> argparse.Namespace:
+        values = {
+            "manifest": str(tmp_path / "missing.json"),
+            "review_id": "range",
+            "prompt": "Review.",
+            "prompt_file": None,
+            "model": "accepted",
+            "transport": "llm",
+            "policy": None,
+            "source_class": "synthetic",
+            "response_contract": "findings-json",
+            "aggregate_output": str(tmp_path / "aggregate.json"),
+            "artifact_root": str(tmp_path / "artifacts"),
+            "timeout_seconds": None,
+            "max_output_tokens": 10,
+            "max_attempts": 1,
+            "repository": None,
+            "base": None,
+            "head": None,
+            "output": None,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    for override, _message in (
+        ({"review_id": None}, "requires --review-id"),
+        ({"model": None}, "requires --model"),
+        ({"aggregate_output": None}, "requires --aggregate-output"),
+    ):
+        with pytest.raises(SystemExit):
+            cli.run_range_review(parser, args(**override))
+
+    with pytest.raises(SystemExit):
+        cli.run_range_review(parser, args())
+    valid_manifest = tmp_path / "valid.json"
+    repository, base, head = make_range_cli_repository(tmp_path)
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(valid_manifest),
+        ).returncode
+        == 0
+    )
+
+    checks = (
+        ({"manifest": str(tmp_path / "bad.json")}, "could not read range manifest"),
+        ({"manifest": str(valid_manifest), "review_id": "bad/id"}, "invalid range review id"),
+        (
+            {
+                "manifest": str(valid_manifest),
+                "prompt": None,
+                "prompt_file": str(tmp_path / "missing-prompt"),
+            },
+            "could not read review prompt",
+        ),
+        (
+            {"manifest": str(valid_manifest), "prompt": " ", "prompt_file": None},
+            "must not be empty",
+        ),
+        (
+            {"manifest": str(valid_manifest), "prompt": "", "prompt_file": None},
+            "requires prompt",
+        ),
+        (
+            {"manifest": str(valid_manifest), "prompt_file": str(tmp_path / "empty-prompt")},
+            "must be empty",
+        ),
+        (
+            {
+                "manifest": str(valid_manifest),
+                "prompt_file": None,
+                "prompt": "Review.",
+                "response_contract": "verdict",
+            },
+            "requires --response-contract",
+        ),
+        ({"manifest": str(valid_manifest), "max_attempts": 4}, "max attempts"),
+        ({"manifest": str(valid_manifest), "max_output_tokens": 0}, "max output tokens"),
+    )
+    for override, message in checks:
+        with pytest.raises(SystemExit):
+            cli.run_range_review(parser, args(**override))
+        assert message
+
+    malformed_manifest = tmp_path / "malformed.json"
+    malformed_manifest.write_text("{}")
+    with pytest.raises(SystemExit):
+        cli.run_range_review(parser, args(manifest=str(malformed_manifest)))
+
+    (tmp_path / "empty-prompt").write_text("")
+    empty_manifest = tmp_path / "empty.json"
+    empty_manifest.write_text(
+        json.dumps(
+            {
+                **json.loads(valid_manifest.read_text()),
+                "chunks": [],
+                "chunkCount": 0,
+                "canonicalDiffSha256": hashlib.sha256(b"").hexdigest(),
+            }
+        )
+    )
+    with pytest.raises(SystemExit):
+        cli.run_range_review(parser, args(manifest=str(empty_manifest)))
+
+    malformed = json.loads(valid_manifest.read_text())
+    malformed["chunks"][0]["patch"] = base64.b64encode(b"x" * (cli.MAX_FRAGMENT_BYTES + 1)).decode()
+    oversized = tmp_path / "oversized.json"
+    oversized.write_text(json.dumps(malformed))
+    original_validate = cli.validate_range_manifest
+    cli.validate_range_manifest = lambda value: ()
+    try:
+        with pytest.raises(SystemExit):
+            cli.run_range_review(parser, args(manifest=str(oversized)))
+    finally:
+        cli.validate_range_manifest = original_validate
+
+    with pytest.raises(SystemExit):
+        cli.range_review_command(
+            parser,
+            args(
+                manifest=None,
+                review_id=None,
+                model=None,
+                aggregate_output=None,
+                repository=str(repository),
+            ),
+        )
+    with pytest.raises(SystemExit):
+        cli.range_review_command(parser, args(review_id="range", manifest=None))
+    with pytest.raises(SystemExit):
+        cli.range_review_command(
+            parser, args(manifest=str(valid_manifest), repository=str(repository))
+        )
+
+
+def test_range_verify_cli_reports_read_and_receipt_loader_failures(tmp_path: Path) -> None:
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        cli.verify_range_aggregate_command(
+            parser,
+            argparse.Namespace(
+                manifest=str(tmp_path / "missing"), aggregate=str(tmp_path / "missing2")
+            ),
+        )
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "reviewctl",
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(manifest_path),
+        ],
+        cwd=REPOSITORY,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    manifest = json.loads(manifest_path.read_text())
+    record = {
+        "index": 0,
+        "chunkId": manifest["chunks"][0]["patchSha256"],
+        "patchSha256": manifest["chunks"][0]["patchSha256"],
+        "reviewId": "range.chunk-0",
+        "receipt": str(tmp_path / "missing-receipt.json"),
+        "receiptFileSha256": "0" * 64,
+        "receiptSha256": "0" * 64,
+        "result": "unavailable",
+        "verdict": None,
+        "findings": [],
+    }
+    aggregate = cli.build_range_aggregate(manifest, "range", [record])
+    aggregate_path = tmp_path / "aggregate.json"
+    aggregate_path.write_bytes(cli.canonical_json(aggregate) + b"\n")
+    result = cli.verify_range_aggregate_command(
+        parser,
+        argparse.Namespace(manifest=str(manifest_path), aggregate=str(aggregate_path)),
+    )
+    assert result != 0
+
+
+def test_range_formal_mode_handles_missing_child_output_and_aggregate_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(manifest_path),
+        ).returncode
+        == 0
+    )
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    args = argparse.Namespace(
+        manifest=str(manifest_path),
+        review_id="range-child",
+        prompt="Review.",
+        prompt_file=None,
+        model="accepted",
+        transport="llm",
+        policy=None,
+        source_class="synthetic",
+        response_contract="findings-json",
+        aggregate_output=str(tmp_path / "aggregate.json"),
+        artifact_root=str(tmp_path / "artifacts"),
+        timeout_seconds=1,
+        max_output_tokens=10,
+        max_attempts=1,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_range_child_process",
+        lambda command, *, timeout_seconds: (17, f"other\n{candidate}\n".encode(), b""),
+    )
+    assert cli.run_range_review(cli.build_parser(), args) != 0
+    assert json.loads(Path(args.aggregate_output).read_text())["result"] == "incomplete"
+
+    monkeypatch.setattr(
+        cli,
+        "write_private_exclusive",
+        lambda *arguments, **kwargs: (_ for _ in ()).throw(OSError("aggregate write")),
+    )
+    args.aggregate_output = str(tmp_path / "aggregate-error.json")
+    with pytest.raises(SystemExit):
+        cli.run_range_review(cli.build_parser(), args)
+
+
+def test_run_rejects_invalid_range_receipt_context(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("source\n")
+    fake_llm = write_fake_llm(tmp_path)
+    missing = run_cli(
+        "run",
+        "--review-id",
+        "context-missing",
+        "--prompt",
+        "Review.",
+        "--file",
+        str(source),
+        "--model",
+        "accepted",
+        "--range-context-file",
+        str(tmp_path / "missing-context.json"),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+    assert missing.returncode != 0
+    invalid = tmp_path / "invalid-context.json"
+    invalid.write_text("{}")
+    shaped = run_cli(
+        "run",
+        "--review-id",
+        "context-shaped",
+        "--prompt",
+        "Review.",
+        "--file",
+        str(source),
+        "--model",
+        "accepted",
+        "--range-context-file",
+        str(invalid),
+        env={"LLM_BIN": str(fake_llm)},
+    )
+    assert shaped.returncode != 0
+
+
 def test_cli_imports_without_the_posix_resource_module() -> None:
     script = """
 import builtins
@@ -125,6 +846,13 @@ assert build_parser().prog == "reviewctl"
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_positive_integer_rejects_invalid_and_non_positive_values() -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match="must be an integer"):
+        cli.positive_integer("not-an-integer")
+    with pytest.raises(argparse.ArgumentTypeError, match="must be positive"):
+        cli.positive_integer("0")
 
 
 def write_fake_python_executable(path: Path, name: str, source: str) -> Path:
@@ -4253,12 +4981,177 @@ files = ["{brief}"]
     ]
     assert report["actualSpendUsd"] == 0.125
     assert observed_max_output_tokens == [400]
+    assert [run["requestedMaxOutputTokens"] for run in report["runs"]] == [400, 200, 200]
+    assert [run["outputTokenLimitEnforced"] for run in report["runs"]] == [
+        True,
+        False,
+        False,
+    ]
     assert report["runs"][0]["maxOutputTokens"] == 400
     assert report["runs"][1]["maxOutputTokens"] == 200
     assert report["runs"][2]["maxOutputTokens"] == 200
     assert report["runs"][0]["estimatedCostUsd"] == pytest.approx(0.0000859)
     assert report["runs"][1]["estimatedCostUsd"] is None
     assert report["runs"][2]["estimatedCostUsd"] is None
+
+
+def test_product_tournament_records_a_missing_receipt_without_crashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "brief.md"
+    source.write_text("Synthetic product brief.\n")
+    candidate = cli.parse_tournament_candidates(
+        {
+            "candidates": [
+                {
+                    "id": "metered",
+                    "family": "test",
+                    "model": "openrouter/test/model",
+                    "transport": "openrouter",
+                    "cost_mode": "metered",
+                    "pricing": {"input_per_million_usd": 0.1, "output_per_million_usd": 0.2},
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(cli, "run_review", lambda *_args, **_kwargs: 502)
+    parser = cli.build_parser()
+    report_root = tmp_path / "artifacts"
+
+    assert (
+        cli.run_candidate_tournament(
+            parser,
+            __import__("argparse").Namespace(),
+            plan={"response_contract": "product-review-json", "artifact_root": str(report_root)},
+            plan_path=tmp_path / "product.toml",
+            budget=1,
+            cases=[{"id": "flow", "prompt": "Design.", "files": [str(source)]}],
+            candidates=candidate,
+            max_output_tokens=128,
+        )
+        == 1
+    )
+
+    report = json.loads((report_root / "tournament.json").read_text())
+    assert report["result"] == "incomplete"
+    run = report["runs"][0]
+    assert run["actualCostUsd"] is None
+    assert run["candidate"] == "metered"
+    assert run["case"] == "flow"
+    assert run["councilEligible"] is True
+    assert run["costMode"] == "metered"
+    assert run["estimatedCostUsd"] == pytest.approx(0.0000305)
+    assert run["exitCode"] == 502
+    assert run["family"] == "test"
+    assert run["maxOutputTokens"] == 128
+    assert run["model"] == "openrouter/test/model"
+    assert run["receipt"] is None
+    assert run["requestedMaxOutputTokens"] == 128
+    assert run["result"] == "missing-receipt"
+    assert run["transport"] == "openrouter"
+
+
+def test_tournament_receipt_identity_detects_overwritten_paths(tmp_path: Path) -> None:
+    receipt_root = tmp_path / "receipts" / "run"
+    receipt_root.mkdir(parents=True)
+    receipt = receipt_root / "receipt.json"
+    receipt.write_text('{"result":"old"}\n')
+
+    before = cli.receipt_fingerprints(tmp_path / "receipts")
+    receipt.write_text('{"result":"new"}\n')
+
+    assert cli.changed_receipt_paths(tmp_path / "receipts", before) == [receipt]
+
+
+def test_tournament_receipt_selection_fails_closed_on_mixed_receipts(tmp_path: Path) -> None:
+    receipt_root = tmp_path / "receipts"
+    receipt_root.mkdir()
+    valid = {"result": "accepted", "reviewId": "target"}
+    valid["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(valid))
+    valid_dir = receipt_root / "valid"
+    foreign_dir = receipt_root / "foreign"
+    valid_dir.mkdir()
+    foreign_dir.mkdir()
+    (valid_dir / "receipt.json").write_text(json.dumps(valid))
+    (foreign_dir / "receipt.json").write_text('{"result":"accepted","reviewId":"other"}\n')
+
+    assert cli.tournament_receipt_path(receipt_root, {}, "target") is None
+
+
+def test_tournament_receipt_selection_fails_closed_on_unreadable_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt_root = tmp_path / "receipts"
+    valid_dir = receipt_root / "valid"
+    broken_dir = receipt_root / "broken"
+    valid_dir.mkdir(parents=True)
+    broken_dir.mkdir()
+    valid = {"result": "accepted", "reviewId": "target"}
+    valid["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(valid))
+    (valid_dir / "receipt.json").write_text(json.dumps(valid))
+    (broken_dir / "receipt.json").symlink_to(broken_dir / "missing.json")
+
+    assert cli.tournament_receipt_path(receipt_root, {}, "target") is None
+
+
+def test_receipt_fingerprints_skips_unreadable_receipts(tmp_path: Path) -> None:
+    receipt_root = tmp_path / "receipts"
+    receipt_root.mkdir()
+    broken = receipt_root / "receipt.json"
+    broken.symlink_to(tmp_path / "missing.json")
+
+    assert cli.receipt_fingerprints(receipt_root) == {}
+
+
+def test_tournament_receipt_selection_rejects_malformed_receipt(tmp_path: Path) -> None:
+    receipt_root = tmp_path / "receipts"
+    receipt_root.mkdir()
+    (receipt_root / "receipt.json").write_text("not-json\n")
+
+    assert cli.tournament_receipt_path(receipt_root, {}, "target") is None
+
+
+def test_tournament_receipt_selection_rejects_foreign_receipt(tmp_path: Path) -> None:
+    receipt_root = tmp_path / "receipts"
+    receipt_root.mkdir()
+    (receipt_root / "receipt.json").write_text(
+        json.dumps({"result": "accepted", "reviewId": "other"})
+    )
+
+    assert cli.tournament_receipt_path(receipt_root, {}, "target") is None
+
+
+def test_legacy_tournament_records_a_missing_receipt_without_crashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "brief.md"
+    source.write_text("Synthetic product brief.\n")
+    plan = tmp_path / "legacy.toml"
+    plan.write_text(
+        f'''budget_usd = 1
+max_output_tokens = 128
+transport = "codex"
+artifact_root = "{tmp_path / "artifacts"}"
+
+[models.accepted]
+input_per_million_usd = 0
+output_per_million_usd = 0
+
+[[cases]]
+id = "flow"
+prompt = "Design."
+files = ["{source}"]
+'''
+    )
+    monkeypatch.setattr(cli, "run_review", lambda *_args, **_kwargs: 502)
+    parser = cli.build_parser()
+    args = parser.parse_args(["tournament", "--plan", str(plan)])
+
+    assert cli.run_tournament(parser, args) == 1
+    report = json.loads((tmp_path / "artifacts" / "tournament.json").read_text())
+    assert report["result"] == "incomplete"
+    assert report["runs"][0]["result"] == "missing-receipt"
+    assert report["runs"][0]["receipt"] is None
 
 
 def test_product_tournament_retries_only_an_incomplete_delivery(
@@ -5404,12 +6297,184 @@ def test_invoke_codex_passes_an_explicit_allowlisted_environment(
     assert response.response == "VERDICT: approved."
 
 
+def test_invoke_codex_does_not_limit_unrelated_child_files(
+    tmp_path: Path,
+) -> None:
+    fake_codex = write_fake_python_executable(
+        tmp_path,
+        "codex",
+        """from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+output = Path(arguments[arguments.index('--output-last-message') + 1])
+output.with_name('codex-auxiliary.bin').write_bytes(
+    b'x' * (4 * 1024 * 1024 + 1024)
+)
+output.write_text('VERDICT: approved.')
+sys.stdout.write('x' * (4 * 1024 * 1024 + 1024))
+print('session id: codex-conversation')
+print('model: gpt-test')
+""",
+    )
+
+    exit_code, error, response = cli.invoke_codex(
+        codex_bin=str(fake_codex),
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=5,
+        workspace=tmp_path,
+    )
+
+    assert (exit_code, response.response) == (0, "VERDICT: approved.")
+    assert (response.conversation_id, response.model) == ("codex-conversation", "gpt-test")
+    assert error == "Codex transport output truncated: stdout"
+
+
+def test_invoke_codex_stops_a_runaway_final_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_codex = write_fake_python_executable(
+        tmp_path,
+        "codex",
+        """from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+output = Path(arguments[arguments.index('--output-last-message') + 1])
+with output.open('wb') as stream:
+    while True:
+        stream.write(b'x' * 65536)
+        stream.flush()
+""",
+    )
+    monkeypatch.setattr(cli, "MAX_CODEX_RESPONSE_BYTES", 128 * 1024)
+
+    exit_code, error, response = cli.invoke_codex(
+        codex_bin=str(fake_codex),
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=5,
+        workspace=tmp_path,
+    )
+
+    assert (exit_code, response.response) == (502, "")
+    assert error == "Codex final response exceeded bounded capture"
+
+
+def test_invoke_codex_handles_oversized_response_without_a_process_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        pid = "not-a-pid"
+        returncode = 0
+
+        def communicate(self, timeout: int) -> tuple[None, None]:
+            command = captured["command"]
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_bytes(b"x" * 5)
+            time.sleep(0.15)
+            return None, None
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        captured["command"] = command
+        return Process()
+
+    monkeypatch.setattr(cli, "MAX_CODEX_RESPONSE_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+
+    exit_code, error, response = cli.invoke_codex(
+        codex_bin="codex",
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=1,
+        workspace=tmp_path,
+    )
+
+    assert (exit_code, error, response.response) == (
+        502,
+        "Codex final response exceeded bounded capture",
+        "",
+    )
+
+
+def test_invoke_codex_handles_non_pipe_and_timeout_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    terminated: list[object] = []
+
+    class NonPipeProcess:
+        returncode = 0
+
+        def communicate(self, timeout: int) -> tuple[None, None]:
+            command = captured["command"]
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text("VERDICT: approved.")
+            return None, None
+
+    class TimeoutProcess:
+        returncode = 0
+
+        def communicate(self, timeout: int) -> tuple[bytes, bytes]:
+            raise subprocess.TimeoutExpired("codex", timeout)
+
+    timeout_process = TimeoutProcess()
+    processes: list[object] = [NonPipeProcess(), timeout_process]
+
+    def popen(command: list[str], **kwargs: object) -> object:
+        captured["command"] = command
+        return processes.pop(0)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    monkeypatch.setattr(cli, "terminate_process_group", lambda process: terminated.append(process))
+
+    success = cli.invoke_codex(
+        codex_bin="codex",
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=1,
+        workspace=tmp_path,
+    )
+    timeout = cli.invoke_codex(
+        codex_bin="codex",
+        prompt="Review",
+        model="gpt-test",
+        response_contract="verdict",
+        source_roots=None,
+        timeout_seconds=1,
+        workspace=tmp_path,
+    )
+
+    assert (success[0], success[2].response) == (0, "VERDICT: approved.")
+    assert timeout[0] == 124
+    assert terminated == [timeout_process]
+
+
 @pytest.mark.parametrize(
-    ("stdout", "stderr", "final_response", "expected_error"),
+    (
+        "stdout",
+        "stderr",
+        "final_response",
+        "expected_exit",
+        "expected_error",
+        "expected_response",
+    ),
     [
-        (b"12345", b"", b"ok", "Codex transport output exceeded bounded capture"),
-        (b"", b"12345", b"ok", "Codex transport output exceeded bounded capture"),
-        (b"", b"", b"12345", "Codex final response exceeded bounded capture"),
+        (b"12345", b"", b"ok", 0, "Codex transport output truncated: stdout", "ok"),
+        (b"", b"12345", b"ok", 0, "Codex transport output truncated: stderr", "ok"),
+        (b"", b"", b"12345", 502, "Codex final response exceeded bounded capture", ""),
+        (b"", b"", b"\xff", 502, "Codex final response is not valid UTF-8", ""),
     ],
 )
 def test_invoke_codex_rejects_oversized_output(
@@ -5418,7 +6483,9 @@ def test_invoke_codex_rejects_oversized_output(
     stdout: bytes,
     stderr: bytes,
     final_response: bytes,
+    expected_exit: int,
     expected_error: str,
+    expected_response: str,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -5450,21 +6517,18 @@ def test_invoke_codex_rejects_oversized_output(
         workspace=tmp_path,
     )
 
-    assert (exit_code, error, response.response) == (502, expected_error, "")
+    assert (exit_code, response.response) == (expected_exit, expected_response)
+    assert error.endswith(expected_error)
 
 
-def test_invoke_codex_fails_closed_without_bounded_capture_support(
+def test_invoke_codex_does_not_require_resource_module_for_bounded_capture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    fake_codex = write_fake_codex(tmp_path)
     monkeypatch.setattr(cli, "resource", None)
-    monkeypatch.setattr(
-        cli.subprocess,
-        "Popen",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
-    )
 
     exit_code, error, response = cli.invoke_codex(
-        codex_bin="codex",
+        codex_bin=str(fake_codex),
         prompt="Review",
         model="gpt-test",
         response_contract="verdict",
@@ -5474,9 +6538,9 @@ def test_invoke_codex_fails_closed_without_bounded_capture_support(
     )
 
     assert (exit_code, error, response.response) == (
-        126,
-        "Codex bounded output capture unsupported on this platform",
+        0,
         "",
+        "VERDICT: approved without blocking findings.",
     )
 
 
@@ -6045,6 +7109,7 @@ files = ["{source}"]
     assert result.returncode == 0, result.stderr
     report = json.loads((tmp_path / "tournament-artifacts" / "tournament.json").read_text())
     assert report["runs"][0]["maxOutputTokens"] == 300
+    assert report["runs"][0]["outputTokenLimitEnforced"] is True
 
 
 def test_legacy_tournament_defaults_to_one_attempt_and_reserves_declared_retries(
@@ -7051,16 +8116,15 @@ files = ["{source}"]
         artifact_root = Path(args.artifact_root)
         turn = artifact_root / "turn"
         turn.mkdir(parents=True)
-        (turn / "receipt.json").write_text(
-            json.dumps(
-                {
-                    "result": "accepted",
-                    "findings": [],
-                    "response": {"costUsd": 0.0},
-                    "transport": transport,
-                }
-            )
-        )
+        receipt = {
+            "result": "accepted",
+            "findings": [],
+            "response": {"costUsd": 0.0},
+            "reviewId": args.review_id,
+            "transport": transport,
+        }
+        receipt["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(receipt))
+        (turn / "receipt.json").write_text(json.dumps(receipt))
         transports.append((transport, args.provider_only, args.provider_allow_fallbacks))
         return 0
 
@@ -7188,16 +8252,14 @@ files = ["{source}"]
     def fake_run_review(parser: object, args: object) -> int:
         turn = Path(args.artifact_root) / "turn"
         turn.mkdir(parents=True)
-        (turn / "receipt.json").write_text(
-            json.dumps(
-                {
-                    "result": "accepted",
-                    "findings": [],
-                    "attempts": [{"costUsd": 0.1}, {"costUsd": 0.2}],
-                    "response": {"costUsd": 0.2},
-                }
-            )
-        )
+        receipt = {
+            "result": "accepted",
+            "attempts": [{"costUsd": 0.1}, {"costUsd": 0.2}],
+            "response": {"costUsd": 0.2},
+            "reviewId": args.review_id,
+        }
+        receipt["sha256"] = cli.sha256_bytes(cli.contract_canonical_json(receipt))
+        (turn / "receipt.json").write_text(json.dumps(receipt))
         return 0
 
     monkeypatch.setattr(cli, "run_review", fake_run_review)
@@ -8279,19 +9341,20 @@ def test_invoke_openrouter_persists_a_portable_structured_response(
 
 
 @pytest.mark.parametrize(
-    "model",
+    ("model", "expected_reasoning"),
     [
-        "google/gemini-3.6-flash",
-        "google/gemini-3.7-flash",
-        "z-ai/glm-5.2",
-        "z-ai/glm-5.3-flash",
-        "meta/muse-spark-1.2-contributor",
+        ("google/gemini-3.6-flash", None),
+        ("google/gemini-3.7-flash", None),
+        ("z-ai/glm-5.2", None),
+        ("z-ai/glm-5.3-flash", {"effort": "max"}),
+        ("meta/muse-spark-1.2-contributor", None),
     ],
 )
-def test_invoke_openrouter_leaves_reasoning_to_the_provider(
+def test_invoke_openrouter_sets_model_specific_reasoning_parameters(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     model: str,
+    expected_reasoning: dict[str, str] | None,
 ) -> None:
     source = tmp_path / "source.py"
     source.write_text("pass\n")
@@ -8318,7 +9381,89 @@ def test_invoke_openrouter_leaves_reasoning_to_the_provider(
     )
 
     assert (exit_code, error) == (0, "")
-    assert "reasoning" not in json.loads((tmp_path / "request.json").read_text())
+    request = json.loads((tmp_path / "request.json").read_text())
+    if expected_reasoning is None:
+        assert "reasoning" not in request
+    else:
+        assert request["reasoning"] == expected_reasoning
+
+
+def test_invoke_openrouter_reserves_a_reasoning_budget_for_glm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(
+        monkeypatch,
+        body=json.dumps(
+            {
+                "model": "z-ai/glm-5.3-flash",
+                "choices": [{"message": {"content": "VERDICT: approved"}}],
+            }
+        ).encode(),
+    )
+
+    exit_code, error, _ = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Return JSON.",
+        model="z-ai/glm-5.3-flash",
+        files=[source],
+        max_output_tokens=64,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert (exit_code, error) == (0, "")
+    request = json.loads((tmp_path / "request.json").read_text())
+    assert request["reasoning"] == {"effort": "max"}
+    assert request["max_tokens"] == cli.DEFAULT_MAX_OUTPUT_TOKENS
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("z-ai/glm-5.3-flash", cli.DEFAULT_MAX_OUTPUT_TOKENS),
+        ("openrouter/z-ai/glm-5.3-flash", cli.DEFAULT_MAX_OUTPUT_TOKENS),
+        ("z-ai/glm-5.3-flash:free", cli.DEFAULT_MAX_OUTPUT_TOKENS),
+        ("google/gemini-3.7-flash", 64),
+    ],
+)
+def test_openrouter_reasoning_floor_normalizes_model_routes(model: str, expected: int) -> None:
+    assert cli.openrouter_output_token_budget(model, 64) == expected
+
+
+def test_invoke_openrouter_normalizes_route_prefix_in_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    mock_openrouter_curl(
+        monkeypatch,
+        body=json.dumps(
+            {
+                "model": "z-ai/glm-5.3-flash",
+                "choices": [{"message": {"content": "VERDICT: approved"}}],
+            }
+        ).encode(),
+    )
+
+    exit_code, error, _ = cli.invoke_openrouter(
+        api_key="test",
+        prompt="Return a verdict.",
+        model="openrouter/z-ai/glm-5.3-flash",
+        files=[source],
+        max_output_tokens=64,
+        response_contract="verdict",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert (exit_code, error) == (0, "")
+    request = json.loads((tmp_path / "request.json").read_text())
+    assert request["model"] == "z-ai/glm-5.3-flash"
 
 
 def test_invoke_openrouter_rejects_a_malformed_choice_shape(
@@ -11326,6 +12471,49 @@ def test_invoke_pi_rejects_oversized_subprocess_output(
     monkeypatch.setattr(cli, "MAX_PI_LEGACY_STDOUT_BYTES", 4, raising=False)
     monkeypatch.setattr(cli, "MAX_PI_LEGACY_STDERR_BYTES", 4, raising=False)
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Process())
+
+    exit_code, error, response = cli.invoke_pi(
+        pi_bin="pi",
+        prompt="Review.",
+        model="openrouter/test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+        session_path=tmp_path / "session.json",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert (exit_code, error, response.response) == (
+        502,
+        "Pi transport output exceeded bounded capture",
+        "",
+    )
+
+
+def test_invoke_pi_bounds_output_captured_in_temp_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, **kwargs: object) -> tuple[None, None]:
+            return None, None
+
+    def popen(*args: object, **kwargs: object) -> Process:
+        stdout = kwargs["stdout"]
+        stdout.write(b"12345")
+        stdout.flush()
+        return Process()
+
+    monkeypatch.setattr(cli, "MAX_PI_LEGACY_STDOUT_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli, "MAX_PI_LEGACY_STDERR_BYTES", 4, raising=False)
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
 
     exit_code, error, response = cli.invoke_pi(
         pi_bin="pi",

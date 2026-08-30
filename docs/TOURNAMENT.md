@@ -65,7 +65,9 @@ the response receipt and require the intended number of accepted cases before pr
 individual candidate. Use an override only when a model's reasoning budget
 would otherwise prevent a structured final response. `reviewctl` uses the
 effective value both in the provider request and in the reserved maximum-cost
-calculation, and persists it as `maxOutputTokens` in every tournament run.
+calculation. Every run persists `requestedMaxOutputTokens`, the effective
+`maxOutputTokens`, and `outputTokenLimitEnforced`; this keeps transports such as
+Codex, Pi, and Gemini from being mistaken for hard output-token caps.
 
 Do not place a model that needs a pinned host in a shared multi-model plan. Use
 a dedicated plan for each provider experiment so a fallback cannot silently
