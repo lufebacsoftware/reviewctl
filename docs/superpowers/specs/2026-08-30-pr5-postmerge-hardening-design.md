@@ -62,16 +62,26 @@ the first model attempt. For every attempt that reaches a transport, it creates 
 `TemporaryDirectory` outside `.reviewctl`, writes the already-frozen bytes there through the
 confined artifact writer, and passes only those temporary paths to the backend.
 
-The temporary directory surrounds `transport.execute` and is removed when that call returns or
-raises. Accepted, refused, partial, fallback, timeout, and exception paths therefore share the
-same cleanup boundary. No `attempt-XX/source` directory is created.
+Each attempt that reaches a transport gets a distinct system temporary directory outside the
+project's `.reviewctl` tree. The directory surrounds `transport.execute` and is removed when that
+call returns or raises. The transport result is not evaluated or accepted until the context has
+exited successfully. Accepted, refused, partial, fallback, timeout, and exception paths therefore
+share the same cleanup boundary, and a fallback cannot reuse an earlier attempt's source path. No
+`attempt-XX/source` directory is created.
 
 `ReviewRequest.source_root` remains an input-validation and logical-path boundary, not a bypass
 around snapshotting. Even externally materialized GitHub sources are copied from the frozen bytes
 into the per-attempt temporary directory. The backend request retains the original project and
 external roots for sandbox denial and adds the temporary root so transports can validate the
-paths they receive. This prevents later mutations of the original source from changing the bytes
+paths they receive. The project root remains first for transports that use the first root as their
+working directory. This prevents later mutations of the original source from changing the bytes
 reviewed.
+
+If operating-system cleanup of the temporary directory fails, the transport result is discarded
+and the attempt becomes a controlled transport failure; it cannot become accepted. The
+implementation never copies the temporary bytes or their path into `.reviewctl`. No userspace
+design can guarantee physical deletion when the filesystem itself refuses removal, so that case
+is an explicit residual host-security boundary rather than a successful review outcome.
 
 Durable artifacts retain only source names, hashes, packet metadata, model output, diagnostics,
 and the project checkpoint.
@@ -98,11 +108,15 @@ Global `reviewctl verify` no longer delegates to `verify_project_receipt`. Befor
 handling, it rejects:
 
 - a marked project checkpoint; and
-- the historical project-checkpoint signature (`reviewId`, `configDigest`, `projectId`, and
-  `originId` without `receiptSchemaVersion`).
+- the historical project-checkpoint signature: no `receiptSchemaVersion`, no canonical V1
+  `result`, and the complete stable project-only field set `status`, `configDigest`, `projectId`,
+  `originId`, `journalSequence`, `privacyMode`, `dimensionSchemaVersion`, `dimensionCoverage`, and
+  `fallbackRelationships`.
 
 The violation is `project-checkpoint-not-review-receipt`. Canonical V2 receipts continue through
-`validate_v2_receipt`; historical generic V1 receipts retain their documented digest-only path.
+`validate_v2_receipt`; historical generic V1 receipts—including one augmented with project-like
+identity or config fields but still carrying canonical `result`—retain their documented
+digest-only path.
 This is classification, not authentication: neither checkpoint nor receipt digest becomes a
 signature or trust root.
 
@@ -138,16 +152,21 @@ Response selection becomes explicit:
 - if it is present with any other value—including `null`, scalar, or array—return controlled
   status 502 with `agy returned invalid structured output`.
 
-No malformed structured output can be accepted by falling back to another field. Raw provider
-stdout remains durable before validation, and no finding is promoted from the rejected attempt.
+The exact outer JSON parser applies to the complete provider payload, including the nested object,
+so duplicate keys and non-finite numbers are rejected before response selection. A structurally
+valid object is transported canonically; the selected response contract still decides whether its
+domain shape is complete and valid, producing `contract_failed` rather than a transport 502 when
+appropriate. No malformed structured output can be accepted by falling back to another field.
+Raw provider stdout remains durable before validation, and no finding is promoted from the
+rejected attempt.
 
 ## Error and Compatibility Boundaries
 
-- Temporary-source cleanup is mandatory even if a transport raises `OSError`, `UnicodeError`, or
+- Temporary-source cleanup is attempted even if a transport raises `OSError`, `UnicodeError`, or
   `ValueError`.
-- Temporary-source cleanup failure must not expose source by moving it into durable artifacts; the
-  standard-library temporary-directory failure propagates as a controlled transport failure where
-  possible.
+- Temporary-source cleanup failure invalidates the attempt and must never be masked as acceptance
+  or move source bytes/path metadata into durable artifacts. Physical deletion after an
+  operating-system removal failure is outside the process guarantee.
 - Existing project checkpoint paths and `ReviewResult` fields remain available.
 - Old project checkpoints remain directly digest-checkable through `verify_project_receipt`, but
   global `reviewctl verify` rejects them as noncanonical.
@@ -159,19 +178,27 @@ stdout remains durable before validation, and no finding is promoted from the re
 Every production change follows red-green-refactor.
 
 1. **Source lifetime:** a fake transport observes exact frozen bytes inside a private temporary
-   directory; after success, nonzero execution, fallback, and exception, every observed path is
-   absent and no durable `source` directory exists. An original-file mutation does not alter the
-   staged bytes.
+   directory outside `.reviewctl`; the backend request retains original roots, adds that temporary
+   root, and keeps the project root first. Success, nonzero execution, fallback, and exception
+   paths remove every normally cleanable observed path and create no durable `source` directory.
+   Fallback attempts receive distinct temporary directories. An original-file mutation does not
+   alter staged bytes. An injected cleanup failure prevents acceptance and still leaves no source
+   copy or temporary path below `.reviewctl`; the test does not claim the hostile filesystem
+   removed the external directory.
 2. **Checkpoint classification:** a self-consistent marked checkpoint and a historical unmarked
    project checkpoint both fail global verification with
    `project-checkpoint-not-review-receipt`; direct internal verification still detects tampering
-   and expected-digest mismatch; canonical V1 and V2 controls retain their existing outcomes.
+   and expected-digest mismatch. Canonical V1 and V2 controls retain their existing outcomes, and
+   a recomputed generic V1 control augmented with `configDigest`, `projectId`, and `originId` still
+   follows the V1 path rather than the project-checkpoint path.
 3. **Template:** all init modes generate empty routes and local execution with no provider/model
    text. Reviewing immediately after initialization returns `route_invalid`, writes no accepted
    attempt, and invokes no transport.
 4. **Antigravity:** separate `null`, string, number, array, and boolean structured outputs fail
    closed while preserving raw response evidence. An absent structured-output field still permits
-   legacy response fallback, and a valid object remains canonical.
+   legacy response fallback, a valid object remains canonical, duplicate/non-finite nested values
+   still fail the exact parser, and a valid JSON object with an invalid review-contract shape is
+   rejected by contract evaluation rather than accepted.
 5. **Large packet regression:** retain the existing assertion that the packet is absent from argv,
    available through the sandbox file, and removed with the sandbox.
 
