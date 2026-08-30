@@ -5366,6 +5366,12 @@ def test_invoke_codex_passes_an_explicit_allowlisted_environment(
         captured["environment"] = kwargs["env"]
         return Process()
 
+    def bounded_capture(process: object, **kwargs: object) -> tuple[bytes, bytes, bool, bool]:
+        command = captured["command"]
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text("VERDICT: approved.")
+        return b"session id: test-session\nmodel: gpt-5.6-terra\n", b"", False, False
+
     codex_home = tmp_path / "codex-home"
     auth_file = tmp_path / "auth.json"
     monkeypatch.setenv("PATH", "/opt/reviewctl/bin")
@@ -5378,6 +5384,7 @@ def test_invoke_codex_passes_an_explicit_allowlisted_environment(
     monkeypatch.setenv("ARBITRARY_SECRET", "arbitrary-secret")
     monkeypatch.setenv("HTTPS_PROXY", "https://proxy-user:proxy-secret@example.test")
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    monkeypatch.setattr(cli, "communicate_bounded", bounded_capture)
 
     exit_code, _, response = cli.invoke_codex(
         codex_bin="/opt/reviewctl/bin/codex",
@@ -5423,7 +5430,14 @@ def test_invoke_codex_does_not_apply_file_size_limit_to_cli_process(
         captured["kwargs"] = kwargs
         return Process()
 
+    def bounded_capture(process: object, **kwargs: object) -> tuple[bytes, bytes, bool, bool]:
+        command = captured["command"]
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text("VERDICT: approved.")
+        return b"session id: test-session\nmodel: gpt-5.6-terra\n", b"", False, False
+
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    monkeypatch.setattr(cli, "communicate_bounded", bounded_capture)
 
     exit_code, _, response = cli.invoke_codex(
         codex_bin="codex",
@@ -5438,6 +5452,57 @@ def test_invoke_codex_does_not_apply_file_size_limit_to_cli_process(
     assert exit_code == 0
     assert response.response == "VERDICT: approved."
     assert "preexec_fn" not in captured["kwargs"]
+
+
+def test_bounded_process_capture_terminates_a_streaming_child() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000); sys.stdout.flush()"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    stdout, stderr, timed_out, exceeded = cli.communicate_bounded(
+        process,
+        timeout_seconds=5,
+        stdout_limit=4,
+        stderr_limit=4,
+    )
+
+    assert len(stdout) == 4
+    assert stderr == b""
+    assert not timed_out
+    assert exceeded
+
+
+def test_bounded_process_capture_returns_when_descendant_escapes_process_group(
+    tmp_path: Path,
+) -> None:
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, time; child = os.fork(); "
+            "os.setsid() if child == 0 else None; time.sleep(2)",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    started = time.monotonic()
+    stdout, stderr, timed_out, exceeded = cli.communicate_bounded(
+        process,
+        timeout_seconds=1,
+        stdout_limit=4,
+        stderr_limit=4,
+    )
+
+    assert stdout == b""
+    assert stderr == b""
+    assert timed_out
+    assert not exceeded
+    assert time.monotonic() - started < 1.8
 
 
 @pytest.mark.parametrize(
@@ -5471,10 +5536,17 @@ def test_invoke_codex_rejects_oversized_output(
         captured["command"] = command
         return Process()
 
+    def bounded_capture(process: object, **kwargs: object) -> tuple[bytes, bytes, bool, bool]:
+        command = captured["command"]
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_bytes(final_response)
+        return stdout, stderr, False, len(stdout) > 4 or len(stderr) > 4
+
     monkeypatch.setattr(cli, "MAX_CODEX_STDOUT_BYTES", 4, raising=False)
     monkeypatch.setattr(cli, "MAX_CODEX_STDERR_BYTES", 4, raising=False)
     monkeypatch.setattr(cli, "MAX_CODEX_RESPONSE_BYTES", 4, raising=False)
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    monkeypatch.setattr(cli, "communicate_bounded", bounded_capture)
 
     exit_code, error, response = cli.invoke_codex(
         codex_bin="codex",

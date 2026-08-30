@@ -10,6 +10,7 @@ import math
 import os
 import re
 import secrets
+import selectors
 import shutil
 import signal
 import sqlite3
@@ -3433,6 +3434,87 @@ def codex_prompt(
     return f"{prompt}\n\n{contract} Read only the supplied review files."
 
 
+def communicate_bounded(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: int,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> tuple[bytes, bytes, bool, bool]:
+    """Drain a process without allowing either captured stream to grow unbounded."""
+    streams = (
+        (getattr(process, "stdout", None), stdout_limit),
+        (getattr(process, "stderr", None), stderr_limit),
+    )
+    if any(stream is None for stream, _ in streams):
+        raise RuntimeError("Codex bounded capture requires stdout and stderr pipes")
+
+    selector = selectors.DefaultSelector()
+    buffers: dict[int, bytearray] = {}
+    limits: dict[int, int] = {}
+    for stream, limit in streams:
+        assert stream is not None
+        selector.register(stream, selectors.EVENT_READ)
+        descriptor = stream.fileno()
+        buffers[descriptor] = bytearray()
+        limits[descriptor] = limit
+
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    exceeded = False
+    terminated = False
+
+    def terminate() -> None:
+        nonlocal terminated
+        if not terminated:
+            terminate_process_group(process, grace_seconds=0)
+            terminated = True
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if not timed_out and remaining <= 0:
+                timed_out = True
+                terminate()
+                break
+            events = selector.select(max(0, min(remaining, 0.1)))
+            if not events:
+                if process.poll() is not None and not terminated:
+                    terminated = True
+                continue
+            for key, _ in events:
+                descriptor = key.fileobj.fileno()
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer = buffers[descriptor]
+                limit = limits[descriptor]
+                if len(buffer) <= limit:
+                    buffer.extend(chunk[: limit + 1 - len(buffer)])
+                if len(buffer) > limit and not exceeded:
+                    exceeded = True
+                    terminate()
+                    break
+            if terminated:
+                break
+    finally:
+        selector.close()
+        if process.poll() is None:
+            terminate()
+        try:
+            process.wait()
+        except (ChildProcessError, OSError):
+            pass
+
+    return (
+        bytes(buffers[streams[0][0].fileno()][:stdout_limit]),
+        bytes(buffers[streams[1][0].fileno()][:stderr_limit]),
+        timed_out,
+        exceeded,
+    )
+
+
 def invoke_codex(
     *,
     codex_bin: str,
@@ -3513,44 +3595,22 @@ def invoke_codex(
         )
     )
     try:
-        # Codex writes its own ephemeral state while it runs.  RLIMIT_FSIZE applies to
-        # every file descriptor in the child, not just these capture files, and causes
-        # otherwise healthy CLI runs to die with SIGXFSZ.  Bound the captured streams
-        # and final response after the process exits instead.
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-            process = subprocess.Popen(
-                command,
-                cwd=workspace,
-                env=process_environment,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                start_new_session=True,
-            )
-            try:
-                communicated_stdout, communicated_stderr = process.communicate(
-                    timeout=timeout_seconds
-                )
-                exit_code = process.returncode
-            except subprocess.TimeoutExpired:
-                terminate_process_group(process)
-                communicated_stdout = b""
-                communicated_stderr = b""
-                exit_code = 124
-                timed_out = True
-
-            def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
-                if not isinstance(value, bytes):
-                    stream.seek(0)
-                    value = stream.read(limit + 1)
-                return value[:limit], len(value) > limit
-
-            stdout, stdout_truncated = bounded_output(
-                communicated_stdout, stdout_file, MAX_CODEX_STDOUT_BYTES
-            )
-            stderr, stderr_truncated = bounded_output(
-                communicated_stderr, stderr_file, MAX_CODEX_STDERR_BYTES
-            )
-        if stdout_truncated or stderr_truncated:
+        process = subprocess.Popen(
+            command,
+            cwd=workspace,
+            env=process_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        stdout, stderr, timed_out, output_exceeded = communicate_bounded(
+            process,
+            timeout_seconds=timeout_seconds,
+            stdout_limit=MAX_CODEX_STDOUT_BYTES,
+            stderr_limit=MAX_CODEX_STDERR_BYTES,
+        )
+        exit_code = 124 if timed_out else process.returncode
+        if output_exceeded:
             return (
                 502,
                 "Codex transport output exceeded bounded capture",
