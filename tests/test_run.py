@@ -10405,6 +10405,88 @@ def test_invoke_agy_prefers_schema_validated_structured_output(
     assert response.response == json.dumps(structured, separators=(",", ":"), sort_keys=True)
 
 
+def test_invoke_agy_uses_legacy_response_when_structured_output_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    legacy_response = '{"verdict":"approved","findings":[]}'
+    monkeypatch.setenv("AGY_RESPONSE", legacy_response)
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin=str(fake_agy),
+        prompt="Review synthetic source.",
+        model="gemini-3.7-flash-high",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert exit_code == 0
+    assert error == ""
+    assert response.response == legacy_response
+
+
+@pytest.mark.parametrize("structured_output", [None, "text", 7, [], True])
+def test_invoke_agy_rejects_present_non_object_structured_output(
+    structured_output: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "conversation_id": "agy-conversation",
+        "status": "SUCCESS",
+        "response": '{"verdict":"approved","findings":[]}',
+        "structured_output": structured_output,
+    }
+    monkeypatch.setenv("AGY_RAW_PAYLOAD", json.dumps(payload))
+    fake_agy = write_fake_agy(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    exit_code, error, response = cli.invoke_agy(
+        agy_bin=str(fake_agy),
+        prompt="Review synthetic source.",
+        model="gemini-3.7-flash-high",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=7,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.json",
+    )
+
+    assert exit_code == 502
+    assert error == "agy returned invalid structured output"
+    assert response.response == ""
+
+
+def test_agy_structured_object_still_requires_the_selected_response_contract(
+    tmp_path: Path,
+) -> None:
+    fake_agy = write_fake_agy(tmp_path)
+
+    result = run_cli(
+        *review_arguments(tmp_path, "gemini-3.7-flash-high"),
+        "--transport",
+        "agy",
+        "--response-contract",
+        "findings-json",
+        env={"AGY_BIN": str(fake_agy), "AGY_STRUCTURED_OUTPUT": "{}"},
+    )
+
+    assert result.returncode == 1
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    assert receipt["result"] == "unavailable"
+    assert receipt["acceptedAttempt"] is None
+    assert receipt["attempts"][0]["result"] == "incomplete"
+    assert receipt["attempts"][0]["validationError"] == (
+        "findings-json: missing required field 'verdict'"
+    )
+
+
 def test_invoke_agy_rejects_duplicate_keys_in_structured_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
