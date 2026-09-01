@@ -4,6 +4,24 @@
 **Repository:** local `reviewctl` checkout
 **Purpose:** point-in-time operational handoff and roadmap
 
+## 2026-09-01 product viability decision
+
+The project remains viable as a smaller product: a local-first evidence control
+plane for bounded model reviews. The decision, ownership seams, current
+blockers, and staged roadmap are recorded in
+[Product scope and viability decision](PRODUCT-SCOPE.md).
+
+The immediate priority is correctness closure and one repeatable local review
+loop. New transports, federation, tournament/council workflows, and Sentrux
+integration are deferred until the shared backend conformance bar, policy
+semantics, merge-gate eligibility, and crash-recovery behavior are explicit and
+verified. A registered or available backend is not thereby qualified.
+
+The current pending thinking-level change is intentionally part of this product
+scope: it controls reasoning effort and records the request setting, but does
+not claim an output-token limit. Its Pi capture path still requires a real
+subprocess canary before it can support a gate lane.
+
 ## 2026-08-23 product iteration
 
 The local product loop is now implemented on `main` as a project-first API and

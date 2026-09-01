@@ -689,6 +689,7 @@ class ReviewClient:
                         source_roots=transport_source_roots,
                         provider_preferences=None,
                         tools=profile.tools,
+                        thinking=profile.thinking,
                     )
                     execution = transport.execute(backend_request)
             except OSError, UnicodeError, ValueError:
