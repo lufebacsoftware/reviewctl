@@ -6,6 +6,11 @@ Evidence-backed, organization-neutral control plane for bounded LLM code review.
 or policy. Each organization runs the same CLI against its own policy file and private receipt
 repository. It uses `llm` as a transport, not as the source of review governance.
 
+The current product boundary and viability roadmap are recorded in
+[Product scope and viability decision](docs/PRODUCT-SCOPE.md). The supported
+core is the bounded local evidence loop; transports, publishers, qualification
+work, and federation remain separate extension boundaries.
+
 ## Install
 
 Python 3.14 or newer is required.
@@ -148,6 +153,11 @@ routes = [
 timeout_seconds = 600
 max_attempts = 2
 ```
+
+Pi-backed profiles may also set `thinking` to `off`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `max`. The selected level is forwarded to Pi and recorded
+in request evidence; it controls reasoning effort, not an output-token cap.
+The default is `minimal`.
 
 Select a profile with `--profile gemini`. A profile cannot be combined with `--model` or
 `--route`; the receipt records the profile name, config path, config SHA-256, and execution settings.

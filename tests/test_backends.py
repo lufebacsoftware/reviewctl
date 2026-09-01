@@ -731,6 +731,7 @@ def test_execute_pi_backend_invokes_legacy_transport_and_maps_all_evidence(
         "session_path": scratch_session,
         "diagnostic_path": stderr_path,
         "evidence_parent_identity": request.evidence_parent_identity,
+        "thinking": request.thinking,
     }
     assert scratch_session != session_path
     assert session_path.read_text() == "session evidence"

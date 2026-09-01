@@ -3670,6 +3670,7 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
         'routes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n'
         "timeout_seconds = 600\n"
         "max_attempts = 2\n"
+        'thinking = "max"\n'
     )
 
     result = run_cli(
@@ -3693,6 +3694,7 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
     assert receipt["routeProfile"]["settings"] == {
         "timeout_seconds": 600,
         "max_attempts": 2,
+        "thinking": "max",
     }
     assert receipt["executionSettings"] == {
         "timeoutSeconds": 5,
@@ -3863,6 +3865,16 @@ def test_route_profile_hashes_the_exact_parsed_config_bytes(
     assert metadata["sha256"] == hashlib.sha256(parsed).hexdigest()
 
 
+def test_route_profile_normalizes_thinking_like_project_config(tmp_path: Path) -> None:
+    config = tmp_path / "reviewctl.toml"
+    config.write_text('[profiles.code]\nroutes = ["llm:accepted"]\nthinking = " max "\n')
+
+    routes, metadata = cli.load_route_profile(cli.build_parser(), str(config), "code")
+
+    assert routes == (cli.ReviewRoute("llm", "accepted"),)
+    assert metadata["settings"]["thinking"] == "max"
+
+
 def test_mixed_routes_do_not_apply_the_first_transports_defaults(tmp_path: Path) -> None:
     fake_agy = write_fake_agy(tmp_path)
     fake_pi = write_fake_pi(tmp_path)
@@ -3952,6 +3964,10 @@ def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) ->
         (
             '[profiles.invalid-attempts]\nroutes = ["llm:accepted"]\nmax_attempts = 4\n',
             "invalid-attempts",
+        ),
+        (
+            '[profiles.invalid-thinking]\nroutes = ["llm:accepted"]\nthinking = "unbounded"\n',
+            "invalid-thinking",
         ),
     ],
 )
@@ -12553,6 +12569,8 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
             "--no-prompt-templates",
             "--no-context-files",
             "--no-approve",
+            "--thinking",
+            "minimal",
             "--system-prompt",
             cli.pi_system_prompt("findings-json"),
             "--model",

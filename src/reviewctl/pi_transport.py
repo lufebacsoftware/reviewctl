@@ -313,7 +313,7 @@ class PiTransport:
             "--no-context-files",
             "--no-approve",
             "--thinking",
-            "minimal",
+            request.thinking,
             "--system-prompt",
             "Return only raw JSON matching the requested review contract; "
             "do not use Markdown fences.",
@@ -330,6 +330,7 @@ class PiTransport:
             "model": request.model,
             "responseContract": request.response_contract,
             "requestedMaxOutputTokens": request.max_output_tokens,
+            "thinking": request.thinking,
             "outputTokenLimitEnforced": False,
             "tools": request.tools,
             "files": [path.name for path in request.files],
@@ -385,6 +386,7 @@ class PiTransport:
             diagnostic=diagnostic,
             response=persisted,
             evidence=BackendEvidence(
+                request=request.attempt_dir / "request.json",
                 response=response_path,
                 session=session_path if session_path.is_file() else None,
                 stderr=stderr_path,
