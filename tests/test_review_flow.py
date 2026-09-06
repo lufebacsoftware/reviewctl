@@ -1094,6 +1094,25 @@ def test_promote_fragments_accepts_genuine_mixed_findings_with_missing_declarati
     assert evaluation.completion_request.invalid_fragment_indexes == (1,)
 
 
+def test_findings_prompt_declares_reviewed_files_when_required() -> None:
+    contract = get_contract("findings-json")
+    context = ContractContext(
+        file_names=("source.py",),
+        review_declaration_required=True,
+    )
+
+    prepared = contract.prepare(context)
+
+    assert (
+        "top-level object has exactly `verdict`, `findings`, and `reviewedFiles`"
+        in prepared.output_instructions
+    )
+    assert (
+        "top-level object has exactly `verdict` and `findings`"
+        not in prepared.output_instructions
+    )
+
+
 def test_build_completion_context_deduplicates_content_but_preserves_provenance() -> None:
     first = promoted(finding(), attempt=2, route_index=1)
     second = promoted(finding(), attempt=1, route_index=0)
