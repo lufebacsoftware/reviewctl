@@ -1112,6 +1112,15 @@ def test_findings_prompt_declares_reviewed_files_when_required() -> None:
         not in prepared.output_instructions
     )
 
+    without_declaration = contract.prepare(
+        ContractContext(file_names=("source.py",))
+    )
+    assert (
+        "top-level object has exactly `verdict` and `findings`"
+        in without_declaration.output_instructions
+    )
+    assert "reviewedFiles" not in without_declaration.output_instructions
+
 
 def test_build_completion_context_deduplicates_content_but_preserves_provenance() -> None:
     first = promoted(finding(), attempt=2, route_index=1)
