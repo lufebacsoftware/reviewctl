@@ -11151,7 +11151,7 @@ def test_kiro_bounded_capture_marks_forced_pipe_close_as_incomplete(
             self.released = threading.Event()
 
         def read(self, _size: int) -> bytes:
-            assert self.released.wait(1)
+            assert self.released.wait(10)
             return b""
 
     class ExitedProcess:
@@ -11181,6 +11181,52 @@ def test_kiro_bounded_capture_marks_forced_pipe_close_as_incomplete(
     )
 
     assert captured == (b"", b"", False, False, True)
+
+
+def test_kiro_bounded_capture_allows_a_slow_normal_pipe_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DelayedStream:
+        def __init__(self, value: bytes) -> None:
+            self.value = value
+            self.reads = 0
+
+        def read(self, _size: int) -> bytes:
+            self.reads += 1
+            if self.reads == 1:
+                time.sleep(0.05)
+                return self.value
+            return b""
+
+    class ExitedProcess:
+        pid = 123
+        returncode = 0
+        stderr = BytesIO(b"")
+
+        def __init__(self) -> None:
+            self.stdout = DelayedStream(b"response")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+    terminated = False
+
+    def unexpected_termination(*_args: object, **_kwargs: object) -> None:
+        nonlocal terminated
+        terminated = True
+
+    monkeypatch.setattr(cli, "terminate_process_group", unexpected_termination)
+
+    captured = cli._communicate_kiro_bounded(
+        ExitedProcess(),
+        input_bytes=None,
+        timeout_seconds=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    assert captured == (b"response", b"", False, False, False)
+    assert terminated is False
 
 
 def test_kiro_bounded_capture_handles_a_broken_input_pipe(

@@ -2289,6 +2289,12 @@ def _communicate_kiro_bounded(
     # A descendant that inherits either pipe can keep it open after the Kiro
     # process exits. Treat that as a failed capture and terminate the whole
     # isolated process group instead of returning a silently incomplete review.
+    # A normal child exit can race with the reader threads consuming bytes
+    # already buffered in the pipes. Give that drain a short bounded window;
+    # only a pipe that remains open after the window requires forced cleanup.
+    normal_drain_deadline = min(operation_deadline, time.monotonic() + 1)
+    for reader in (stdout_reader, stderr_reader):
+        reader.join(timeout=max(0, normal_drain_deadline - time.monotonic()))
     if not all(event.is_set() for event in reader_finished.values()):
         capture_interrupted.set()
         terminate_once()
