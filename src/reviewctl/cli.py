@@ -2215,6 +2215,7 @@ def _communicate_kiro_bounded(
     captures: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
     output_exceeded = threading.Event()
     capture_failed = threading.Event()
+    capture_interrupted = threading.Event()
     terminated = threading.Event()
     termination_lock = threading.Lock()
     reader_finished = {"stdout": threading.Event(), "stderr": threading.Event()}
@@ -2289,6 +2290,7 @@ def _communicate_kiro_bounded(
     # process exits. Treat that as a failed capture and terminate the whole
     # isolated process group instead of returning a silently incomplete review.
     if not all(event.is_set() for event in reader_finished.values()):
+        capture_interrupted.set()
         terminate_once()
     # Allow a short, bounded post-termination drain so bytes already written
     # before a timeout are retained without permitting reader threads to extend
@@ -2297,7 +2299,7 @@ def _communicate_kiro_bounded(
     join_deadline = min(cleanup_deadline, time.monotonic() + 5)
     for reader in (stdout_reader, stderr_reader):
         reader.join(timeout=max(0, join_deadline - time.monotonic()))
-    capture_incomplete = capture_failed.is_set() or not all(
+    capture_incomplete = capture_failed.is_set() or capture_interrupted.is_set() or not all(
         event.is_set() for event in reader_finished.values()
     )
     return (

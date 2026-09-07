@@ -11143,6 +11143,46 @@ def test_kiro_bounded_capture_keeps_draining_after_output_limit(
     assert captured == (b"x", b"", False, True, False)
 
 
+def test_kiro_bounded_capture_marks_forced_pipe_close_as_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingStream:
+        def __init__(self) -> None:
+            self.released = threading.Event()
+
+        def read(self, _size: int) -> bytes:
+            assert self.released.wait(1)
+            return b""
+
+    class ExitedProcess:
+        pid = 123
+        returncode = 0
+        stderr = BytesIO(b"")
+
+        def __init__(self) -> None:
+            self.stdout = BlockingStream()
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+    process = ExitedProcess()
+
+    def release_pipe(*_args: object, **_kwargs: object) -> None:
+        process.stdout.released.set()
+
+    monkeypatch.setattr(cli, "terminate_process_group", release_pipe)
+
+    captured = cli._communicate_kiro_bounded(
+        process,
+        input_bytes=None,
+        timeout_seconds=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    assert captured == (b"", b"", False, False, True)
+
+
 def test_kiro_bounded_capture_handles_a_broken_input_pipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
