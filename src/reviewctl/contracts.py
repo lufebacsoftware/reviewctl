@@ -411,9 +411,14 @@ class FindingsJsonContract:
         if context.review_declaration_required:
             schema["required"].append("reviewedFiles")
             schema["properties"]["reviewedFiles"] = deepcopy(REVIEWED_FILES_SCHEMA)
+        top_level_fields = (
+            "`verdict`, `findings`, and `reviewedFiles`"
+            if context.review_declaration_required
+            else "`verdict` and `findings`"
+        )
         instructions = (
             "Return only JSON matching the supplied schema. The top-level object has exactly "
-            "`verdict` and `findings`. Each finding has exactly six fields: `severity`, `path`, "
+            f"{top_level_fields}. Each finding has exactly six fields: `severity`, `path`, "
             "`line`, `title`, `evidence`, and `reproduction`. Use `changes-requested` if and only "
             "if `findings` is non-empty; use `approved` if and only if `findings` is empty."
         )
