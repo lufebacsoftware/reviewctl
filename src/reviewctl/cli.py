@@ -50,6 +50,7 @@ from reviewctl.backends import (
     ReadOnlyCapability,
     SourceIsolation,
 )
+from reviewctl.config import THINKING_LEVELS
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
     REVIEWED_FILES_SCHEMA,
@@ -143,6 +144,7 @@ DEFAULT_REVIEW_MAX_ATTEMPTS = 1
 TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
 ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"}
+PI_THINKING_LEVELS = THINKING_LEVELS
 LOCAL_POLICY_TRANSPORTS = frozenset({"codex", "gemini", "kiro", "pi"})
 REQUIRED_LOCAL_POLICY_TRANSPORTS = frozenset({"gemini", "kiro", "pi"})
 RETRIABLE_REVIEW_RESULTS = {
@@ -616,6 +618,18 @@ def load_route_profile(
         if maximum is not None and value > maximum:
             parser.error(f"profile {profile!r}: {key} must be from {minimum} to {maximum}")
         settings[key] = value
+    thinking = profile_config.get("thinking") if isinstance(profile_config, dict) else None
+    if thinking is not None:
+        normalized_thinking = thinking.strip() if isinstance(thinking, str) else thinking
+        if (
+            not isinstance(normalized_thinking, str)
+            or normalized_thinking not in PI_THINKING_LEVELS
+        ):
+            parser.error(
+                f"profile {profile!r}: thinking must be one of "
+                f"{', '.join(sorted(PI_THINKING_LEVELS))}"
+            )
+        settings["thinking"] = normalized_thinking
     return routes, {
         "name": profile,
         "path": str(config_path),
@@ -3351,6 +3365,7 @@ def invoke_pi(
     session_path: Path,
     diagnostic_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    thinking: str = "minimal",
 ) -> tuple[int, str, PersistedResponse]:
     """Run Pi in JSON mode and retain its complete event stream and session."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -3367,6 +3382,8 @@ def invoke_pi(
         "--no-prompt-templates",
         "--no-context-files",
         "--no-approve",
+        "--thinking",
+        thinking,
         "--system-prompt",
         pi_system_prompt(response_contract),
         "--model",
@@ -3387,6 +3404,7 @@ def invoke_pi(
                 "mode": "json",
                 "model": model,
                 "requestedMaxOutputTokens": max_output_tokens,
+                "thinking": thinking,
                 "outputTokenLimitEnforced": False,
                 "responseContract": response_contract,
                 "files": [str(file) for file in files],
@@ -4386,6 +4404,7 @@ def execute_pi_backend(request: BackendRequest) -> BackendExecution:
             session_path=scratch_session,
             diagnostic_path=stderr_path,
             evidence_parent_identity=request.evidence_parent_identity,
+            thinking=request.thinking,
         )
         if os.path.lexists(scratch_session):
             try:
@@ -5106,6 +5125,10 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if args.max_attempts is not None
         else configured_attempts or DEFAULT_REVIEW_MAX_ATTEMPTS
     )
+    configured_thinking = (
+        profile_settings.get("thinking") if isinstance(profile_settings, dict) else None
+    )
+    thinking = configured_thinking if isinstance(configured_thinking, str) else "minimal"
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
     requested_models = [route.model for route in routes]
@@ -5248,6 +5271,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     source_roots=tuple(codex_source_roots or ()),
                     provider_preferences=provider_preferences,
                     evidence_parent_identity=attempt_identity,
+                    thinking=thinking,
                 )
             )
             exit_code = execution.exit_code

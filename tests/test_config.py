@@ -277,6 +277,26 @@ def test_review_dimensions_are_normalized_and_project_required(tmp_path: Path) -
     assert config.profile("default").dimensions == ("architecture", "security")
 
 
+def test_profile_thinking_level_is_loaded_and_validated(tmp_path: Path) -> None:
+    project = tmp_path / "reviewctl.toml"
+    project.write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:openrouter/z-ai/glm-5.3-flash"]\n'
+        'thinking = "max"\n'
+    )
+
+    config = load_config(project, user_path=None)
+
+    assert config.profile("default").thinking == "max"
+
+    project.write_text(
+        '[project]\nprivacy_mode = "private"\n[profiles.default]\nthinking = "unbounded"\n'
+    )
+    with pytest.raises(ConfigError, match="thinking"):
+        load_config(project, user_path=None)
+
+
 @pytest.mark.parametrize(
     "value",
     [

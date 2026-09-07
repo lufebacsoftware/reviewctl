@@ -295,6 +295,23 @@ def test_client_injects_contract_instructions_into_transport_prompt(tmp_path: Pa
     assert "Return only JSON matching the supplied schema" in transport.requests[0].prompt
 
 
+def test_client_forwards_profile_thinking_to_transport(tmp_path: Path) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:fake/model"]\n'
+        'execution = "remote"\n'
+        'thinking = "max"\n'
+    )
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+    client = ReviewClient.from_project(tmp_path, transports={"pi": transport})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == "accepted"
+    assert transport.requests[0].thinking == "max"
+
+
 def test_client_rejects_review_id_path_traversal(tmp_path: Path) -> None:
     write_default_config(tmp_path)
     client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
