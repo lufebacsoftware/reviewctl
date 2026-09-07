@@ -35,8 +35,9 @@ as an accepted review.
 
 ## Run a review
 
-For the simpler project-local workflow, initialize once and use the Pi-backed
-front door:
+For the simpler project-local workflow, initialize once, explicitly add an
+organization-approved route to `reviewctl.toml`, and then use the project front
+door:
 
 ```bash
 reviewctl init --project .
@@ -47,11 +48,13 @@ reviewctl review --project . --profile default \
 reviewctl findings --project . --status open
 ```
 
-Project reviews keep a private append-only journal under `.reviewctl/`, try
-ordered routes, preserve validated findings from incomplete attempts, and
-write receipts that can be checked offline with `reviewctl verify`. The
-existing `run` command below remains the compatibility and organization-level
-path.
+The generated profile is deliberately local and route-free, so initialization
+cannot send source to a provider. Project reviews keep a private append-only
+journal under `.reviewctl/`, try explicitly configured routes, preserve
+validated findings from incomplete attempts, and write compatibility
+checkpoints. Those checkpoints are not canonical V1/V2 receipts and global
+`reviewctl verify` rejects them. Use the `run` command below for persisted,
+offline-verifiable formal review evidence.
 
 The project journal deduplicates repeated observations by stable finding ID.
 Use the lifecycle command to record a human or CI decision without rewriting

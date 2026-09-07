@@ -51,10 +51,10 @@ privacy_mode = "private"
 required_dimensions = ["correctness"]
 
 [profiles.default]
-routes = ["pi:openrouter/stealth/ox-alpha"]
+routes = []
 dimensions = ["correctness"]
 response_contract = "findings-json"
-execution = "remote"
+execution = "local"
 tools = "none"
 timeout_seconds = 300
 max_output_tokens = 8000
@@ -240,10 +240,6 @@ def init_project(args: Any) -> int:
     template = PROJECT_TEMPLATE.format(project_id=project_id).replace(
         'privacy_mode = "private"', f'privacy_mode = "{args.mode}"'
     )
-    if args.mode == "sensitive":
-        template = template.replace(
-            'routes = ["pi:openrouter/stealth/ox-alpha"]', "routes = []"
-        ).replace('execution = "remote"', 'execution = "local"')
     try:
         ensure_project_state_root(project)
     except JournalOperationError as error:
