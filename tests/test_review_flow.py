@@ -1108,13 +1108,10 @@ def test_findings_prompt_declares_reviewed_files_when_required() -> None:
         in prepared.output_instructions
     )
     assert (
-        "top-level object has exactly `verdict` and `findings`"
-        not in prepared.output_instructions
+        "top-level object has exactly `verdict` and `findings`" not in prepared.output_instructions
     )
 
-    without_declaration = contract.prepare(
-        ContractContext(file_names=("source.py",))
-    )
+    without_declaration = contract.prepare(ContractContext(file_names=("source.py",)))
     assert (
         "top-level object has exactly `verdict` and `findings`"
         in without_declaration.output_instructions
