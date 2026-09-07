@@ -146,6 +146,11 @@ timeout_seconds = 600
 max_attempts = 2
 ```
 
+Pi-backed profiles may also set `thinking` to `off`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `max`. The selected level is forwarded to Pi and recorded
+in request evidence; it controls reasoning effort, not an output-token cap.
+The default is `minimal`.
+
 Select a profile with `--profile gemini`. A profile cannot be combined with `--model` or
 `--route`; the receipt records the profile name, config path, config SHA-256, and execution settings.
 `defaults.<transport>` applies to direct `--transport` invocations and profile runs when the
@@ -235,6 +240,7 @@ Synthetic prompt-only rounds intentionally omit `--file`; their receipt records 
 ```bash
 reviewctl verify receipt.json
 reviewctl policy-check --policy org-policy.toml --model <model-id>
+reviewctl policy-check --policy org-policy.toml --transport kiro --model <model-id> --enforce
 reviewctl tournament --plan /path/to/organization-tournament.toml
 reviewctl tournament --plan /path/to/organization-tournament.toml --case <case-id>
 reviewctl provider-preflight --plan /path/to/provider-comparison.toml

@@ -683,6 +683,7 @@ class ReviewClient:
                 source_roots=transport_source_roots,
                 provider_preferences=None,
                 tools=profile.tools,
+                thinking=profile.thinking,
             )
             try:
                 execution = transport.execute(backend_request)

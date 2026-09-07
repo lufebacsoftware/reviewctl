@@ -50,6 +50,7 @@ from reviewctl.backends import (
     ReadOnlyCapability,
     SourceIsolation,
 )
+from reviewctl.config import THINKING_LEVELS
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
     REVIEWED_FILES_SCHEMA,
@@ -112,8 +113,13 @@ MAX_OPENROUTER_STDERR_BYTES = 100_000
 MAX_OPENROUTER_STATUS_BYTES = 32
 MAX_PI_EXPLORATION_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_PI_EXPLORATION_STDERR_BYTES = 100_000
-MAX_PI_LEGACY_STDOUT_BYTES = 4 * 1024 * 1024
+# Pi JSON mode can emit a multi-megabyte event stream when reasoning is enabled;
+# retain a finite capture bound while allowing normal long review sessions.
+MAX_PI_LEGACY_STDOUT_BYTES = 256 * 1024 * 1024
 MAX_PI_LEGACY_STDERR_BYTES = 100_000
+# Pi persists its session/runtime state separately from the captured streams.
+# Keep this process-wide filesystem guard independent from stream limits.
+MAX_PI_PROCESS_FILE_BYTES = 512 * 1024 * 1024
 MAX_CODEX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CODEX_STDERR_BYTES = 100_000
@@ -143,6 +149,7 @@ DEFAULT_REVIEW_MAX_ATTEMPTS = 1
 TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
 ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"}
+PI_THINKING_LEVELS = THINKING_LEVELS
 LOCAL_POLICY_TRANSPORTS = frozenset({"codex", "gemini", "kiro", "pi"})
 REQUIRED_LOCAL_POLICY_TRANSPORTS = frozenset({"gemini", "kiro", "pi"})
 RETRIABLE_REVIEW_RESULTS = {
@@ -565,7 +572,7 @@ def execution_default_settings(
         return {}
     if not isinstance(transport_defaults, dict):
         parser.error(f"defaults.{transport} must be a TOML table")
-    settings: dict[str, int] = {}
+    settings: dict[str, object] = {}
     for key, minimum, maximum in (
         ("timeout_seconds", 1, None),
         ("max_attempts", 1, 3),
@@ -616,6 +623,21 @@ def load_route_profile(
         if maximum is not None and value > maximum:
             parser.error(f"profile {profile!r}: {key} must be from {minimum} to {maximum}")
         settings[key] = value
+    thinking = profile_config.get("thinking") if isinstance(profile_config, dict) else None
+    if thinking is not None:
+        if not isinstance(thinking, str) or thinking not in PI_THINKING_LEVELS:
+            parser.error(
+                f"profile {profile!r}: thinking must be one of "
+                f"{', '.join(sorted(PI_THINKING_LEVELS))}"
+            )
+        settings["thinking"] = thinking
+    require_reviewed_files = (
+        profile_config.get("require_reviewed_files") if isinstance(profile_config, dict) else None
+    )
+    if require_reviewed_files is not None:
+        if type(require_reviewed_files) is not bool:
+            parser.error(f"profile {profile!r}: require_reviewed_files must be boolean")
+        settings["require_reviewed_files"] = require_reviewed_files
     return routes, {
         "name": profile,
         "path": str(config_path),
@@ -2158,6 +2180,135 @@ def terminate_process_group(process: subprocess.Popen[bytes], *, grace_seconds: 
             pass
 
 
+def _communicate_kiro_bounded(
+    process: subprocess.Popen[bytes],
+    *,
+    input_bytes: bytes | None,
+    timeout_seconds: float,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> tuple[bytes, bytes, bool, bool, bool]:
+    """Drain Kiro pipes without constraining files that Kiro writes internally."""
+    streams = (
+        (getattr(process, "stdout", None), stdout_limit),
+        (getattr(process, "stderr", None), stderr_limit),
+    )
+
+    def bounded(value: object, limit: int) -> tuple[bytes, bool]:
+        data = value if isinstance(value, bytes) else b""
+        return data[:limit], len(data) > limit
+
+    # Keep compatibility with lightweight fake processes used by the unit tests.
+    # Real Popen instances below always expose both pipe streams.
+    if any(stream is None for stream, _ in streams):
+        try:
+            stdout, stderr = process.communicate(input=input_bytes, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            terminate_process_group(process, grace_seconds=0)
+            stdout, stdout_truncated = bounded(error.output, stdout_limit)
+            stderr, stderr_truncated = bounded(error.stderr, stderr_limit)
+            return stdout, stderr, True, stdout_truncated or stderr_truncated, False
+        stdout, stdout_truncated = bounded(stdout, stdout_limit)
+        stderr, stderr_truncated = bounded(stderr, stderr_limit)
+        return stdout, stderr, False, stdout_truncated or stderr_truncated, False
+
+    captures: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    output_exceeded = threading.Event()
+    capture_failed = threading.Event()
+    terminated = threading.Event()
+    termination_lock = threading.Lock()
+    reader_finished = {"stdout": threading.Event(), "stderr": threading.Event()}
+
+    def terminate_once() -> None:
+        with termination_lock:
+            if terminated.is_set():
+                return
+            terminated.set()
+        terminate_process_group(process, grace_seconds=0)
+
+    def drain(stream: object, name: str, limit: int) -> None:
+        if stream is None:  # pragma: no cover - guarded by the branch above
+            return
+        retained = captures[name]
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)  # type: ignore[union-attr]
+                if not chunk:
+                    return
+                if len(retained) <= limit:
+                    retained.extend(chunk[: limit + 1 - len(retained)])
+                if len(retained) > limit:
+                    output_exceeded.set()
+                    terminate_once()
+        except (OSError, ValueError):
+            capture_failed.set()
+            return
+        finally:
+            reader_finished[name].set()
+
+    (stdout_stream, _), (stderr_stream, _) = streams
+    stdout_reader = threading.Thread(
+        target=drain,
+        args=(stdout_stream, "stdout", stdout_limit),
+        daemon=True,
+        name="reviewctl-kiro-stdout",
+    )
+    stderr_reader = threading.Thread(
+        target=drain,
+        args=(stderr_stream, "stderr", stderr_limit),
+        daemon=True,
+        name="reviewctl-kiro-stderr",
+    )
+    stdout_reader.start()
+    stderr_reader.start()
+
+    stdin_stream = getattr(process, "stdin", None)
+    if input_bytes is not None and stdin_stream is not None:
+
+        def write_input() -> None:
+            try:
+                stdin_stream.write(input_bytes)  # type: ignore[union-attr]
+                stdin_stream.close()  # type: ignore[union-attr]
+            except (BrokenPipeError, OSError, ValueError):
+                return
+
+        threading.Thread(
+            target=write_input,
+            daemon=True,
+            name="reviewctl-kiro-stdin",
+        ).start()
+
+    operation_deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        terminate_once()
+    # A descendant that inherits either pipe can keep it open after the Kiro
+    # process exits. Treat that as a failed capture and terminate the whole
+    # isolated process group instead of returning a silently incomplete review.
+    if not all(event.is_set() for event in reader_finished.values()):
+        terminate_once()
+    # Allow a short, bounded post-termination drain so bytes already written
+    # before a timeout are retained without permitting reader threads to extend
+    # the operation indefinitely.
+    cleanup_deadline = operation_deadline + 1
+    join_deadline = min(cleanup_deadline, time.monotonic() + 5)
+    for reader in (stdout_reader, stderr_reader):
+        reader.join(timeout=max(0, join_deadline - time.monotonic()))
+    capture_incomplete = capture_failed.is_set() or not all(
+        event.is_set() for event in reader_finished.values()
+    )
+    return (
+        bytes(captures["stdout"][:stdout_limit]),
+        bytes(captures["stderr"][:stderr_limit]),
+        timed_out,
+        output_exceeded.is_set(),
+        capture_incomplete,
+    )
+
+
 def packet_prompt(prompt: str, files: list[Path], response_contract: str = "verdict") -> str:
     """Add stable file names so structured findings are comparable across models."""
     supplied = ", ".join(file.name for file in files)
@@ -2428,56 +2579,37 @@ def invoke_kiro(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return 124, b"", b"", "review attempt timed out"
-        if resource is None:
-            return 126, b"", b"", "Kiro bounded output capture unsupported on this platform"
-        capture_file_limit = max(MAX_KIRO_STDOUT_BYTES, MAX_KIRO_STDERR_BYTES) + 1
-
-        def limit_output_files() -> None:
-            resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
-                resource.RLIMIT_FSIZE,
-                (capture_file_limit, capture_file_limit),
-            )
 
         try:
-            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-                process = subprocess.Popen(
-                    command,
-                    cwd=cwd,
-                    env=environment,
-                    stdin=subprocess.PIPE if input_bytes is not None else None,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    start_new_session=True,
-                    preexec_fn=limit_output_files,
-                )
-                try:
-                    communicated_stdout, communicated_stderr = process.communicate(
-                        input=input_bytes, timeout=remaining
-                    )
-                    code = process.returncode
-                    transport_error = ""
-                except subprocess.TimeoutExpired as error:
-                    terminate_process_group(process, grace_seconds=0)
-                    communicated_stdout = error.output
-                    communicated_stderr = error.stderr
-                    code = 124
-                    transport_error = "review attempt timed out"
-
-                def bounded_output(value: object, stream, limit: int) -> tuple[bytes, bool]:
-                    if not isinstance(value, bytes):
-                        stream.seek(0)
-                        value = stream.read(limit + 1)
-                    return value[:limit], len(value) > limit
-
-                stdout, stdout_truncated = bounded_output(
-                    communicated_stdout, stdout_file, MAX_KIRO_STDOUT_BYTES
-                )
-                stderr, stderr_truncated = bounded_output(
-                    communicated_stderr, stderr_file, MAX_KIRO_STDERR_BYTES
-                )
-                if stdout_truncated or stderr_truncated:
-                    return 502, stdout, stderr, "Kiro transport output exceeded bounded capture"
-                return code, stdout, stderr, transport_error
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=environment,
+                stdin=subprocess.PIPE if input_bytes is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            (
+                stdout,
+                stderr,
+                timed_out,
+                output_exceeded,
+                capture_incomplete,
+            ) = _communicate_kiro_bounded(
+                process,
+                input_bytes=input_bytes,
+                timeout_seconds=remaining,
+                stdout_limit=MAX_KIRO_STDOUT_BYTES,
+                stderr_limit=MAX_KIRO_STDERR_BYTES,
+            )
+            if output_exceeded:
+                return 502, stdout, stderr, "Kiro transport output exceeded bounded capture"
+            if timed_out:
+                return 124, stdout, stderr, "review attempt timed out"
+            if capture_incomplete:
+                return 502, stdout, stderr, "Kiro transport capture did not reach EOF"
+            return process.returncode, stdout, stderr, ""
         except FileNotFoundError:
             return 127, b"", b"", f"Kiro transport executable not found: {kiro_bin}"
         except subprocess.SubprocessError as error:
@@ -3350,6 +3482,7 @@ def invoke_pi(
     session_path: Path,
     diagnostic_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    thinking: str = "minimal",
 ) -> tuple[int, str, PersistedResponse]:
     """Run Pi in JSON mode and retain its complete event stream and session."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -3366,6 +3499,8 @@ def invoke_pi(
         "--no-prompt-templates",
         "--no-context-files",
         "--no-approve",
+        "--thinking",
+        thinking,
         "--system-prompt",
         pi_system_prompt(response_contract),
         "--model",
@@ -3386,6 +3521,7 @@ def invoke_pi(
                 "mode": "json",
                 "model": model,
                 "requestedMaxOutputTokens": max_output_tokens,
+                "thinking": thinking,
                 "outputTokenLimitEnforced": False,
                 "responseContract": response_contract,
                 "files": [str(file) for file in files],
@@ -3400,7 +3536,11 @@ def invoke_pi(
     started = time.monotonic()
     stdout = b""
     stderr = b""
-    capture_file_limit = max(MAX_PI_LEGACY_STDOUT_BYTES, MAX_PI_LEGACY_STDERR_BYTES) + 1
+    capture_file_limit = max(
+        MAX_PI_PROCESS_FILE_BYTES,
+        MAX_PI_LEGACY_STDOUT_BYTES,
+        MAX_PI_LEGACY_STDERR_BYTES,
+    ) + 1
 
     def limit_output_files() -> None:
         resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
@@ -4385,6 +4525,7 @@ def execute_pi_backend(request: BackendRequest) -> BackendExecution:
             session_path=scratch_session,
             diagnostic_path=stderr_path,
             evidence_parent_identity=request.evidence_parent_identity,
+            thinking=request.thinking,
         )
         if os.path.lexists(scratch_session):
             try:
@@ -5105,6 +5246,27 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if args.max_attempts is not None
         else configured_attempts or DEFAULT_REVIEW_MAX_ATTEMPTS
     )
+    configured_thinking = (
+        profile_settings.get("thinking")
+        if isinstance(profile_settings, dict)
+        else None
+    )
+    thinking = configured_thinking if isinstance(configured_thinking, str) else "minimal"
+    configured_reviewed_files = (
+        profile_settings.get("require_reviewed_files")
+        if isinstance(profile_settings, dict)
+        else None
+    )
+    explicit_reviewed_files = getattr(args, "require_reviewed_files", None)
+    if explicit_reviewed_files is not None and type(explicit_reviewed_files) is not bool:
+        parser.error("require reviewed files must be boolean")
+    if configured_reviewed_files is not None and type(configured_reviewed_files) is not bool:
+        parser.error("profile require_reviewed_files must be boolean")
+    require_reviewed_files = (
+        explicit_reviewed_files
+        if explicit_reviewed_files is not None
+        else bool(configured_reviewed_files)
+    )
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
     requested_models = [route.model for route in routes]
@@ -5129,7 +5291,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 ContractContext(
                     file_names=tuple(item["name"] for item in source_files),
                     review_declaration_required=(
-                        transport == "codex" and args.source_class == "proprietary"
+                        require_reviewed_files
+                        or (transport == "codex" and args.source_class == "proprietary")
                     ),
                 )
                 if native_contract
@@ -5247,6 +5410,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     source_roots=tuple(codex_source_roots or ()),
                     provider_preferences=provider_preferences,
                     evidence_parent_identity=attempt_identity,
+                    thinking=thinking,
                 )
             )
             exit_code = execution.exit_code
@@ -5451,7 +5615,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     "contractContext": {
                         "fileNames": [item["name"] for item in source_files],
                         "reviewDeclarationRequired": (
-                            transport == "codex" and args.source_class == "proprietary"
+                            require_reviewed_files
+                            or (transport == "codex" and args.source_class == "proprietary")
                         ),
                     },
                 }
@@ -5602,6 +5767,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "rotation": {"maxBytes": 5 * 1024 * 1024, "backupCount": 5},
         },
     }
+    if require_reviewed_files:
+        receipt["executionSettings"]["requireReviewedFiles"] = True
     if kiro_identity_waiver:
         receipt["extension.kiroUnresolvedIdentityWaiver"] = True
     if range_context is not None:
@@ -5820,7 +5987,7 @@ def verify_receipt(args: argparse.Namespace) -> int:
 
 def policy_check(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    model = policy.get("models", {}).get(args.model, {})
+    model = policy_entry(policy, args.model, transport=getattr(args, "transport", None))
     source_allowed = bool(model.get("source_allowed", False))
     decision = {
         "advisory": not args.enforce,
@@ -5831,6 +5998,9 @@ def policy_check(args: argparse.Namespace) -> int:
         "dataCollection": model.get("data_collection", "unknown"),
         "mode": "enforced" if args.enforce else "advisory",
     }
+    if args.transport is not None:
+        decision["transport"] = args.transport
+        decision["allowUnresolvedIdentity"] = bool(model.get("allow_unresolved_identity", False))
     print(json.dumps(decision, sort_keys=True))
     return 0 if source_allowed or not args.enforce else 3
 
@@ -6460,6 +6630,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
     run.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     run.add_argument("--max-attempts", type=int, default=None)
+    run.add_argument(
+        "--require-reviewed-files",
+        action="store_true",
+        default=None,
+        help="require the model to declare every supplied file in reviewedFiles",
+    )
     run.add_argument("--policy")
     run.add_argument("--provider-only", action="append", default=[])
     run.add_argument("--provider-order", action="append", default=[])
@@ -6636,6 +6812,11 @@ def build_parser() -> argparse.ArgumentParser:
     policy = commands.add_parser("policy-check", help="check a model privacy profile")
     policy.add_argument("--policy", required=True)
     policy.add_argument("--model", required=True)
+    policy.add_argument(
+        "--transport",
+        choices=tuple(sorted(LOCAL_POLICY_TRANSPORTS)),
+        help="resolve a local transport default when no exact model entry exists",
+    )
     policy.add_argument(
         "--enforce",
         action="store_true",

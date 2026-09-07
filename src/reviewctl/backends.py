@@ -107,6 +107,7 @@ class BackendRequest:
     provider_preferences: dict[str, object] | None
     evidence_parent_identity: tuple[int, int] | None = None
     tools: str = "none"
+    thinking: str = "minimal"
 
 
 @dataclass(frozen=True)

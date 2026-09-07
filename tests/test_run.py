@@ -1197,6 +1197,8 @@ else:
         'id': 'pi-session',
         'cwd': str(Path.cwd()),
     }) + '\\n')
+if os.environ.get('PI_LARGE_STATE'):
+    (Path.cwd() / 'pi-runtime-state.bin').write_bytes(b'x' * (5 * 1024 * 1024))
 response = json.dumps({'verdict': 'approved', 'findings': []})
 if model == 'empty' or model.endswith('/empty'):
     content = []
@@ -1221,6 +1223,8 @@ events = [
     {'type': 'agent_end', 'messages': [message]},
 ]
 if not os.environ.get('PI_SILENT'):
+    if os.environ.get('PI_LARGE_OUTPUT'):
+        sys.stdout.write((json.dumps({'type': 'agent_start'}) + '\\n') * 220000)
     print('\\n'.join(json.dumps(event) for event in events))
     sys.stdout.flush()
 if diagnostic := os.environ.get('PI_STDERR'):
@@ -1297,6 +1301,12 @@ if arguments == ["chat", "--list-models", "--format", "json"]:
         print(json.dumps({{
             "models": [{{"model_id": "claude-sonnet-5"}}],
             "default_model": "missing",
+        }}))
+    elif mode == "large-state":
+        (Path.cwd() / "kiro-runtime-state.bin").write_bytes(b"x" * (5 * 1024 * 1024))
+        print(json.dumps({{
+            "models": [{{"model_id": "claude-sonnet-5"}}],
+            "default_model": "claude-sonnet-5",
         }}))
     else:
         print(json.dumps({{
@@ -2065,6 +2075,7 @@ def _run_registered_findings_sequence(
     models: tuple[str, ...] = ("accepted",),
     max_attempts: int = 2,
     response_contract: str = "findings-json",
+    require_reviewed_files: bool = False,
 ) -> tuple[int, dict[str, object], list[cli.BackendRequest]]:
     captured: list[cli.BackendRequest] = []
     registry = cli.BackendRegistry()
@@ -2106,12 +2117,57 @@ def _run_registered_findings_sequence(
             response_contract,
             "--max-attempts",
             str(max_attempts),
+            *(["--require-reviewed-files"] if require_reviewed_files else []),
         ]
     )
 
     return_code = namespace.handler(namespace)
     turn = Path(capsys.readouterr().out.strip())
     return return_code, json.loads((turn / "receipt.json").read_text()), captured
+
+
+def test_muse_style_review_requires_reviewed_files_and_retries_format_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = {
+        "severity": "medium",
+        "path": "source.py",
+        "line": 1,
+        "title": "Bounded finding",
+        "evidence": "The finding is present in the supplied source.",
+        "reproduction": "Inspect source.py line 1.",
+    }
+    partial = json.dumps({"verdict": "changes-requested", "findings": [finding]})
+    complete = json.dumps(
+        {
+            "verdict": "changes-requested",
+            "findings": [finding],
+            "reviewedFiles": ["source.py"],
+        }
+    )
+
+    return_code, receipt, requests = _run_registered_findings_sequence(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        [{"response": partial}, {"response": complete}],
+        require_reviewed_files=True,
+    )
+
+    assert return_code == 0
+    assert [attempt["result"] for attempt in receipt["attempts"]] == [
+        "incomplete",
+        "accepted",
+    ]
+    assert receipt["executionSettings"]["requireReviewedFiles"] is True
+    assert receipt["attempts"][0]["contractEvaluation"]["contractContext"] == {
+        "fileNames": ["source.py"],
+        "reviewDeclarationRequired": True,
+    }
+    assert "reviewedFiles" in requests[1].prompt
+    assert cli.validate_v2_receipt(receipt) == ()
 
 
 def test_partial_findings_complete_with_typed_same_route_retry(
@@ -2684,6 +2740,60 @@ def test_pi_transport_archives_events_session_and_final_response(tmp_path: Path)
         '{"verdict": "approved", "findings": []}'
     )
     assert attempt["evidence"]["stderr"] is None
+
+
+def test_invoke_pi_allows_pi_runtime_state_larger_than_capture_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setenv("PI_LARGE_STATE", "1")
+
+    exit_code, error, response = cli.invoke_pi(
+        pi_bin=str(fake_pi),
+        prompt="Review.",
+        model="openrouter/test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=10,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.jsonl",
+        session_path=tmp_path / "session.jsonl",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert exit_code == 0
+    assert error == ""
+    assert response.response == '{"verdict": "approved", "findings": []}'
+
+
+def test_invoke_pi_allows_large_json_event_stream_with_bounded_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_pi = write_fake_pi(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+    monkeypatch.setenv("PI_LARGE_OUTPUT", "1")
+
+    exit_code, error, response = cli.invoke_pi(
+        pi_bin=str(fake_pi),
+        prompt="Review.",
+        model="openrouter/test",
+        files=[source],
+        max_output_tokens=10,
+        response_contract="findings-json",
+        timeout_seconds=10,
+        request_path=tmp_path / "request.json",
+        response_path=tmp_path / "response.jsonl",
+        session_path=tmp_path / "session.jsonl",
+        diagnostic_path=tmp_path / "stderr.log",
+    )
+
+    assert exit_code == 0
+    assert error == ""
+    assert response.response == '{"verdict": "approved", "findings": []}'
 
 
 def test_pi_transport_preserves_failed_event_stream(tmp_path: Path) -> None:
@@ -3662,6 +3772,7 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
         'routes = ["agy:gemini-3.6-flash-high", "llm:accepted"]\n'
         "timeout_seconds = 600\n"
         "max_attempts = 2\n"
+        'thinking = "max"\n'
     )
 
     result = run_cli(
@@ -3685,6 +3796,7 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
     assert receipt["routeProfile"]["settings"] == {
         "timeout_seconds": 600,
         "max_attempts": 2,
+        "thinking": "max",
     }
     assert receipt["executionSettings"] == {
         "timeoutSeconds": 5,
@@ -3945,6 +4057,15 @@ def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) ->
             '[profiles.invalid-attempts]\nroutes = ["llm:accepted"]\nmax_attempts = 4\n',
             "invalid-attempts",
         ),
+        (
+            '[profiles.invalid-thinking]\nroutes = ["llm:accepted"]\nthinking = "unbounded"\n',
+            "invalid-thinking",
+        ),
+        (
+            '[profiles.invalid-reviewed-files]\nroutes = ["llm:accepted"]\n'
+            'require_reviewed_files = "yes"\n',
+            "invalid-reviewed-files",
+        ),
     ],
 )
 def test_route_profile_rejects_unusable_configurations(
@@ -3956,6 +4077,53 @@ def test_route_profile_rejects_unusable_configurations(
 
     with pytest.raises(SystemExit) as error:
         cli.load_route_profile(cli.build_parser(), str(config), profile)
+
+    assert error.value.code == 2
+
+
+def test_route_profile_accepts_reviewed_files_requirement(tmp_path: Path) -> None:
+    config = tmp_path / "reviewed-files.toml"
+    config.write_text(
+        '[profiles.code]\nroutes = ["llm:accepted"]\nrequire_reviewed_files = true\n'
+    )
+
+    routes, metadata = cli.load_route_profile(cli.build_parser(), str(config), "code")
+
+    assert routes == (cli.ReviewRoute("llm", "accepted"),)
+    assert metadata["settings"]["require_reviewed_files"] is True
+
+
+def test_run_rejects_non_boolean_reviewed_files_override_before_artifacts(
+    tmp_path: Path,
+) -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(review_arguments(tmp_path, "accepted"))
+    args.require_reviewed_files = 1
+
+    with pytest.raises(SystemExit) as error:
+        cli.run_review(parser, args)
+
+    assert error.value.code == 2
+
+
+def test_run_rejects_non_boolean_reviewed_files_profile_setting_before_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(review_arguments(tmp_path, "accepted"))
+    monkeypatch.setattr(
+        cli,
+        "review_routes",
+        lambda _parser, _args: (
+            (cli.ReviewRoute("llm", "accepted"),),
+            {"path": str(tmp_path / "config.toml"), "sha256": "0" * 64, "settings": {
+                "require_reviewed_files": 1,
+            }, "defaultSettings": {}},
+        ),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        cli.run_review(parser, args)
 
     assert error.value.code == 2
 
@@ -7780,6 +7948,33 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     assert json.loads(verified.stdout)["valid"] is True
 
 
+@pytest.mark.parametrize(
+    "execution_settings",
+    [[], {"requireReviewedFiles": 1}],
+)
+def test_v2_receipt_rejects_malformed_execution_settings(
+    tmp_path: Path, execution_settings: object
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    result = run_cli(
+        *review_arguments(tmp_path, "accepted"),
+        "--response-contract",
+        "findings-json",
+        env={"LLM_BIN": str(fake_llm)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
+    receipt["executionSettings"] = execution_settings
+    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json({
+        key: value for key, value in receipt.items() if key != "sha256"
+    }))
+
+    violations = review_flow.validate_v2_receipt(receipt)
+
+    assert "execution-settings" in violations
+
+
 def test_generated_complete_duplicate_findings_receipt_self_verifies(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     duplicate = {
@@ -8091,6 +8286,33 @@ files = ["{source}"]
     assert report["actualSpendUsd"] == 0
     assert report["runs"][0]["result"] == "accepted"
     assert report["runs"][0]["exitCode"] == 0
+
+
+def test_policy_check_uses_transport_fallback_for_local_profiles(tmp_path: Path) -> None:
+    policy = tmp_path / "policy.toml"
+    policy.write_text(
+        """[transports.kiro]
+source_allowed = true
+allow_unresolved_identity = true
+"""
+    )
+
+    result = run_cli(
+        "policy-check",
+        "--policy",
+        str(policy),
+        "--model",
+        "claude-opus-5",
+        "--transport",
+        "kiro",
+        "--enforce",
+    )
+
+    assert result.returncode == 0
+    decision = json.loads(result.stdout)
+    assert decision["sourceAllowed"] is True
+    assert decision["transport"] == "kiro"
+    assert decision["allowUnresolvedIdentity"] is True
 
 
 def test_tournament_uses_the_configured_direct_openrouter_transport(
@@ -10834,15 +11056,166 @@ def test_invoke_kiro_bounds_captured_process_output(
     assert response.response == ""
 
 
-def test_invoke_kiro_fails_closed_without_bounded_capture_support(
+def test_invoke_kiro_allows_kiro_runtime_state_larger_than_capture_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exit_code, error, response = invoke_fake_kiro(
+        tmp_path,
+        monkeypatch,
+        inventory_mode="large-state",
+    )
+
+    assert exit_code == 0
+    assert error == "token=super-secret-token-value\n"
+    assert response.response == '{"verdict": "approved", "findings": []}'
+
+
+def test_invoke_kiro_does_not_require_process_file_size_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, "resource", None)
 
     exit_code, error, response = invoke_fake_kiro(tmp_path, monkeypatch)
 
-    assert exit_code == 126
-    assert error == "Kiro bounded output capture unsupported on this platform"
+    assert exit_code == 0, error
+    assert error == "token=super-secret-token-value\n"
+    assert response.response == '{"verdict": "approved", "findings": []}'
+
+
+def test_kiro_bounded_capture_fails_closed_on_pipe_read_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingStream:
+        def read(self, _size: int) -> bytes:
+            raise OSError("capture failed")
+
+    class ExitedProcess:
+        pid = 123
+        returncode = 0
+        stdout = FailingStream()
+        stderr = BytesIO(b"")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+    monkeypatch.setattr(cli, "terminate_process_group", lambda *_args, **_kwargs: None)
+
+    captured = cli._communicate_kiro_bounded(
+        ExitedProcess(),
+        input_bytes=None,
+        timeout_seconds=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    assert captured == (b"", b"", False, False, True)
+
+
+def test_kiro_bounded_capture_keeps_draining_after_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ChunkStream:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.chunks = chunks
+
+        def read(self, _size: int) -> bytes:
+            return self.chunks.pop(0)
+
+    class ExitedProcess:
+        pid = 123
+        returncode = 0
+        stdout = ChunkStream([b"xy", b"z", b""])
+        stderr = BytesIO(b"")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+    monkeypatch.setattr(cli, "terminate_process_group", lambda *_args, **_kwargs: None)
+
+    captured = cli._communicate_kiro_bounded(
+        ExitedProcess(),
+        input_bytes=None,
+        timeout_seconds=1,
+        stdout_limit=1,
+        stderr_limit=1024,
+    )
+
+    assert captured == (b"x", b"", False, True, False)
+
+
+def test_kiro_bounded_capture_handles_a_broken_input_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingStdin:
+        def __init__(self) -> None:
+            self.called = threading.Event()
+
+        def write(self, _value: bytes) -> None:
+            self.called.set()
+            raise BrokenPipeError
+
+        def close(self) -> None:
+            raise AssertionError("close is unreachable after a broken write")
+
+    class ExitedProcess:
+        pid = 123
+        returncode = 0
+        stdout = BytesIO(b"")
+        stderr = BytesIO(b"")
+
+        def __init__(self) -> None:
+            self.stdin = FailingStdin()
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert self.stdin.called.wait(1)
+            return self.returncode
+
+    process = ExitedProcess()
+    monkeypatch.setattr(cli, "terminate_process_group", lambda *_args, **_kwargs: None)
+
+    captured = cli._communicate_kiro_bounded(
+        process,
+        input_bytes=b"request",
+        timeout_seconds=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    assert captured == (b"", b"", False, False, False)
+
+
+def test_invoke_kiro_fails_closed_when_pipe_capture_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("pass\n")
+
+    class ExitedProcess:
+        returncode = 0
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    monkeypatch.setattr(cli.subprocess, "Popen", ExitedProcess)
+    monkeypatch.setattr(
+        cli,
+        "_communicate_kiro_bounded",
+        lambda _process, **_kwargs: (b"", b"", False, False, True),
+    )
+
+    exit_code, error, response = cli.invoke_kiro(
+        kiro_bin="kiro-cli",
+        prompt="Review synthetic source.",
+        model="claude-sonnet-5",
+        files=[source],
+        max_output_tokens=1,
+        response_contract="findings-json",
+        timeout_seconds=1,
+        **kiro_paths(tmp_path),
+    )
+
+    assert exit_code == 502
+    assert error == "Kiro transport capture did not reach EOF"
     assert response.response == ""
 
 
@@ -12311,6 +12684,8 @@ def test_cli_task8_pi_invocation_edges(tmp_path: Path, monkeypatch) -> None:
             "--no-prompt-templates",
             "--no-context-files",
             "--no-approve",
+            "--thinking",
+            "minimal",
             "--system-prompt",
             cli.pi_system_prompt("findings-json"),
             "--model",

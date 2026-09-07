@@ -1216,6 +1216,17 @@ def _receipt_extensions_have_exact_scalar_types(value: object) -> bool:
     return True
 
 
+def _receipt_requires_reviewed_files(receipt: dict[str, Any]) -> bool | None:
+    """Read the optional run-level requirement for model file declarations."""
+    settings = receipt.get("executionSettings")
+    if settings is None:
+        return False
+    if type(settings) is not dict:
+        return None
+    value = settings.get("requireReviewedFiles", False)
+    return value if type(value) is bool else None
+
+
 def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     """Validate one schema-v2 receipt without consulting external state."""
     violations: list[str] = []
@@ -1248,6 +1259,10 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
 
     source_class = receipt.get("sourceClass")
     source_is_proprietary = type(source_class) is str and source_class == "proprietary"
+    require_reviewed_files = _receipt_requires_reviewed_files(receipt)
+    if require_reviewed_files is None:
+        reject("execution-settings")
+        require_reviewed_files = False
     source_file_names = _receipt_source_file_names(receipt)
     if (
         type(source_class) is not str
@@ -1456,9 +1471,12 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     and route is not None
                     and contract_context.review_declaration_required
                     == (
-                        type(route.get("transport")) is str
-                        and route["transport"] == "codex"
-                        and source_is_proprietary
+                        require_reviewed_files
+                        or (
+                            type(route.get("transport")) is str
+                            and route["transport"] == "codex"
+                            and source_is_proprietary
+                        )
                     )
                 )
                 if context_is_authoritative and type(evaluation.get("name")) is str:
@@ -1789,7 +1807,8 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         output_context = ContractContext(
             file_names=source_file_names or (),
             review_declaration_required=(
-                accepted.get("transport") == "codex" and source_is_proprietary
+                require_reviewed_files
+                or (accepted.get("transport") == "codex" and source_is_proprietary)
             ),
         )
         output_digest = (
@@ -1851,7 +1870,11 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 destination_context = ContractContext(
                     file_names=source_file_names or (),
                     review_declaration_required=(
-                        destination_attempt.get("transport") == "codex" and source_is_proprietary
+                        require_reviewed_files
+                        or (
+                            destination_attempt.get("transport") == "codex"
+                            and source_is_proprietary
+                        )
                     ),
                 )
                 destination_prepared = (
@@ -1905,7 +1928,11 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
         consolidation_context = ContractContext(
             file_names=source_file_names or (),
             review_declaration_required=(
-                consolidation_attempt.get("transport") == "codex" and source_is_proprietary
+                require_reviewed_files
+                or (
+                    consolidation_attempt.get("transport") == "codex"
+                    and source_is_proprietary
+                )
             ),
         )
         expected_consolidation = consolidate(
