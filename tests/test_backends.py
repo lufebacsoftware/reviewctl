@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +136,33 @@ def backend_request(tmp_path: Path) -> BackendRequest:
         source_roots=(source_dir, tmp_path / "shared"),
         provider_preferences={"only": ["example"]},
     )
+
+
+@pytest.mark.parametrize("transport", ["llm", "codex", "kiro", "openrouter", "agy", "gemini", "pi"])
+def test_every_backend_forwards_the_exact_prepared_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: str,
+) -> None:
+    prepared = cli.get_contract("findings-json").prepare(
+        cli.ContractContext(
+            file_names=("source.py", "test_source.py"),
+            review_declaration_required=True,
+        )
+    )
+    request = replace(backend_request(tmp_path), prepared_contract=prepared)
+    request.attempt_dir.mkdir()
+    calls = []
+
+    def capture(**kwargs):
+        calls.append(kwargs)
+        if transport == "llm":
+            return 0, ""
+        return 0, "", PersistedResponse("turn", None, None, None, "example/model", None, None, "")
+
+    monkeypatch.setattr(cli, f"invoke_{transport}", capture)
+    getattr(cli, f"execute_{transport}_backend")(request)
+    assert calls[0]["prepared_contract"] is prepared
 
 
 def assert_execution_has_transport_semantics_only(execution: BackendExecution) -> None:
@@ -367,6 +394,7 @@ def test_execute_llm_backend_invokes_legacy_transport_and_maps_database_evidence
             "max_output_tokens": request.max_output_tokens,
             "response_contract": request.response_contract,
             "timeout_seconds": request.timeout_seconds,
+            "prepared_contract": request.prepared_contract,
         },
         "load": b"database evidence",
     }
@@ -521,6 +549,40 @@ def test_execute_kiro_backend_omits_empty_final_response(
     assert not (request.attempt_dir / "response.md").exists()
 
 
+@pytest.mark.parametrize("contract", ["verdict", "document"])
+def test_execute_codex_backend_prompt_only_uses_temporary_empty_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contract: str
+) -> None:
+    request = replace(
+        backend_request(tmp_path),
+        files=(),
+        source_roots=(),
+        source_class="synthetic",
+        response_contract=contract,
+    )
+    request.attempt_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    response = PersistedResponse("turn", None, None, None, "model", None, None, "result")
+
+    def fake_invoke_codex(**kwargs):
+        workspace = kwargs["workspace"]
+        assert workspace.is_dir()
+        assert workspace.resolve() != Path.cwd()
+        assert workspace.resolve() != request.attempt_dir.resolve()
+        assert list(workspace.iterdir()) == []
+        calls.append(kwargs)
+        return 0, "", response
+
+    monkeypatch.setattr(cli, "invoke_codex", fake_invoke_codex)
+    execution = cli.execute_codex_backend(request)
+    assert not calls[0]["workspace"].exists()
+    assert calls[0]["source_roots"] is None
+    assert execution.response is response
+    assert execution.exit_code == 0
+    assert (request.attempt_dir / "response.md").read_text() == "result"
+
+
 def test_execute_codex_backend_persists_rejected_response_and_maps_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -549,6 +611,7 @@ def test_execute_codex_backend_persists_rejected_response_and_maps_evidence(
         "source_roots": list(request.source_roots),
         "timeout_seconds": request.timeout_seconds,
         "workspace": request.files[0].parent,
+        "prepared_contract": request.prepared_contract,
     }
     assert response_path.read_text() == "rejected"
     assert execution == BackendExecution(
@@ -594,6 +657,7 @@ def test_execute_gemini_backend_invokes_headless_transport_and_maps_all_evidence
         "session_path": session_path,
         "diagnostic_path": stderr_path,
         "evidence_parent_identity": request.evidence_parent_identity,
+        "prepared_contract": request.prepared_contract,
     }
     assert final_response_path.read_text() == "ok"
     assert execution == BackendExecution(
@@ -636,6 +700,7 @@ def test_execute_openrouter_backend_invokes_legacy_transport_and_maps_json_evide
         "files": list(request.files),
         "max_output_tokens": request.max_output_tokens,
         "provider_preferences": request.provider_preferences,
+        "prepared_contract": request.prepared_contract,
         "response_contract": request.response_contract,
         "timeout_seconds": request.timeout_seconds,
         "request_path": request_path,
@@ -680,6 +745,7 @@ def test_execute_agy_backend_invokes_legacy_transport_and_maps_json_evidence(
         "request_path": request_path,
         "response_path": response_path,
         "evidence_parent_identity": request.evidence_parent_identity,
+        "prepared_contract": request.prepared_contract,
     }
     assert execution == BackendExecution(
         0,
@@ -732,6 +798,7 @@ def test_execute_pi_backend_invokes_legacy_transport_and_maps_all_evidence(
         "diagnostic_path": stderr_path,
         "evidence_parent_identity": request.evidence_parent_identity,
         "thinking": request.thinking,
+        "prepared_contract": request.prepared_contract,
     }
     assert scratch_session != session_path
     assert session_path.read_text() == "session evidence"

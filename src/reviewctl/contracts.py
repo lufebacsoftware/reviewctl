@@ -14,6 +14,8 @@ FINDING_FIELDS = {"severity", "path", "line", "title", "evidence", "reproduction
 FINDING_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 REVIEW_VERDICTS = {"approved", "changes-requested"}
 FINDINGS_REQUIRED_FIELDS = ("verdict", "findings")
+OPTIONAL_REVIEWED_FILES_DIALECT = "optional-reviewed-files-v1"
+REVIEW_DECLARATION_CONTRACTS = frozenset({"findings-json"})
 FINDINGS_CONTRACT_VIOLATION_CODES = frozenset(
     {
         "finding-fields",
@@ -185,10 +187,11 @@ class PreparedContract:
     schema: dict[str, Any]
     output_instructions: str
     digest: str
+    dialect: str | None = None
 
     @property
     def identity_material(self) -> dict[str, object]:
-        return {
+        identity = {
             "name": self.name,
             "version": self.version,
             "context": {
@@ -198,6 +201,9 @@ class PreparedContract:
             "schema": self.schema,
             "outputInstructions": self.output_instructions,
         }
+        if self.dialect is not None:
+            identity["dialect"] = self.dialect
+        return identity
 
 
 class EvaluationStatus(StrEnum):
@@ -404,18 +410,26 @@ class FindingsJsonContract:
     name = "findings-json"
     version = "1"
 
+    def __init__(self, *, dialect: str | None = OPTIONAL_REVIEWED_FILES_DIALECT) -> None:
+        if dialect not in (None, OPTIONAL_REVIEWED_FILES_DIALECT):
+            raise ValueError("unsupported findings dialect")
+        self.dialect = dialect
+
     def prepare(self, context: ContractContext) -> PreparedContract:
         if not valid_contract_context(context):
             raise ValueError("invalid contract context")
         schema = deepcopy(FINDINGS_SCHEMA)
         if context.review_declaration_required:
             schema["required"].append("reviewedFiles")
+        if context.review_declaration_required or (self.dialect and context.file_names):
             schema["properties"]["reviewedFiles"] = deepcopy(REVIEWED_FILES_SCHEMA)
         top_level_fields = (
             "`verdict`, `findings`, and `reviewedFiles`"
             if context.review_declaration_required
             else "`verdict` and `findings`"
         )
+        if self.dialect and context.file_names and not context.review_declaration_required:
+            top_level_fields += ", plus optional `reviewedFiles`"
         instructions = (
             "Return only JSON matching the supplied schema. The top-level object has exactly "
             f"{top_level_fields}. Each finding has exactly six fields: `severity`, `path`, "
@@ -438,6 +452,8 @@ class FindingsJsonContract:
             "schema": schema,
             "outputInstructions": instructions,
         }
+        if self.dialect is not None:
+            identity["dialect"] = self.dialect
         return PreparedContract(
             name=self.name,
             version=self.version,
@@ -446,6 +462,7 @@ class FindingsJsonContract:
             schema=schema,
             output_instructions=instructions,
             digest=hashlib.sha256(canonical_json(identity)).hexdigest(),
+            dialect=self.dialect,
         )
 
     def evaluate(
@@ -514,8 +531,10 @@ class FindingsJsonContract:
             return rejected("top-level-not-object")
 
         required_fields = findings_required_fields(context.review_declaration_required)
-        expected_fields = set(required_fields)
-        violation = "response-fields" if set(value) != expected_fields else None
+        allowed_fields = set(prepared.schema["properties"])
+        violation = (
+            None if set(required_fields) <= set(value) <= allowed_fields else "response-fields"
+        )
 
         verdict = value.get("verdict")
         verdict_valid = type(verdict) is str and verdict in REVIEW_VERDICTS
@@ -554,7 +573,7 @@ class FindingsJsonContract:
             violation = first_finding_violation
 
         normalized_files: list[str] | None = None
-        if context.review_declaration_required:
+        if context.review_declaration_required or (self.dialect and "reviewedFiles" in value):
             reviewed_files = value.get("reviewedFiles")
             candidate_files: list[str] = []
             review_declaration_valid = isinstance(reviewed_files, list)
@@ -678,6 +697,25 @@ class FindingsJsonContract:
 
 
 _CONTRACTS: dict[str, ReviewContract] = {"findings-json": FindingsJsonContract()}
+_LEGACY_FINDINGS_CONTRACT = FindingsJsonContract(dialect=None)
+
+
+def findings_contract_for_dialect(dialect: object) -> ReviewContract:
+    """Resolve only the frozen legacy envelope or the explicitly named current dialect."""
+    if dialect is None:
+        return _LEGACY_FINDINGS_CONTRACT
+    if type(dialect) is str and dialect == OPTIONAL_REVIEWED_FILES_DIALECT:
+        return get_contract("findings-json")
+    raise ValueError("unsupported findings dialect")
+
+
+def resolve_findings_prepared(context: ContractContext, digest: str) -> PreparedContract:
+    """Reproduce an exact supported preparation for fragment/completion provenance."""
+    for dialect in (OPTIONAL_REVIEWED_FILES_DIALECT, None):
+        prepared = findings_contract_for_dialect(dialect).prepare(context)
+        if prepared.digest == digest:
+            return prepared
+    raise ValueError("unsupported prepared findings identity")
 
 
 def get_contract(name: str) -> ReviewContract:

@@ -1,0 +1,247 @@
+{
+  "acceptedAttempt": 2,
+  "attempts": [
+    {
+      "contractEvaluation": {
+        "completionRequest": {
+          "invalidFragmentIndexes": [],
+          "missingFields": [
+            "findings"
+          ],
+          "packetDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "preparedDigest": "7504ba2449da2f9f7f43d1d58f94695b910b4e0369ede051903fe96e1ff4d9ae",
+          "violations": [
+            "response-fields"
+          ]
+        },
+        "contractContext": {
+          "fileNames": [
+            "source.py"
+          ],
+          "reviewDeclarationRequired": false
+        },
+        "coverage": {
+          "coveredFields": [
+            "verdict"
+          ],
+          "missingFields": [
+            "findings"
+          ],
+          "requiredFields": [
+            "verdict",
+            "findings"
+          ]
+        },
+        "fragments": [
+          {
+            "fingerprint": "b2a2c752afb252f96e37920852e97d7bd3261cf046312263d03b903b22039203",
+            "fragmentId": "4f9883d70da09e2a5456fd1b066d8b4f5a079a1c64e9197657ed94837b3b7ea7",
+            "kind": "finding",
+            "payloadDigest": "0ec32023917c53ef9792b0f5f71c499d15a9f9dfbbf91f60de8970d125fbbe6d",
+            "scope": [
+              "source.py"
+            ],
+            "value": {
+              "evidence": "The same key reaches the write twice.",
+              "line": 3,
+              "path": "source.py",
+              "reproduction": "Submit the same key twice.",
+              "severity": "high",
+              "title": "Duplicate effect"
+            }
+          }
+        ],
+        "name": "findings-json",
+        "normalizedSha256": null,
+        "normalizedValue": null,
+        "payloadSha256": "0ec32023917c53ef9792b0f5f71c499d15a9f9dfbbf91f60de8970d125fbbe6d",
+        "preparedSha256": "7504ba2449da2f9f7f43d1d58f94695b910b4e0369ede051903fe96e1ff4d9ae",
+        "status": "incomplete",
+        "version": "1",
+        "violations": [
+          "response-fields"
+        ]
+      },
+      "findings": [],
+      "model": {
+        "requested": "first",
+        "resolved": "first"
+      },
+      "number": 1,
+      "promotedFragments": [
+        {
+          "contractContext": {
+            "fileNames": [
+              "source.py"
+            ],
+            "reviewDeclarationRequired": false
+          },
+          "finding": {
+            "evidence": "The same key reaches the write twice.",
+            "line": 3,
+            "path": "source.py",
+            "reproduction": "Submit the same key twice.",
+            "severity": "high",
+            "title": "Duplicate effect"
+          },
+          "fingerprint": "b2a2c752afb252f96e37920852e97d7bd3261cf046312263d03b903b22039203",
+          "fragmentId": "4f9883d70da09e2a5456fd1b066d8b4f5a079a1c64e9197657ed94837b3b7ea7",
+          "packetDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "payloadDigest": "0ec32023917c53ef9792b0f5f71c499d15a9f9dfbbf91f60de8970d125fbbe6d",
+          "preparedDigest": "7504ba2449da2f9f7f43d1d58f94695b910b4e0369ede051903fe96e1ff4d9ae",
+          "rawResponseDigest": "0ec32023917c53ef9792b0f5f71c499d15a9f9dfbbf91f60de8970d125fbbe6d",
+          "routeIndex": 0,
+          "sourceAttempt": 1
+        }
+      ],
+      "rawResponse": {
+        "characters": 243,
+        "path": "attempts/01/raw-response.txt",
+        "sha256": "0ec32023917c53ef9792b0f5f71c499d15a9f9dfbbf91f60de8970d125fbbe6d"
+      },
+      "result": "incomplete",
+      "route": {
+        "model": "first",
+        "transport": "llm"
+      },
+      "routeIndex": 0,
+      "transport": "llm"
+    },
+    {
+      "contractEvaluation": {
+        "completionRequest": null,
+        "contractContext": {
+          "fileNames": [
+            "source.py"
+          ],
+          "reviewDeclarationRequired": false
+        },
+        "coverage": {
+          "coveredFields": [
+            "verdict",
+            "findings"
+          ],
+          "missingFields": [],
+          "requiredFields": [
+            "verdict",
+            "findings"
+          ]
+        },
+        "fragments": [],
+        "name": "findings-json",
+        "normalizedSha256": "c53393b6086419fdf0afa9e97f80143ab64773e260c94432922e0e85432dd67e",
+        "normalizedValue": {
+          "findings": [],
+          "verdict": "approved"
+        },
+        "payloadSha256": "7650fe5a295148d8a9c8b50ffb4b51705f4d035e441a87d0a6785bb667ac781f",
+        "preparedSha256": "7504ba2449da2f9f7f43d1d58f94695b910b4e0369ede051903fe96e1ff4d9ae",
+        "status": "complete",
+        "version": "1",
+        "violations": []
+      },
+      "findings": [],
+      "model": {
+        "requested": "second",
+        "resolved": "second"
+      },
+      "number": 2,
+      "promotedFragments": [],
+      "rawResponse": {
+        "characters": 39,
+        "path": "attempts/02/raw-response.txt",
+        "sha256": "7650fe5a295148d8a9c8b50ffb4b51705f4d035e441a87d0a6785bb667ac781f"
+      },
+      "result": "accepted",
+      "route": {
+        "model": "second",
+        "transport": "codex"
+      },
+      "routeIndex": 1,
+      "transport": "codex"
+    }
+  ],
+  "consolidatedReview": {
+    "acceptedAttempt": 2,
+    "approved": false,
+    "findings": [
+      {
+        "confirmed": false,
+        "disputed": false,
+        "finding": {
+          "evidence": "The same key reaches the write twice.",
+          "line": 3,
+          "path": "source.py",
+          "reproduction": "Submit the same key twice.",
+          "severity": "high",
+          "title": "Duplicate effect"
+        },
+        "fingerprint": "b2a2c752afb252f96e37920852e97d7bd3261cf046312263d03b903b22039203",
+        "sources": [
+          {
+            "attempt": 1,
+            "contractContext": {
+              "fileNames": [
+                "source.py"
+              ],
+              "reviewDeclarationRequired": false
+            },
+            "fragmentId": "4f9883d70da09e2a5456fd1b066d8b4f5a079a1c64e9197657ed94837b3b7ea7",
+            "packetDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "payloadDigest": "0ec32023917c53ef9792b0f5f71c499d15a9f9dfbbf91f60de8970d125fbbe6d",
+            "preparedDigest": "7504ba2449da2f9f7f43d1d58f94695b910b4e0369ede051903fe96e1ff4d9ae",
+            "rawResponseDigest": "0ec32023917c53ef9792b0f5f71c499d15a9f9dfbbf91f60de8970d125fbbe6d",
+            "routeIndex": 0
+          }
+        ]
+      }
+    ],
+    "status": "accepted",
+    "verdict": "approved"
+  },
+  "contract": {
+    "name": "findings-json",
+    "version": "1"
+  },
+  "fallbackRelationships": [
+    {
+      "fromAttempt": 1,
+      "kind": "route-fallback",
+      "promotedFragmentIds": [
+        "4f9883d70da09e2a5456fd1b066d8b4f5a079a1c64e9197657ed94837b3b7ea7"
+      ],
+      "reason": "contract-incomplete",
+      "toAttempt": 2
+    }
+  ],
+  "findings": [],
+  "prompt": {
+    "packetSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "receiptSchemaVersion": 2,
+  "result": "accepted",
+  "reviewContract": "findings-json",
+  "routes": [
+    {
+      "model": "first",
+      "transport": "llm"
+    },
+    {
+      "model": "second",
+      "transport": "codex"
+    }
+  ],
+  "sha256": "2b9d724d407d2e3a6e101b247b57c65f1af01645e4ab4379f1dcede637660927",
+  "source": {
+    "files": [
+      {
+        "name": "source.py",
+        "path": "/bounded/source.py",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ]
+  },
+  "sourceClass": "synthetic",
+  "transport": "routed",
+  "verdict": "approved"
+}
