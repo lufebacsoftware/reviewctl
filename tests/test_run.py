@@ -8075,7 +8075,11 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     assert receipt["verdict"] == complete_response["verdict"]
     assert receipt["findings"] == complete_response["findings"]
     assert receipt["reviewContract"] == "findings-json"
-    assert receipt["contract"] == {"name": "findings-json", "version": "1"}
+    assert receipt["contract"] == {
+        "name": "findings-json",
+        "version": "1",
+        "dialect": "optional-reviewed-files-v1",
+    }
     assert set(evaluation) == {
         "name",
         "version",
@@ -9665,6 +9669,125 @@ def test_invoke_llm_fails_closed_without_bounded_capture_support(
         response_contract="findings-json",
         timeout_seconds=1,
     ) == (126, "LLM bounded output capture unsupported on this platform")
+
+
+def assert_openrouter_contract_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    require_declaration: bool,
+    omit_declaration: bool,
+    *,
+    invalid_declaration: bool = False,
+    declaration_value: object = None,
+    partial: bool = False,
+) -> None:
+    payload = {"verdict": "approved", "findings": []}
+    if not omit_declaration:
+        payload["reviewedFiles"] = ["source.py"]
+    if invalid_declaration:
+        payload["reviewedFiles"] = declaration_value
+    if partial:
+        payload["verdict"] = "changes-requested"
+        payload["findings"] = [
+            {
+                "severity": "high",
+                "path": "source.py",
+                "line": 1,
+                "title": "Synthetic finding",
+                "evidence": "Synthetic evidence",
+                "reproduction": "Inspect the supplied fixture",
+            }
+        ]
+    real_run = cli.subprocess.run
+    mock_openrouter_curl(
+        monkeypatch,
+        body=json.dumps(
+            {
+                "id": "synthetic-turn",
+                "model": "test/reviewer",
+                "provider": "Test Provider",
+                "choices": [{"message": {"content": json.dumps(payload)}}],
+            }
+        ).encode(),
+    )
+    fake_curl = cli.subprocess.run
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            fake_curl(command, **kwargs) if "--config" in command else real_run(command, **kwargs)
+        ),
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-key")
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path, "test/reviewer"),
+            "--transport",
+            "openrouter",
+            "--response-contract",
+            "findings-json",
+            *(["--require-reviewed-files"] if require_declaration else []),
+        ]
+    )
+    result = cli.run_review(parser, args)
+    receipt_path = next((tmp_path / "artifacts").glob("*/*/receipt.json"))
+    request_path = next(receipt_path.parent.glob("**/request.json"))
+    request = json.loads(request_path.read_text())
+    prepared = cli.get_contract("findings-json").prepare(
+        cli.ContractContext(
+            file_names=("source.py",),
+            review_declaration_required=require_declaration,
+        )
+    )
+    assert request["response_format"]["json_schema"]["schema"] == prepared.schema
+    assert "reviewedFiles" in prepared.schema["properties"]
+    assert ("reviewedFiles" in prepared.schema["required"]) is require_declaration
+    assert prepared.output_instructions in request["messages"][0]["content"]
+    receipt = json.loads(receipt_path.read_text())
+    if (require_declaration and omit_declaration) or invalid_declaration:
+        assert result != 0
+        assert receipt["acceptedAttempt"] is None
+        assert not receipt["consolidatedReview"]["approved"]
+    else:
+        assert result == 0
+        assert receipt["acceptedAttempt"] == 1
+    assert cli.verify_receipt(parser.parse_args(["verify", str(receipt_path)])) == 0
+
+
+@pytest.mark.parametrize("require_declaration", [False, True])
+@pytest.mark.parametrize("omit_declaration", [False, True])
+def test_openrouter_outgoing_contract_matches_receipt_requirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    require_declaration: bool,
+    omit_declaration: bool,
+) -> None:
+    assert_openrouter_contract_receipt(
+        tmp_path,
+        monkeypatch,
+        require_declaration,
+        omit_declaration,
+    )
+
+
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("declaration", [["wrong.py"], [], None, ["source.py", "source.py"]])
+def test_openrouter_invalid_optional_declaration_preserves_rejection_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    declaration: object,
+    partial: bool,
+) -> None:
+    assert_openrouter_contract_receipt(
+        tmp_path,
+        monkeypatch,
+        False,
+        False,
+        invalid_declaration=True,
+        declaration_value=declaration,
+        partial=partial,
+    )
 
 
 def test_openrouter_packet_makes_findings_verdict_semantics_explicit(tmp_path: Path) -> None:

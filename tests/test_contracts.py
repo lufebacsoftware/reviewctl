@@ -155,6 +155,40 @@ def test_findings_contract_accepts_printable_unicode_scope() -> None:
     assert evaluation.status is EvaluationStatus.COMPLETE
 
 
+def test_findings_dialect_changes_envelope_without_changing_finding_identity() -> None:
+    from reviewctl.contracts import findings_contract_for_dialect
+
+    current = get_contract("findings-json")
+    legacy = findings_contract_for_dialect(None)
+    context = ContractContext(file_names=("source.py",))
+    payload = json.dumps(finding_payload())
+    old = legacy.evaluate(payload, legacy.prepare(context), context)
+    new = current.evaluate(payload, current.prepare(context), context)
+    # Version 1 still identifies identical finding/fragment semantics. The explicit
+    # dialect versions the response envelope and participates in prepared identity.
+    assert old.version == new.version == "1"
+    assert old.value == new.value
+    assert old.valid_fragments == new.valid_fragments
+    assert old.prepared_digest != new.prepared_digest
+    assert legacy.prepare(context).dialect is None
+    assert current.prepare(context).dialect == "optional-reviewed-files-v1"
+
+
+def test_findings_dialect_resolution_rejects_unknown_identity() -> None:
+    from reviewctl.contracts import (
+        FindingsJsonContract,
+        findings_contract_for_dialect,
+        resolve_findings_prepared,
+    )
+
+    with pytest.raises(ValueError, match="unsupported findings dialect"):
+        FindingsJsonContract(dialect="unknown")
+    with pytest.raises(ValueError, match="unsupported findings dialect"):
+        findings_contract_for_dialect("unknown")
+    with pytest.raises(ValueError, match="unsupported prepared findings identity"):
+        resolve_findings_prepared(ContractContext(file_names=("source.py",)), "a" * 64)
+
+
 def test_findings_contract_prepares_a_stable_portable_contract() -> None:
     prepared = get_contract("findings-json").prepare(ContractContext())
 
@@ -183,7 +217,11 @@ def test_findings_contract_can_require_a_review_declaration_without_mutating_por
         "minItems": 1,
         "items": {"type": "string", "minLength": 1},
     }
-    assert "reviewedFiles" not in portable.schema["properties"]
+    assert (
+        portable.schema["properties"]["reviewedFiles"]
+        == (declared.schema["properties"]["reviewedFiles"])
+    )
+    assert "reviewedFiles" not in portable.schema["required"]
     assert declared.digest != portable.digest
 
 

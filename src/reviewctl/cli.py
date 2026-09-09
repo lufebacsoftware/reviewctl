@@ -59,6 +59,7 @@ from reviewctl.contracts import (
     ContractEvaluation,
     EvaluationContext,
     EvaluationStatus,
+    PreparedContract,
     exact_json_object,
     get_contract,
     require_string_json_object_keys,
@@ -2420,13 +2421,19 @@ def invoke_llm(
 
 
 def openrouter_packet(
-    prompt: str, files: list[Path], response_contract: str = "findings-json"
+    prompt: str,
+    files: list[Path],
+    response_contract: str = "findings-json",
+    *,
+    prepared_contract: PreparedContract | None = None,
 ) -> str:
     """Embed bounded frozen fragments in the direct OpenRouter request."""
     fragments = "\n\n".join(
         f"--- BEGIN {file.name} ---\n{file.read_text()}\n--- END {file.name} ---" for file in files
     )
-    if response_contract == "findings-json":
+    if prepared_contract is not None:
+        contract = prepared_contract.output_instructions
+    elif response_contract == "findings-json":
         contract = (
             get_contract(response_contract)
             .prepare(ContractContext(file_names=tuple(file.name for file in files)))
@@ -3001,6 +3008,7 @@ def invoke_openrouter(
     request_path: Path,
     response_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Call OpenRouter directly and persist source-safe request and raw response evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -3011,13 +3019,19 @@ def invoke_openrouter(
         "model": model_id,
         "temperature": 0,
         "messages": [
-            {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
+            {
+                "role": "user",
+                "content": openrouter_packet(
+                    prompt, files, response_contract, prepared_contract=prepared_contract
+                ),
+            }
         ],
     }
     payload["max_tokens"] = openrouter_output_token_budget(model, max_output_tokens)
     if reasoning := openrouter_reasoning_parameters(model):
         payload["reasoning"] = reasoning
-    if schema := response_schema(response_contract):
+    schema = prepared_contract.schema if prepared_contract else response_schema(response_contract)
+    if schema:
         payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {"name": response_contract, "strict": True, "schema": schema},
@@ -4441,6 +4455,7 @@ def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
         request_path=request_path,
         response_path=response_path,
         evidence_parent_identity=request.evidence_parent_identity,
+        prepared_contract=request.prepared_contract,
     )
     return BackendExecution(
         exit_code,
@@ -5420,6 +5435,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     provider_preferences=provider_preferences,
                     evidence_parent_identity=attempt_identity,
                     thinking=thinking,
+                    prepared_contract=prepared_contract,
                 )
             )
             exit_code = execution.exit_code
