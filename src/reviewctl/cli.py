@@ -2241,7 +2241,7 @@ def _communicate_kiro_bounded(
                 if len(retained) > limit:
                     output_exceeded.set()
                     terminate_once()
-        except (OSError, ValueError):
+        except OSError, ValueError:
             capture_failed.set()
             return
         finally:
@@ -2270,7 +2270,7 @@ def _communicate_kiro_bounded(
             try:
                 stdin_stream.write(input_bytes)  # type: ignore[union-attr]
                 stdin_stream.close()  # type: ignore[union-attr]
-            except (BrokenPipeError, OSError, ValueError):
+            except BrokenPipeError, OSError, ValueError:
                 return
 
         threading.Thread(
@@ -2305,8 +2305,10 @@ def _communicate_kiro_bounded(
     join_deadline = min(cleanup_deadline, time.monotonic() + 5)
     for reader in (stdout_reader, stderr_reader):
         reader.join(timeout=max(0, join_deadline - time.monotonic()))
-    capture_incomplete = capture_failed.is_set() or capture_interrupted.is_set() or not all(
-        event.is_set() for event in reader_finished.values()
+    capture_incomplete = (
+        capture_failed.is_set()
+        or capture_interrupted.is_set()
+        or not all(event.is_set() for event in reader_finished.values())
     )
     return (
         bytes(captures["stdout"][:stdout_limit]),
@@ -3545,11 +3547,14 @@ def invoke_pi(
     started = time.monotonic()
     stdout = b""
     stderr = b""
-    capture_file_limit = max(
-        MAX_PI_PROCESS_FILE_BYTES,
-        MAX_PI_LEGACY_STDOUT_BYTES,
-        MAX_PI_LEGACY_STDERR_BYTES,
-    ) + 1
+    capture_file_limit = (
+        max(
+            MAX_PI_PROCESS_FILE_BYTES,
+            MAX_PI_LEGACY_STDOUT_BYTES,
+            MAX_PI_LEGACY_STDERR_BYTES,
+        )
+        + 1
+    )
 
     def limit_output_files() -> None:
         resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
@@ -5256,9 +5261,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         else configured_attempts or DEFAULT_REVIEW_MAX_ATTEMPTS
     )
     configured_thinking = (
-        profile_settings.get("thinking")
-        if isinstance(profile_settings, dict)
-        else None
+        profile_settings.get("thinking") if isinstance(profile_settings, dict) else None
     )
     thinking = configured_thinking if isinstance(configured_thinking, str) else "minimal"
     configured_reviewed_files = (

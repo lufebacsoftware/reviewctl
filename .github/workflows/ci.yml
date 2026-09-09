@@ -20,5 +20,18 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pytest --cov=reviewctl --cov-branch --cov-report=term-missing
+      - name: Run deterministic unit and contract tests
+        run: |
+          mkdir -p test-results
+          uv run pytest -m "unit or contract" \
+            --junitxml=test-results/junit.xml --durations=20 \
+            --cov=reviewctl --cov-branch --cov-report=term-missing
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ github.job }}
+          path: test-results/junit.xml
+          if-no-files-found: error
+          retention-days: 14
       - run: uv build

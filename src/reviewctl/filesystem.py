@@ -9,6 +9,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_MACOS_SYSTEM_ALIASES = {
+    Path("/etc"): Path("/private/etc"),
+    Path("/tmp"): Path("/private/tmp"),
+    Path("/var"): Path("/private/var"),
+}
 
 
 def _close_descriptors(descriptors: list[int]) -> None:
@@ -24,6 +29,19 @@ def _close_descriptors(descriptors: list[int]) -> None:
         raise close_error
 
 
+def _confined_absolute_directory_path(path: Path) -> Path:
+    """Canonicalize macOS system aliases without resolving user-controlled symlinks."""
+    absolute = Path(os.path.abspath(path.expanduser()))
+    if sys.platform != "darwin":
+        return absolute
+    for alias, target in _MACOS_SYSTEM_ALIASES.items():
+        try:
+            return target / absolute.relative_to(alias)
+        except ValueError:
+            continue
+    return absolute
+
+
 @contextmanager
 def confined_directory_descriptor(
     path: Path,
@@ -32,7 +50,7 @@ def confined_directory_descriptor(
     expected_identity: tuple[int, int] | None = None,
 ):
     """Open an absolute directory without following any pathname component."""
-    absolute = Path(os.path.abspath(path.expanduser()))
+    absolute = _confined_absolute_directory_path(path)
     anchor = Path(absolute.anchor)
     parts = absolute.relative_to(anchor).parts
     no_follow = getattr(os, "O_NOFOLLOW", None)

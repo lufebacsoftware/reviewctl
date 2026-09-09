@@ -1929,10 +1929,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             file_names=source_file_names or (),
             review_declaration_required=(
                 require_reviewed_files
-                or (
-                    consolidation_attempt.get("transport") == "codex"
-                    and source_is_proprietary
-                )
+                or (consolidation_attempt.get("transport") == "codex" and source_is_proprietary)
             ),
         )
         expected_consolidation = consolidate(

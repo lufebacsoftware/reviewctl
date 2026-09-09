@@ -4091,9 +4091,7 @@ def test_route_profile_rejects_unusable_configurations(
 
 def test_route_profile_accepts_reviewed_files_requirement(tmp_path: Path) -> None:
     config = tmp_path / "reviewed-files.toml"
-    config.write_text(
-        '[profiles.code]\nroutes = ["llm:accepted"]\nrequire_reviewed_files = true\n'
-    )
+    config.write_text('[profiles.code]\nroutes = ["llm:accepted"]\nrequire_reviewed_files = true\n')
 
     routes, metadata = cli.load_route_profile(cli.build_parser(), str(config), "code")
 
@@ -4124,9 +4122,14 @@ def test_run_rejects_non_boolean_reviewed_files_profile_setting_before_artifacts
         "review_routes",
         lambda _parser, _args: (
             (cli.ReviewRoute("llm", "accepted"),),
-            {"path": str(tmp_path / "config.toml"), "sha256": "0" * 64, "settings": {
-                "require_reviewed_files": 1,
-            }, "defaultSettings": {}},
+            {
+                "path": str(tmp_path / "config.toml"),
+                "sha256": "0" * 64,
+                "settings": {
+                    "require_reviewed_files": 1,
+                },
+                "defaultSettings": {},
+            },
         ),
     )
 
@@ -8126,9 +8129,9 @@ def test_v2_receipt_rejects_malformed_execution_settings(
     assert result.returncode == 0, result.stderr
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
     receipt["executionSettings"] = execution_settings
-    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json({
-        key: value for key, value in receipt.items() if key != "sha256"
-    }))
+    receipt["sha256"] = cli.sha256_bytes(
+        cli.canonical_json({key: value for key, value in receipt.items() if key != "sha256"})
+    )
 
     violations = review_flow.validate_v2_receipt(receipt)
 
