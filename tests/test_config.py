@@ -281,7 +281,7 @@ def test_profile_thinking_level_is_loaded_and_validated(tmp_path: Path) -> None:
     project = tmp_path / "reviewctl.toml"
     project.write_text(
         '[project]\nprivacy_mode = "private"\n'
-        '[profiles.default]\n'
+        "[profiles.default]\n"
         'routes = ["pi:openrouter/z-ai/glm-5.3-flash"]\n'
         'thinking = "max"\n'
     )
@@ -291,9 +291,7 @@ def test_profile_thinking_level_is_loaded_and_validated(tmp_path: Path) -> None:
     assert config.profile("default").thinking == "max"
 
     project.write_text(
-        '[project]\nprivacy_mode = "private"\n'
-        '[profiles.default]\n'
-        'thinking = "unbounded"\n'
+        '[project]\nprivacy_mode = "private"\n[profiles.default]\nthinking = "unbounded"\n'
     )
     with pytest.raises(ConfigError, match="thinking"):
         load_config(project, user_path=None)
