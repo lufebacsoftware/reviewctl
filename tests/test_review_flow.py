@@ -2433,10 +2433,12 @@ def test_validate_v2_receipt_accepts_reproducible_partial_review_structure() -> 
 
 @pytest.mark.parametrize("historical", [False, True])
 @pytest.mark.parametrize("mutation", ["dialect", "digest", "unknown-dialect"])
-def test_findings_receipt_rejects_dialect_downgrade_and_identity_mutation(
+def test_findings_receipt_rejects_inconsistent_dialect_and_prepared_digest(
     historical: bool,
     mutation: str,
 ) -> None:
+    # Covers inconsistent mutations and unknown dialects, not a coherent rewrite
+    # with a recomputed checksum; receipt checksums are not signatures.
     receipt = (
         json.loads(
             (Path(__file__).parent / "fixtures" / "historical_findings_v1_partial.json").read_text()
