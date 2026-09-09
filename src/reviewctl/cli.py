@@ -5365,14 +5365,12 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     )
     if require_reviewed_files and args.response_contract not in REVIEW_DECLARATION_CONTRACTS:
         parser.error("--require-reviewed-files is supported only for findings-json")
-    if not snapshots and (
-        require_reviewed_files
-        or codex_source_roots is not None
-        or (
-            args.response_contract == "findings-json"
-            and any(route.transport == "codex" for route in routes)
-        )
-    ):
+    # Codex's strict schema makes declaration mandatory across the fallback chain.
+    effective_reviewed_files = require_reviewed_files or (
+        args.response_contract == "findings-json"
+        and any(route.transport == "codex" for route in routes)
+    )
+    if not snapshots and (effective_reviewed_files or codex_source_roots is not None):
         parser.error("reviewed-files declarations require at least one actual --file")
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
@@ -5397,10 +5395,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             contract_context = (
                 ContractContext(
                     file_names=tuple(item["name"] for item in source_files),
-                    review_declaration_required=(
-                        require_reviewed_files
-                        or (transport == "codex" and args.source_class == "proprietary")
-                    ),
+                    review_declaration_required=effective_reviewed_files,
                 )
                 if native_contract
                 else None
@@ -5875,7 +5870,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "rotation": {"maxBytes": 5 * 1024 * 1024, "backupCount": 5},
         },
     }
-    if require_reviewed_files:
+    if effective_reviewed_files:
         receipt["executionSettings"]["requireReviewedFiles"] = True
     if kiro_identity_waiver:
         receipt["extension.kiroUnresolvedIdentityWaiver"] = True
