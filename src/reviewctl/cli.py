@@ -736,9 +736,7 @@ def llm_help_payload() -> dict[str, object]:
                 "purpose": (
                     "make one synthetic provider-backed request through a configured profile"
                 ),
-                "result": (
-                    "writes transport-canary.json only beside one valid canonical receipt"
-                ),
+                "result": ("writes transport-canary.json only beside one valid canonical receipt"),
                 "mutatesProfile": False,
             },
             "setup": {
