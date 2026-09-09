@@ -3387,8 +3387,9 @@ def test_help_llm_json_is_machine_readable() -> None:
         "receipt verification succeeds, and material findings are independently checked"
     )
     assert payload["errors"]["exitCodes"]["1"]["meaning"] == "unavailable-or-invalid"
+    assert payload["commands"]["transport-canary"]["mutatesProfile"] is False
     assert payload["errors"]["exitCodes"]["0"]["next"] == (
-        "follow the selected command's next step; only run creates a receipt"
+        "follow the selected command's next step; run and transport-canary create receipts"
     )
     assert payload["errors"]["attemptResults"]["incomplete"]["inspect"] == [
         "attempt.json:contractEvaluation.completionRequest",

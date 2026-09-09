@@ -112,6 +112,21 @@ reviewctl run --review-id ID --transport TRANSPORT --model MODEL \
 reviewctl verify RECEIPT.json
 ```
 
+## Provider-backed transport canary
+
+`setup check` only probes local installation state. Before depending on a
+configured profile, make one bounded synthetic request through its real route:
+
+```bash
+reviewctl transport-canary --profile NAME
+```
+
+The canary freezes a tiny file, requires a strict `findings-json` declaration,
+and writes `transport-canary.json` only beside one valid receipt. It records
+the selected profile, routes, config digest, receipt reference, and result. It
+does not modify profiles, routes, policies, credentials, or provider settings.
+An unavailable canary is a transport diagnostic, not qualification or approval.
+
 For formal routes, `MODEL` must be qualified by the organization's private
 policy and evidence store. This public guide intentionally contains no model
 roster, prices, provider-specific invocation commands, or credentials.
