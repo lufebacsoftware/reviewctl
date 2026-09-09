@@ -4432,16 +4432,26 @@ def execute_llm_backend(request: BackendRequest) -> BackendExecution:
 
 def execute_codex_backend(request: BackendRequest) -> BackendExecution:
     response_path = request.attempt_dir / "response.md"
-    exit_code, diagnostic, response = invoke_codex(
-        codex_bin=os.environ.get("CODEX_BIN", "codex"),
-        prompt=request.prompt,
-        model=request.model,
-        response_contract=request.response_contract,
-        source_roots=list(request.source_roots) or None,
-        timeout_seconds=request.timeout_seconds,
-        workspace=request.files[0].parent,
-        prepared_contract=request.prepared_contract,
-    )
+    with ExitStack() as workspace_context:
+        workspace = (
+            request.files[0].parent
+            if request.files
+            else Path(
+                workspace_context.enter_context(
+                    tempfile.TemporaryDirectory(prefix="reviewctl-codex-prompt-")
+                )
+            )
+        )
+        exit_code, diagnostic, response = invoke_codex(
+            codex_bin=os.environ.get("CODEX_BIN", "codex"),
+            prompt=request.prompt,
+            model=request.model,
+            response_contract=request.response_contract,
+            source_roots=list(request.source_roots) or None,
+            timeout_seconds=request.timeout_seconds,
+            workspace=workspace,
+            prepared_contract=request.prepared_contract,
+        )
     write_private_exclusive(
         response_path,
         response.response.encode(),
@@ -5355,7 +5365,14 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     )
     if require_reviewed_files and args.response_contract not in REVIEW_DECLARATION_CONTRACTS:
         parser.error("--require-reviewed-files is supported only for findings-json")
-    if not snapshots and (require_reviewed_files or codex_source_roots is not None):
+    if not snapshots and (
+        require_reviewed_files
+        or codex_source_roots is not None
+        or (
+            args.response_contract == "findings-json"
+            and any(route.transport == "codex" for route in routes)
+        )
+    ):
         parser.error("reviewed-files declarations require at least one actual --file")
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")

@@ -14047,7 +14047,9 @@ def test_cli_task8_proprietary_codex_completion_requires_reviewed_files(
     assert receipt["attempts"][1]["result"] == "accepted"
 
 
-@pytest.mark.parametrize("requirement", ["explicit", "profile", "implicit-codex"])
+@pytest.mark.parametrize(
+    "requirement", ["explicit", "profile", "implicit-codex", "synthetic-codex"]
+)
 def test_prompt_only_reviewed_files_requirement_rejects_before_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -14087,7 +14089,7 @@ def test_prompt_only_reviewed_files_requirement_rejects_before_transport(
                 "--model",
                 "accepted",
                 "--transport",
-                "codex" if requirement == "implicit-codex" else "llm",
+                "codex" if requirement.endswith("codex") else "llm",
             ]
         )
         if requirement == "explicit":
@@ -14098,16 +14100,20 @@ def test_prompt_only_reviewed_files_requirement_rejects_before_transport(
     assert invoked == []
 
 
-@pytest.mark.parametrize("contract", ["verdict", "findings-json"])
+@pytest.mark.parametrize(
+    ("transport", "contract"),
+    [("llm", "verdict"), ("llm", "findings-json"), ("codex", "verdict"), ("codex", "document")],
+)
 def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    transport: str,
     contract: str,
 ) -> None:
     registry = cli.BackendRegistry()
     registry.register(
-        cli.build_backend_registry().require("llm").descriptor,
+        cli.build_backend_registry().require(transport).descriptor,
         lambda request: cli.BackendExecution(
             0,
             "",
@@ -14119,7 +14125,9 @@ def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
                 request.model,
                 3,
                 None,
-                "VERDICT: approved"
+                "# Review\nThis prompt-only document is complete."
+                if contract == "document"
+                else "VERDICT: approved"
                 if contract == "verdict"
                 else json.dumps({"verdict": "approved", "findings": []}),
             ),
@@ -14138,6 +14146,8 @@ def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
             str(tmp_path / "artifacts"),
             "--model",
             "model",
+            "--transport",
+            transport,
             "--response-contract",
             contract,
             "--max-attempts",

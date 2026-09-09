@@ -549,6 +549,40 @@ def test_execute_kiro_backend_omits_empty_final_response(
     assert not (request.attempt_dir / "response.md").exists()
 
 
+@pytest.mark.parametrize("contract", ["verdict", "document"])
+def test_execute_codex_backend_prompt_only_uses_temporary_empty_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contract: str
+) -> None:
+    request = replace(
+        backend_request(tmp_path),
+        files=(),
+        source_roots=(),
+        source_class="synthetic",
+        response_contract=contract,
+    )
+    request.attempt_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    response = PersistedResponse("turn", None, None, None, "model", None, None, "result")
+
+    def fake_invoke_codex(**kwargs):
+        workspace = kwargs["workspace"]
+        assert workspace.is_dir()
+        assert workspace.resolve() != Path.cwd()
+        assert workspace.resolve() != request.attempt_dir.resolve()
+        assert list(workspace.iterdir()) == []
+        calls.append(kwargs)
+        return 0, "", response
+
+    monkeypatch.setattr(cli, "invoke_codex", fake_invoke_codex)
+    execution = cli.execute_codex_backend(request)
+    assert not calls[0]["workspace"].exists()
+    assert calls[0]["source_roots"] is None
+    assert execution.response is response
+    assert execution.exit_code == 0
+    assert (request.attempt_dir / "response.md").read_text() == "result"
+
+
 def test_execute_codex_backend_persists_rejected_response_and_maps_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
