@@ -5355,6 +5355,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     )
     if require_reviewed_files and args.response_contract not in REVIEW_DECLARATION_CONTRACTS:
         parser.error("--require-reviewed-files is supported only for findings-json")
+    if not snapshots and (require_reviewed_files or codex_source_roots is not None):
+        parser.error("reviewed-files declarations require at least one actual --file")
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
     requested_models = [route.model for route in routes]

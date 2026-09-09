@@ -14047,8 +14047,63 @@ def test_cli_task8_proprietary_codex_completion_requires_reviewed_files(
     assert receipt["attempts"][1]["result"] == "accepted"
 
 
+@pytest.mark.parametrize("requirement", ["explicit", "profile", "implicit-codex"])
+def test_prompt_only_reviewed_files_requirement_rejects_before_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requirement: str,
+) -> None:
+    invoked = []
+
+    def unexpected_transport(request):
+        invoked.append(request)
+        raise AssertionError("prompt-only declaration reached transport")
+
+    monkeypatch.setattr(cli, "execute_llm_backend", unexpected_transport)
+    monkeypatch.setattr(cli, "execute_codex_backend", unexpected_transport)
+    parser = cli.build_parser()
+    arguments = [
+        "run",
+        "--review-id",
+        "prompt-only",
+        "--prompt",
+        "Review this prompt.",
+        "--source-class",
+        "proprietary" if requirement == "implicit-codex" else "synthetic",
+        "--response-contract",
+        "findings-json",
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+    ]
+    if requirement == "profile":
+        config = tmp_path / "reviewctl.toml"
+        config.write_text(
+            '[profiles.required]\nroutes = ["llm:accepted"]\nrequire_reviewed_files = true\n'
+        )
+        arguments.extend(["--config", str(config), "--profile", "required"])
+    else:
+        arguments.extend(
+            [
+                "--model",
+                "accepted",
+                "--transport",
+                "codex" if requirement == "implicit-codex" else "llm",
+            ]
+        )
+        if requirement == "explicit":
+            arguments.append("--require-reviewed-files")
+    with pytest.raises(SystemExit) as error:
+        cli.run_review(parser, parser.parse_args(arguments))
+    assert error.value.code == 2
+    assert invoked == []
+
+
+@pytest.mark.parametrize("contract", ["verdict", "findings-json"])
 def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    contract: str,
 ) -> None:
     registry = cli.BackendRegistry()
     registry.register(
@@ -14057,7 +14112,16 @@ def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
             0,
             "",
             cli.PersistedResponse(
-                "conversation", None, 1, 2, request.model, 3, None, "VERDICT: approved"
+                "conversation",
+                None,
+                1,
+                2,
+                request.model,
+                3,
+                None,
+                "VERDICT: approved"
+                if contract == "verdict"
+                else json.dumps({"verdict": "approved", "findings": []}),
             ),
             cli.BackendEvidence(),
         ),
@@ -14075,7 +14139,7 @@ def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
             "--model",
             "model",
             "--response-contract",
-            "verdict",
+            contract,
             "--max-attempts",
             "1",
         ]
