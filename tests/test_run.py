@@ -1144,7 +1144,7 @@ else:
     )
 
 
-def write_fake_gemini(path: Path) -> Path:
+def write_fake_gemini(path: Path, *, reviewed_files: tuple[str, ...] | None = None) -> Path:
     return write_fake_python_executable(
         path,
         "gemini",
@@ -1155,6 +1155,7 @@ import time
 
 arguments = sys.argv[1:]
 test_mode = os.environ.get('GEMINI_API_KEY', '')
+reviewed_files = __REVIEWED_FILES__
 if log := os.environ.get('GEMINI_ARGUMENTS_LOG'):
     from pathlib import Path
     Path(log).write_text(json.dumps(arguments))
@@ -1165,9 +1166,12 @@ elif test_mode == 'invalid':
 elif test_mode == 'list':
     print('[]')
 else:
+    response = {'verdict': 'approved', 'findings': []}
+    if reviewed_files is not None:
+        response['reviewedFiles'] = list(reviewed_files)
     print(json.dumps({
         'session_id': 'gemini-session',
-        'response': '```json\\n' + json.dumps({'verdict': 'approved', 'findings': []}) + '\\n```',
+        'response': '```json\\n' + json.dumps(response) + '\\n```',
         'stats': {'models': {'gemini-3.5-flash': {'tokens': {
             'input': 12, 'candidates': 34, 'total': 46,
         }}}},
@@ -1176,11 +1180,11 @@ if test_mode.startswith('sleep:'):
     time.sleep(float(test_mode.removeprefix('sleep:')))
 if test_mode.startswith('exit:'):
     sys.exit(int(test_mode.removeprefix('exit:')))
-""",
+""".replace("__REVIEWED_FILES__", repr(reviewed_files)),
     )
 
 
-def write_fake_pi(path: Path) -> Path:
+def write_fake_pi(path: Path, *, reviewed_files: tuple[str, ...] | None = None) -> Path:
     return write_fake_python_executable(
         path,
         "pi",
@@ -1207,7 +1211,11 @@ else:
     }) + '\\n')
 if os.environ.get('PI_LARGE_STATE'):
     (Path.cwd() / 'pi-runtime-state.bin').write_bytes(b'x' * (5 * 1024 * 1024))
-response = json.dumps({'verdict': 'approved', 'findings': []})
+response_value = {'verdict': 'approved', 'findings': []}
+reviewed_files = __REVIEWED_FILES__
+if reviewed_files is not None:
+    response_value['reviewedFiles'] = list(reviewed_files)
+response = json.dumps(response_value)
 if model == 'empty' or model.endswith('/empty'):
     content = []
 else:
@@ -1247,7 +1255,7 @@ if delay := os.environ.get('PI_SLEEP'):
 if model == 'failure' or model.endswith('/failure'):
     print('provider failed after retries', file=sys.stderr)
     raise SystemExit(17)
-""",
+""".replace("__REVIEWED_FILES__", repr(reviewed_files)),
     )
 
 
@@ -1256,6 +1264,7 @@ def write_fake_kiro(
     *,
     inventory_mode: str = "valid",
     stage_delays: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    reviewed_files: tuple[str, ...] | None = None,
 ) -> Path:
     observations = path / "kiro-observations.jsonl"
     return write_fake_python_executable(
@@ -1381,7 +1390,11 @@ if model == "invalid-utf8":
 if model == "styled":
     sys.stdout.buffer.write(b'> {{"verdict":"approved",' + b'\\x1b[0m' + b'"findings":[]}}\\n')
     raise SystemExit(0)
-response = json.dumps({{"verdict": "approved", "findings": []}})
+response_value = {{"verdict": "approved", "findings": []}}
+reviewed_files = {reviewed_files!r}
+if reviewed_files is not None:
+    response_value['reviewedFiles'] = list(reviewed_files)
+response = json.dumps(response_value)
 sys.stdout.write(
     "\\x1b[m> \\x1b[0m\\x1b[1mjson\\n\\x1b[0m\\x1b[m"
     + response
@@ -2528,7 +2541,7 @@ def test_native_value_error_is_data_invalid_but_runtime_error_still_propagates(
         ("llm", "codex"),
     ],
 )
-def test_completion_prompt_uses_target_route_contract_context(
+def test_completion_prompt_uses_shared_codex_route_contract_context(
     source_transport: str,
     target_transport: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -2549,8 +2562,7 @@ def test_completion_prompt_uses_target_route_contract_context(
         "verdict": "changes-requested",
         "findings": [finding],
     }
-    if target_transport == "codex":
-        target_review["reviewedFiles"] = ["source.py"]
+    target_review["reviewedFiles"] = ["source.py"]
     responses = [partial, json.dumps(target_review)]
     captured: list[cli.BackendRequest] = []
     real_registry = cli.build_backend_registry()
@@ -2591,12 +2603,12 @@ def test_completion_prompt_uses_target_route_contract_context(
     first_prompt, target_prompt = (request.prompt for request in captured)
     source_contract_context = cli.ContractContext(
         file_names=("source.py",),
-        review_declaration_required=source_transport == "codex",
+        review_declaration_required=True,
     )
     source_prepared = cli.get_contract("findings-json").prepare(source_contract_context)
 
-    assert target_prompt == first_prompt
-    assert "<reviewctl-completion-context>" not in target_prompt
+    assert target_prompt.startswith(first_prompt)
+    assert "<reviewctl-completion-context>" in target_prompt
     assert receipt["prompt"]["packetSha256"] == cli.sha256_bytes(first_prompt.encode())
     assert receipt["attempts"][1]["attemptRequestSha256"] == cli.sha256_bytes(
         target_prompt.encode()
@@ -2612,9 +2624,12 @@ def test_completion_prompt_uses_target_route_contract_context(
     assert first_attempt["promotedFragments"][0]["preparedDigest"] == source_prepared.digest
     assert first_attempt["promotedFragments"][0]["contractContext"] == {
         "fileNames": ["source.py"],
-        "reviewDeclarationRequired": source_transport == "codex",
+        "reviewDeclarationRequired": True,
     }
-    assert receipt["fallbackRelationships"][0]["promotedFragmentIds"] == []
+    assert receipt["fallbackRelationships"][0]["promotedFragmentIds"] == [
+        first_attempt["promotedFragments"][0]["fragmentId"]
+    ]
+    assert cli.validate_v2_receipt(receipt) == ()
 
 
 def test_max_attempts_applies_per_route_in_order_for_retriable_outcomes(
@@ -3372,8 +3387,9 @@ def test_help_llm_json_is_machine_readable() -> None:
         "receipt verification succeeds, and material findings are independently checked"
     )
     assert payload["errors"]["exitCodes"]["1"]["meaning"] == "unavailable-or-invalid"
+    assert payload["commands"]["transport-canary"]["mutatesProfile"] is False
     assert payload["errors"]["exitCodes"]["0"]["next"] == (
-        "follow the selected command's next step; only run creates a receipt"
+        "follow the selected command's next step; run and transport-canary create receipts"
     )
     assert payload["errors"]["attemptResults"]["incomplete"]["inspect"] == [
         "attempt.json:contractEvaluation.completionRequest",
@@ -4091,9 +4107,7 @@ def test_route_profile_rejects_unusable_configurations(
 
 def test_route_profile_accepts_reviewed_files_requirement(tmp_path: Path) -> None:
     config = tmp_path / "reviewed-files.toml"
-    config.write_text(
-        '[profiles.code]\nroutes = ["llm:accepted"]\nrequire_reviewed_files = true\n'
-    )
+    config.write_text('[profiles.code]\nroutes = ["llm:accepted"]\nrequire_reviewed_files = true\n')
 
     routes, metadata = cli.load_route_profile(cli.build_parser(), str(config), "code")
 
@@ -4124,9 +4138,14 @@ def test_run_rejects_non_boolean_reviewed_files_profile_setting_before_artifacts
         "review_routes",
         lambda _parser, _args: (
             (cli.ReviewRoute("llm", "accepted"),),
-            {"path": str(tmp_path / "config.toml"), "sha256": "0" * 64, "settings": {
-                "require_reviewed_files": 1,
-            }, "defaultSettings": {}},
+            {
+                "path": str(tmp_path / "config.toml"),
+                "sha256": "0" * 64,
+                "settings": {
+                    "require_reviewed_files": 1,
+                },
+                "defaultSettings": {},
+            },
         ),
     )
 
@@ -4537,9 +4556,11 @@ def test_codex_receipt_records_why_a_structured_response_is_rejected(tmp_path: P
     )
 
 
-def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) -> None:
+def test_synthetic_codex_review_requires_declaration_without_proprietary_isolation(
+    tmp_path: Path,
+) -> None:
     arguments_log = tmp_path / "codex-arguments.json"
-    response = json.dumps({"verdict": "approved", "findings": []})
+    response = json.dumps({"verdict": "approved", "findings": [], "reviewedFiles": ["source.py"]})
     fake_codex = write_fake_codex(
         tmp_path,
         arguments_log=arguments_log,
@@ -4566,7 +4587,7 @@ def test_synthetic_codex_review_does_not_require_a_read_proof(tmp_path: Path) ->
     assert receipt["sourceClass"] == "synthetic"
     assert receipt["attempts"][0]["contractEvaluation"]["contractContext"] == {
         "fileNames": ["source.py"],
-        "reviewDeclarationRequired": False,
+        "reviewDeclarationRequired": True,
     }
     receipt_path = Path(result.stdout.strip()) / "receipt.json"
     verified = run_cli("verify", str(receipt_path))
@@ -8075,7 +8096,11 @@ def test_findings_receipt_binds_native_contract_evaluation(tmp_path: Path) -> No
     assert receipt["verdict"] == complete_response["verdict"]
     assert receipt["findings"] == complete_response["findings"]
     assert receipt["reviewContract"] == "findings-json"
-    assert receipt["contract"] == {"name": "findings-json", "version": "1"}
+    assert receipt["contract"] == {
+        "name": "findings-json",
+        "version": "1",
+        "dialect": "optional-reviewed-files-v1",
+    }
     assert set(evaluation) == {
         "name",
         "version",
@@ -8126,9 +8151,9 @@ def test_v2_receipt_rejects_malformed_execution_settings(
     assert result.returncode == 0, result.stderr
     receipt = json.loads((Path(result.stdout.strip()) / "receipt.json").read_text())
     receipt["executionSettings"] = execution_settings
-    receipt["sha256"] = cli.sha256_bytes(cli.canonical_json({
-        key: value for key, value in receipt.items() if key != "sha256"
-    }))
+    receipt["sha256"] = cli.sha256_bytes(
+        cli.canonical_json({key: value for key, value in receipt.items() if key != "sha256"})
+    )
 
     violations = review_flow.validate_v2_receipt(receipt)
 
@@ -9665,6 +9690,369 @@ def test_invoke_llm_fails_closed_without_bounded_capture_support(
         response_contract="findings-json",
         timeout_seconds=1,
     ) == (126, "LLM bounded output capture unsupported on this platform")
+
+
+def assert_openrouter_contract_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    require_declaration: bool,
+    omit_declaration: bool,
+    *,
+    invalid_declaration: bool = False,
+    declaration_value: object = None,
+    partial: bool = False,
+) -> None:
+    payload = {"verdict": "approved", "findings": []}
+    if not omit_declaration:
+        payload["reviewedFiles"] = ["source.py"]
+    if invalid_declaration:
+        payload["reviewedFiles"] = declaration_value
+    if partial:
+        payload["verdict"] = "changes-requested"
+        payload["findings"] = [
+            {
+                "severity": "high",
+                "path": "source.py",
+                "line": 1,
+                "title": "Synthetic finding",
+                "evidence": "Synthetic evidence",
+                "reproduction": "Inspect the supplied fixture",
+            }
+        ]
+    real_run = cli.subprocess.run
+    mock_openrouter_curl(
+        monkeypatch,
+        body=json.dumps(
+            {
+                "id": "synthetic-turn",
+                "model": "test/reviewer",
+                "provider": "Test Provider",
+                "choices": [{"message": {"content": json.dumps(payload)}}],
+            }
+        ).encode(),
+    )
+    fake_curl = cli.subprocess.run
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            fake_curl(command, **kwargs) if "--config" in command else real_run(command, **kwargs)
+        ),
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-key")
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path, "test/reviewer"),
+            "--transport",
+            "openrouter",
+            "--response-contract",
+            "findings-json",
+            *(["--require-reviewed-files"] if require_declaration else []),
+        ]
+    )
+    result = cli.run_review(parser, args)
+    receipt_path = next((tmp_path / "artifacts").glob("*/*/receipt.json"))
+    request_path = next(receipt_path.parent.glob("**/request.json"))
+    request = json.loads(request_path.read_text())
+    prepared = cli.get_contract("findings-json").prepare(
+        cli.ContractContext(
+            file_names=("source.py",),
+            review_declaration_required=require_declaration,
+        )
+    )
+    assert request["response_format"]["json_schema"]["schema"] == prepared.schema
+    assert "reviewedFiles" in prepared.schema["properties"]
+    assert ("reviewedFiles" in prepared.schema["required"]) is require_declaration
+    assert prepared.output_instructions in request["messages"][0]["content"]
+    receipt = json.loads(receipt_path.read_text())
+    if (require_declaration and omit_declaration) or invalid_declaration:
+        assert result != 0
+        assert receipt["acceptedAttempt"] is None
+        assert not receipt["consolidatedReview"]["approved"]
+    else:
+        assert result == 0
+        assert receipt["result"] == "accepted"
+        assert receipt["acceptedAttempt"] == 1
+    assert cli.verify_receipt(parser.parse_args(["verify", str(receipt_path)])) == 0
+
+
+@pytest.mark.parametrize("require_declaration", [False, True])
+@pytest.mark.parametrize("omit_declaration", [False, True])
+def test_openrouter_outgoing_contract_matches_receipt_requirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    require_declaration: bool,
+    omit_declaration: bool,
+) -> None:
+    assert_openrouter_contract_receipt(
+        tmp_path,
+        monkeypatch,
+        require_declaration,
+        omit_declaration,
+    )
+
+
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("declaration", [["wrong.py"], [], None, ["source.py", "source.py"]])
+def test_openrouter_invalid_optional_declaration_preserves_rejection_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    declaration: object,
+    partial: bool,
+) -> None:
+    assert_openrouter_contract_receipt(
+        tmp_path,
+        monkeypatch,
+        False,
+        False,
+        invalid_declaration=True,
+        declaration_value=declaration,
+        partial=partial,
+    )
+
+
+def test_llm_required_declaration_uses_prepared_contract_and_verifiable_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    monkeypatch.setenv("LLM_BIN", str(fake_llm))
+    monkeypatch.setenv(
+        "LLM_SCHEMA_RESPONSE",
+        json.dumps(
+            {
+                "verdict": "approved",
+                "findings": [],
+                "reviewedFiles": ["source.py"],
+            }
+        ),
+    )
+    commands = []
+    real_popen = cli.subprocess.Popen
+
+    def capture_popen(command, **kwargs):
+        if command[0] == str(fake_llm):
+            commands.append(command)
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", capture_popen)
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path, "accepted"),
+            "--transport",
+            "llm",
+            "--response-contract",
+            "findings-json",
+            "--require-reviewed-files",
+        ]
+    )
+    assert cli.run_review(parser, args) == 0
+    prepared = cli.get_contract("findings-json").prepare(
+        cli.ContractContext(
+            file_names=("source.py",),
+            review_declaration_required=True,
+        )
+    )
+    assert json.loads(commands[0][commands[0].index("--schema") + 1]) == prepared.schema
+    assert prepared.output_instructions in commands[0][2]
+    receipt_path = next((tmp_path / "artifacts").glob("*/*/receipt.json"))
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["result"] == "accepted"
+    assert receipt["acceptedAttempt"] == 1
+    assert cli.verify_receipt(parser.parse_args(["verify", str(receipt_path)])) == 0
+
+
+@pytest.mark.parametrize(
+    "contract", ["product-review-json", "product-judge-json", "document", "verdict"]
+)
+def test_rejects_unsupported_required_declaration_before_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contract: str,
+) -> None:
+    invoked = []
+
+    def unexpected_transport(request):
+        invoked.append(request)
+        raise AssertionError("unsupported declaration reached the transport")
+
+    monkeypatch.setattr(cli, "execute_llm_backend", unexpected_transport)
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path, "accepted"),
+            "--transport",
+            "llm",
+            "--response-contract",
+            contract,
+            "--require-reviewed-files",
+        ]
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.run_review(parser, args)
+    assert error.value.code == 2
+    assert invoked == []
+
+
+@pytest.mark.parametrize(
+    "transport,model",
+    [
+        ("codex", "synthetic-reviewer"),
+        ("kiro", "claude-sonnet-5"),
+        ("gemini", "gemini-3.5-flash"),
+        ("agy", "synthetic-reviewer"),
+        ("pi", "openrouter/synthetic-reviewer"),
+    ],
+)
+@pytest.mark.parametrize("require_declaration", [False, True])
+def test_native_transports_communicate_exact_prepared_declaration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: str,
+    model: str,
+    require_declaration: bool,
+) -> None:
+    builders = {
+        "kiro": write_fake_kiro,
+        "gemini": write_fake_gemini,
+        "pi": write_fake_pi,
+    }
+    response = json.dumps({"verdict": "approved", "findings": [], "reviewedFiles": ["source.py"]})
+    if transport == "codex":
+        executable = write_fake_codex(tmp_path, response=response)
+    elif transport == "agy":
+        executable = write_fake_agy(tmp_path)
+        monkeypatch.setenv("AGY_RESPONSE", response)
+    else:
+        executable = builders[transport](tmp_path, reviewed_files=("source.py",))
+    monkeypatch.setenv(f"{transport.upper()}_BIN", str(executable))
+    command_text = []
+    schemas = []
+    real_popen = cli.subprocess.Popen
+
+    def capture_popen(command, **kwargs):
+        if str(executable) in command:
+            command_text.extend(command)
+            if "--output-schema" in command:
+                schemas.append(
+                    json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
+                )
+            if "--json-schema" in command:
+                schemas.append(json.loads(command[command.index("--json-schema") + 1]))
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", capture_popen)
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path, model),
+            "--transport",
+            transport,
+            "--response-contract",
+            "findings-json",
+            *(["--require-reviewed-files"] if require_declaration else []),
+        ]
+    )
+    assert cli.run_review(parser, args) == 0
+    receipt_path = next((tmp_path / "artifacts").glob("*/*/receipt.json"))
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["result"] == "accepted"
+    assert receipt["acceptedAttempt"] == 1
+    request_paths = list(receipt_path.parent.glob("**/request.json"))
+    for path in request_paths:
+        command_text.append(json.loads(path.read_text()).get("prompt", ""))
+    prepared = cli.get_contract("findings-json").prepare(
+        cli.ContractContext(
+            file_names=("source.py",),
+            review_declaration_required=require_declaration or transport == "codex",
+        )
+    )
+    assert any(prepared.output_instructions in text for text in command_text)
+    if transport == "codex":
+        assert set(schemas[0]["properties"]) == set(schemas[0]["required"])
+        assert schemas == [{**prepared.schema, "required": list(prepared.schema["properties"])}]
+        assert schemas[0]["required"].count("reviewedFiles") == 1
+    elif transport == "agy":
+        assert schemas == [prepared.schema]
+    else:
+        assert any(cli.canonical_json(prepared.schema).decode() in text for text in command_text)
+    assert ("reviewedFiles" in prepared.schema["required"]) is (
+        require_declaration or transport == "codex"
+    )
+    assert cli.verify_receipt(parser.parse_args(["verify", str(receipt_path)])) == 0
+
+
+@pytest.mark.parametrize("transports", [("llm", "codex"), ("codex", "llm")])
+def test_codex_fallback_routes_share_required_frozen_declaration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transports: tuple[str, str],
+) -> None:
+    registry = cli.BackendRegistry()
+    original_registry = cli.build_backend_registry()
+    captured = []
+
+    def execute(request):
+        captured.append(request)
+        return cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse(
+                "turn",
+                None,
+                None,
+                None,
+                request.model,
+                None,
+                None,
+                ""
+                if len(captured) == 1
+                else json.dumps(
+                    {
+                        "verdict": "approved",
+                        "findings": [],
+                        "reviewedFiles": ["source.py"],
+                    }
+                ),
+            ),
+            cli.BackendEvidence(),
+        )
+
+    for transport in transports:
+        registry.register(original_registry.require(transport).descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    config = tmp_path / "routes.toml"
+    config.write_text(
+        "[profiles.review]\nroutes = " + json.dumps([f"{t}:model" for t in transports])
+    )
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path),
+            "--config",
+            str(config),
+            "--profile",
+            "review",
+            "--response-contract",
+            "findings-json",
+            "--max-attempts",
+            "1",
+        ]
+    )
+    assert cli.run_review(parser, args) == 0
+    assert len(captured) == 2
+    expected = cli.get_contract("findings-json").prepare(
+        cli.ContractContext(
+            file_names=("source.py",),
+            review_declaration_required=True,
+        )
+    )
+    for request in captured:
+        assert request.prepared_contract == expected
+    receipt_path = next((tmp_path / "artifacts").glob("*/*/receipt.json"))
+    assert cli.verify_receipt(parser.parse_args(["verify", str(receipt_path)])) == 0
 
 
 def test_openrouter_packet_makes_findings_verdict_semantics_explicit(tmp_path: Path) -> None:
@@ -11353,6 +11741,47 @@ def test_kiro_bounded_capture_fails_closed_on_pipe_read_error(
     assert captured == (b"", b"", False, False, True)
 
 
+def test_kiro_bounded_capture_terminates_immediately_on_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminations = []
+
+    class ImmediateReader:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target, self.args = target, args
+
+        def start(self):
+            self.target(*self.args)
+
+        def join(self, timeout):
+            pass
+
+    class FailedStream:
+        def read(self, size):
+            raise OSError("synthetic read failure")
+
+    class Child:
+        stdout = FailedStream()
+        stderr = FailedStream()
+
+        def wait(self, timeout):
+            assert terminations == [True]
+            return 0
+
+    monkeypatch.setattr(cli.threading, "Thread", ImmediateReader)
+    monkeypatch.setattr(
+        cli, "terminate_process_group", lambda *_args, **_kwargs: terminations.append(True)
+    )
+    assert cli._communicate_kiro_bounded(
+        Child(),
+        input_bytes=None,
+        timeout_seconds=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    ) == (b"", b"", False, False, True)
+    assert terminations == [True]
+
+
 def test_kiro_bounded_capture_keeps_draining_after_output_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11469,6 +11898,62 @@ def test_kiro_bounded_capture_allows_a_slow_normal_pipe_drain(
 
     assert captured == (b"response", b"", False, False, False)
     assert terminated is False
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_kiro_bounded_capture_drains_normal_exit_at_operation_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    timed_out: bool,
+) -> None:
+    clock = [0.0]
+    joins: list[float] = []
+    terminations: list[bool] = []
+
+    class DeferredReader:
+        def __init__(self, *, target, args, **_kwargs) -> None:
+            self.target = target
+            self.args = args
+            self.finished = False
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float) -> None:
+            joins.append(timeout)
+            # Model buffered bytes needing a short scheduling/drain window.
+            if not self.finished and timeout >= 0.05:
+                clock[0] += 0.05
+                self.target(*self.args)
+                self.finished = True
+
+    class FinishingProcess:
+        stdout = BytesIO(b"complete response")
+        stderr = BytesIO(b"")
+
+        def wait(self, timeout: float) -> int:
+            clock[0] += timeout
+            if timed_out:
+                raise subprocess.TimeoutExpired("synthetic", timeout)
+            return 0
+
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cli.threading, "Thread", DeferredReader)
+    monkeypatch.setattr(
+        cli,
+        "terminate_process_group",
+        lambda *_args, **_kwargs: terminations.append(True),
+    )
+    captured = cli._communicate_kiro_bounded(
+        FinishingProcess(),
+        input_bytes=None,
+        timeout_seconds=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    assert captured == (b"complete response", b"", timed_out, False, timed_out)
+    assert terminations == ([True] if timed_out else [])
+    assert joins[0] == (0 if timed_out else 1)
 
 
 def test_kiro_bounded_capture_handles_a_broken_input_pipe(
@@ -13640,17 +14125,89 @@ def test_cli_task8_proprietary_codex_completion_requires_reviewed_files(
     assert receipt["attempts"][1]["result"] == "accepted"
 
 
+@pytest.mark.parametrize(
+    "requirement", ["explicit", "profile", "implicit-codex", "synthetic-codex"]
+)
+def test_prompt_only_reviewed_files_requirement_rejects_before_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requirement: str,
+) -> None:
+    invoked = []
+
+    def unexpected_transport(request):
+        invoked.append(request)
+        raise AssertionError("prompt-only declaration reached transport")
+
+    monkeypatch.setattr(cli, "execute_llm_backend", unexpected_transport)
+    monkeypatch.setattr(cli, "execute_codex_backend", unexpected_transport)
+    parser = cli.build_parser()
+    arguments = [
+        "run",
+        "--review-id",
+        "prompt-only",
+        "--prompt",
+        "Review this prompt.",
+        "--source-class",
+        "proprietary" if requirement == "implicit-codex" else "synthetic",
+        "--response-contract",
+        "findings-json",
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+    ]
+    if requirement == "profile":
+        config = tmp_path / "reviewctl.toml"
+        config.write_text(
+            '[profiles.required]\nroutes = ["llm:accepted"]\nrequire_reviewed_files = true\n'
+        )
+        arguments.extend(["--config", str(config), "--profile", "required"])
+    else:
+        arguments.extend(
+            [
+                "--model",
+                "accepted",
+                "--transport",
+                "codex" if requirement.endswith("codex") else "llm",
+            ]
+        )
+        if requirement == "explicit":
+            arguments.append("--require-reviewed-files")
+    with pytest.raises(SystemExit) as error:
+        cli.run_review(parser, parser.parse_args(arguments))
+    assert error.value.code == 2
+    assert invoked == []
+
+
+@pytest.mark.parametrize(
+    ("transport", "contract"),
+    [("llm", "verdict"), ("llm", "findings-json"), ("codex", "verdict"), ("codex", "document")],
+)
 def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    transport: str,
+    contract: str,
 ) -> None:
     registry = cli.BackendRegistry()
     registry.register(
-        cli.build_backend_registry().require("llm").descriptor,
+        cli.build_backend_registry().require(transport).descriptor,
         lambda request: cli.BackendExecution(
             0,
             "",
             cli.PersistedResponse(
-                "conversation", None, 1, 2, request.model, 3, None, "VERDICT: approved"
+                "conversation",
+                None,
+                1,
+                2,
+                request.model,
+                3,
+                None,
+                "# Review\nThis prompt-only document is complete."
+                if contract == "document"
+                else "VERDICT: approved"
+                if contract == "verdict"
+                else json.dumps({"verdict": "approved", "findings": []}),
             ),
             cli.BackendEvidence(),
         ),
@@ -13667,8 +14224,10 @@ def test_cli_task8_prompt_only_review_records_synthetic_prompt_source(
             str(tmp_path / "artifacts"),
             "--model",
             "model",
+            "--transport",
+            transport,
             "--response-contract",
-            "verdict",
+            contract,
             "--max-attempts",
             "1",
         ]

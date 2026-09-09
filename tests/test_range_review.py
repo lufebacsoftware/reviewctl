@@ -73,7 +73,11 @@ def make_fake_receipt(
         },
         "transport": "llm",
         "reviewContract": "findings-json",
-        "contract": {"name": "findings-json", "version": "1"},
+        "contract": {
+            "name": "findings-json",
+            "version": "1",
+            "dialect": "optional-reviewed-files-v1",
+        },
         "prompt": {"packetSha256": "b" * 64},
         "routes": [{"model": "model", "transport": "llm"}],
         "attempts": [

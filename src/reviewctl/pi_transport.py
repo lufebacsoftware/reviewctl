@@ -30,8 +30,10 @@ try:
 except ImportError:  # pragma: no cover - exercised on non-POSIX hosts
     resource = None  # type: ignore[assignment]
 
-MAX_PI_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_PI_STDOUT_BYTES = 256 * 1024 * 1024
 MAX_PI_STDERR_BYTES = 1024 * 1024
+# Runtime/session files need headroom beyond the retained reasoning stream.
+MAX_PI_PROCESS_FILE_BYTES = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -108,7 +110,9 @@ def _run_process(
             b"Pi bounded output capture unsupported on this platform",
             False,
         )
-    capture_file_limit = max(MAX_PI_STDOUT_BYTES, MAX_PI_STDERR_BYTES) + 1
+    capture_file_limit = (
+        max(MAX_PI_PROCESS_FILE_BYTES, MAX_PI_STDOUT_BYTES, MAX_PI_STDERR_BYTES) + 1
+    )
 
     def limit_output_files() -> None:
         resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child

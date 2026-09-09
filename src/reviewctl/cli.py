@@ -53,12 +53,14 @@ from reviewctl.backends import (
 from reviewctl.config import THINKING_LEVELS
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
+    REVIEW_DECLARATION_CONTRACTS,
     REVIEWED_FILES_SCHEMA,
     ContractCompletionRequest,
     ContractContext,
     ContractEvaluation,
     EvaluationContext,
     EvaluationStatus,
+    PreparedContract,
     exact_json_object,
     get_contract,
     require_string_json_object_keys,
@@ -98,6 +100,12 @@ from reviewctl.review_flow import (
     validate_v2_receipt,
 )
 from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discover_topology
+from reviewctl.transport_canary import (
+    CANARY_SOURCE,
+    CANARY_SOURCE_NAME,
+    build_canary_report,
+    canary_prompt,
+)
 
 MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
@@ -351,8 +359,15 @@ def codex_schema(schema: dict[str, object]) -> dict[str, object]:
     }
 
 
-def response_schema(contract: str, *, codex: bool = False) -> dict[str, object] | None:
+def response_schema(
+    contract: str,
+    *,
+    codex: bool = False,
+    prepared_contract: PreparedContract | None = None,
+) -> dict[str, object] | None:
     """Return the strict JSON schema for one supported response contract."""
+    if prepared_contract is not None:
+        return prepared_contract.schema
     if contract == "findings-json":
         return (
             get_contract(contract)
@@ -716,6 +731,14 @@ def llm_help_payload() -> dict[str, object]:
                     "independently checked"
                 ),
             },
+            "transport-canary": {
+                "usage": "reviewctl transport-canary --profile NAME",
+                "purpose": (
+                    "make one synthetic provider-backed request through a configured profile"
+                ),
+                "result": ("writes transport-canary.json only beside one valid canonical receipt"),
+                "mutatesProfile": False,
+            },
             "setup": {
                 "discover": "reviewctl setup discover --format json",
                 "show": "reviewctl setup show --format json",
@@ -750,7 +773,10 @@ def llm_help_payload() -> dict[str, object]:
             "exitCodes": {
                 "0": {
                     "meaning": "completed",
-                    "next": "follow the selected command's next step; only run creates a receipt",
+                    "next": (
+                        "follow the selected command's next step; run and transport-canary create "
+                        "receipts"
+                    ),
                 },
                 "1": {
                     "meaning": "unavailable-or-invalid",
@@ -886,6 +912,14 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "A formal result requires receipt.result=accepted, a non-null acceptedAttempt, "
         "successful receipt verification, and independent checking of material findings. "
         "Hash verification alone proves integrity, not acceptance.\n\n"
+        "## Provider-backed transport canary\n\n"
+        "```bash\n"
+        "reviewctl transport-canary --profile NAME\n"
+        "```\n\n"
+        "This makes one bounded synthetic request through a configured profile and writes "
+        "`transport-canary.json` only beside one valid receipt. It never changes profiles, "
+        "routes, policies, credentials, or provider settings. Treat an unavailable canary as "
+        "a transport diagnostic, not qualification or approval.\n\n"
         "## GitHub pull-request review\n\n"
         "The project-scoped GitHub flow uses Pi by default and also registers Codex:\n\n"
         "```bash\n"
@@ -2241,8 +2275,9 @@ def _communicate_kiro_bounded(
                 if len(retained) > limit:
                     output_exceeded.set()
                     terminate_once()
-        except (OSError, ValueError):
+        except OSError, ValueError:
             capture_failed.set()
+            terminate_once()
             return
         finally:
             reader_finished[name].set()
@@ -2270,7 +2305,7 @@ def _communicate_kiro_bounded(
             try:
                 stdin_stream.write(input_bytes)  # type: ignore[union-attr]
                 stdin_stream.close()  # type: ignore[union-attr]
-            except (BrokenPipeError, OSError, ValueError):
+            except BrokenPipeError, OSError, ValueError:
                 return
 
         threading.Thread(
@@ -2292,7 +2327,7 @@ def _communicate_kiro_bounded(
     # A normal child exit can race with the reader threads consuming bytes
     # already buffered in the pipes. Give that drain a short bounded window;
     # only a pipe that remains open after the window requires forced cleanup.
-    normal_drain_deadline = min(operation_deadline, time.monotonic() + 1)
+    normal_drain_deadline = time.monotonic() + (0 if timed_out else 1)
     for reader in (stdout_reader, stderr_reader):
         reader.join(timeout=max(0, normal_drain_deadline - time.monotonic()))
     if not all(event.is_set() for event in reader_finished.values()):
@@ -2305,8 +2340,10 @@ def _communicate_kiro_bounded(
     join_deadline = min(cleanup_deadline, time.monotonic() + 5)
     for reader in (stdout_reader, stderr_reader):
         reader.join(timeout=max(0, join_deadline - time.monotonic()))
-    capture_incomplete = capture_failed.is_set() or capture_interrupted.is_set() or not all(
-        event.is_set() for event in reader_finished.values()
+    capture_incomplete = (
+        capture_failed.is_set()
+        or capture_interrupted.is_set()
+        or not all(event.is_set() for event in reader_finished.values())
     )
     return (
         bytes(captures["stdout"][:stdout_limit]),
@@ -2359,9 +2396,12 @@ def invoke_llm(
     max_output_tokens: int,
     response_contract: str,
     timeout_seconds: int,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str]:
     if resource is None:
         return 126, "LLM bounded output capture unsupported on this platform"
+    if prepared_contract is not None:
+        prompt = f"{prompt}\n\n{prepared_contract.output_instructions}"
     command = [
         llm_bin,
         "prompt",
@@ -2379,7 +2419,7 @@ def invoke_llm(
     ]
     for file in files:
         command.extend(["-f", str(file)])
-    if schema := response_schema(response_contract):
+    if schema := response_schema(response_contract, prepared_contract=prepared_contract):
         command.extend(["--schema", json.dumps(schema, separators=(",", ":"))])
 
     capture_file_limit = max(MAX_LLM_DATABASE_BYTES, MAX_LLM_STDOUT_BYTES, MAX_LLM_STDERR_BYTES) + 1
@@ -2420,13 +2460,22 @@ def invoke_llm(
 
 
 def openrouter_packet(
-    prompt: str, files: list[Path], response_contract: str = "findings-json"
+    prompt: str,
+    files: list[Path],
+    response_contract: str = "findings-json",
+    *,
+    prepared_contract: PreparedContract | None = None,
 ) -> str:
     """Embed bounded frozen fragments in the direct OpenRouter request."""
     fragments = "\n\n".join(
         f"--- BEGIN {file.name} ---\n{file.read_text()}\n--- END {file.name} ---" for file in files
     )
-    if response_contract == "findings-json":
+    if prepared_contract is not None:
+        contract = (
+            f"{prepared_contract.output_instructions}\n"
+            f"JSON Schema:\n{canonical_json(prepared_contract.schema).decode()}"
+        )
+    elif response_contract == "findings-json":
         contract = (
             get_contract(response_contract)
             .prepare(ContractContext(file_names=tuple(file.name for file in files)))
@@ -2560,6 +2609,7 @@ def invoke_kiro(
     session_path: Path,
     diagnostic_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Kiro from an empty directory and retain its runtime-owned evidence."""
     blank = PersistedResponse("", None, None, None, model, None, None, "")
@@ -2632,7 +2682,12 @@ def invoke_kiro(
         agent_path = agent_dir / "reviewctl_readonly.json"
         agent_bytes = canonical_json(KIRO_REVIEW_AGENT) + b"\n"
         write_private_exclusive(agent_path, agent_bytes)
-        inline_packet = openrouter_packet(prompt, files, response_contract)
+        inline_packet = openrouter_packet(
+            prompt,
+            files,
+            response_contract,
+            prepared_contract=prepared_contract,
+        )
         command = [
             kiro_bin,
             "chat",
@@ -2834,10 +2889,16 @@ def invoke_gemini(
     session_path: Path,
     diagnostic_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Gemini CLI headlessly with a read-only plan and durable JSON evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
-    packet = openrouter_packet(prompt, files, response_contract)
+    packet = openrouter_packet(
+        prompt,
+        files,
+        response_contract,
+        prepared_contract=prepared_contract,
+    )
     command = [
         gemini_bin,
         "--model",
@@ -3001,6 +3062,7 @@ def invoke_openrouter(
     request_path: Path,
     response_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Call OpenRouter directly and persist source-safe request and raw response evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -3011,13 +3073,19 @@ def invoke_openrouter(
         "model": model_id,
         "temperature": 0,
         "messages": [
-            {"role": "user", "content": openrouter_packet(prompt, files, response_contract)}
+            {
+                "role": "user",
+                "content": openrouter_packet(
+                    prompt, files, response_contract, prepared_contract=prepared_contract
+                ),
+            }
         ],
     }
     payload["max_tokens"] = openrouter_output_token_budget(model, max_output_tokens)
     if reasoning := openrouter_reasoning_parameters(model):
         payload["reasoning"] = reasoning
-    if schema := response_schema(response_contract):
+    schema = prepared_contract.schema if prepared_contract else response_schema(response_contract)
+    if schema:
         payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {"name": response_contract, "strict": True, "schema": schema},
@@ -3195,12 +3263,18 @@ def invoke_agy(
     request_path: Path,
     response_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run a native Antigravity model in an empty sandbox with durable JSON evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
     if resource is None:
         return 126, "Antigravity bounded output capture unsupported on this platform", blank
-    packet = openrouter_packet(prompt, files, response_contract)
+    packet = openrouter_packet(
+        prompt,
+        files,
+        response_contract,
+        prepared_contract=prepared_contract,
+    )
     request_payload: dict[str, object] = {
         "command": "agy",
         "maxOutputTokens": max_output_tokens,
@@ -3226,7 +3300,7 @@ def invoke_agy(
         "--disable-slash-commands",
         "--sandbox",
     ]
-    if schema := response_schema(response_contract):
+    if schema := response_schema(response_contract, prepared_contract=prepared_contract):
         command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
     capture_file_limit = max(MAX_AGY_STDOUT_BYTES, MAX_AGY_STDERR_BYTES) + 1
 
@@ -3432,12 +3506,17 @@ def pi_timeout_diagnostic(stderr: bytes) -> str:
     return f"review attempt timed out: {details}" if details else "review attempt timed out"
 
 
-def pi_system_prompt(response_contract: str) -> str:
+def pi_system_prompt(
+    response_contract: str,
+    *,
+    prepared_contract: PreparedContract | None = None,
+) -> str:
     """Replace Pi's coding-agent prompt with the selected review contract."""
-    schema = response_schema(response_contract)
+    schema = response_schema(response_contract, prepared_contract=prepared_contract)
     if schema is not None:
+        instructions = f"{prepared_contract.output_instructions}\n" if prepared_contract else ""
         return (
-            "You are a bounded review transport. Read only the supplied files. "
+            f"{instructions}You are a bounded review transport. Read only the supplied files. "
             "Return exactly one JSON object and no Markdown fences, commentary, or alternative "
             "review format. The object must satisfy this JSON Schema:\n"
             f"{canonical_json(schema).decode()}"
@@ -3492,6 +3571,7 @@ def invoke_pi(
     diagnostic_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
     thinking: str = "minimal",
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Pi in JSON mode and retain its complete event stream and session."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -3511,7 +3591,7 @@ def invoke_pi(
         "--thinking",
         thinking,
         "--system-prompt",
-        pi_system_prompt(response_contract),
+        pi_system_prompt(response_contract, prepared_contract=prepared_contract),
         "--model",
         model,
         "--session",
@@ -3545,11 +3625,14 @@ def invoke_pi(
     started = time.monotonic()
     stdout = b""
     stderr = b""
-    capture_file_limit = max(
-        MAX_PI_PROCESS_FILE_BYTES,
-        MAX_PI_LEGACY_STDOUT_BYTES,
-        MAX_PI_LEGACY_STDERR_BYTES,
-    ) + 1
+    capture_file_limit = (
+        max(
+            MAX_PI_PROCESS_FILE_BYTES,
+            MAX_PI_LEGACY_STDOUT_BYTES,
+            MAX_PI_LEGACY_STDERR_BYTES,
+        )
+        + 1
+    )
 
     def limit_output_files() -> None:
         resource.setrlimit(  # pragma: no cover - runs only in the pre-exec child
@@ -3977,11 +4060,15 @@ def promote_exploration(parser: argparse.ArgumentParser, args: argparse.Namespac
 
 
 def codex_prompt(
-    prompt: str, response_contract: str, *, review_declaration_required: bool = True
+    prompt: str,
+    response_contract: str,
+    *,
+    review_declaration_required: bool = True,
+    prepared_contract: PreparedContract | None = None,
 ) -> str:
     """Add the output contract Codex must satisfy without expanding source scope."""
     if response_contract == "findings-json":
-        prepared = get_contract(response_contract).prepare(
+        prepared = prepared_contract or get_contract(response_contract).prepare(
             ContractContext(review_declaration_required=review_declaration_required)
         )
         contract = (
@@ -4021,6 +4108,7 @@ def invoke_codex(
     source_roots: list[Path] | None,
     timeout_seconds: int,
     workspace: Path,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Codex against the isolated snapshots and recover its final response."""
     isolation: CodexIsolation | None = None
@@ -4058,7 +4146,15 @@ def invoke_codex(
         "--output-last-message",
         str(output_path),
     ]
-    if schema := response_schema(response_contract, codex=source_roots is not None):
+    if schema := response_schema(
+        response_contract,
+        codex=source_roots is not None,
+        prepared_contract=prepared_contract,
+    ):
+        if prepared_contract is not None:
+            # Codex Structured Outputs requires every declared property. Project
+            # only that constraint; keep the portable contract and schema intact.
+            schema = {**schema, "required": list(schema["properties"])}
         schema_path = output_path.with_name("codex-response.schema.json")
         schema_path.write_bytes(canonical_json(schema))
         command.extend(["--output-schema", str(schema_path)])
@@ -4067,6 +4163,7 @@ def invoke_codex(
             prompt,
             response_contract,
             review_declaration_required=source_roots is not None,
+            prepared_contract=prepared_contract,
         )
     )
     if isolation:
@@ -4330,6 +4427,7 @@ def execute_llm_backend(request: BackendRequest) -> BackendExecution:
             max_output_tokens=request.max_output_tokens,
             response_contract=request.response_contract,
             timeout_seconds=request.timeout_seconds,
+            prepared_contract=request.prepared_contract,
         )
         response = None
         if os.path.lexists(scratch_database):
@@ -4359,15 +4457,26 @@ def execute_llm_backend(request: BackendRequest) -> BackendExecution:
 
 def execute_codex_backend(request: BackendRequest) -> BackendExecution:
     response_path = request.attempt_dir / "response.md"
-    exit_code, diagnostic, response = invoke_codex(
-        codex_bin=os.environ.get("CODEX_BIN", "codex"),
-        prompt=request.prompt,
-        model=request.model,
-        response_contract=request.response_contract,
-        source_roots=list(request.source_roots) or None,
-        timeout_seconds=request.timeout_seconds,
-        workspace=request.files[0].parent,
-    )
+    with ExitStack() as workspace_context:
+        workspace = (
+            request.files[0].parent
+            if request.files
+            else Path(
+                workspace_context.enter_context(
+                    tempfile.TemporaryDirectory(prefix="reviewctl-codex-prompt-")
+                )
+            )
+        )
+        exit_code, diagnostic, response = invoke_codex(
+            codex_bin=os.environ.get("CODEX_BIN", "codex"),
+            prompt=request.prompt,
+            model=request.model,
+            response_contract=request.response_contract,
+            source_roots=list(request.source_roots) or None,
+            timeout_seconds=request.timeout_seconds,
+            workspace=workspace,
+            prepared_contract=request.prepared_contract,
+        )
     write_private_exclusive(
         response_path,
         response.response.encode(),
@@ -4403,6 +4512,7 @@ def execute_kiro_backend(request: BackendRequest) -> BackendExecution:
         session_path=session_path,
         diagnostic_path=diagnostic_path,
         evidence_parent_identity=request.evidence_parent_identity,
+        prepared_contract=request.prepared_contract,
     )
     final_evidence = None
     if response.response:
@@ -4441,6 +4551,7 @@ def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
         request_path=request_path,
         response_path=response_path,
         evidence_parent_identity=request.evidence_parent_identity,
+        prepared_contract=request.prepared_contract,
     )
     return BackendExecution(
         exit_code,
@@ -4464,6 +4575,7 @@ def execute_agy_backend(request: BackendRequest) -> BackendExecution:
         request_path=request_path,
         response_path=response_path,
         evidence_parent_identity=request.evidence_parent_identity,
+        prepared_contract=request.prepared_contract,
     )
     return BackendExecution(
         exit_code,
@@ -4492,6 +4604,7 @@ def execute_gemini_backend(request: BackendRequest) -> BackendExecution:
         session_path=session_path,
         diagnostic_path=diagnostic_path,
         evidence_parent_identity=request.evidence_parent_identity,
+        prepared_contract=request.prepared_contract,
     )
     if response.response:
         write_private_exclusive(
@@ -4535,6 +4648,7 @@ def execute_pi_backend(request: BackendRequest) -> BackendExecution:
             diagnostic_path=stderr_path,
             evidence_parent_identity=request.evidence_parent_identity,
             thinking=request.thinking,
+            prepared_contract=request.prepared_contract,
         )
         if os.path.lexists(scratch_session):
             try:
@@ -5256,9 +5370,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         else configured_attempts or DEFAULT_REVIEW_MAX_ATTEMPTS
     )
     configured_thinking = (
-        profile_settings.get("thinking")
-        if isinstance(profile_settings, dict)
-        else None
+        profile_settings.get("thinking") if isinstance(profile_settings, dict) else None
     )
     thinking = configured_thinking if isinstance(configured_thinking, str) else "minimal"
     configured_reviewed_files = (
@@ -5276,6 +5388,15 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if explicit_reviewed_files is not None
         else bool(configured_reviewed_files)
     )
+    if require_reviewed_files and args.response_contract not in REVIEW_DECLARATION_CONTRACTS:
+        parser.error("--require-reviewed-files is supported only for findings-json")
+    # Codex's strict schema makes declaration mandatory across the fallback chain.
+    effective_reviewed_files = require_reviewed_files or (
+        args.response_contract == "findings-json"
+        and any(route.transport == "codex" for route in routes)
+    )
+    if not snapshots and (effective_reviewed_files or codex_source_roots is not None):
+        parser.error("reviewed-files declarations require at least one actual --file")
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
     requested_models = [route.model for route in routes]
@@ -5299,10 +5420,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             contract_context = (
                 ContractContext(
                     file_names=tuple(item["name"] for item in source_files),
-                    review_declaration_required=(
-                        require_reviewed_files
-                        or (transport == "codex" and args.source_class == "proprietary")
-                    ),
+                    review_declaration_required=effective_reviewed_files,
                 )
                 if native_contract
                 else None
@@ -5420,6 +5538,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     provider_preferences=provider_preferences,
                     evidence_parent_identity=attempt_identity,
                     thinking=thinking,
+                    prepared_contract=prepared_contract,
                 )
             )
             exit_code = execution.exit_code
@@ -5776,7 +5895,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
             "rotation": {"maxBytes": 5 * 1024 * 1024, "backupCount": 5},
         },
     }
-    if require_reviewed_files:
+    if effective_reviewed_files:
         receipt["executionSettings"]["requireReviewedFiles"] = True
     if kiro_identity_waiver:
         receipt["extension.kiroUnresolvedIdentityWaiver"] = True
@@ -5892,6 +6011,67 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                         pass
             except OSError:
                 pass
+
+
+def run_transport_canary(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Exercise one configured profile through the ordinary receipt pipeline."""
+    routes, profile = load_route_profile(parser, args.config, args.profile)
+    artifact_root = Path(os.path.abspath(Path(args.artifact_root).expanduser()))
+    review_id = f"transport-canary-{sha256_bytes(args.profile.encode())[:12]}"
+    before = receipt_fingerprints(artifact_root)
+    with tempfile.TemporaryDirectory(prefix="reviewctl-transport-canary-") as temporary_directory:
+        source_path = Path(temporary_directory) / CANARY_SOURCE_NAME
+        source_path.write_text(CANARY_SOURCE, encoding="utf-8")
+        review_arguments = [
+            "run",
+            "--review-id",
+            review_id,
+            "--profile",
+            args.profile,
+            "--config",
+            args.config,
+            "--prompt",
+            canary_prompt(),
+            "--file",
+            str(source_path),
+            "--artifact-root",
+            str(artifact_root),
+            "--source-class",
+            "synthetic",
+            "--response-contract",
+            "findings-json",
+            "--require-reviewed-files",
+            "--max-attempts",
+            "1",
+            "--max-output-tokens",
+            str(args.max_output_tokens),
+        ]
+        if args.timeout_seconds is not None:
+            review_arguments.extend(("--timeout-seconds", str(args.timeout_seconds)))
+        review_args = parser.parse_args(review_arguments)
+        exit_code = run_review(parser, review_args)
+
+    receipt_path = tournament_receipt_path(artifact_root, before, review_id)
+    if receipt_path is None:
+        return exit_code
+    receipt = json.loads(read_confined_text(receipt_path))
+    parent_metadata = receipt_path.parent.stat(follow_symlinks=False)
+    report = build_canary_report(
+        profile=profile,
+        routes=[{"model": route.model, "transport": route.transport} for route in routes],
+        receipt_path=receipt_path,
+        receipt=receipt,
+        exit_code=exit_code,
+    )
+    report_path = receipt_path.with_name("transport-canary.json")
+    write_private_exclusive(
+        report_path,
+        canonical_json(report) + b"\n",
+        label="transport canary report",
+        expected_parent_identity=(parent_metadata.st_dev, parent_metadata.st_ino),
+    )
+    print(report_path)
+    return exit_code
 
 
 def valid_receipt(receipt: dict[str, Any]) -> bool:
@@ -6677,6 +6857,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="llm",
     )
     run.set_defaults(handler=lambda namespace: run_review(parser, namespace))
+
+    transport_canary = commands.add_parser(
+        "transport-canary",
+        help="exercise one configured profile through a synthetic formal receipt",
+    )
+    transport_canary.add_argument("--profile", required=True)
+    transport_canary.add_argument(
+        "--config",
+        help="TOML route config (default: ~/.config/reviewctl/config.toml)",
+    )
+    transport_canary.add_argument("--artifact-root", default="~/.cache/reviewctl/canaries")
+    transport_canary.add_argument("--timeout-seconds", type=positive_timeout_seconds)
+    transport_canary.add_argument(
+        "--max-output-tokens", type=positive_integer, default=DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    transport_canary.set_defaults(handler=lambda namespace: run_transport_canary(parser, namespace))
 
     range_review = commands.add_parser(
         "range-review",

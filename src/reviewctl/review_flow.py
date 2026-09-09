@@ -9,6 +9,7 @@ from typing import Any
 from reviewctl.contracts import (
     FINDING_FIELDS,
     FINDINGS_CONTRACT_VIOLATION_CODES,
+    OPTIONAL_REVIEWED_FILES_DIALECT,
     ContractCompletionRequest,
     ContractContext,
     ContractCoverage,
@@ -18,9 +19,11 @@ from reviewctl.contracts import (
     FragmentKind,
     FrozenDict,
     canonical_json,
+    findings_contract_for_dialect,
     findings_required_fields,
     get_contract,
     has_exact_json_scalar_types,
+    resolve_findings_prepared,
     valid_contract_context,
     valid_finding,
     valid_review_basename,
@@ -127,7 +130,10 @@ def receipt_contract_identity(review_contract: str) -> dict[str, str]:
         version = RECEIPT_CONTRACT_VERSIONS[review_contract]
     except (KeyError, TypeError) as error:
         raise ValueError(f"unsupported review contract: {review_contract!r}") from error
-    return {"name": review_contract, "version": version}
+    identity = {"name": review_contract, "version": version}
+    if review_contract == "findings-json":
+        identity["dialect"] = OPTIONAL_REVIEWED_FILES_DIALECT
+    return identity
 
 
 def _is_positive_int(value: object) -> bool:
@@ -256,8 +262,8 @@ def _coverage_matches_violation(
     covered = set(covered_fields)
     missing = set(missing_fields)
     must_cover, must_miss = _VIOLATION_COVERAGE_RULES[violation]
-    if not must_cover.issubset(required) or not must_miss.issubset(required):
-        return False
+    if violation == "review-declaration" and "reviewedFiles" not in required:
+        must_miss = must_miss - {"reviewedFiles"}
     if not must_cover.issubset(covered) or not must_miss.issubset(missing):
         return False
     # A serialized finding fragment is evidence that the findings collection was
@@ -283,9 +289,9 @@ def _validated_promoted_finding(fragment: PromotedFragment) -> dict[str, Any] | 
         return None
     finding = _copy_finding(fragment.finding)
     try:
-        expected_prepared_digest = (
-            get_contract("findings-json").prepare(fragment.contract_context).digest
-        )
+        expected_prepared_digest = resolve_findings_prepared(
+            fragment.contract_context, fragment.prepared_digest
+        ).digest
     except AttributeError, KeyError, TypeError, ValueError, UnicodeError:
         return None
     fingerprint = _fragment_fingerprint(
@@ -691,10 +697,8 @@ def _promote_contract_fragments(
     ):
         return None
     try:
-        expected_prepared = get_contract("findings-json").prepare(contract_context)
+        resolve_findings_prepared(contract_context, prepared_digest)
     except AttributeError, KeyError, TypeError, ValueError, UnicodeError:
-        return None
-    if prepared_digest != expected_prepared.digest:
         return None
 
     promoted: list[PromotedFragment] = []
@@ -850,6 +854,7 @@ def consolidate(
     accepted_attempt: int | None,
     *,
     contract_context: ContractContext,
+    contract_dialect: str | None = OPTIONAL_REVIEWED_FILES_DIALECT,
 ) -> ConsolidatedReview:
     """Combine accepted and partial findings without manufacturing acceptance or dispute."""
     unavailable = ConsolidatedReview(
@@ -865,7 +870,8 @@ def consolidate(
     ):
         return unavailable
     try:
-        expected_prepared_digest = get_contract("findings-json").prepare(contract_context).digest
+        contract = findings_contract_for_dialect(contract_dialect)
+        expected_prepared_digest = contract.prepare(contract_context).digest
     except AttributeError, KeyError, TypeError, ValueError, UnicodeError:
         return unavailable
     validated_fragments: list[tuple[PromotedFragment, dict[str, Any]]] = []
@@ -928,7 +934,6 @@ def consolidate(
             findings=consolidated_findings(),
         )
 
-    contract = get_contract("findings-json")
     try:
         if not has_exact_json_scalar_types(accepted_review):
             raise ValueError("accepted review contains non-exact JSON scalars")
@@ -1311,9 +1316,19 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
     expected_contract_identity = (
         receipt_contract_identity(review_contract) if review_contract_valid else None
     )
+    legacy_findings = (
+        review_contract_valid
+        and review_contract == "findings-json"
+        and type(contract_identity) is dict
+        and has_exact_json_scalar_types(contract_identity)
+        and contract_identity == {"name": "findings-json", "version": "1"}
+    )
+    contract_dialect = None if legacy_findings else OPTIONAL_REVIEWED_FILES_DIALECT
+    if legacy_findings:
+        expected_contract_identity = {"name": "findings-json", "version": "1"}
     if (
         type(contract_identity) is not dict
-        or set(contract_identity) != {"name", "version"}
+        or not has_exact_json_scalar_types(contract_identity)
         or type(contract_identity.get("name")) is not str
         or type(contract_identity.get("version")) is not str
         or contract_identity != expected_contract_identity
@@ -1481,7 +1496,12 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 )
                 if context_is_authoritative and type(evaluation.get("name")) is str:
                     try:
-                        prepared = get_contract(evaluation["name"]).prepare(contract_context)
+                        contract = (
+                            findings_contract_for_dialect(None)
+                            if legacy_findings
+                            else get_contract(evaluation["name"])
+                        )
+                        prepared = contract.prepare(contract_context)
                     except KeyError, TypeError, ValueError, UnicodeError:
                         prepared = None
                     if prepared is not None and prepared.version == evaluation.get("version"):
@@ -1558,7 +1578,15 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                 if declaration_required:
                     expected_required.append("reviewedFiles")
                 coverage_valid = coverage is not None and coverage[0] == expected_required
-                state_valid = identity_valid and contract_fragments_canonical
+                state_valid = (
+                    identity_valid
+                    and contract_fragments_canonical
+                    and not (
+                        legacy_findings
+                        and not declaration_required
+                        and violations_value == ["review-declaration"]
+                    )
+                )
                 if evaluation_is_complete:
                     state_valid = (
                         state_valid
@@ -1570,9 +1598,10 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                         and coverage_valid
                         and coverage[1] == coverage[0]
                         and coverage[2] == []
-                        and set(coverage[0]) == set(normalized_value)
+                        and set(coverage[0]) <= set(normalized_value)
+                        and (not legacy_findings or set(coverage[0]) == set(normalized_value))
                         and (
-                            not declaration_required
+                            "reviewedFiles" not in normalized_value
                             or normalized_value.get("reviewedFiles")
                             == list(contract_context.file_names)
                         )
@@ -1878,7 +1907,9 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
                     ),
                 )
                 destination_prepared = (
-                    get_contract("findings-json").prepare(destination_context).digest
+                    findings_contract_for_dialect(contract_dialect)
+                    .prepare(destination_context)
+                    .digest
                 )
                 expected_ids = sorted(
                     {
@@ -1929,10 +1960,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             file_names=source_file_names or (),
             review_declaration_required=(
                 require_reviewed_files
-                or (
-                    consolidation_attempt.get("transport") == "codex"
-                    and source_is_proprietary
-                )
+                or (consolidation_attempt.get("transport") == "codex" and source_is_proprietary)
             ),
         )
         expected_consolidation = consolidate(
@@ -1940,6 +1968,7 @@ def validate_v2_receipt(receipt: object) -> tuple[str, ...]:
             tuple(all_promoted),
             accepted_attempt if _is_positive_int(accepted_attempt) else None,
             contract_context=consolidation_context,
+            contract_dialect=contract_dialect,
         ).to_dict()
         if not _receipt_canonical_equal(receipt.get("consolidatedReview"), expected_consolidation):
             reject("consolidated-review")

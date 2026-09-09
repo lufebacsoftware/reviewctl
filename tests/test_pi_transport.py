@@ -242,8 +242,14 @@ def test_run_process_fails_typed_without_resource_limits(
     ],
 )
 def test_run_process_bounds_child_output(
-    tmp_path: Path, stream: str, size: int, limit_name: str, truncated_name: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: str,
+    size: int,
+    limit_name: str,
+    truncated_name: str,
 ) -> None:
+    monkeypatch.setattr(pi_module, limit_name, 1024)
     descriptor = 1 if stream == "stdout" else 2
 
     result = pi_module._run_process(
@@ -256,6 +262,27 @@ def test_run_process_bounds_child_output(
     limit = getattr(pi_module, limit_name)
     assert len(getattr(result, stream)) <= limit
     assert getattr(result, truncated_name)
+
+
+def test_project_pi_capture_accepts_large_reasoning_and_runtime_files(tmp_path: Path) -> None:
+    result = pi_module._run_process(
+        [
+            sys.executable,
+            "-c",
+            "import os,resource; "
+            "assert resource.getrlimit(resource.RLIMIT_FSIZE) == (536870913, 536870913); "
+            "open('runtime.bin', 'wb').write(b'r' * (9 * 1024 * 1024)); "
+            "os.write(1, b'x' * (9 * 1024 * 1024))",
+        ],
+        input_text="",
+        timeout_seconds=10,
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0
+    assert len(result.stdout) == 9 * 1024 * 1024
+    assert not result.output_truncated
+    assert (tmp_path / "runtime.bin").stat().st_size == 9 * 1024 * 1024
+    assert pi_module.MAX_PI_STDOUT_BYTES == 256 * 1024 * 1024
 
 
 @pytest.mark.parametrize(

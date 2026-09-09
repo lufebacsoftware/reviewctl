@@ -8,6 +8,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from reviewctl.contracts import PreparedContract
+
 
 class BackendFamily(StrEnum):
     AGENT_CLI = "agent-cli"
@@ -108,6 +110,7 @@ class BackendRequest:
     evidence_parent_identity: tuple[int, int] | None = None
     tools: str = "none"
     thinking: str = "minimal"
+    prepared_contract: PreparedContract | None = None
 
 
 @dataclass(frozen=True)
