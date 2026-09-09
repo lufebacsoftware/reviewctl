@@ -112,6 +112,60 @@ def test_transport_canary_runs_a_profile_and_writes_report(
     )
 
 
+def test_transport_canary_propagates_reviewed_file_requirement_to_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[profiles.codex]\nroutes = ["codex:canary"]\n')
+    registry = cli.BackendRegistry()
+    descriptor = cli.build_backend_registry().require("codex").descriptor
+    captured: list[cli.BackendRequest] = []
+
+    def execute(request: cli.BackendRequest) -> cli.BackendExecution:
+        captured.append(request)
+        return cli.BackendExecution(
+            0,
+            "",
+            cli.PersistedResponse(
+                "conversation",
+                None,
+                1,
+                1,
+                request.model,
+                1,
+                "openai-codex",
+                json.dumps(
+                    {
+                        "verdict": "approved",
+                        "findings": [],
+                        "reviewedFiles": [CANARY_SOURCE_NAME],
+                    }
+                ),
+            ),
+            cli.BackendEvidence(),
+        )
+
+    registry.register(descriptor, execute)
+    monkeypatch.setattr(cli, "build_backend_registry", lambda: registry)
+    namespace = cli.build_parser().parse_args(
+        [
+            "transport-canary",
+            "--profile",
+            "codex",
+            "--config",
+            str(config),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert namespace.handler(namespace) == 0
+    assert captured[0].prepared_contract is not None
+    assert captured[0].prepared_contract.review_declaration_required is True
+    report_path = Path(capsys.readouterr().out.splitlines()[-1])
+    assert json.loads(report_path.read_text())["result"] == "accepted"
+
+
 def test_transport_canary_does_not_write_report_without_one_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
