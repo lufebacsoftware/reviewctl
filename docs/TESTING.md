@@ -34,6 +34,20 @@ Run it locally with:
 uv run python scripts/synthetic_canary.py
 ```
 
+This deterministic fake is distinct from a provider-backed profile canary. The
+profile canary makes one real synthetic request through a user-configured
+route, then writes `transport-canary.json` only when the resulting
+`receipt.json` is valid:
+
+```bash
+reviewctl transport-canary --profile NAME
+reviewctl verify /path/to/receipt.json
+```
+
+It is an operability observation for that profile at that time, not model
+qualification or approval evidence. It never updates routes, policies, or
+credentials.
+
 ## Platform and live checks
 
 New tests that require an operating-system feature belong to `@pytest.mark.platform`.

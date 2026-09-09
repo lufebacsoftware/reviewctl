@@ -100,6 +100,12 @@ from reviewctl.review_flow import (
     validate_v2_receipt,
 )
 from reviewctl.setup import BackendInstallation, LocalExecutionTopology, discover_topology
+from reviewctl.transport_canary import (
+    CANARY_SOURCE,
+    CANARY_SOURCE_NAME,
+    build_canary_report,
+    canary_prompt,
+)
 
 MAX_FILES = 3
 MAX_FRAGMENT_BYTES = 128 * 1024
@@ -725,6 +731,14 @@ def llm_help_payload() -> dict[str, object]:
                     "independently checked"
                 ),
             },
+            "transport-canary": {
+                "usage": "reviewctl transport-canary --profile NAME",
+                "purpose": (
+                    "make one synthetic provider-backed request through a configured profile"
+                ),
+                "result": ("writes transport-canary.json only beside one valid canonical receipt"),
+                "mutatesProfile": False,
+            },
             "setup": {
                 "discover": "reviewctl setup discover --format json",
                 "show": "reviewctl setup show --format json",
@@ -759,7 +773,10 @@ def llm_help_payload() -> dict[str, object]:
             "exitCodes": {
                 "0": {
                     "meaning": "completed",
-                    "next": "follow the selected command's next step; only run creates a receipt",
+                    "next": (
+                        "follow the selected command's next step; run and transport-canary create "
+                        "receipts"
+                    ),
                 },
                 "1": {
                     "meaning": "unavailable-or-invalid",
@@ -895,6 +912,14 @@ def help_llm(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         "A formal result requires receipt.result=accepted, a non-null acceptedAttempt, "
         "successful receipt verification, and independent checking of material findings. "
         "Hash verification alone proves integrity, not acceptance.\n\n"
+        "## Provider-backed transport canary\n\n"
+        "```bash\n"
+        "reviewctl transport-canary --profile NAME\n"
+        "```\n\n"
+        "This makes one bounded synthetic request through a configured profile and writes "
+        "`transport-canary.json` only beside one valid receipt. It never changes profiles, "
+        "routes, policies, credentials, or provider settings. Treat an unavailable canary as "
+        "a transport diagnostic, not qualification or approval.\n\n"
         "## GitHub pull-request review\n\n"
         "The project-scoped GitHub flow uses Pi by default and also registers Codex:\n\n"
         "```bash\n"
@@ -5988,6 +6013,67 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                 pass
 
 
+def run_transport_canary(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Exercise one configured profile through the ordinary receipt pipeline."""
+    routes, profile = load_route_profile(parser, args.config, args.profile)
+    artifact_root = Path(os.path.abspath(Path(args.artifact_root).expanduser()))
+    review_id = f"transport-canary-{sha256_bytes(args.profile.encode())[:12]}"
+    before = receipt_fingerprints(artifact_root)
+    with tempfile.TemporaryDirectory(prefix="reviewctl-transport-canary-") as temporary_directory:
+        source_path = Path(temporary_directory) / CANARY_SOURCE_NAME
+        source_path.write_text(CANARY_SOURCE, encoding="utf-8")
+        review_arguments = [
+            "run",
+            "--review-id",
+            review_id,
+            "--profile",
+            args.profile,
+            "--config",
+            args.config,
+            "--prompt",
+            canary_prompt(),
+            "--file",
+            str(source_path),
+            "--artifact-root",
+            str(artifact_root),
+            "--source-class",
+            "synthetic",
+            "--response-contract",
+            "findings-json",
+            "--require-reviewed-files",
+            "--max-attempts",
+            "1",
+            "--max-output-tokens",
+            str(args.max_output_tokens),
+        ]
+        if args.timeout_seconds is not None:
+            review_arguments.extend(("--timeout-seconds", str(args.timeout_seconds)))
+        review_args = parser.parse_args(review_arguments)
+        exit_code = run_review(parser, review_args)
+
+    receipt_path = tournament_receipt_path(artifact_root, before, review_id)
+    if receipt_path is None:
+        return exit_code
+    receipt = json.loads(read_confined_text(receipt_path))
+    parent_metadata = receipt_path.parent.stat(follow_symlinks=False)
+    report = build_canary_report(
+        profile=profile,
+        routes=[{"model": route.model, "transport": route.transport} for route in routes],
+        receipt_path=receipt_path,
+        receipt=receipt,
+        exit_code=exit_code,
+    )
+    report_path = receipt_path.with_name("transport-canary.json")
+    write_private_exclusive(
+        report_path,
+        canonical_json(report) + b"\n",
+        label="transport canary report",
+        expected_parent_identity=(parent_metadata.st_dev, parent_metadata.st_ino),
+    )
+    print(report_path)
+    return exit_code
+
+
 def valid_receipt(receipt: dict[str, Any]) -> bool:
     """Verify the hash embedded in an in-memory receipt without mutating it."""
     recorded = receipt.get("sha256")
@@ -6771,6 +6857,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="llm",
     )
     run.set_defaults(handler=lambda namespace: run_review(parser, namespace))
+
+    transport_canary = commands.add_parser(
+        "transport-canary",
+        help="exercise one configured profile through a synthetic formal receipt",
+    )
+    transport_canary.add_argument("--profile", required=True)
+    transport_canary.add_argument(
+        "--config",
+        help="TOML route config (default: ~/.config/reviewctl/config.toml)",
+    )
+    transport_canary.add_argument("--artifact-root", default="~/.cache/reviewctl/canaries")
+    transport_canary.add_argument("--timeout-seconds", type=positive_timeout_seconds)
+    transport_canary.add_argument(
+        "--max-output-tokens", type=positive_integer, default=DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    transport_canary.set_defaults(handler=lambda namespace: run_transport_canary(parser, namespace))
 
     range_review = commands.add_parser(
         "range-review",

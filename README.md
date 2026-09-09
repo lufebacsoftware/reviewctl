@@ -168,6 +168,24 @@ not block a model, transport, or response contract. `policy-check` is advisory b
 The receipt also records the effective `executionSettings`, including the timeout and attempt limit
 after applying profile values and any CLI overrides.
 
+### Provider-backed transport canary
+
+`setup check` only inspects a local executable. Before assigning a profile to a
+formal review, exercise it through a single synthetic, provider-backed packet:
+
+```bash
+reviewctl transport-canary --profile gemini
+```
+
+The command freezes a tiny `canary.py`, requires the exact `findings-json`
+approval declaration for that file, makes one bounded attempt, and writes a
+canonical `receipt.json`. When exactly one valid receipt is produced, it also
+writes `transport-canary.json` beside it with the profile name, config digest,
+routes, receipt path, receipt digest, and result. It never changes a profile,
+route, policy, credential, or provider setting. A missing or invalid receipt
+produces no canary report; an unavailable-but-valid receipt remains a transport
+diagnostic, not a qualification result.
+
 ### Interactive exploration with pi
 
 Use the integrated exploration flow for product ideas, architecture questions,
@@ -242,6 +260,7 @@ Synthetic prompt-only rounds intentionally omit `--file`; their receipt records 
 
 ```bash
 reviewctl verify receipt.json
+reviewctl transport-canary --profile NAME
 reviewctl policy-check --policy org-policy.toml --model <model-id>
 reviewctl policy-check --policy org-policy.toml --transport kiro --model <model-id> --enforce
 reviewctl tournament --plan /path/to/organization-tournament.toml
