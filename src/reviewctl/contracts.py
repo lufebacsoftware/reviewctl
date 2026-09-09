@@ -15,6 +15,7 @@ FINDING_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 REVIEW_VERDICTS = {"approved", "changes-requested"}
 FINDINGS_REQUIRED_FIELDS = ("verdict", "findings")
 OPTIONAL_REVIEWED_FILES_DIALECT = "optional-reviewed-files-v1"
+REVIEW_DECLARATION_CONTRACTS = frozenset({"findings-json"})
 FINDINGS_CONTRACT_VIOLATION_CODES = frozenset(
     {
         "finding-fields",

@@ -53,6 +53,7 @@ from reviewctl.backends import (
 from reviewctl.config import THINKING_LEVELS
 from reviewctl.contracts import (
     FINDINGS_SCHEMA,
+    REVIEW_DECLARATION_CONTRACTS,
     REVIEWED_FILES_SCHEMA,
     ContractCompletionRequest,
     ContractContext,
@@ -352,8 +353,15 @@ def codex_schema(schema: dict[str, object]) -> dict[str, object]:
     }
 
 
-def response_schema(contract: str, *, codex: bool = False) -> dict[str, object] | None:
+def response_schema(
+    contract: str,
+    *,
+    codex: bool = False,
+    prepared_contract: PreparedContract | None = None,
+) -> dict[str, object] | None:
     """Return the strict JSON schema for one supported response contract."""
+    if prepared_contract is not None:
+        return prepared_contract.schema
     if contract == "findings-json":
         return (
             get_contract(contract)
@@ -2244,6 +2252,7 @@ def _communicate_kiro_bounded(
                     terminate_once()
         except OSError, ValueError:
             capture_failed.set()
+            terminate_once()
             return
         finally:
             reader_finished[name].set()
@@ -2362,9 +2371,12 @@ def invoke_llm(
     max_output_tokens: int,
     response_contract: str,
     timeout_seconds: int,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str]:
     if resource is None:
         return 126, "LLM bounded output capture unsupported on this platform"
+    if prepared_contract is not None:
+        prompt = f"{prompt}\n\n{prepared_contract.output_instructions}"
     command = [
         llm_bin,
         "prompt",
@@ -2382,7 +2394,7 @@ def invoke_llm(
     ]
     for file in files:
         command.extend(["-f", str(file)])
-    if schema := response_schema(response_contract):
+    if schema := response_schema(response_contract, prepared_contract=prepared_contract):
         command.extend(["--schema", json.dumps(schema, separators=(",", ":"))])
 
     capture_file_limit = max(MAX_LLM_DATABASE_BYTES, MAX_LLM_STDOUT_BYTES, MAX_LLM_STDERR_BYTES) + 1
@@ -2434,7 +2446,10 @@ def openrouter_packet(
         f"--- BEGIN {file.name} ---\n{file.read_text()}\n--- END {file.name} ---" for file in files
     )
     if prepared_contract is not None:
-        contract = prepared_contract.output_instructions
+        contract = (
+            f"{prepared_contract.output_instructions}\n"
+            f"JSON Schema:\n{canonical_json(prepared_contract.schema).decode()}"
+        )
     elif response_contract == "findings-json":
         contract = (
             get_contract(response_contract)
@@ -2569,6 +2584,7 @@ def invoke_kiro(
     session_path: Path,
     diagnostic_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Kiro from an empty directory and retain its runtime-owned evidence."""
     blank = PersistedResponse("", None, None, None, model, None, None, "")
@@ -2641,7 +2657,12 @@ def invoke_kiro(
         agent_path = agent_dir / "reviewctl_readonly.json"
         agent_bytes = canonical_json(KIRO_REVIEW_AGENT) + b"\n"
         write_private_exclusive(agent_path, agent_bytes)
-        inline_packet = openrouter_packet(prompt, files, response_contract)
+        inline_packet = openrouter_packet(
+            prompt,
+            files,
+            response_contract,
+            prepared_contract=prepared_contract,
+        )
         command = [
             kiro_bin,
             "chat",
@@ -2843,10 +2864,16 @@ def invoke_gemini(
     session_path: Path,
     diagnostic_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Gemini CLI headlessly with a read-only plan and durable JSON evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
-    packet = openrouter_packet(prompt, files, response_contract)
+    packet = openrouter_packet(
+        prompt,
+        files,
+        response_contract,
+        prepared_contract=prepared_contract,
+    )
     command = [
         gemini_bin,
         "--model",
@@ -3211,12 +3238,18 @@ def invoke_agy(
     request_path: Path,
     response_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run a native Antigravity model in an empty sandbox with durable JSON evidence."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
     if resource is None:
         return 126, "Antigravity bounded output capture unsupported on this platform", blank
-    packet = openrouter_packet(prompt, files, response_contract)
+    packet = openrouter_packet(
+        prompt,
+        files,
+        response_contract,
+        prepared_contract=prepared_contract,
+    )
     request_payload: dict[str, object] = {
         "command": "agy",
         "maxOutputTokens": max_output_tokens,
@@ -3242,7 +3275,7 @@ def invoke_agy(
         "--disable-slash-commands",
         "--sandbox",
     ]
-    if schema := response_schema(response_contract):
+    if schema := response_schema(response_contract, prepared_contract=prepared_contract):
         command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
     capture_file_limit = max(MAX_AGY_STDOUT_BYTES, MAX_AGY_STDERR_BYTES) + 1
 
@@ -3448,12 +3481,17 @@ def pi_timeout_diagnostic(stderr: bytes) -> str:
     return f"review attempt timed out: {details}" if details else "review attempt timed out"
 
 
-def pi_system_prompt(response_contract: str) -> str:
+def pi_system_prompt(
+    response_contract: str,
+    *,
+    prepared_contract: PreparedContract | None = None,
+) -> str:
     """Replace Pi's coding-agent prompt with the selected review contract."""
-    schema = response_schema(response_contract)
+    schema = response_schema(response_contract, prepared_contract=prepared_contract)
     if schema is not None:
+        instructions = f"{prepared_contract.output_instructions}\n" if prepared_contract else ""
         return (
-            "You are a bounded review transport. Read only the supplied files. "
+            f"{instructions}You are a bounded review transport. Read only the supplied files. "
             "Return exactly one JSON object and no Markdown fences, commentary, or alternative "
             "review format. The object must satisfy this JSON Schema:\n"
             f"{canonical_json(schema).decode()}"
@@ -3508,6 +3546,7 @@ def invoke_pi(
     diagnostic_path: Path,
     evidence_parent_identity: tuple[int, int] | None = None,
     thinking: str = "minimal",
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Pi in JSON mode and retain its complete event stream and session."""
     blank = PersistedResponse("", None, None, None, "", None, None, "")
@@ -3527,7 +3566,7 @@ def invoke_pi(
         "--thinking",
         thinking,
         "--system-prompt",
-        pi_system_prompt(response_contract),
+        pi_system_prompt(response_contract, prepared_contract=prepared_contract),
         "--model",
         model,
         "--session",
@@ -3996,11 +4035,15 @@ def promote_exploration(parser: argparse.ArgumentParser, args: argparse.Namespac
 
 
 def codex_prompt(
-    prompt: str, response_contract: str, *, review_declaration_required: bool = True
+    prompt: str,
+    response_contract: str,
+    *,
+    review_declaration_required: bool = True,
+    prepared_contract: PreparedContract | None = None,
 ) -> str:
     """Add the output contract Codex must satisfy without expanding source scope."""
     if response_contract == "findings-json":
-        prepared = get_contract(response_contract).prepare(
+        prepared = prepared_contract or get_contract(response_contract).prepare(
             ContractContext(review_declaration_required=review_declaration_required)
         )
         contract = (
@@ -4040,6 +4083,7 @@ def invoke_codex(
     source_roots: list[Path] | None,
     timeout_seconds: int,
     workspace: Path,
+    prepared_contract: PreparedContract | None = None,
 ) -> tuple[int, str, PersistedResponse]:
     """Run Codex against the isolated snapshots and recover its final response."""
     isolation: CodexIsolation | None = None
@@ -4077,7 +4121,15 @@ def invoke_codex(
         "--output-last-message",
         str(output_path),
     ]
-    if schema := response_schema(response_contract, codex=source_roots is not None):
+    if schema := response_schema(
+        response_contract,
+        codex=source_roots is not None,
+        prepared_contract=prepared_contract,
+    ):
+        if prepared_contract is not None:
+            # Codex Structured Outputs requires every declared property. Project
+            # only that constraint; keep the portable contract and schema intact.
+            schema = {**schema, "required": list(schema["properties"])}
         schema_path = output_path.with_name("codex-response.schema.json")
         schema_path.write_bytes(canonical_json(schema))
         command.extend(["--output-schema", str(schema_path)])
@@ -4086,6 +4138,7 @@ def invoke_codex(
             prompt,
             response_contract,
             review_declaration_required=source_roots is not None,
+            prepared_contract=prepared_contract,
         )
     )
     if isolation:
@@ -4349,6 +4402,7 @@ def execute_llm_backend(request: BackendRequest) -> BackendExecution:
             max_output_tokens=request.max_output_tokens,
             response_contract=request.response_contract,
             timeout_seconds=request.timeout_seconds,
+            prepared_contract=request.prepared_contract,
         )
         response = None
         if os.path.lexists(scratch_database):
@@ -4386,6 +4440,7 @@ def execute_codex_backend(request: BackendRequest) -> BackendExecution:
         source_roots=list(request.source_roots) or None,
         timeout_seconds=request.timeout_seconds,
         workspace=request.files[0].parent,
+        prepared_contract=request.prepared_contract,
     )
     write_private_exclusive(
         response_path,
@@ -4422,6 +4477,7 @@ def execute_kiro_backend(request: BackendRequest) -> BackendExecution:
         session_path=session_path,
         diagnostic_path=diagnostic_path,
         evidence_parent_identity=request.evidence_parent_identity,
+        prepared_contract=request.prepared_contract,
     )
     final_evidence = None
     if response.response:
@@ -4484,6 +4540,7 @@ def execute_agy_backend(request: BackendRequest) -> BackendExecution:
         request_path=request_path,
         response_path=response_path,
         evidence_parent_identity=request.evidence_parent_identity,
+        prepared_contract=request.prepared_contract,
     )
     return BackendExecution(
         exit_code,
@@ -4512,6 +4569,7 @@ def execute_gemini_backend(request: BackendRequest) -> BackendExecution:
         session_path=session_path,
         diagnostic_path=diagnostic_path,
         evidence_parent_identity=request.evidence_parent_identity,
+        prepared_contract=request.prepared_contract,
     )
     if response.response:
         write_private_exclusive(
@@ -4555,6 +4613,7 @@ def execute_pi_backend(request: BackendRequest) -> BackendExecution:
             diagnostic_path=stderr_path,
             evidence_parent_identity=request.evidence_parent_identity,
             thinking=request.thinking,
+            prepared_contract=request.prepared_contract,
         )
         if os.path.lexists(scratch_session):
             try:
@@ -5294,6 +5353,8 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if explicit_reviewed_files is not None
         else bool(configured_reviewed_files)
     )
+    if require_reviewed_files and args.response_contract not in REVIEW_DECLARATION_CONTRACTS:
+        parser.error("--require-reviewed-files is supported only for findings-json")
     if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 3:
         parser.error("max attempts must be an integer from 1 to 3")
     requested_models = [route.model for route in routes]

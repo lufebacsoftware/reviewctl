@@ -1144,7 +1144,7 @@ else:
     )
 
 
-def write_fake_gemini(path: Path) -> Path:
+def write_fake_gemini(path: Path, *, reviewed_files: tuple[str, ...] | None = None) -> Path:
     return write_fake_python_executable(
         path,
         "gemini",
@@ -1155,6 +1155,7 @@ import time
 
 arguments = sys.argv[1:]
 test_mode = os.environ.get('GEMINI_API_KEY', '')
+reviewed_files = __REVIEWED_FILES__
 if log := os.environ.get('GEMINI_ARGUMENTS_LOG'):
     from pathlib import Path
     Path(log).write_text(json.dumps(arguments))
@@ -1165,9 +1166,12 @@ elif test_mode == 'invalid':
 elif test_mode == 'list':
     print('[]')
 else:
+    response = {'verdict': 'approved', 'findings': []}
+    if reviewed_files is not None:
+        response['reviewedFiles'] = list(reviewed_files)
     print(json.dumps({
         'session_id': 'gemini-session',
-        'response': '```json\\n' + json.dumps({'verdict': 'approved', 'findings': []}) + '\\n```',
+        'response': '```json\\n' + json.dumps(response) + '\\n```',
         'stats': {'models': {'gemini-3.5-flash': {'tokens': {
             'input': 12, 'candidates': 34, 'total': 46,
         }}}},
@@ -1176,11 +1180,11 @@ if test_mode.startswith('sleep:'):
     time.sleep(float(test_mode.removeprefix('sleep:')))
 if test_mode.startswith('exit:'):
     sys.exit(int(test_mode.removeprefix('exit:')))
-""",
+""".replace("__REVIEWED_FILES__", repr(reviewed_files)),
     )
 
 
-def write_fake_pi(path: Path) -> Path:
+def write_fake_pi(path: Path, *, reviewed_files: tuple[str, ...] | None = None) -> Path:
     return write_fake_python_executable(
         path,
         "pi",
@@ -1207,7 +1211,11 @@ else:
     }) + '\\n')
 if os.environ.get('PI_LARGE_STATE'):
     (Path.cwd() / 'pi-runtime-state.bin').write_bytes(b'x' * (5 * 1024 * 1024))
-response = json.dumps({'verdict': 'approved', 'findings': []})
+response_value = {'verdict': 'approved', 'findings': []}
+reviewed_files = __REVIEWED_FILES__
+if reviewed_files is not None:
+    response_value['reviewedFiles'] = list(reviewed_files)
+response = json.dumps(response_value)
 if model == 'empty' or model.endswith('/empty'):
     content = []
 else:
@@ -1247,7 +1255,7 @@ if delay := os.environ.get('PI_SLEEP'):
 if model == 'failure' or model.endswith('/failure'):
     print('provider failed after retries', file=sys.stderr)
     raise SystemExit(17)
-""",
+""".replace("__REVIEWED_FILES__", repr(reviewed_files)),
     )
 
 
@@ -1256,6 +1264,7 @@ def write_fake_kiro(
     *,
     inventory_mode: str = "valid",
     stage_delays: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    reviewed_files: tuple[str, ...] | None = None,
 ) -> Path:
     observations = path / "kiro-observations.jsonl"
     return write_fake_python_executable(
@@ -1381,7 +1390,11 @@ if model == "invalid-utf8":
 if model == "styled":
     sys.stdout.buffer.write(b'> {{"verdict":"approved",' + b'\\x1b[0m' + b'"findings":[]}}\\n')
     raise SystemExit(0)
-response = json.dumps({{"verdict": "approved", "findings": []}})
+response_value = {{"verdict": "approved", "findings": []}}
+reviewed_files = {reviewed_files!r}
+if reviewed_files is not None:
+    response_value['reviewedFiles'] = list(reviewed_files)
+response = json.dumps(response_value)
 sys.stdout.write(
     "\\x1b[m> \\x1b[0m\\x1b[1mjson\\n\\x1b[0m\\x1b[m"
     + response
@@ -9754,6 +9767,7 @@ def assert_openrouter_contract_receipt(
         assert not receipt["consolidatedReview"]["approved"]
     else:
         assert result == 0
+        assert receipt["result"] == "accepted"
         assert receipt["acceptedAttempt"] == 1
     assert cli.verify_receipt(parser.parse_args(["verify", str(receipt_path)])) == 0
 
@@ -9791,6 +9805,176 @@ def test_openrouter_invalid_optional_declaration_preserves_rejection_receipt(
         declaration_value=declaration,
         partial=partial,
     )
+
+
+def test_llm_required_declaration_uses_prepared_contract_and_verifiable_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_llm = write_fake_llm(tmp_path)
+    monkeypatch.setenv("LLM_BIN", str(fake_llm))
+    monkeypatch.setenv(
+        "LLM_SCHEMA_RESPONSE",
+        json.dumps(
+            {
+                "verdict": "approved",
+                "findings": [],
+                "reviewedFiles": ["source.py"],
+            }
+        ),
+    )
+    commands = []
+    real_popen = cli.subprocess.Popen
+
+    def capture_popen(command, **kwargs):
+        if command[0] == str(fake_llm):
+            commands.append(command)
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", capture_popen)
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path, "accepted"),
+            "--transport",
+            "llm",
+            "--response-contract",
+            "findings-json",
+            "--require-reviewed-files",
+        ]
+    )
+    assert cli.run_review(parser, args) == 0
+    prepared = cli.get_contract("findings-json").prepare(
+        cli.ContractContext(
+            file_names=("source.py",),
+            review_declaration_required=True,
+        )
+    )
+    assert json.loads(commands[0][commands[0].index("--schema") + 1]) == prepared.schema
+    assert prepared.output_instructions in commands[0][2]
+    receipt_path = next((tmp_path / "artifacts").glob("*/*/receipt.json"))
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["result"] == "accepted"
+    assert receipt["acceptedAttempt"] == 1
+    assert cli.verify_receipt(parser.parse_args(["verify", str(receipt_path)])) == 0
+
+
+@pytest.mark.parametrize(
+    "contract", ["product-review-json", "product-judge-json", "document", "verdict"]
+)
+def test_rejects_unsupported_required_declaration_before_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contract: str,
+) -> None:
+    invoked = []
+
+    def unexpected_transport(request):
+        invoked.append(request)
+        raise AssertionError("unsupported declaration reached the transport")
+
+    monkeypatch.setattr(cli, "execute_llm_backend", unexpected_transport)
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path, "accepted"),
+            "--transport",
+            "llm",
+            "--response-contract",
+            contract,
+            "--require-reviewed-files",
+        ]
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.run_review(parser, args)
+    assert error.value.code == 2
+    assert invoked == []
+
+
+@pytest.mark.parametrize(
+    "transport,model",
+    [
+        ("codex", "synthetic-reviewer"),
+        ("kiro", "claude-sonnet-5"),
+        ("gemini", "gemini-3.5-flash"),
+        ("agy", "synthetic-reviewer"),
+        ("pi", "openrouter/synthetic-reviewer"),
+    ],
+)
+@pytest.mark.parametrize("require_declaration", [False, True])
+def test_native_transports_communicate_exact_prepared_declaration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: str,
+    model: str,
+    require_declaration: bool,
+) -> None:
+    builders = {
+        "kiro": write_fake_kiro,
+        "gemini": write_fake_gemini,
+        "pi": write_fake_pi,
+    }
+    response = json.dumps({"verdict": "approved", "findings": [], "reviewedFiles": ["source.py"]})
+    if transport == "codex":
+        executable = write_fake_codex(tmp_path, response=response)
+    elif transport == "agy":
+        executable = write_fake_agy(tmp_path)
+        monkeypatch.setenv("AGY_RESPONSE", response)
+    else:
+        executable = builders[transport](tmp_path, reviewed_files=("source.py",))
+    monkeypatch.setenv(f"{transport.upper()}_BIN", str(executable))
+    command_text = []
+    schemas = []
+    real_popen = cli.subprocess.Popen
+
+    def capture_popen(command, **kwargs):
+        if str(executable) in command:
+            command_text.extend(command)
+            if "--output-schema" in command:
+                schemas.append(
+                    json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
+                )
+            if "--json-schema" in command:
+                schemas.append(json.loads(command[command.index("--json-schema") + 1]))
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", capture_popen)
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            *review_arguments(tmp_path, model),
+            "--transport",
+            transport,
+            "--response-contract",
+            "findings-json",
+            *(["--require-reviewed-files"] if require_declaration else []),
+        ]
+    )
+    assert cli.run_review(parser, args) == 0
+    receipt_path = next((tmp_path / "artifacts").glob("*/*/receipt.json"))
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["result"] == "accepted"
+    assert receipt["acceptedAttempt"] == 1
+    request_paths = list(receipt_path.parent.glob("**/request.json"))
+    for path in request_paths:
+        command_text.append(json.loads(path.read_text()).get("prompt", ""))
+    prepared = cli.get_contract("findings-json").prepare(
+        cli.ContractContext(
+            file_names=("source.py",),
+            review_declaration_required=require_declaration,
+        )
+    )
+    assert any(prepared.output_instructions in text for text in command_text)
+    if transport == "codex":
+        assert set(schemas[0]["properties"]) == set(schemas[0]["required"])
+        assert schemas == [{**prepared.schema, "required": list(prepared.schema["properties"])}]
+        assert schemas[0]["required"].count("reviewedFiles") == 1
+    elif transport == "agy":
+        assert schemas == [prepared.schema]
+    else:
+        assert any(cli.canonical_json(prepared.schema).decode() in text for text in command_text)
+    assert ("reviewedFiles" in prepared.schema["required"]) is require_declaration
+    assert cli.verify_receipt(parser.parse_args(["verify", str(receipt_path)])) == 0
 
 
 def test_openrouter_packet_makes_findings_verdict_semantics_explicit(tmp_path: Path) -> None:
@@ -11477,6 +11661,47 @@ def test_kiro_bounded_capture_fails_closed_on_pipe_read_error(
     )
 
     assert captured == (b"", b"", False, False, True)
+
+
+def test_kiro_bounded_capture_terminates_immediately_on_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminations = []
+
+    class ImmediateReader:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target, self.args = target, args
+
+        def start(self):
+            self.target(*self.args)
+
+        def join(self, timeout):
+            pass
+
+    class FailedStream:
+        def read(self, size):
+            raise OSError("synthetic read failure")
+
+    class Child:
+        stdout = FailedStream()
+        stderr = FailedStream()
+
+        def wait(self, timeout):
+            assert terminations == [True]
+            return 0
+
+    monkeypatch.setattr(cli.threading, "Thread", ImmediateReader)
+    monkeypatch.setattr(
+        cli, "terminate_process_group", lambda *_args, **_kwargs: terminations.append(True)
+    )
+    assert cli._communicate_kiro_bounded(
+        Child(),
+        input_bytes=None,
+        timeout_seconds=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    ) == (b"", b"", False, False, True)
+    assert terminations == [True]
 
 
 def test_kiro_bounded_capture_keeps_draining_after_output_limit(
