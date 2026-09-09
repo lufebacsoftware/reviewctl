@@ -11597,6 +11597,62 @@ def test_kiro_bounded_capture_allows_a_slow_normal_pipe_drain(
     assert terminated is False
 
 
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_kiro_bounded_capture_drains_normal_exit_at_operation_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    timed_out: bool,
+) -> None:
+    clock = [0.0]
+    joins: list[float] = []
+    terminations: list[bool] = []
+
+    class DeferredReader:
+        def __init__(self, *, target, args, **_kwargs) -> None:
+            self.target = target
+            self.args = args
+            self.finished = False
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float) -> None:
+            joins.append(timeout)
+            # Model buffered bytes needing a short scheduling/drain window.
+            if not self.finished and timeout >= 0.05:
+                clock[0] += 0.05
+                self.target(*self.args)
+                self.finished = True
+
+    class FinishingProcess:
+        stdout = BytesIO(b"complete response")
+        stderr = BytesIO(b"")
+
+        def wait(self, timeout: float) -> int:
+            clock[0] += timeout
+            if timed_out:
+                raise subprocess.TimeoutExpired("synthetic", timeout)
+            return 0
+
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cli.threading, "Thread", DeferredReader)
+    monkeypatch.setattr(
+        cli,
+        "terminate_process_group",
+        lambda *_args, **_kwargs: terminations.append(True),
+    )
+    captured = cli._communicate_kiro_bounded(
+        FinishingProcess(),
+        input_bytes=None,
+        timeout_seconds=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    assert captured == (b"complete response", b"", timed_out, False, timed_out)
+    assert terminations == ([True] if timed_out else [])
+    assert joins[0] == (0 if timed_out else 1)
+
+
 def test_kiro_bounded_capture_handles_a_broken_input_pipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
