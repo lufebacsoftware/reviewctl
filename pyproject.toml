@@ -22,6 +22,12 @@ dev = ["pytest>=8.3,<9", "pytest-cov>=6,<7", "ruff>=0.15,<0.16"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "unit: deterministic local behavior with no external process contract",
+  "contract: deterministic adapter or CLI contract using local fakes",
+  "platform: explicit operating-system integration check",
+  "live: explicit provider, account, repository, or secret-dependent check",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/reviewctl"]
