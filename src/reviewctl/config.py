@@ -24,6 +24,7 @@ PRIVACY_RANK = {"personal": 0, "private": 1, "sensitive": 2}
 VISIBILITIES = frozenset({"public", "private", "unknown"})
 EXECUTION_MODES = frozenset({"local", "remote"})
 TOOL_MODES = frozenset({"none", "read-only"})
+THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_USER_CONFIG = Path("~/.config/reviewctl/config.toml")
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -54,6 +55,7 @@ class ReviewProfile:
     max_output_tokens: int | None
     execution: str
     tools: str
+    thinking: str
     dimensions: tuple[str, ...]
 
     @property
@@ -244,6 +246,11 @@ def _profile(
     tools = _string(value.get("tools"), f"profiles.{name}.tools", "none")
     if tools not in TOOL_MODES:
         raise ConfigError(f"profiles.{name}.tools must be none or read-only")
+    thinking = _string(value.get("thinking"), f"profiles.{name}.thinking", "minimal")
+    if thinking not in THINKING_LEVELS:
+        raise ConfigError(
+            f"profiles.{name}.thinking must be one of {', '.join(sorted(THINKING_LEVELS))}"
+        )
     if execution == "local" and any(
         route.transport in {"openrouter", "pi"} or route.model.startswith("openrouter/")
         for route in parsed_routes
@@ -266,6 +273,7 @@ def _profile(
         max_output_tokens=max_output_tokens,
         execution=execution,
         tools=tools,
+        thinking=thinking,
         dimensions=dimensions,
     )
 
@@ -336,6 +344,7 @@ def load_config(
             max_output_tokens=8000,
             execution="local",
             tools="none",
+            thinking="minimal",
             dimensions=required_dimensions,
         )
     raw_digest = hashlib.sha256(project_raw + b"\n" + user_raw).hexdigest()

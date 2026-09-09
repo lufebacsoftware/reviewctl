@@ -35,6 +35,11 @@ blindly.
 two routes and `max_attempts = 2` can therefore make at most four bounded
 attempts; each attempt and transition is recorded in the receipt.
 
+Pi-backed profiles accept `thinking = "off"`, `"minimal"`, `"low"`, `"medium"`,
+`"high"`, `"xhigh"`, or `"max"`. The value is forwarded to Pi and recorded in
+request evidence. It controls reasoning effort and does not enforce an output
+token limit; the default is `minimal`.
+
 The project-scoped GitHub pull-request flow uses Pi by default and also
 registers Codex. It freezes the PR snapshot, reuses the project profile, and
 creates a local publication plan. Select a profile with a `codex:MODEL` route

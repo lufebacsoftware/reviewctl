@@ -24,6 +24,55 @@ def test_confined_directory_rejects_missing_component_without_creation(tmp_path:
             pass
 
 
+def test_confined_directory_keeps_non_macos_paths_unchanged(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(filesystem.sys, "platform", "linux")
+
+    assert filesystem._confined_absolute_directory_path(tmp_path) == tmp_path
+
+
+def test_confined_directory_keeps_unaliased_macos_paths_unchanged(monkeypatch) -> None:
+    path = Path("/Users/reviewctl/artifacts")
+    monkeypatch.setattr(filesystem.sys, "platform", "darwin")
+
+    assert filesystem._confined_absolute_directory_path(path) == path
+
+
+def test_confined_directory_normalizes_only_the_macos_tmp_alias(
+    tmp_path: Path, monkeypatch
+) -> None:
+    alias = tmp_path / "tmp"
+    private_tmp = tmp_path / "private" / "tmp"
+    private_tmp.mkdir(parents=True)
+    alias.symlink_to(private_tmp, target_is_directory=True)
+    monkeypatch.setattr(filesystem.sys, "platform", "darwin")
+    monkeypatch.setattr(filesystem, "_MACOS_SYSTEM_ALIASES", {alias: private_tmp})
+
+    with filesystem.confined_directory_descriptor(alias / "reviewctl", create=True) as descriptor:
+        assert filesystem.stat.S_ISDIR(os.fstat(descriptor).st_mode)
+
+    assert (private_tmp / "reviewctl").is_dir()
+
+
+def test_confined_directory_still_rejects_a_symlink_below_macos_tmp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    alias = tmp_path / "tmp"
+    private_tmp = tmp_path / "private" / "tmp"
+    external = tmp_path / "external"
+    private_tmp.mkdir(parents=True)
+    external.mkdir()
+    alias.symlink_to(private_tmp, target_is_directory=True)
+    (private_tmp / "escape").symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(filesystem.sys, "platform", "darwin")
+    monkeypatch.setattr(filesystem, "_MACOS_SYSTEM_ALIASES", {alias: private_tmp})
+
+    with pytest.raises(OSError):
+        with filesystem.confined_directory_descriptor(alias / "escape" / "reviewctl", create=True):
+            pass
+
+    assert list(external.iterdir()) == []
+
+
 def test_relative_confinement_rejects_unsupported_platform_and_invalid_paths(
     tmp_path: Path, monkeypatch
 ) -> None:

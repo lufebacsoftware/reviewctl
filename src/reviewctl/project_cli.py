@@ -778,6 +778,7 @@ def doctor_project(args: Any) -> int:
             "timeoutSeconds": profile.timeout_seconds,
             "maxOutputTokens": profile.max_output_tokens,
             "dimensions": list(profile.dimensions),
+            "thinking": profile.thinking,
         }
         for profile in config.profiles.values()
     ]
@@ -808,7 +809,10 @@ def doctor_project(args: Any) -> int:
         print(f"portable project id: {'yes' if config.project.portable_project_id else 'no'}")
         print(f"privacy: {config.project.privacy_mode}")
         for profile in profiles:
-            print(f"profile {profile['name']}: {', '.join(profile['routes']) or '(no route)'}")
+            print(
+                f"profile {profile['name']}: {', '.join(profile['routes']) or '(no route)'} "
+                f"(thinking={profile['thinking']})"
+            )
         for name, transport in payload["transports"].items():
             print(f"{name} executable: {'yes' if transport['executable'] else 'no'}")
     return 0

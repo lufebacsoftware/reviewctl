@@ -1134,6 +1134,7 @@ def test_doctor_reports_route_and_capability_without_credentials(tmp_path: Path,
         profile for profile in payload["profiles"] if profile["name"] == "default"
     )
     assert default_profile["routes"] == ["pi:openrouter/stealth/ox-alpha"]
+    assert default_profile["thinking"] == "minimal"
     assert "OPENROUTER_API_KEY" not in output
 
 

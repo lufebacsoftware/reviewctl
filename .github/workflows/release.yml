@@ -25,7 +25,7 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pytest --cov=reviewctl --cov-branch --cov-report=term-missing
+      - run: uv run pytest -m "unit or contract" --cov=reviewctl --cov-branch --cov-report=term-missing
       - run: uv build
       - name: Verify clean installation
         run: |
