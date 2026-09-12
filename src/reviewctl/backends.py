@@ -110,6 +110,7 @@ class BackendRequest:
     evidence_parent_identity: tuple[int, int] | None = None
     tools: str = "none"
     thinking: str = "minimal"
+    reasoning_effort: str | None = None
     prepared_contract: PreparedContract | None = None
 
 

@@ -134,7 +134,6 @@ MAX_CODEX_STDERR_BYTES = 100_000
 MAX_RANGE_CHILD_STDOUT_BYTES = 256 * 1024
 MAX_RANGE_CHILD_STDERR_BYTES = 100_000
 DEFAULT_MAX_OUTPUT_TOKENS = 16_384
-GLM_REASONING_MIN_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
 REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$")
 FINDING_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 PRODUCT_CONSTRAINT_DISPOSITIONS = {"satisfied", "rejected", "assumed"}
@@ -158,6 +157,7 @@ TOURNAMENT_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "kiro", "pi"}
 TOURNAMENT_COST_MODES = {"metered", "account-included", "subscription"}
 ROUTE_TRANSPORTS = {"llm", "codex", "openrouter", "agy", "gemini", "kiro", "pi"}
 PI_THINKING_LEVELS = THINKING_LEVELS
+OPENROUTER_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
 LOCAL_POLICY_TRANSPORTS = frozenset({"codex", "gemini", "kiro", "pi"})
 REQUIRED_LOCAL_POLICY_TRANSPORTS = frozenset({"gemini", "kiro", "pi"})
 RETRIABLE_REVIEW_RESULTS = {
@@ -625,7 +625,7 @@ def load_route_profile(
     route_transports = {route.transport for route in routes}
     transport_default_key = next(iter(route_transports)) if len(route_transports) == 1 else ""
     default_settings = execution_default_settings(parser, config, transport_default_key)
-    settings: dict[str, int] = {}
+    settings: dict[str, object] = {}
     for key, minimum, maximum in (
         ("timeout_seconds", 1, None),
         ("max_attempts", 1, 3),
@@ -646,6 +646,19 @@ def load_route_profile(
                 f"{', '.join(sorted(PI_THINKING_LEVELS))}"
             )
         settings["thinking"] = thinking
+    reasoning_effort = (
+        profile_config.get("reasoning_effort") if isinstance(profile_config, dict) else None
+    )
+    if reasoning_effort is not None:
+        if (
+            not isinstance(reasoning_effort, str)
+            or reasoning_effort not in OPENROUTER_REASONING_EFFORTS
+        ):
+            parser.error(
+                f"profile {profile!r}: reasoning_effort must be one of "
+                f"{', '.join(sorted(OPENROUTER_REASONING_EFFORTS))}"
+            )
+        settings["reasoning_effort"] = reasoning_effort
     require_reviewed_files = (
         profile_config.get("require_reviewed_files") if isinstance(profile_config, dict) else None
     )
@@ -1210,21 +1223,6 @@ def resolved_provider_matches(
 def openrouter_model_id(model: str) -> str:
     """Remove the local transport prefix before addressing an OpenRouter endpoint."""
     return model.removeprefix("openrouter/")
-
-
-def openrouter_reasoning_parameters(model: str) -> dict[str, str] | None:
-    """Keep GLM-5.3-Flash on its native maximum reasoning setting."""
-    model_id = openrouter_model_id(model)
-    if model_id == "z-ai/glm-5.3-flash" or model_id.startswith("z-ai/glm-5.3-flash:"):
-        return {"effort": "max"}
-    return None
-
-
-def openrouter_output_token_budget(model: str, requested: int) -> int:
-    """Keep small manual caps from starving native reasoning models of answer space."""
-    if openrouter_reasoning_parameters(model):
-        return max(requested, GLM_REASONING_MIN_OUTPUT_TOKENS)
-    return requested
 
 
 def endpoint_price_per_million(endpoint: dict[str, object], field: str) -> float | None:
@@ -3056,6 +3054,7 @@ def invoke_openrouter(
     model: str,
     files: list[Path],
     max_output_tokens: int,
+    reasoning_effort: str | None = None,
     provider_preferences: dict[str, object] | None = None,
     response_contract: str,
     timeout_seconds: int,
@@ -3081,9 +3080,9 @@ def invoke_openrouter(
             }
         ],
     }
-    payload["max_tokens"] = openrouter_output_token_budget(model, max_output_tokens)
-    if reasoning := openrouter_reasoning_parameters(model):
-        payload["reasoning"] = reasoning
+    payload["max_tokens"] = max_output_tokens
+    if reasoning_effort is not None:
+        payload["reasoning"] = {"effort": reasoning_effort}
     schema = prepared_contract.schema if prepared_contract else response_schema(response_contract)
     if schema:
         payload["response_format"] = {
@@ -4545,6 +4544,7 @@ def execute_openrouter_backend(request: BackendRequest) -> BackendExecution:
         model=request.model,
         files=list(request.files),
         max_output_tokens=request.max_output_tokens,
+        reasoning_effort=request.reasoning_effort,
         provider_preferences=request.provider_preferences,
         response_contract=request.response_contract,
         timeout_seconds=request.timeout_seconds,
@@ -5373,6 +5373,17 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         profile_settings.get("thinking") if isinstance(profile_settings, dict) else None
     )
     thinking = configured_thinking if isinstance(configured_thinking, str) else "minimal"
+    configured_reasoning_effort = (
+        profile_settings.get("reasoning_effort") if isinstance(profile_settings, dict) else None
+    )
+    explicit_reasoning_effort = getattr(args, "reasoning_effort", None)
+    reasoning_effort = (
+        explicit_reasoning_effort
+        if isinstance(explicit_reasoning_effort, str)
+        else configured_reasoning_effort
+        if isinstance(configured_reasoning_effort, str)
+        else None
+    )
     configured_reviewed_files = (
         profile_settings.get("require_reviewed_files")
         if isinstance(profile_settings, dict)
@@ -5538,6 +5549,7 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
                     provider_preferences=provider_preferences,
                     evidence_parent_identity=attempt_identity,
                     thinking=thinking,
+                    reasoning_effort=reasoning_effort if transport == "openrouter" else None,
                     prepared_contract=prepared_contract,
                 )
             )
@@ -6408,11 +6420,7 @@ def run_candidate_tournament(
         input_tokens = estimate_tokens(packet_prompt(prompt, files, response_contract), files)
         for candidate in candidates:
             requested_max_output_tokens = candidate.max_output_tokens or max_output_tokens
-            candidate_max_output_tokens = (
-                openrouter_output_token_budget(candidate.model, requested_max_output_tokens)
-                if candidate.transport == "openrouter"
-                else requested_max_output_tokens
-            )
+            candidate_max_output_tokens = requested_max_output_tokens
             estimate: float | None = None
             if candidate.cost_mode == "metered":
                 assert candidate.pricing is not None
@@ -6625,11 +6633,7 @@ def run_tournament(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         ):
             parser.error("tournament model max_output_tokens must be a positive integer")
         requested_max_output_tokens = raw_candidate_max_output_tokens or max_output_tokens
-        effective_max_output_tokens = (
-            openrouter_output_token_budget(model, requested_max_output_tokens)
-            if transport == "openrouter"
-            else requested_max_output_tokens
-        )
+        effective_max_output_tokens = requested_max_output_tokens
         legacy_models.append(
             (
                 model,
@@ -6824,6 +6828,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
     run.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
+    run.add_argument(
+        "--reasoning-effort",
+        choices=sorted(OPENROUTER_REASONING_EFFORTS),
+        default=None,
+        help="OpenRouter reasoning effort; overrides profile reasoning_effort",
+    )
     run.add_argument("--max-attempts", type=int, default=None)
     run.add_argument(
         "--require-reviewed-files",

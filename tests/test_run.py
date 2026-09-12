@@ -3832,6 +3832,86 @@ def test_route_profile_loads_ordered_fallback_and_records_config_digest(tmp_path
     ]
 
 
+def test_route_profile_loads_openrouter_reasoning_effort(tmp_path: Path) -> None:
+    config = tmp_path / "reviewctl.toml"
+    config.write_text(
+        '[profiles.flash]\nroutes = ["openrouter:z-ai/glm-5.3-flash"]\n'
+        'reasoning_effort = "medium"\n'
+    )
+
+    routes, metadata = cli.load_route_profile(cli.build_parser(), str(config), "flash")
+
+    assert routes == (cli.ReviewRoute("openrouter", "z-ai/glm-5.3-flash"),)
+    assert metadata["settings"]["reasoning_effort"] == "medium"
+
+
+def test_run_reasoning_effort_overrides_openrouter_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prompt = tmp_path / "prompt.md"
+    source = tmp_path / "source.py"
+    config = tmp_path / "reviewctl.toml"
+    prompt.write_text("Review this synthetic packet.")
+    source.write_text("def source() -> None: pass\n")
+    config.write_text(
+        '[profiles.flash]\nroutes = ["openrouter:deepseek/deepseek-v4.1-flash"]\n'
+        'reasoning_effort = "medium"\n'
+    )
+    observed: dict[str, object] = {}
+
+    def fake_openrouter(**kwargs: object) -> tuple[int, str, cli.PersistedResponse]:
+        observed["reasoning_effort"] = kwargs["reasoning_effort"]
+        request_path = kwargs["request_path"]
+        response_path = kwargs["response_path"]
+        assert isinstance(request_path, Path)
+        assert isinstance(response_path, Path)
+        request_path.write_text('{"model":"test-model","reasoning":{"effort":"low"}}')
+        response_path.write_text('{"id":"turn-test"}')
+        return (
+            0,
+            "",
+            cli.PersistedResponse(
+                conversation_id="turn-test",
+                cost_usd=0.001,
+                duration_ms=1,
+                input_tokens=2,
+                model="deepseek/deepseek-v4.1-flash",
+                output_tokens=3,
+                provider="Test Provider",
+                response='{"verdict":"approved","findings":[]}',
+            ),
+        )
+
+    monkeypatch.setattr(cli, "invoke_openrouter", fake_openrouter)
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "run",
+            "--review-id",
+            "reasoning-override",
+            "--prompt-file",
+            str(prompt),
+            "--file",
+            str(source),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--profile",
+            "flash",
+            "--config",
+            str(config),
+            "--reasoning-effort",
+            "low",
+            "--response-contract",
+            "findings-json",
+        ]
+    )
+
+    assert args.handler(args) == 0
+    assert observed["reasoning_effort"] == "low"
+    receipt = json.loads((Path(capsys.readouterr().out.strip()) / "receipt.json").read_text())
+    assert receipt["routeProfile"]["settings"]["reasoning_effort"] == "medium"
+
+
 def test_route_profile_applies_execution_settings_when_cli_omits_them(tmp_path: Path) -> None:
     fake_llm = write_fake_llm(tmp_path)
     config = tmp_path / "reviewctl.toml"
@@ -4084,6 +4164,11 @@ def test_route_profile_cannot_be_combined_with_explicit_model(tmp_path: Path) ->
         (
             '[profiles.invalid-thinking]\nroutes = ["llm:accepted"]\nthinking = "unbounded"\n',
             "invalid-thinking",
+        ),
+        (
+            '[profiles.invalid-reasoning]\nroutes = ["openrouter:accepted"]\n'
+            'reasoning_effort = "max"\n',
+            "invalid-reasoning",
         ),
         (
             '[profiles.invalid-reviewed-files]\nroutes = ["llm:accepted"]\n'
@@ -10117,21 +10202,9 @@ def test_invoke_openrouter_persists_a_portable_structured_response(
     assert captured["timeout"] == 8
 
 
-@pytest.mark.parametrize(
-    ("model", "expected_reasoning"),
-    [
-        ("google/gemini-3.6-flash", None),
-        ("google/gemini-3.7-flash", None),
-        ("z-ai/glm-5.2", None),
-        ("z-ai/glm-5.3-flash", {"effort": "max"}),
-        ("meta/muse-spark-1.2-contributor", None),
-    ],
-)
-def test_invoke_openrouter_sets_model_specific_reasoning_parameters(
+def test_invoke_openrouter_omits_reasoning_without_an_explicit_effort(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    model: str,
-    expected_reasoning: dict[str, str] | None,
 ) -> None:
     source = tmp_path / "source.py"
     source.write_text("pass\n")
@@ -10139,7 +10212,7 @@ def test_invoke_openrouter_sets_model_specific_reasoning_parameters(
         monkeypatch,
         body=json.dumps(
             {
-                "model": model,
+                "model": "z-ai/glm-5.3-flash",
                 "choices": [{"message": {"content": "VERDICT: approved"}}],
             }
         ).encode(),
@@ -10148,7 +10221,7 @@ def test_invoke_openrouter_sets_model_specific_reasoning_parameters(
     exit_code, error, _ = cli.invoke_openrouter(
         api_key="test",
         prompt="Return JSON.",
-        model=model,
+        model="z-ai/glm-5.3-flash",
         files=[source],
         max_output_tokens=12000,
         response_contract="findings-json",
@@ -10159,13 +10232,10 @@ def test_invoke_openrouter_sets_model_specific_reasoning_parameters(
 
     assert (exit_code, error) == (0, "")
     request = json.loads((tmp_path / "request.json").read_text())
-    if expected_reasoning is None:
-        assert "reasoning" not in request
-    else:
-        assert request["reasoning"] == expected_reasoning
+    assert "reasoning" not in request
 
 
-def test_invoke_openrouter_reserves_a_reasoning_budget_for_glm(
+def test_invoke_openrouter_uses_selected_reasoning_effort(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "source.py"
@@ -10186,6 +10256,7 @@ def test_invoke_openrouter_reserves_a_reasoning_budget_for_glm(
         model="z-ai/glm-5.3-flash",
         files=[source],
         max_output_tokens=64,
+        reasoning_effort="low",
         response_contract="findings-json",
         timeout_seconds=1,
         request_path=tmp_path / "request.json",
@@ -10194,21 +10265,8 @@ def test_invoke_openrouter_reserves_a_reasoning_budget_for_glm(
 
     assert (exit_code, error) == (0, "")
     request = json.loads((tmp_path / "request.json").read_text())
-    assert request["reasoning"] == {"effort": "max"}
-    assert request["max_tokens"] == cli.DEFAULT_MAX_OUTPUT_TOKENS
-
-
-@pytest.mark.parametrize(
-    ("model", "expected"),
-    [
-        ("z-ai/glm-5.3-flash", cli.DEFAULT_MAX_OUTPUT_TOKENS),
-        ("openrouter/z-ai/glm-5.3-flash", cli.DEFAULT_MAX_OUTPUT_TOKENS),
-        ("z-ai/glm-5.3-flash:free", cli.DEFAULT_MAX_OUTPUT_TOKENS),
-        ("google/gemini-3.7-flash", 64),
-    ],
-)
-def test_openrouter_reasoning_floor_normalizes_model_routes(model: str, expected: int) -> None:
-    assert cli.openrouter_output_token_budget(model, 64) == expected
+    assert request["reasoning"] == {"effort": "low"}
+    assert request["max_tokens"] == 64
 
 
 def test_invoke_openrouter_normalizes_route_prefix_in_request(
