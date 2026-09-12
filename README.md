@@ -144,6 +144,12 @@ routes = [
   "codex:gpt-5.6-luna",
 ]
 
+[profiles.openrouter-flash]
+routes = [
+  "openrouter:deepseek/deepseek-v4.1-flash",
+]
+reasoning_effort = "low"
+
 [defaults.codex]
 timeout_seconds = 600
 max_attempts = 2
@@ -153,6 +159,13 @@ Pi-backed profiles may also set `thinking` to `off`, `minimal`, `low`, `medium`,
 `high`, `xhigh`, or `max`. The selected level is forwarded to Pi and recorded
 in request evidence; it controls reasoning effort, not an output-token cap.
 The default is `minimal`.
+
+OpenRouter routes use the separate `reasoning_effort` setting. Its supported
+values are `low`, `medium`, and `high`; it is omitted from the request unless
+selected. Use `--reasoning-effort low` on `reviewctl run` to override the
+profile for one invocation. The effective OpenRouter request, including its
+reasoning field when present, is retained as attempt evidence. `thinking`
+remains a Pi-specific control and does not alter OpenRouter requests.
 
 Select a profile with `--profile gemini`. A profile cannot be combined with `--model` or
 `--route`; the receipt records the profile name, config path, config SHA-256, and execution settings.
@@ -301,12 +314,10 @@ synthetic qualification before making a role mandatory.
 The tournament command accepts only synthetic cases by policy. It estimates the maximum spend from
 the assembled packet and attached file bytes before each request, then stops before crossing the
 configured budget. A candidate may override the plan's `max_output_tokens`; the runner reserves that
-candidate's effective cap and records both `requestedMaxOutputTokens` and `maxOutputTokens` alongside
+candidate's requested cap and records both `requestedMaxOutputTokens` and `maxOutputTokens` alongside
 the estimate and actual provider cost when available. `outputTokenLimitEnforced` makes clear whether the
-transport actually enforces that ceiling. For OpenRouter GLM-5.3-Flash, the runner requests native
-maximum reasoning (`reasoning.effort = "max"`) and applies the normal 16,384-token minimum completion budget so
-native reasoning cannot consume a tiny manual cap before the structured answer; the request remains
-bounded by the provider and review timeout.
+transport actually enforces that ceiling. Tournament requests preserve the
+declared output-token cap; they do not silently increase it for a model name.
 
 For an isolated OpenRouter provider comparison, run `provider-preflight` immediately before the
 tournament. It snapshots the live endpoint catalog, checks the pinned provider, declared price, active

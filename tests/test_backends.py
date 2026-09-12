@@ -699,6 +699,7 @@ def test_execute_openrouter_backend_invokes_legacy_transport_and_maps_json_evide
         "model": request.model,
         "files": list(request.files),
         "max_output_tokens": request.max_output_tokens,
+        "reasoning_effort": request.reasoning_effort,
         "provider_preferences": request.provider_preferences,
         "prepared_contract": request.prepared_contract,
         "response_contract": request.response_contract,
