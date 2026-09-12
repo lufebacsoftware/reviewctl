@@ -55,8 +55,8 @@ Before merging any pull request, request the GitHub Codex review for the exact
 final head SHA and wait for it to finish. Inspect every Codex review comment and
 thread; fix each confirmed defect or record a technically supported disposition
 in the PR before merging. If Codex is unavailable or does not complete, record
-that gate as unavailable rather than treating the absence of comments as a clean
-review.
+that gate as unavailable and block the merge; never treat the absence of
+comments as a clean review.
 ```
 
 For a UI change, add the project's real visual checks: keyboard flow, a11y
@@ -90,6 +90,7 @@ A merge decision records:
 4. independent confirmation or rejection of every material model finding; and
 5. for UI, screenshots and interaction/a11y evidence in addition to code review.
 6. the completed GitHub Codex review for the exact final PR head, including a
-   disposition for every Codex comment or an explicit unavailable-gate record.
+   disposition for every Codex comment. An unavailable or incomplete Codex
+   review blocks the merge.
 
 No model may approve, merge, or replace source verification on its own.
