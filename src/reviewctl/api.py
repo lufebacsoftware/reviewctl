@@ -1134,33 +1134,26 @@ def verify_project_receipt(
             )
         attempts = value.get("attempts")
         if type(attempts) is not list:
-            return Diagnostic(
-                "receipt_invalid", "accepted project checkpoint attempts are invalid"
-            )
+            return Diagnostic("receipt_invalid", "accepted project checkpoint attempts are invalid")
         accepted_attempts = [
             attempt
             for attempt in attempts
             if type(attempt) is dict and attempt.get("status") == "accepted"
         ]
         if len(accepted_attempts) != 1:
-            return Diagnostic(
-                "receipt_invalid", "accepted project checkpoint attempt is ambiguous"
-            )
+            return Diagnostic("receipt_invalid", "accepted project checkpoint attempt is ambiguous")
         accepted_attempt = accepted_attempts[0].get("attempt")
         if type(accepted_attempt) is not int or accepted_attempt <= 0:
-            return Diagnostic(
-                "receipt_invalid", "accepted project checkpoint attempt is invalid"
-            )
+            return Diagnostic("receipt_invalid", "accepted project checkpoint attempt is invalid")
         response_path = path.parent / f"attempt-{accepted_attempt:02d}" / "response.md"
         try:
             response_bytes = read_confined_bytes(response_path)
             response_text = response_bytes.decode("utf-8")
         except (OSError, UnicodeError) as error:
             return Diagnostic("receipt_invalid", f"could not read accepted response: {error}")
-        if (
-            accepted_response["sha256"] != _digest(response_bytes)
-            or accepted_response["characters"] != len(response_text)
-        ):
+        if accepted_response["sha256"] != _digest(response_bytes) or accepted_response[
+            "characters"
+        ] != len(response_text):
             return Diagnostic(
                 "receipt_invalid",
                 "accepted response does not match the project checkpoint binding",

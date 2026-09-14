@@ -358,9 +358,7 @@ def test_accepted_checkpoint_binds_profile_and_exact_persisted_response(
         '"path":"app.py","line":1,"title":"\u00a1listo!","evidence":"e",'
         '"reproduction":"r"}]}'
     )
-    client = ReviewClient.from_project(
-        tmp_path, transports={"pi": FakeTransport(response)}
-    )
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport(response)})
 
     result = client.review(ReviewRequest(prompt="review", profile="security"))
 
@@ -394,9 +392,7 @@ def test_nonaccepted_checkpoint_omits_accepted_response(
     tmp_path: Path, response: str | None, expected_status: str
 ) -> None:
     write_default_config(tmp_path)
-    client = ReviewClient.from_project(
-        tmp_path, transports={"pi": QueueTransport([response])}
-    )
+    client = ReviewClient.from_project(tmp_path, transports={"pi": QueueTransport([response])})
 
     result = client.review(ReviewRequest(prompt="review"))
 
@@ -406,9 +402,7 @@ def test_nonaccepted_checkpoint_omits_accepted_response(
 
 def test_v2_nonaccepted_checkpoint_rejects_null_accepted_response(tmp_path: Path) -> None:
     write_default_config(tmp_path)
-    client = ReviewClient.from_project(
-        tmp_path, transports={"pi": QueueTransport([None])}
-    )
+    client = ReviewClient.from_project(tmp_path, transports={"pi": QueueTransport([None])})
     result = client.review(ReviewRequest(prompt="review"))
     receipt = json.loads(result.receipt_path.read_text())
     receipt["acceptedResponse"] = None
@@ -517,12 +511,8 @@ def _resign_project_checkpoint(path: Path, receipt: dict[str, object]) -> None:
         lambda receipt: receipt.setdefault("acceptedResponse", {}).__setitem__(
             "path", "response.md"
         ),
-        lambda receipt: receipt.setdefault("acceptedResponse", {}).__setitem__(
-            "sha256", "0" * 63
-        ),
-        lambda receipt: receipt.setdefault("acceptedResponse", {}).__setitem__(
-            "characters", True
-        ),
+        lambda receipt: receipt.setdefault("acceptedResponse", {}).__setitem__("sha256", "0" * 63),
+        lambda receipt: receipt.setdefault("acceptedResponse", {}).__setitem__("characters", True),
     ],
 )
 def test_v2_accepted_checkpoint_rejects_malformed_response_binding(

@@ -144,9 +144,7 @@ class FakeClient:
     def __init__(self, project_dir: Path) -> None:
         self._journal = self.Journal()
         self.project_dir = project_dir
-        self._client = ReviewClient.from_project(
-            project_dir, transports={"pi": self.Transport()}
-        )
+        self._client = ReviewClient.from_project(project_dir, transports={"pi": self.Transport()})
         self.config = self._client.config
 
     @classmethod
@@ -437,9 +435,7 @@ def test_github_review_withholds_publication_when_formal_receipt_cannot_be_read(
     class RealClientFactory:
         @classmethod
         def from_project(cls, project_dir: Path):
-            return ReviewClient.from_project(
-                project_dir, transports={"pi": ApprovedTransport()}
-            )
+            return ReviewClient.from_project(project_dir, transports={"pi": ApprovedTransport()})
 
     monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
     monkeypatch.setattr(project_cli, "ReviewClient", RealClientFactory)
@@ -898,9 +894,7 @@ def test_github_front_door_materialization_review_and_plan_errors(
     assert project_cli.github_review_project(args) == 2
     assert "review failed" in capsys.readouterr().out
 
-    monkeypatch.setattr(
-        project_cli, "_materialized_github_files", materialized_github_files
-    )
+    monkeypatch.setattr(project_cli, "_materialized_github_files", materialized_github_files)
     monkeypatch.setattr(project_cli, "ReviewClient", FakeClient)
     monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
     monkeypatch.setattr(

@@ -434,9 +434,7 @@ def test_promotion_marks_kiro_receipts_and_wraps_persistence_errors(
 ) -> None:
     client, result, snapshot = _accepted_promotion_inputs(tmp_path)
     profile = replace(client.config.profile("default"), routes=("kiro:model",))
-    kiro_client = SimpleNamespace(
-        config=replace(client.config, profiles={"default": profile})
-    )
+    kiro_client = SimpleNamespace(config=replace(client.config, profiles={"default": profile}))
     result = _resign_checkpoint(
         result.receipt_path,
         result,

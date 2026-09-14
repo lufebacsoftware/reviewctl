@@ -142,9 +142,7 @@ def _valid_usage(usage: object, *, expected_model: str) -> bool:
     if provider is not None and (type(provider) is not str or not provider.strip()):
         return False
     cost = usage.get("costUsd")
-    if cost is not None and (
-        type(cost) not in {int, float} or not math.isfinite(cost) or cost < 0
-    ):
+    if cost is not None and (type(cost) not in {int, float} or not math.isfinite(cost) or cost < 0):
         return False
     return all(
         value is None or (type(value) is int and value >= 0)
@@ -172,9 +170,7 @@ def github_v2_findings(receipt_path: Path) -> tuple[Finding, ...]:
     source = receipt.get("source")
     source_files = source.get("files") if type(source) is dict else None
     paths_by_name = (
-        {item["name"]: item["path"] for item in source_files}
-        if type(source_files) is list
-        else {}
+        {item["name"]: item["path"] for item in source_files} if type(source_files) is list else {}
     )
     try:
         return tuple(
@@ -239,9 +235,7 @@ def write_github_v2_receipt(
         or len(accepted_attempts) != 1
         or checkpoint_attempts[0].get("status") != "accepted"
     ):
-        raise GitHubReceiptError(
-            "only a checkpoint with one accepted attempt can be promoted"
-        )
+        raise GitHubReceiptError("only a checkpoint with one accepted attempt can be promoted")
     accepted_checkpoint_attempt = accepted_attempts[0]
     accepted_number = accepted_checkpoint_attempt.get("attempt")
     if (
@@ -366,9 +360,7 @@ def write_github_v2_receipt(
     if not _valid_usage(usage, expected_model=selected_route.model):
         raise GitHubReceiptError("accepted response usage does not match the selected route")
     normalized_review = _plain_json(evaluation.value)
-    routes = [
-        {"model": route.model, "transport": route.transport} for route in configured_routes
-    ]
+    routes = [{"model": route.model, "transport": route.transport} for route in configured_routes]
     transports = {route.transport for route in configured_routes}
     attempt = {
         "number": 1,
