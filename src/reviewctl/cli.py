@@ -5403,10 +5403,11 @@ def run_review(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     )
     if require_reviewed_files and args.response_contract not in REVIEW_DECLARATION_CONTRACTS:
         parser.error("--require-reviewed-files is supported only for findings-json")
-    # Codex's strict schema makes declaration mandatory across the fallback chain.
+    # Strict structured-output schemas require every declared property. Keep
+    # reviewedFiles mandatory for Codex and OpenRouter across a fallback chain.
     effective_reviewed_files = require_reviewed_files or (
         args.response_contract == "findings-json"
-        and any(route.transport == "codex" for route in routes)
+        and any(route.transport in {"codex", "openrouter"} for route in routes)
     )
     if not snapshots and (effective_reviewed_files or codex_source_roots is not None):
         parser.error("reviewed-files declarations require at least one actual --file")
