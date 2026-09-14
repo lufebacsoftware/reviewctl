@@ -392,7 +392,7 @@ def test_range_review_forwards_openrouter_reasoning_effort_to_each_chunk(
     monkeypatch.setattr(
         cli,
         "_range_child_process",
-        lambda command, *, timeout_seconds: (commands.append(command) or (17, b"", b"")),
+        lambda command, *, timeout_seconds: commands.append(command) or (17, b"", b""),
     )
 
     assert cli.run_range_review(parser, args) != 0
