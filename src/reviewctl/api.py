@@ -560,7 +560,9 @@ class ReviewClient:
             # therefore bind an explicit reviewedFiles declaration.
             context = ContractContext(
                 file_names=tuple(sorted(source_names)),
-                review_declaration_required=routes[0].transport in {"codex", "openrouter"},
+                review_declaration_required=(
+                    bool(source_names) and routes[0].transport in {"codex", "openrouter"}
+                ),
             )
             prepared = contract.prepare(context)
         except (KeyError, TypeError, ValueError) as error:
@@ -635,7 +637,9 @@ class ReviewClient:
             route_label = f"{route.transport}:{route.model}"
             attempt_context = replace(
                 context,
-                review_declaration_required=route.transport in {"codex", "openrouter"},
+                review_declaration_required=(
+                    bool(source_names) and route.transport in {"codex", "openrouter"}
+                ),
             )
             attempt_prepared = contract.prepare(attempt_context)
             transport = self.transports.get(route.transport)
@@ -690,6 +694,7 @@ class ReviewClient:
                         provider_preferences=None,
                         tools=profile.tools,
                         thinking=profile.thinking,
+                        prepared_contract=attempt_prepared,
                     )
                     execution = transport.execute(backend_request)
             except OSError, UnicodeError, ValueError:
