@@ -38,6 +38,12 @@ from reviewctl.github import (
     build_publication_plan,
 )
 from reviewctl.github_publisher import GitHubPublisher, PublicationResult, publication_key
+from reviewctl.github_receipt import (
+    GitHubReceiptError,
+    github_review_prompt,
+    github_v2_findings,
+    write_github_v2_receipt,
+)
 from reviewctl.identity import ProjectIdentityStore, ensure_project_state_root
 from reviewctl.journal import FINDING_STATUSES, ProjectJournal
 from reviewctl.pi_transport import PiTransport
@@ -303,19 +309,6 @@ def review_project(args: Any) -> int:
     return exit_code_for(result.status)
 
 
-def _github_prompt(snapshot: PullRequestSnapshot) -> str:
-    return (
-        "Review this GitHub pull request as a bounded, read-only code review.\n"
-        f"Repository: {snapshot.ref.repository}\n"
-        f"Pull request: {snapshot.ref.number}\n"
-        f"Base commit: {snapshot.base_sha}\n"
-        f"Head commit: {snapshot.head_sha}\n"
-        "Return only the configured findings contract. Report actionable findings "
-        "with a path and line only when the line is present on the pull-request diff.\n\n"
-        "PULL REQUEST DIFF\n" + snapshot.diff
-    )
-
-
 @contextmanager
 def _materialized_github_files(project_dir: Path, snapshot: PullRequestSnapshot) -> Any:
     project_root = project_dir.expanduser().resolve()
@@ -437,7 +430,7 @@ def github_review_project(args: Any) -> int:
             source_root = files[0].parent if files else None
             result = client.review(
                 ReviewRequest(
-                    prompt=_github_prompt(snapshot),
+                    prompt=github_review_prompt(snapshot),
                     files=files,
                     source_root=source_root,
                     source_names=tuple(item.path for item in snapshot.changed_files),
@@ -451,6 +444,8 @@ def github_review_project(args: Any) -> int:
         return _diagnostic_result(Diagnostic("invalid_request", str(error)), args.format)
 
     receipt_diagnostic = None
+    formal_receipt_path: Path | None = None
+    formal_findings: tuple[Finding, ...] = ()
     if result.status == "accepted":
         if result.receipt_sha256 is None:
             receipt_diagnostic = Diagnostic(
@@ -458,8 +453,33 @@ def github_review_project(args: Any) -> int:
             )
         else:
             receipt_diagnostic = verify_project_receipt(
-                result.receipt_path, expected_sha256=result.receipt_sha256
+                result.receipt_path,
+                expected_sha256=result.receipt_sha256,
+                expected_profile=args.profile,
             )
+            if receipt_diagnostic is None:
+                try:
+                    promoted_receipt = write_github_v2_receipt(
+                        client=client,
+                        result=result,
+                        snapshot=snapshot,
+                        receipt_path=result.receipt_path,
+                        profile_name=args.profile,
+                    )
+                except GitHubReceiptError as error:
+                    receipt_diagnostic = error.diagnostic
+                else:
+                    try:
+                        formal_findings = github_v2_findings(promoted_receipt)
+                    except GitHubReceiptError as error:
+                        receipt_diagnostic = error.diagnostic
+                    else:
+                        formal_receipt_path = promoted_receipt
+                        result = replace(
+                            result,
+                            receipt_path=promoted_receipt,
+                            findings=formal_findings,
+                        )
     plan_status = result.status if receipt_diagnostic is None else "receipt_invalid"
     findings = (
         tuple(
@@ -468,8 +488,8 @@ def github_review_project(args: Any) -> int:
                 "findingId": finding_id(original_finding),
             }
             for original_finding, mapped_finding in zip(
-                result.findings,
-                _map_github_finding_paths(snapshot, result.findings),
+                formal_findings,
+                _map_github_finding_paths(snapshot, formal_findings),
                 strict=True,
             )
         )
@@ -484,9 +504,9 @@ def github_review_project(args: Any) -> int:
         review_status=plan_status,
     )
     publication_plan_artifact: Path | None = None
-    if result.receipt_path.is_file():
+    if formal_receipt_path is not None:
         try:
-            publication_plan_artifact = _persist_github_plan(plan, result.receipt_path)
+            publication_plan_artifact = _persist_github_plan(plan, formal_receipt_path)
         except (OSError, ValueError) as error:
             return _diagnostic_result(
                 Diagnostic("receipt_invalid", f"could not persist publication plan: {error}"),
@@ -519,9 +539,16 @@ def github_review_project(args: Any) -> int:
         )
         publication = GitHubPublisher(project).publish(plan)
         _record_github_publication_events(client, plan, publication)
+    review_payload = _result_payload(result)
+    review_payload["formalReceipt"] = (
+        str(formal_receipt_path) if formal_receipt_path is not None else None
+    )
+    if result.status == "accepted" and formal_receipt_path is None:
+        review_payload["receipt"] = None
+        review_payload["findings"] = []
     payload = {
         "snapshot": snapshot.to_context(),
-        "review": _result_payload(result),
+        "review": review_payload,
         "publicationPlan": _github_plan_payload(plan),
         "publicationPlanArtifact": (
             str(publication_plan_artifact) if publication_plan_artifact is not None else None

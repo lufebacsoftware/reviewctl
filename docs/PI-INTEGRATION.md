@@ -13,9 +13,12 @@ receipt flow.
 REPL, try a report, or shape a review question. Keep these sessions in the
 exploration root, outside the formal `reviewctl` artifact root.
 
-`reviewctl` is for a bounded review. It freezes the selected source files,
-applies the source and provider policy, invokes the selected transport, stores
-the request and response evidence, and writes a verifiable receipt. Its
+`reviewctl` is for bounded review execution. In the project API, the resulting
+`receipt.json` is a project-review checkpoint: verify it with
+`verify_project_receipt`, and do not treat it as canonical, formal, or
+merge-grade evidence. A formal GitHub publication flow instead produces
+`github-review-receipt.json`, canonical V2 evidence verified by global
+`reviewctl verify`, and binds publication to the matching frozen PR head. Its
 artifact root is the archive for formal reviews; use `--seal-to` when the
 request and response must also be encrypted with Age. The `pi` transport runs
 with tools, extensions, skills, prompt templates, and context-file discovery
@@ -73,16 +76,18 @@ The lifecycle is `open`, `disputed`, `fixed`, `verified`, or `dismissed`.
 Re-observation does not reset an existing status. Invalid transitions and
 unknown IDs are safe `invalid_request` diagnostics rather than silent writes.
 
-Project receipts have a local SHA-256 envelope for detecting accidental
+Project checkpoints have a local SHA-256 envelope for detecting accidental
 corruption and can be checked offline:
 
 ```bash
-reviewctl verify .reviewctl/reviews/<review-id>/receipt.json
+python -c 'from pathlib import Path; from reviewctl.api import verify_project_receipt; raise SystemExit(1 if verify_project_receipt(Path(".reviewctl/reviews/<review-id>/receipt.json")) else 0)'
 ```
 
 The SHA-256 is not a cryptographic signature or shared trust root; anyone who
-can rewrite a local receipt can also recompute it. Federation and signed
-exchange bundles are separate future work. The stable project exit meanings
+can rewrite a local checkpoint can also recompute it. Federation and signed
+exchange bundles are separate future work. A checkpoint covering multiple
+attempts cannot be formally promoted: its history lacks V2 attempt evidence,
+so promotion fails closed. The stable project exit meanings
 are: `0` accepted review (findings may
 exist), `1` caller-selected `--fail-on` threshold, `2` invalid input or
 configuration, `3` unavailable/timeout/empty/contract failure, `4` privacy
@@ -210,9 +215,10 @@ the source boundary and fail-closed diagnostics.
 reviewctl verify review-artifacts/bounded-accounting-change/*/receipt.json
 ```
 
-Only a non-empty, accepted, verified receipt is a formal review result. Check
-the frozen file manifest, commit or diff identity, tests, and every material
-finding independently before merging.
+Only a non-empty, accepted `github-review-receipt.json` that passes global
+`reviewctl verify` and matches the frozen file/PR-head identity is eligible as
+a formal review result. Check the tests and every material finding
+independently before merging.
 
 ## Provider notes
 
