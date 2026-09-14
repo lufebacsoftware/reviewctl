@@ -168,10 +168,11 @@ reasoning field when present, is retained as attempt evidence. `thinking`
 remains a Pi-specific control and does not alter OpenRouter requests.
 
 For a direct GLM route, pass `--reasoning-effort low` explicitly (or select a
-profile that sets it). Do not treat an HTTP-success response with an empty
-`content` field as a clean review: some providers can otherwise consume the
-entire output budget in internal reasoning. Such a receipt is `unavailable`,
-not an approval; inspect the persisted request before retrying.
+profile that sets it). The same flag is forwarded by formal `range-review` to
+every chunk. Do not treat an HTTP-success response with an empty `content`
+field as a clean review: some providers can otherwise consume the entire
+output budget in internal reasoning. Such a receipt is `unavailable`, not an
+approval; inspect the persisted request before retrying.
 
 Select a profile with `--profile gemini`. A profile cannot be combined with `--model` or
 `--route`; the receipt records the profile name, config path, config SHA-256, and execution settings.

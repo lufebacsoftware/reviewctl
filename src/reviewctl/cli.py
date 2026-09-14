@@ -1918,6 +1918,8 @@ def run_range_review(parser: argparse.ArgumentParser, args: argparse.Namespace) 
                 "--max-attempts",
                 str(args.max_attempts),
             ]
+            if getattr(args, "reasoning_effort", None) is not None:
+                command.extend(("--reasoning-effort", args.reasoning_effort))
             if args.policy:
                 command.extend(("--policy", str(Path(args.policy).expanduser().resolve())))
             before_receipts = receipt_fingerprints(artifact_root)
@@ -6935,6 +6937,12 @@ def build_parser() -> argparse.ArgumentParser:
     range_review.add_argument("--timeout-seconds", type=positive_timeout_seconds, default=None)
     range_review.add_argument(
         "--max-output-tokens", type=positive_integer, default=DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    range_review.add_argument(
+        "--reasoning-effort",
+        choices=sorted(OPENROUTER_REASONING_EFFORTS),
+        default=None,
+        help="OpenRouter reasoning effort forwarded to each formal chunk review",
     )
     range_review.add_argument("--max-attempts", type=positive_integer, default=1)
     range_review.set_defaults(handler=lambda namespace: range_review_command(parser, namespace))

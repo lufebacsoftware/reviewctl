@@ -347,6 +347,58 @@ def test_range_review_formal_mode_persists_incomplete_aggregate_on_failed_chunk(
     assert json.loads(verified.stdout)["valid"] is False
 
 
+def test_range_review_forwards_openrouter_reasoning_effort_to_each_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, base, head = make_range_cli_repository(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    assert (
+        run_cli(
+            "range-review",
+            "--repository",
+            str(repository),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--output",
+            str(manifest_path),
+        ).returncode
+        == 0
+    )
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "range-review",
+            "--manifest",
+            str(manifest_path),
+            "--review-id",
+            "range-low-reasoning",
+            "--prompt",
+            "Review this frozen patch.",
+            "--model",
+            "z-ai/glm-5.3-flash",
+            "--transport",
+            "openrouter",
+            "--reasoning-effort",
+            "low",
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--aggregate-output",
+            str(tmp_path / "aggregate.json"),
+        ]
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        cli,
+        "_range_child_process",
+        lambda command, *, timeout_seconds: (commands.append(command) or (17, b"", b"")),
+    )
+
+    assert cli.run_range_review(parser, args) != 0
+    assert commands[0][commands[0].index("--reasoning-effort") + 1] == "low"
+
+
 def test_range_review_formal_mode_rejects_stale_receipt_after_failed_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
