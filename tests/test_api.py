@@ -832,6 +832,63 @@ def test_from_project_constructs_default_pi_transport(tmp_path: Path) -> None:
     assert isinstance(client.transports["codex"], CodexProjectTransport)
 
 
+@pytest.mark.parametrize("route", ("openrouter:meta/muse-spark-1.3-contributor", "kiro:auto"))
+def test_project_review_rejects_exploratory_transport_before_receipt(
+    tmp_path: Path, route: str
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        f'routes = ["{route}"]\n'
+        'execution = "remote"\n'
+    )
+
+    result = ReviewClient.from_project(tmp_path).review(ReviewRequest(prompt="review"))
+
+    assert result.status == "route_invalid"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "route_invalid"
+    assert "not supported for formal project review" in result.diagnostic.message
+    assert not (tmp_path / ".reviewctl" / "reviews").exists()
+
+
+def test_exploratory_route_preserves_invalid_contract_precedence(tmp_path: Path) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["kiro:auto"]\n'
+        'response_contract = "unknown-contract"\n'
+        'execution = "remote"\n'
+    )
+
+    result = ReviewClient.from_project(tmp_path).review(ReviewRequest(prompt="review"))
+
+    assert result.status == "contract_failed"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "contract_failed"
+
+
+def test_project_review_accepts_openrouter_only_when_explicitly_injected(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["openrouter:example/model"]\n'
+        'execution = "remote"\n'
+    )
+    source = tmp_path / "src.py"
+    source.write_text("value = 1\n")
+    transport = QueueTransport(['{"verdict":"approved","findings":[],"reviewedFiles":["src.py"]}'])
+
+    result = ReviewClient.from_project(tmp_path, transports={"openrouter": transport}).review(
+        ReviewRequest(prompt="review", files=(source,))
+    )
+
+    assert result.status == "accepted"
+    assert transport.requests[0].prepared_contract is not None
+
+
 def test_default_codex_project_route_executes_registered_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

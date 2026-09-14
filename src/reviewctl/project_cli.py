@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import quote
 
 from reviewctl.api import (
+    FORMAL_PROJECT_TRANSPORTS,
     Finding,
     ReviewClient,
     ReviewRequest,
@@ -768,20 +769,26 @@ def doctor_project(args: Any) -> int:
         config = load_config(_project_path(args.project))
     except ValueError as error:
         return _diagnostic_result(Diagnostic("config_invalid", str(error)), args.format)
-    profiles = [
-        {
-            "name": profile.name,
-            "routes": list(profile.routes),
-            "responseContract": profile.response_contract,
-            "execution": profile.execution,
-            "tools": profile.tools,
-            "timeoutSeconds": profile.timeout_seconds,
-            "maxOutputTokens": profile.max_output_tokens,
-            "dimensions": list(profile.dimensions),
-            "thinking": profile.thinking,
-        }
-        for profile in config.profiles.values()
-    ]
+    profiles = []
+    for profile in config.profiles.values():
+        unsupported_transports = sorted(
+            {route.transport for route in profile.parsed_routes} - FORMAL_PROJECT_TRANSPORTS
+        )
+        profiles.append(
+            {
+                "name": profile.name,
+                "routes": list(profile.routes),
+                "responseContract": profile.response_contract,
+                "execution": profile.execution,
+                "tools": profile.tools,
+                "timeoutSeconds": profile.timeout_seconds,
+                "maxOutputTokens": profile.max_output_tokens,
+                "dimensions": list(profile.dimensions),
+                "thinking": profile.thinking,
+                "projectReviewSupported": not unsupported_transports,
+                "unsupportedProjectReviewTransports": unsupported_transports,
+            }
+        )
     payload = {
         "project": config.project.name,
         "projectId": config.project.project_id,
@@ -811,7 +818,8 @@ def doctor_project(args: Any) -> int:
         for profile in profiles:
             print(
                 f"profile {profile['name']}: {', '.join(profile['routes']) or '(no route)'} "
-                f"(thinking={profile['thinking']})"
+                f"(thinking={profile['thinking']}, formal-project-review="
+                f"{'yes' if profile['projectReviewSupported'] else 'no'})"
             )
         for name, transport in payload["transports"].items():
             print(f"{name} executable: {'yes' if transport['executable'] else 'no'}")
