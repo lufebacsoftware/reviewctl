@@ -212,7 +212,7 @@ the source boundary and fail-closed diagnostics.
 ### 4. Verify before using the result
 
 ```bash
-reviewctl verify review-artifacts/bounded-accounting-change/*/receipt.json
+reviewctl verify review-artifacts/bounded-accounting-change/*/github-review-receipt.json
 ```
 
 Only a non-empty, accepted `github-review-receipt.json` that passes global
