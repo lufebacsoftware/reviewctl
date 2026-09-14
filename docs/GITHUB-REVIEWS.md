@@ -19,10 +19,13 @@ reviewctl github review \
   --format json
 ```
 
-The command never writes to GitHub. It produces the normal local review
-receipt and a deterministic `publicationPlan` for inspection. A successful
-plan is persisted as `publication-plan.json` beside the receipt; it is not a
-published comment, an approval, or a request for changes.
+The command never writes to GitHub. It produces a canonical V2
+`github-review-receipt.json` and a deterministic `publicationPlan` for
+inspection. The canonical artifact must pass global `reviewctl verify`; a
+project `receipt.json` checkpoint verified with `verify_project_receipt` is not
+an equivalent substitute. A successful plan is persisted as
+`publication-plan.json` beside the canonical artifact; it is not a published
+comment, an approval, or a request for changes.
 
 To request the first supported external side effect explicitly:
 
@@ -36,11 +39,13 @@ reviewctl github review \
   --format json
 ```
 
-This can submit one grouped `COMMENT` review only after the receipt is
-accepted and verified. The publisher reconciles stable finding markers in
-existing review comments and review bodies, rechecks the head immediately
-before and after the POST, and records stale-head races without retrying. It
-does not support `approve` or `request-changes`.
+This can submit one grouped `COMMENT` review only after the canonical V2
+`github-review-receipt.json` is accepted and passes global `reviewctl verify`,
+and its frozen PR head still matches GitHub's current head. The publisher
+reconciles stable finding markers in existing review comments and review
+bodies, rechecks the head immediately before and after the POST, and records
+stale-head races without retrying. It does not support `approve` or
+`request-changes`.
 
 The project profile controls the transport and privacy policy. The command
 does not create a GitHub-specific Pi path or bypass the existing fallback,

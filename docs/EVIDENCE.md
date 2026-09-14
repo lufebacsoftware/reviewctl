@@ -2,9 +2,16 @@
 
 ## Receipt contents
 
-`receipt.json` is canonical JSON and contains the review ID, base source provenance, file SHA-256
-digests, prompt digest, policy digest, requested and resolved models, attempt outcomes, token counts,
-latency, provider cost when available, structured findings, and a receipt digest.
+The project API's `receipt.json` is a project-review checkpoint. It is canonical JSON for its local
+integrity envelope, but it is not a canonical V1/V2 review receipt, formal evidence, or merge-grade
+evidence. Verify it only with `verify_project_receipt`; that check covers the checkpoint digest (and,
+when supplied, the digest returned by the same process).
+
+The GitHub publication artifact is `github-review-receipt.json`. It is a canonical V2 review receipt and
+must pass the global `reviewctl verify` command before publication. It contains the review ID, frozen
+source provenance, file SHA-256 digests, prompt and policy digests, requested and resolved models,
+attempt outcomes, token counts, latency, provider cost when available, structured findings, and a
+receipt digest.
 
 When `--response-contract document` and `--output-file` are supplied, the accepted Markdown response
 is also written as a human-readable working document. The receipt binds that document by path,
@@ -35,6 +42,10 @@ their complete historical field signature. A single coincidentally named field r
 legacy V1. A completely rewritten unsigned document can still masquerade as legacy V1 after its author
 removes a project-owned field and recomputes the digest; this is another reason V1 is integrity
 compatibility, not provenance or authentication.
+
+Project checkpoint history also lacks V2 attempt evidence. Therefore formal promotion fails closed when
+a checkpoint represents multiple attempts; it cannot be promoted into a canonical or merge-grade review
+artifact. Create and verify a canonical V2 receipt instead.
 
 The receipt SHA-256 is tamper detection, not a digital signature and not a trust root. Structural
 verification detects internally incompatible facts, including mixing native findings state into a legacy

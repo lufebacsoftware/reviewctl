@@ -32,6 +32,7 @@ from reviewctl.errors import ConfigError, Diagnostic
 from reviewctl.filesystem import (
     confined_directory_descriptor,
     confined_relative_regular_descriptor,
+    read_confined_bytes,
     read_confined_text,
 )
 from reviewctl.identity import ProjectIdentityStore
@@ -44,7 +45,9 @@ class ReviewTransport(Protocol):
 
 _REVIEW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 PROJECT_CHECKPOINT_KIND = "project-review-checkpoint"
-PROJECT_CHECKPOINT_SCHEMA_VERSION = 1
+PROJECT_CHECKPOINT_SCHEMA_VERSION = 2
+_HISTORICAL_PROJECT_CHECKPOINT_SCHEMA_VERSION = 1
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_FILES = 100
 MAX_SOURCE_SET_BYTES = 8 * 1024 * 1024
@@ -602,6 +605,7 @@ class ReviewClient:
                 review_id=review_id,
                 route="",
                 status="contract_failed",
+                profile=profile.name,
                 diagnostic=diagnostic,
                 dimensions=dimensions,
                 source_context=source_context,
@@ -791,7 +795,8 @@ class ReviewClient:
                 continue
             last_usage = execution.response
             last_usage_route = route_label
-            attempt_artifacts.write_text("response.md", execution.response.response)
+            response_bytes = execution.response.response.encode("utf-8")
+            attempt_artifacts.write_bytes("response.md", response_bytes)
             try:
                 evaluation = contract.evaluate(
                     execution.response.response,
@@ -829,6 +834,11 @@ class ReviewClient:
                         review_id=review_id,
                         route=route_label,
                         status="accepted",
+                        profile=profile.name,
+                        accepted_response={
+                            "sha256": _digest(response_bytes),
+                            "characters": len(execution.response.response),
+                        },
                         packet_digest=packet_digest,
                         usage=execution.response,
                         findings=[self._finding_payload(finding) for finding in findings],
@@ -910,6 +920,7 @@ class ReviewClient:
             review_id=review_id,
             route=last_usage_route or (attempts[-1]["route"] if attempts else ""),
             status=status,
+            profile=profile.name,
             packet_digest=packet_digest,
             diagnostic=diagnostic,
             usage=last_usage,
@@ -979,6 +990,8 @@ class ReviewClient:
         review_id: str,
         route: str,
         status: str,
+        profile: str,
+        accepted_response: Mapping[str, Any] | None = None,
         packet_digest: str | None = None,
         diagnostic: Diagnostic | None = None,
         usage: Any = None,
@@ -995,6 +1008,7 @@ class ReviewClient:
             "reviewId": review_id,
             "route": route,
             "status": status,
+            "profile": profile,
             "configDigest": self.config.digest,
             "projectId": self.config.project.project_id,
             "originId": self._journal.origin_id,
@@ -1013,6 +1027,8 @@ class ReviewClient:
             "attempts": list(attempts),
             "fallbackRelationships": list(fallback_relationships),
         }
+        if status == "accepted" and accepted_response is not None:
+            receipt["acceptedResponse"] = dict(accepted_response)
         if source_context is not None:
             receipt["sourceContext"] = dict(source_context)
         if packet_digest is not None:
@@ -1043,7 +1059,12 @@ class ReviewClient:
         return artifacts.write_bytes("receipt.json", contents + b"\n"), receipt_sha256
 
 
-def verify_project_receipt(path: Path, *, expected_sha256: str | None = None) -> Diagnostic | None:
+def verify_project_receipt(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_profile: str | None = None,
+) -> Diagnostic | None:
     """Check project checkpoint integrity; this is not canonical receipt verification."""
     try:
         value = json.loads(
@@ -1057,12 +1078,18 @@ def verify_project_receipt(path: Path, *, expected_sha256: str | None = None) ->
     if not isinstance(value, dict) or not isinstance(value.get("sha256"), str):
         return Diagnostic("receipt_invalid", "receipt is missing its sha256 digest")
     marker_present = "artifactKind" in value or "projectCheckpointSchemaVersion" in value
-    if marker_present and (
-        value.get("artifactKind") != PROJECT_CHECKPOINT_KIND
-        or type(value.get("projectCheckpointSchemaVersion")) is not int
-        or value["projectCheckpointSchemaVersion"] != PROJECT_CHECKPOINT_SCHEMA_VERSION
-    ):
-        return Diagnostic("receipt_invalid", "project checkpoint marker is invalid")
+    checkpoint_schema_version = value.get("projectCheckpointSchemaVersion")
+    if marker_present:
+        if (
+            value.get("artifactKind") != PROJECT_CHECKPOINT_KIND
+            or type(checkpoint_schema_version) is not int
+            or checkpoint_schema_version
+            not in {
+                _HISTORICAL_PROJECT_CHECKPOINT_SCHEMA_VERSION,
+                PROJECT_CHECKPOINT_SCHEMA_VERSION,
+            }
+        ):
+            return Diagnostic("receipt_invalid", "project checkpoint marker is invalid")
     recorded = value["sha256"]
     if expected_sha256 is not None and recorded != expected_sha256:
         return Diagnostic(
@@ -1078,4 +1105,57 @@ def verify_project_receipt(path: Path, *, expected_sha256: str | None = None) ->
     ).encode()
     if recorded != _digest(canonical):
         return Diagnostic("receipt_invalid", "receipt digest does not match its contents")
+    if expected_profile is not None and value.get("profile") != expected_profile:
+        return Diagnostic(
+            "receipt_invalid", "project checkpoint profile does not match the selected profile"
+        )
+    if marker_present and checkpoint_schema_version == PROJECT_CHECKPOINT_SCHEMA_VERSION:
+        profile = value.get("profile")
+        if not isinstance(profile, str) or not profile:
+            return Diagnostic("receipt_invalid", "project checkpoint profile is invalid")
+        accepted_response = value.get("acceptedResponse")
+        if value.get("status") != "accepted":
+            if "acceptedResponse" in value:
+                return Diagnostic(
+                    "receipt_invalid",
+                    "nonaccepted project checkpoint cannot bind an accepted response",
+                )
+            return None
+        if not (
+            type(accepted_response) is dict
+            and set(accepted_response) == {"sha256", "characters"}
+            and isinstance(accepted_response.get("sha256"), str)
+            and _SHA256.fullmatch(accepted_response["sha256"])
+            and type(accepted_response.get("characters")) is int
+            and accepted_response["characters"] >= 0
+        ):
+            return Diagnostic(
+                "receipt_invalid", "accepted project checkpoint response binding is invalid"
+            )
+        attempts = value.get("attempts")
+        if type(attempts) is not list:
+            return Diagnostic("receipt_invalid", "accepted project checkpoint attempts are invalid")
+        accepted_attempts = [
+            attempt
+            for attempt in attempts
+            if type(attempt) is dict and attempt.get("status") == "accepted"
+        ]
+        if len(accepted_attempts) != 1:
+            return Diagnostic("receipt_invalid", "accepted project checkpoint attempt is ambiguous")
+        accepted_attempt = accepted_attempts[0].get("attempt")
+        if type(accepted_attempt) is not int or accepted_attempt <= 0:
+            return Diagnostic("receipt_invalid", "accepted project checkpoint attempt is invalid")
+        response_path = path.parent / f"attempt-{accepted_attempt:02d}" / "response.md"
+        try:
+            response_bytes = read_confined_bytes(response_path)
+            response_text = response_bytes.decode("utf-8")
+        except (OSError, UnicodeError) as error:
+            return Diagnostic("receipt_invalid", f"could not read accepted response: {error}")
+        if accepted_response["sha256"] != _digest(response_bytes) or accepted_response[
+            "characters"
+        ] != len(response_text):
+            return Diagnostic(
+                "receipt_invalid",
+                "accepted response does not match the project checkpoint binding",
+            )
     return None

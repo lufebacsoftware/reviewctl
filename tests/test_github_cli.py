@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -101,7 +100,6 @@ class FakeSource:
 class FakeClient:
     request = None
     instance = None
-    config = SimpleNamespace(project=SimpleNamespace(project_id="project-test"))
 
     class Journal:
         def __init__(self) -> None:
@@ -110,43 +108,54 @@ class FakeClient:
         def append(self, event):
             self.events.append(event)
 
-    def __init__(self) -> None:
+    class Transport:
+        def execute(self, request):
+            response = json.dumps(
+                {
+                    "verdict": "changes-requested",
+                    "findings": [
+                        {
+                            "severity": "high",
+                            "path": request.files[0].name,
+                            "line": 1,
+                            "title": "Handle failure",
+                            "evidence": "private evidence",
+                            "reproduction": "private reproduction",
+                        }
+                    ],
+                }
+            )
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    "conversation",
+                    0.0,
+                    1,
+                    1,
+                    request.model,
+                    1,
+                    "fake",
+                    response,
+                ),
+                BackendEvidence(),
+            )
+
+    def __init__(self, project_dir: Path) -> None:
         self._journal = self.Journal()
-        self.project_dir = None
+        self.project_dir = project_dir
+        self._client = ReviewClient.from_project(project_dir, transports={"pi": self.Transport()})
+        self.config = self._client.config
 
     @classmethod
     def from_project(cls, project_dir: Path):
         assert project_dir.is_dir()
-        cls.instance = cls()
-        cls.instance.project_dir = project_dir
+        cls.instance = cls(project_dir)
         return cls.instance
 
     def review(self, request):
         type(self).request = request
-        unsigned = {"reviewId": "github-review-1", "status": "accepted"}
-        digest = hashlib.sha256(
-            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        receipt_root = self.project_dir / ".reviewctl"
-        receipt_root.mkdir(parents=True, exist_ok=True)
-        receipt = receipt_root / "fake-receipt.json"
-        receipt.write_text(json.dumps({**unsigned, "sha256": digest}))
-        return ReviewResult(
-            status="accepted",
-            review_id="github-review-1",
-            receipt_path=receipt,
-            findings=(
-                Finding(
-                    severity="high",
-                    path="src/app.py",
-                    line=1,
-                    title="Handle failure",
-                    evidence="private evidence",
-                    reproduction="private reproduction",
-                ),
-            ),
-            receipt_sha256=digest,
-        )
+        return self._client.review(request)
 
     def journal(self):
         return self._journal
@@ -251,6 +260,18 @@ def test_github_review_maps_unique_basename_to_snapshot_path_for_inline_target(
     assert project_cli.github_review_project(github_args(tmp_path, publish=False)) == 0
 
     payload = json.loads(capsys.readouterr().out)
+    receipt = json.loads(Path(payload["review"]["receipt"]).read_text())
+    assert payload["review"]["findings"] == [
+        {
+            "severity": "high",
+            "path": "src/app.py",
+            "line": 1,
+            "title": "Handle failure",
+            "evidence": "private evidence",
+            "reproduction": "private reproduction",
+        }
+    ]
+    assert receipt["findings"][0]["path"] == "src%2Fapp.py"
     assert payload["publicationPlan"]["items"][0]["target"] == {
         "path": "src/app.py",
         "line": 1,
@@ -259,7 +280,7 @@ def test_github_review_maps_unique_basename_to_snapshot_path_for_inline_target(
     assert payload["publicationPlan"]["items"][0]["findingId"] == finding_id(
         Finding(
             severity="high",
-            path="app.py",
+            path="src/app.py",
             line=1,
             title="Handle failure",
             evidence="private evidence",
@@ -330,6 +351,231 @@ def test_github_review_preserves_repository_path_through_real_review_client(
         "line": 1,
         "side": "RIGHT",
     }
+
+
+def test_github_review_real_client_artifact_has_verifiable_receipt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    write_config(tmp_path)
+
+    class ApprovedTransport:
+        def execute(self, request):
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    "conversation",
+                    0.0,
+                    1,
+                    1,
+                    request.model,
+                    1,
+                    "fake",
+                    '{"verdict":"approved","findings":[]}',
+                ),
+                BackendEvidence(),
+            )
+
+    transport = ApprovedTransport()
+
+    class RealClientFactory:
+        @classmethod
+        def from_project(cls, project_dir: Path):
+            return ReviewClient.from_project(project_dir, transports={"pi": transport})
+
+    monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
+    monkeypatch.setattr(project_cli, "ReviewClient", RealClientFactory)
+
+    assert project_cli.github_review_project(github_args(tmp_path, publish=False)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    receipt = Path(payload["review"]["receipt"])
+    assert receipt.is_file()
+
+    verification_status = run_cli(["verify", str(receipt)])
+    verification = json.loads(capsys.readouterr().out)
+    assert verification_status == 0, verification
+    assert verification["valid"] is True, verification
+    assert verification["violations"] == [], verification
+
+    receipt_payload = json.loads(receipt.read_text())
+    assert receipt_payload["receiptSchemaVersion"] == 2
+    assert receipt_payload["sourceContext"] == snapshot().to_context()
+    assert receipt_payload["source"]["files"] == [
+        {
+            "name": "src%2Fapp.py",
+            "path": "src/app.py",
+            "sha256": snapshot().changed_files[0].sha256,
+        }
+    ]
+
+
+def test_github_review_withholds_publication_when_formal_receipt_cannot_be_read(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    write_config(tmp_path)
+
+    class ApprovedTransport:
+        def execute(self, request):
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    "conversation",
+                    0.0,
+                    1,
+                    1,
+                    request.model,
+                    1,
+                    "fake",
+                    '{"verdict":"approved","findings":[]}',
+                ),
+                BackendEvidence(),
+            )
+
+    class RealClientFactory:
+        @classmethod
+        def from_project(cls, project_dir: Path):
+            return ReviewClient.from_project(project_dir, transports={"pi": ApprovedTransport()})
+
+    monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
+    monkeypatch.setattr(project_cli, "ReviewClient", RealClientFactory)
+    monkeypatch.setattr(
+        project_cli,
+        "github_v2_findings",
+        lambda _receipt: (_ for _ in ()).throw(
+            project_cli.GitHubReceiptError("formal receipt unreadable")
+        ),
+    )
+
+    assert project_cli.github_review_project(github_args(tmp_path, publish=False)) == 5
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["review"]["receipt"] is None
+    assert payload["review"]["findings"] == []
+    assert payload["publicationPlanArtifact"] is None
+
+
+def test_github_review_withholds_publication_when_checkpoint_is_invalid(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    write_config(tmp_path)
+    monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
+    monkeypatch.setattr(project_cli, "ReviewClient", FakeClient)
+    monkeypatch.setattr(
+        project_cli,
+        "verify_project_receipt",
+        lambda *_args, **_kwargs: Diagnostic("receipt_invalid", "invalid checkpoint"),
+    )
+
+    assert project_cli.github_review_project(github_args(tmp_path, publish=False)) == 5
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["review"]["receipt"] is None
+    assert payload["publicationPlanArtifact"] is None
+
+
+def test_github_multi_attempt_acceptance_is_not_promoted(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["pi:fake/model"]\n'
+        'execution = "remote"\n'
+        "max_attempts = 2\n"
+    )
+    responses = [
+        json.dumps(
+            {
+                "findings": [
+                    {
+                        "severity": "high",
+                        "path": "src%2Fapp.py",
+                        "line": 1,
+                        "title": "Unreceipted partial finding",
+                        "evidence": "partial evidence",
+                        "reproduction": "partial reproduction",
+                    }
+                ]
+            }
+        ),
+        '{"verdict":"approved","findings":[]}',
+    ]
+
+    class PartialThenApprovedTransport:
+        def execute(self, request):
+            return BackendExecution(
+                0,
+                "",
+                PersistedResponse(
+                    "conversation",
+                    0.0,
+                    1,
+                    1,
+                    request.model,
+                    1,
+                    "fake",
+                    responses.pop(0),
+                ),
+                BackendEvidence(),
+            )
+
+    class RealClientFactory:
+        @classmethod
+        def from_project(cls, project_dir: Path):
+            return ReviewClient.from_project(
+                project_dir, transports={"pi": PartialThenApprovedTransport()}
+            )
+
+    monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
+    monkeypatch.setattr(project_cli, "ReviewClient", RealClientFactory)
+
+    assert project_cli.github_review_project(github_args(tmp_path, publish=False)) == 5
+    payload = json.loads(capsys.readouterr().out)
+    checkpoints = list((tmp_path / ".reviewctl" / "reviews").glob("*/receipt.json"))
+
+    assert len(checkpoints) == 1
+    checkpoint = json.loads(checkpoints[0].read_text())
+    assert [attempt["status"] for attempt in checkpoint["attempts"]] == [
+        "partial",
+        "accepted",
+    ]
+    assert payload["review"]["findings"] == []
+    assert payload["review"]["receipt"] is None
+    assert payload["review"]["formalReceipt"] is None
+    assert payload["publicationPlan"]["executable"] is False
+    assert payload["publicationPlan"]["items"] == []
+    assert payload["publicationPlanArtifact"] is None
+    assert not list((tmp_path / ".reviewctl" / "reviews").glob("*/github-review-receipt.json"))
+
+
+def test_github_promotion_failure_exposes_no_formal_receipt_or_plan_artifact(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    write_config(tmp_path)
+    checkpoint_path = None
+
+    def reject_promotion(**kwargs):
+        nonlocal checkpoint_path
+        checkpoint_path = kwargs["receipt_path"]
+        raise project_cli.GitHubReceiptError("promotion failed")
+
+    class ForbiddenPublisher:
+        def __init__(self, project_dir: Path) -> None:
+            raise AssertionError(f"publisher should not be created: {project_dir}")
+
+    monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
+    monkeypatch.setattr(project_cli, "ReviewClient", FakeClient)
+    monkeypatch.setattr(project_cli, "write_github_v2_receipt", reject_promotion)
+    monkeypatch.setattr(project_cli, "GitHubPublisher", ForbiddenPublisher)
+
+    assert project_cli.github_review_project(github_args(tmp_path, publish=True)) == 5
+    payload = json.loads(capsys.readouterr().out)
+
+    assert checkpoint_path is not None and checkpoint_path.is_file()
+    assert payload["review"]["receipt"] is None
+    assert payload["review"]["formalReceipt"] is None
+    assert payload["publicationPlan"]["executable"] is False
+    assert payload["publicationPlanArtifact"] is None
+    assert not (checkpoint_path.parent / "publication-plan.json").exists()
 
 
 def test_github_finding_path_mapping_leaves_ambiguous_and_unknown_paths_unchanged() -> None:
@@ -611,6 +857,7 @@ def test_github_front_door_materialization_review_and_plan_errors(
 ) -> None:
     write_config(tmp_path)
     args = github_args(tmp_path, publish=False)
+    materialized_github_files = project_cli._materialized_github_files
     monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
 
     class Client:
@@ -647,6 +894,7 @@ def test_github_front_door_materialization_review_and_plan_errors(
     assert project_cli.github_review_project(args) == 2
     assert "review failed" in capsys.readouterr().out
 
+    monkeypatch.setattr(project_cli, "_materialized_github_files", materialized_github_files)
     monkeypatch.setattr(project_cli, "ReviewClient", FakeClient)
     monkeypatch.setattr(project_cli, "LocalGitHubSource", FakeSource)
     monkeypatch.setattr(
@@ -676,7 +924,8 @@ def test_github_front_door_invalid_receipt_nonexecutable_and_text_publication(
     assert project_cli.github_review_project(github_args(tmp_path, format="json")) == 5
     payload = json.loads(capsys.readouterr().out)
     assert payload["publicationPlan"]["executable"] is False
-    (tmp_path / ".reviewctl" / "publication-plan.json").unlink()
+    assert payload["publicationPlanArtifact"] is None
+    assert not (tmp_path / ".reviewctl" / "publication-plan.json").exists()
 
     class NoReceiptClient(FakeClient):
         def review(self, request):

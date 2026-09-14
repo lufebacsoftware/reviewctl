@@ -344,6 +344,76 @@ def test_client_uses_max_attempts_as_bounded_per_route_retries(tmp_path: Path) -
     ]
 
 
+def test_accepted_checkpoint_binds_profile_and_exact_persisted_response(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.security]\n"
+        'routes = ["pi:fake/model"]\n'
+        'execution = "remote"\n'
+    )
+    response = (
+        '{"verdict":"changes-requested","findings":[{"severity":"high",'
+        '"path":"app.py","line":1,"title":"\u00a1listo!","evidence":"e",'
+        '"reproduction":"r"}]}'
+    )
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport(response)})
+
+    result = client.review(ReviewRequest(prompt="review", profile="security"))
+
+    assert result.status == "accepted"
+    response_bytes = response.encode("utf-8")
+    assert (result.receipt_path.parent / "attempt-01" / "response.md").read_bytes() == (
+        response_bytes
+    )
+    receipt = json.loads(result.receipt_path.read_text())
+    assert receipt["projectCheckpointSchemaVersion"] == 2
+    assert receipt["profile"] == "security"
+    assert receipt["acceptedResponse"] == {
+        "sha256": hashlib.sha256(response_bytes).hexdigest(),
+        "characters": len(response),
+    }
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_status"),
+    [
+        (None, "transport_unavailable"),
+        ("not-json", "contract_failed"),
+        (
+            '{"findings":[{"severity":"high","path":"app.py","line":1,'
+            '"title":"Handle failure","evidence":"e","reproduction":"r"}]}',
+            "partial",
+        ),
+    ],
+)
+def test_nonaccepted_checkpoint_omits_accepted_response(
+    tmp_path: Path, response: str | None, expected_status: str
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": QueueTransport([response])})
+
+    result = client.review(ReviewRequest(prompt="review"))
+
+    assert result.status == expected_status
+    assert "acceptedResponse" not in json.loads(result.receipt_path.read_text())
+
+
+def test_v2_nonaccepted_checkpoint_rejects_null_accepted_response(tmp_path: Path) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": QueueTransport([None])})
+    result = client.review(ReviewRequest(prompt="review"))
+    receipt = json.loads(result.receipt_path.read_text())
+    receipt["acceptedResponse"] = None
+    _resign_project_checkpoint(result.receipt_path, receipt)
+
+    diagnostic = verify_project_receipt(result.receipt_path)
+
+    assert diagnostic is not None
+    assert diagnostic.code == "receipt_invalid"
+
+
 def test_client_falls_back_and_keeps_valid_findings_from_partial_attempt(tmp_path: Path) -> None:
     (tmp_path / "reviewctl.toml").write_text(
         '[project]\nprivacy_mode = "private"\n'
@@ -410,12 +480,132 @@ def test_project_receipt_verification_detects_tampering(tmp_path: Path) -> None:
     assert mismatched.code == "receipt_invalid"
     receipt = json.loads(result.receipt_path.read_text())
     assert receipt["artifactKind"] == "project-review-checkpoint"
-    assert receipt["projectCheckpointSchemaVersion"] == 1
+    assert receipt["projectCheckpointSchemaVersion"] == 2
     receipt["status"] = "tampered"
     result.receipt_path.write_text(json.dumps(receipt))
     diagnostic = verify_project_receipt(result.receipt_path)
     assert diagnostic is not None
     assert diagnostic.code == "receipt_invalid"
+
+
+def _resign_project_checkpoint(path: Path, receipt: dict[str, object]) -> None:
+    receipt.pop("sha256", None)
+    receipt["sha256"] = api_module._digest(
+        json.dumps(
+            receipt,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    )
+    path.write_text(json.dumps(receipt))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda receipt: receipt.pop("profile", None),
+        lambda receipt: receipt.__setitem__("profile", ""),
+        lambda receipt: receipt.pop("acceptedResponse", None),
+        lambda receipt: receipt.setdefault("acceptedResponse", {}).__setitem__(
+            "path", "response.md"
+        ),
+        lambda receipt: receipt.setdefault("acceptedResponse", {}).__setitem__("sha256", "0" * 63),
+        lambda receipt: receipt.setdefault("acceptedResponse", {}).__setitem__("characters", True),
+    ],
+)
+def test_v2_accepted_checkpoint_rejects_malformed_response_binding(
+    tmp_path: Path, mutation
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review"))
+    receipt = json.loads(result.receipt_path.read_text())
+    mutation(receipt)
+    _resign_project_checkpoint(result.receipt_path, receipt)
+
+    diagnostic = verify_project_receipt(result.receipt_path)
+
+    assert diagnostic is not None
+
+
+@pytest.mark.parametrize(
+    ("mutation", "remove_response"),
+    [
+        (lambda receipt: receipt.__setitem__("attempts", {}), False),
+        (lambda receipt: receipt.__setitem__("attempts", []), False),
+        (
+            lambda receipt: receipt["attempts"][0].__setitem__("attempt", 0),
+            False,
+        ),
+        (lambda receipt: receipt, True),
+    ],
+)
+def test_v2_accepted_checkpoint_rejects_unusable_attempt_or_response(
+    tmp_path: Path, mutation, remove_response: bool
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review"))
+    receipt = json.loads(result.receipt_path.read_text())
+    mutation(receipt)
+    _resign_project_checkpoint(result.receipt_path, receipt)
+    if remove_response:
+        (result.receipt_path.parent / "attempt-01" / "response.md").unlink()
+
+    diagnostic = verify_project_receipt(result.receipt_path)
+
+    assert diagnostic is not None
+    assert diagnostic.code == "receipt_invalid"
+    assert diagnostic.code == "receipt_invalid"
+
+
+def test_v2_accepted_checkpoint_rejects_altered_contract_valid_response(
+    tmp_path: Path,
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review"))
+    replacement = '{"findings":[],"verdict":"approved"}'
+    contract = get_contract("findings-json")
+    context = ContractContext(file_names=())
+    prepared = contract.prepare(context)
+    assert contract.evaluate(replacement, prepared, context).status is EvaluationStatus.COMPLETE
+
+    (result.receipt_path.parent / "attempt-01" / "response.md").write_text(replacement)
+    diagnostic = verify_project_receipt(result.receipt_path)
+
+    assert diagnostic is not None
+    assert diagnostic.code == "receipt_invalid"
+
+
+def test_v2_accepted_checkpoint_rejects_a_different_expected_profile(
+    tmp_path: Path,
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review"))
+
+    diagnostic = verify_project_receipt(result.receipt_path, expected_profile="security")
+
+    assert diagnostic is not None
+    assert diagnostic.code == "receipt_invalid"
+
+
+def test_v1_accepted_checkpoint_retains_historical_digest_only_verification(
+    tmp_path: Path,
+) -> None:
+    write_default_config(tmp_path)
+    client = ReviewClient.from_project(tmp_path, transports={"pi": FakeTransport()})
+    result = client.review(ReviewRequest(prompt="review"))
+    receipt = json.loads(result.receipt_path.read_text())
+    receipt["projectCheckpointSchemaVersion"] = 1
+    receipt.pop("profile", None)
+    receipt.pop("acceptedResponse", None)
+    _resign_project_checkpoint(result.receipt_path, receipt)
+
+    assert verify_project_receipt(result.receipt_path) is None
 
 
 def test_project_receipt_verifier_rejects_a_mutated_marker_but_accepts_legacy(
