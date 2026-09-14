@@ -3930,7 +3930,7 @@ def test_run_reasoning_effort_overrides_openrouter_profile(
                 model="deepseek/deepseek-v4.1-flash",
                 output_tokens=3,
                 provider="Test Provider",
-                response='{"verdict":"approved","findings":[]}',
+                response='{"verdict":"approved","findings":[],"reviewedFiles":["source.py"]}',
             ),
         )
 
@@ -9892,18 +9892,21 @@ def assert_openrouter_contract_receipt(
     receipt_path = next((tmp_path / "artifacts").glob("*/*/receipt.json"))
     request_path = next(receipt_path.parent.glob("**/request.json"))
     request = json.loads(request_path.read_text())
+    # OpenRouter's strict JSON Schema providers require every declared
+    # property to appear in `required`, even when the command did not request
+    # a separate declaration flag.
     prepared = cli.get_contract("findings-json").prepare(
         cli.ContractContext(
             file_names=("source.py",),
-            review_declaration_required=require_declaration,
+            review_declaration_required=True,
         )
     )
     assert request["response_format"]["json_schema"]["schema"] == prepared.schema
     assert "reviewedFiles" in prepared.schema["properties"]
-    assert ("reviewedFiles" in prepared.schema["required"]) is require_declaration
+    assert "reviewedFiles" in prepared.schema["required"]
     assert prepared.output_instructions in request["messages"][0]["content"]
     receipt = json.loads(receipt_path.read_text())
-    if (require_declaration and omit_declaration) or invalid_declaration:
+    if omit_declaration or invalid_declaration:
         assert result != 0
         assert receipt["acceptedAttempt"] is None
         assert not receipt["consolidatedReview"]["approved"]
@@ -12546,7 +12549,7 @@ def test_usage_private_openrouter_review(
                 model="test-model",
                 output_tokens=3,
                 provider="Test Provider",
-                response='{"verdict":"approved","findings":[]}',
+                response='{"verdict":"approved","findings":[],"reviewedFiles":["source.py"]}',
             ),
         )
 
@@ -12610,7 +12613,7 @@ def test_run_uses_the_openrouter_transport_and_records_evidence(
                 model="deepseek/deepseek-v4-flash-0731",
                 output_tokens=3,
                 provider="Test Provider",
-                response='{"verdict":"approved","findings":[]}',
+                response='{"verdict":"approved","findings":[],"reviewedFiles":["source.py"]}',
             ),
         )
 

@@ -886,6 +886,48 @@ def test_default_codex_project_route_executes_registered_transport(
     assert receipt["attempts"][0]["contractDigest"] == expected_digest
 
 
+def test_openrouter_route_forwards_its_prepared_reviewed_files_contract(tmp_path: Path) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["openrouter:example/model"]\n'
+        'execution = "remote"\n'
+    )
+    source = tmp_path / "src.py"
+    source.write_text("value = 1\n")
+    transport = QueueTransport(['{"verdict":"approved","findings":[],"reviewedFiles":["src.py"]}'])
+
+    result = ReviewClient.from_project(tmp_path, transports={"openrouter": transport}).review(
+        ReviewRequest(prompt="review", files=(source,))
+    )
+
+    assert result.status == "accepted"
+    expected = get_contract("findings-json").prepare(
+        ContractContext(file_names=("src.py",), review_declaration_required=True)
+    )
+    assert transport.requests[0].prepared_contract == expected
+
+
+def test_openrouter_prompt_only_review_does_not_require_impossible_file_declaration(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["openrouter:example/model"]\n'
+        'execution = "remote"\n'
+    )
+    transport = QueueTransport(['{"verdict":"approved","findings":[]}'])
+
+    result = ReviewClient.from_project(tmp_path, transports={"openrouter": transport}).review(
+        ReviewRequest(prompt="review")
+    )
+
+    assert result.status == "accepted"
+    assert transport.requests[0].prepared_contract is not None
+    assert transport.requests[0].prepared_contract.review_declaration_required is False
+
+
 def test_mixed_pi_codex_routes_keep_pi_contract_without_codex_read_proof(
     tmp_path: Path,
 ) -> None:
