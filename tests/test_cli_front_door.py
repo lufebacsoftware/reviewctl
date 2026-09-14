@@ -1135,7 +1135,24 @@ def test_doctor_reports_route_and_capability_without_credentials(tmp_path: Path,
     )
     assert default_profile["routes"] == ["pi:openrouter/stealth/ox-alpha"]
     assert default_profile["thinking"] == "minimal"
+    assert default_profile["projectReviewSupported"] is True
     assert "OPENROUTER_API_KEY" not in output
+
+
+def test_doctor_marks_exploratory_project_review_routes_unsupported(tmp_path: Path, capsys) -> None:
+    (tmp_path / "reviewctl.toml").write_text(
+        '[project]\nprivacy_mode = "private"\n'
+        "[profiles.default]\n"
+        'routes = ["openrouter:meta/muse-spark-1.3-contributor", "kiro:auto"]\n'
+        'execution = "remote"\n'
+    )
+
+    assert run_cli(["doctor", "--project", str(tmp_path), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    profile = next(profile for profile in payload["profiles"] if profile["name"] == "default")
+
+    assert profile["projectReviewSupported"] is False
+    assert profile["unsupportedProjectReviewTransports"] == ["kiro", "openrouter"]
 
 
 def test_review_front_door_maps_transport_diagnostic_to_exit_code(

@@ -50,6 +50,8 @@ MAX_SOURCE_FILES = 100
 MAX_SOURCE_SET_BYTES = 8 * 1024 * 1024
 MAX_SOURCE_CONTEXT_BYTES = 32 * 1024
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+FORMAL_PROJECT_TRANSPORTS = frozenset({"codex", "llm", "pi"})
+_INJECTED_FORMAL_PROJECT_TRANSPORTS = frozenset({"openrouter"})
 
 
 def _read_source_bytes(
@@ -402,6 +404,31 @@ class ReviewClient:
             return ReviewResult(
                 "route_invalid", request.review_id or "invalid", Path(), (), diagnostic
             )
+        formal_transports = FORMAL_PROJECT_TRANSPORTS | (
+            _INJECTED_FORMAL_PROJECT_TRANSPORTS & self.transports.keys()
+        )
+        unsupported_transports = sorted(
+            {route.transport for route in profile.parsed_routes} - formal_transports
+        )
+        if unsupported_transports:
+            try:
+                get_contract(profile.response_contract)
+            except KeyError, TypeError, ValueError:
+                # Preserve the existing contract-failure precedence below.
+                pass
+            else:
+                diagnostic = Diagnostic(
+                    "route_invalid",
+                    f"profile {profile.name!r} uses transport(s) not supported for formal "
+                    f"project review: "
+                    f"{', '.join(unsupported_transports)}",
+                    next=(
+                        "use a registered codex or pi route; OpenRouter and Kiro remain exploratory"
+                    ),
+                )
+                return ReviewResult(
+                    "route_invalid", request.review_id or "invalid", Path(), (), diagnostic
+                )
         if request.review_id is not None and (
             not isinstance(request.review_id, str)
             or not _REVIEW_ID.fullmatch(request.review_id.strip())
